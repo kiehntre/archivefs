@@ -128,11 +128,26 @@ use archivefs_core::patch_manager::{
     XeniaProviderFetchStatus,
 };
 pub mod bulk_confirmation;
+pub(crate) mod cheat_sources_page;
 pub mod game_presentation;
+pub(crate) mod gamer_artwork;
+pub(crate) mod romm_browse;
+pub(crate) mod romm_config;
+pub(crate) mod romm_game;
+pub(crate) mod romm_source;
 pub mod selection_guard;
 pub mod status_wording;
 mod ui;
 pub mod view_mode;
+
+use crate::romm_config::{
+    ConfigDialogRequest, RommConfigDraft, RommPreviewSummary, build_mappings_view,
+    show_config_dialog, token_field_state, validate_draft,
+};
+use crate::romm_source::{
+    RommCardRequest, RommCardState, RommOperation, RommOperationOutcome, RommProgress,
+    RommProgressEvent, RommSnapshot,
+};
 
 #[cfg(test)]
 use archivefs_core::patch_manager::{
@@ -372,12 +387,17 @@ enum ActivityAction {
     /// from `DolphinGeckoCandidateMatch`, which covers per-game provider
     /// lookups (local or network), not the catalogue itself.
     DolphinCatalogueRetrieval,
+    /// A RomM identity-source operation: connection test, enable/disable,
+    /// sample or full import, or clearing cached cover thumbnails. Recorded
+    /// whatever the outcome, so a refused or cancelled import is as visible
+    /// as a successful one.
+    RommSource,
 }
 
 /// Every `ActivityAction`, for the History & Logs "Operation" filter.
 /// Must list each variant exactly once (checked by
 /// `activity_filter_lists_cover_every_variant`).
-const ALL_ACTIVITY_ACTIONS: [ActivityAction; 41] = [
+const ALL_ACTIVITY_ACTIONS: [ActivityAction; 42] = [
     ActivityAction::Refresh,
     ActivityAction::Mount,
     ActivityAction::MountAll,
@@ -419,6 +439,7 @@ const ALL_ACTIVITY_ACTIONS: [ActivityAction; 41] = [
     ActivityAction::CheatPreview,
     ActivityAction::CheatInstall,
     ActivityAction::DolphinCatalogueRetrieval,
+    ActivityAction::RommSource,
 ];
 
 /// Every `ActivityOutcome`, for the History & Logs "Result" filter.
@@ -514,6 +535,7 @@ impl std::fmt::Display for ActivityAction {
             Self::CheatPreview => "Cheats & Mods preview",
             Self::CheatInstall => "Cheats & Mods install",
             Self::DolphinCatalogueRetrieval => "Dolphin cheat catalogue retrieval",
+            Self::RommSource => "RomM identity source",
         })
     }
 }
@@ -2463,6 +2485,22 @@ struct RunningBsFreeOperation {
     receiver: Receiver<Result<BsFreeOperationResult, String>>,
 }
 
+/// One RomM operation in flight.
+///
+/// `generation` is what makes stale traffic harmless: a progress event or a result
+/// carries the generation it was started with, and anything that does not match the
+/// current one is discarded. Without it, cancelling an import and starting another
+/// would let the first one's late progress overwrite the second's.
+struct RunningRommOperation {
+    generation: u64,
+    operation: RommOperation,
+    cancellation: Arc<AtomicBool>,
+    receiver: Receiver<(u64, Result<RommOperationOutcome, String>)>,
+    progress_receiver: Receiver<(u64, RommProgressEvent)>,
+    progress: Option<RommProgress>,
+    cancellation_requested: bool,
+}
+
 #[derive(Debug, Default)]
 struct BsFreeGuiState {
     import_path: String,
@@ -2845,6 +2883,11 @@ enum MainView {
     Mount,
     Selected,
     CheatsMods,
+    /// The registered cheat sources: which are consulted, in what order, and
+    /// for which platforms. Its own destination rather than a section of
+    /// Cheats & Mods, because it is configuration that outlives any one
+    /// archive being worked on.
+    CheatSources,
     ActiveMounts,
     Doctor,
     HistoryLogs,
@@ -3057,10 +3100,11 @@ impl ArchiveInspectorState {
 }
 
 const DEFAULT_INSPECTOR_PATH_COLUMN_WIDTH: f32 = 520.0;
-const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 11] = [
+const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 12] = [
     (MainView::Mount, "Mount"),
     (MainView::Selected, "Selected"),
     (MainView::CheatsMods, "Cheats & Mods"),
+    (MainView::CheatSources, "Cheat Sources"),
     (MainView::ActiveMounts, "Active Mounts"),
     (MainView::Library, "Library"),
     (MainView::RecentlyFound, "Recently Found"),
@@ -3127,6 +3171,7 @@ fn main_view_title(view: MainView) -> &'static str {
         MainView::Mount => "Mount",
         MainView::Selected => "Selected",
         MainView::CheatsMods => "Cheats & Mods",
+        MainView::CheatSources => "Cheat Sources",
         MainView::ActiveMounts => "Active Mounts",
         MainView::Doctor => "Doctor",
         MainView::HistoryLogs => "History & Logs",
@@ -3148,7 +3193,9 @@ fn main_view_content_width(view: MainView) -> ui_layout::ContentWidth {
         | MainView::Sources
         | MainView::LibraryViews
         | MainView::HistoryLogs => ui_layout::ContentWidth::Wide,
-        MainView::Doctor | MainView::Settings | MainView::About => ui_layout::ContentWidth::Normal,
+        MainView::CheatSources | MainView::Doctor | MainView::Settings | MainView::About => {
+            ui_layout::ContentWidth::Normal
+        }
     }
 }
 
@@ -3180,7 +3227,9 @@ fn main_view_content_width(view: MainView) -> ui_layout::ContentWidth {
 fn main_view_uses_page_scroll(view: MainView) -> bool {
     matches!(
         view,
-        MainView::Sources
+        MainView::Selected
+            | MainView::Sources
+            | MainView::CheatSources
             | MainView::Doctor
             | MainView::HistoryLogs
             | MainView::Settings
@@ -3260,6 +3309,95 @@ impl ArchiveContext {
     fn active_cheats(&self) -> Option<&Path> {
         self.focused.as_deref()
     }
+}
+
+/// The one GUI-owned ArchiveFS configuration snapshot.
+///
+/// Rendering is deliberately unable to load this from disk. A failed deliberate
+/// reload keeps the last usable value, while retaining an actionable error for the
+/// configuration UI.
+#[derive(Clone, Debug)]
+struct GuiConfigSnapshot {
+    current: Option<Config>,
+    last_error: Option<String>,
+    load_attempts: u64,
+    loader: fn() -> Result<Config, String>,
+}
+
+impl GuiConfigSnapshot {
+    fn load_with(loader: fn() -> Result<Config, String>) -> Self {
+        match loader() {
+            Ok(config) => Self {
+                current: Some(config),
+                last_error: None,
+                load_attempts: 1,
+                loader,
+            },
+            Err(error) => Self {
+                current: None,
+                last_error: Some(error),
+                load_attempts: 1,
+                loader,
+            },
+        }
+    }
+
+    fn load_default() -> Self {
+        Self::load_with(load_default_gui_config)
+    }
+
+    #[cfg(test)]
+    fn from_config(config: Config) -> Self {
+        Self {
+            current: Some(config),
+            last_error: None,
+            load_attempts: 0,
+            loader: hermetic_gui_config,
+        }
+    }
+
+    fn reload_with(&mut self, loader: fn() -> Result<Config, String>) -> Result<(), String> {
+        self.load_attempts = self.load_attempts.wrapping_add(1);
+        match loader() {
+            Ok(config) => {
+                self.current = Some(config);
+                self.last_error = None;
+                Ok(())
+            }
+            Err(error) => {
+                self.last_error = Some(error.clone());
+                Err(error)
+            }
+        }
+    }
+
+    fn reload_default(&mut self) -> Result<(), String> {
+        self.reload_with(self.loader)
+    }
+
+    fn source_roots(&self) -> Result<&[PathBuf], String> {
+        self.current
+            .as_ref()
+            .map(|config| config.source_folders.as_slice())
+            .ok_or_else(|| {
+                self.last_error.clone().unwrap_or_else(|| {
+                    "ArchiveFS configuration has not been loaded yet.".to_string()
+                })
+            })
+    }
+}
+
+fn load_default_gui_config() -> Result<Config, String> {
+    Config::load_default().map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+fn hermetic_gui_config() -> Result<Config, String> {
+    Ok(Config {
+        source_folders: vec![PathBuf::from("/library")],
+        mount_root: PathBuf::from("/mount"),
+        ratarmount_bin: "ratarmount".to_string(),
+    })
 }
 
 struct ArchiveFsApp {
@@ -3344,6 +3482,14 @@ struct ArchiveFsApp {
     /// reloads the application.
     doctor_scan: DoctorScanState,
     doctor_scan_generation: RefreshGeneration,
+    /// The Cheat Sources page, loaded lazily the first time it is opened so
+    /// that starting the GUI never reads the preferences file for a page the
+    /// user has not visited.
+    cheat_sources_page: Option<cheat_sources_page::CheatSourcesPageState>,
+    /// Unsubmitted Cheat Sources text and disclosure state. Held here rather
+    /// than in the page state because none of it is policy - see
+    /// `CheatSourcesPageUi`.
+    cheat_sources_ui: cheat_sources_page::CheatSourcesPageUi,
     /// The finding whose evidence panel is open, by stable finding id.
     doctor_selected_finding: Option<String>,
     /// The repair awaiting confirmation, if any.
@@ -3429,6 +3575,31 @@ struct ArchiveFsApp {
     bsfree_manager: BsFreeManagerState,
     bsfree_operation: Option<RunningBsFreeOperation>,
     bsfree_ui: BsFreeGuiState,
+    /// Loaded once for GUI use. RomM rendering and cached browsing borrow this
+    /// snapshot instead of reading `config.toml` on every frame.
+    gui_config: GuiConfigSnapshot,
+    /// The last authoritative RomM snapshot. `None` until the first status load,
+    /// so the card shows "reading" rather than a screenful of zeroes.
+    romm_snapshot: Option<Box<RommSnapshot>>,
+    romm_operation: Option<RunningRommOperation>,
+    romm_generation: u64,
+    romm_ui: RommCardState,
+    /// The configuration dialog's draft. `Some` exactly while it is open, which is
+    /// the same open/closed convention every other dialog in this app uses - and is
+    /// what makes opening a second one impossible.
+    romm_config_draft: Option<Box<RommConfigDraft>>,
+    /// The last preview, kept until the dialog closes or another one is asked for.
+    romm_preview: Option<Box<RommPreviewSummary>>,
+    /// The browsing panel. `Some` exactly while it is open, which is what stops a
+    /// second Browse click opening a second one.
+    romm_browse: Option<Box<crate::romm_browse::BrowseState>>,
+    /// How far the stale summary's metadata probes have got.
+    romm_stale_progress: Option<crate::romm_browse::StaleProgress>,
+    /// The selected game's RomM identity panel. Reset whenever the selection moves,
+    /// so one game's cover or verification can never appear beside another's.
+    romm_game: crate::romm_game::GamePanelState,
+    /// Progress from a running hash verification, if one is running.
+    romm_hash_progress: Option<crate::romm_game::HashProgressView>,
     catalogue_manager: CatalogueManagerState,
     catalogue_review: Option<CatalogueReview>,
     catalogue_retrieval: Option<RunningCatalogueRetrieval>,
@@ -3540,6 +3711,28 @@ struct ArchiveFsApp {
     /// session. It is invalidated by directory or file-metadata changes.
     platform_artwork_cache: PlatformArtworkCache,
     platform_artwork_manager: PlatformArtworkManagerState,
+    /// RomM cover artwork for the Gamer View game list: what has been asked
+    /// for, what has been answered, and which library generation those
+    /// answers belong to. Holds no thread of its own - see `gamer_cover_worker`.
+    gamer_covers: crate::gamer_artwork::GamerCoverCache,
+    /// The thread that resolves those covers, started on the first frame that
+    /// actually draws the list so a session that never opens Gamer View never
+    /// opens the catalogue. `None` until then.
+    gamer_cover_worker: Option<crate::gamer_artwork::CoverWorker>,
+    /// Whether a cover worker may be started at all. Always true in the running
+    /// application.
+    ///
+    /// Tests set it false. Starting the worker opens the real per-user identity
+    /// cache under `$HOME` and, for a developer who has RomM configured, can
+    /// reach their instance - neither of which a `cargo test` run may do. It
+    /// also made cover tests racy: the worker answered the very rows the test
+    /// was driving by hand, so a reply could overwrite the slot under test
+    /// between one frame and the next.
+    gamer_cover_worker_allowed: bool,
+    /// The `config_identity` the cover cache's answers were resolved against.
+    /// A change means the same path may now be a different archive, so every
+    /// answer is discarded - see `GamerCoverCache::library_changed`.
+    gamer_cover_library: Option<ConfigIdentity>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -3568,6 +3761,7 @@ struct PlatformArtworkManagerState {
     pending_remove: Option<String>,
     message: Option<(bool, String)>,
     task: Option<mpsc::Receiver<PlatformArtworkTaskResult>>,
+
 }
 
 impl ArchiveFsApp {
@@ -3580,6 +3774,7 @@ impl ArchiveFsApp {
 
     fn new(context: egui::Context) -> Self {
         theme::apply(&context);
+        let gui_config = GuiConfigSnapshot::load_default();
         let generation = RefreshGeneration::INITIAL;
         let database_generation = DatabaseGeneration::INITIAL;
         let mut history = OperationHistory::default();
@@ -3593,6 +3788,8 @@ impl ArchiveFsApp {
             state: start_load(context.clone(), generation, None),
             database_state: start_database_load(context.clone(), database_generation, None, false),
             database_generation,
+            cheat_sources_page: None,
+            cheat_sources_ui: cheat_sources_page::CheatSourcesPageUi::default(),
             library_filters: LibraryRowFilters::default(),
             filter: String::new(),
             filtered_rows: None,
@@ -3682,6 +3879,17 @@ impl ArchiveFsApp {
             bsfree_manager: BsFreeManagerState::NotLoaded,
             bsfree_operation: None,
             bsfree_ui: BsFreeGuiState::default(),
+            gui_config,
+            romm_snapshot: None,
+            romm_operation: None,
+            romm_generation: 0,
+            romm_ui: RommCardState::default(),
+            romm_config_draft: None,
+            romm_preview: None,
+            romm_browse: None,
+            romm_stale_progress: None,
+            romm_game: crate::romm_game::GamePanelState::default(),
+            romm_hash_progress: None,
             catalogue_manager: CatalogueManagerState::NotLoaded,
             catalogue_review: None,
             catalogue_retrieval: None,
@@ -3723,6 +3931,11 @@ impl ArchiveFsApp {
                 archivefs_core::platform_artwork::default_platform_artwork_root().ok(),
             platform_artwork_cache: PlatformArtworkCache::default(),
             platform_artwork_manager: PlatformArtworkManagerState::default(),
+
+            gamer_covers: crate::gamer_artwork::GamerCoverCache::default(),
+            gamer_cover_worker: None,
+            gamer_cover_worker_allowed: true,
+            gamer_cover_library: None,
         }
     }
 
@@ -4371,7 +4584,7 @@ impl ArchiveFsApp {
             .unwrap_or(0);
         // Keep the selected finding only if it still exists.
         if let Some(selected) = &self.doctor_selected_finding
-            && scan.finding(selected).is_none()
+            && scan.finding(doctor_finding_key_id(selected)).is_none()
         {
             self.doctor_selected_finding = None;
         }
@@ -4445,13 +4658,57 @@ impl ArchiveFsApp {
     /// captured path. Afterwards only the affected finding's own check is
     /// re-run (inside the executor), never the whole scan, and exactly one
     /// History entry is recorded whatever the result.
-    fn confirm_doctor_repair(&mut self) {
-        let Some(review) = self.doctor_repair_review.take() else {
+    /// Draws the Cheat Sources page and applies whatever it asked for.
+    ///
+    /// The state is loaded on first visit rather than at startup: opening the
+    /// GUI should not read a preferences file for a page nobody has looked
+    /// at. A path that cannot even be resolved (no `HOME`) is reported in
+    /// place instead of failing the whole page, since every other part of the
+    /// GUI still works without it.
+    fn show_cheat_sources_page(&mut self, ui: &mut egui::Ui) {
+        if self.cheat_sources_page.is_none() {
+            match archivefs_core::patch_manager::default_cheat_sources_config_path() {
+                Ok(path) => {
+                    self.cheat_sources_page =
+                        Some(cheat_sources_page::CheatSourcesPageState::load(path));
+                }
+                Err(error) => {
+                    widgets::banner(
+                        ui,
+                        "Preferences location unknown",
+                        &format!(
+                            "{error}. Cheat source preferences cannot be read or saved without a \
+                             home directory."
+                        ),
+                        widgets::StatusTone::Blocked,
+                    );
+                    return;
+                }
+            }
+        }
+
+        let Some(page) = self.cheat_sources_page.as_mut() else {
             return;
         };
+        let view = page.view();
+        let action =
+            cheat_sources_page::show_cheat_sources_page(ui, &view, &mut self.cheat_sources_ui);
+        if let Some(action) = action {
+            // Reverting throws away in-progress text and any open picker too:
+            // leaving a typed priority behind after "Discard changes" would
+            // show a value that is no longer anywhere in the state.
+            if matches!(action, cheat_sources_page::CheatSourcesPageAction::Revert) {
+                self.cheat_sources_ui.clear();
+            }
+            page.apply(action);
+        }
+    }
+
+    fn confirm_doctor_repair(&mut self) {
         let config = match Config::load_default() {
             Ok(config) => config,
             Err(error) => {
+                self.doctor_repair_review.take();
                 self.history.record(HistoryEntry::new(
                     ActivityAction::DoctorRepair,
                     None,
@@ -4464,6 +4721,7 @@ impl ArchiveFsApp {
         let index_path = match default_index_path() {
             Ok(path) => path,
             Err(error) => {
+                self.doctor_repair_review.take();
                 self.history.record(HistoryEntry::new(
                     ActivityAction::DoctorRepair,
                     None,
@@ -4472,6 +4730,20 @@ impl ArchiveFsApp {
                 ));
                 return;
             }
+        };
+        self.confirm_doctor_repair_with(config, index_path);
+    }
+
+    /// The repair itself, against an already-resolved configuration.
+    ///
+    /// `confirm_doctor_repair` reads the per-user configuration and the index
+    /// path and delegates here. Tests supply both directly: reading them meant a
+    /// test of *refusal* first had to get past a config load, so it passed only
+    /// on a machine that happened to have `~/.config/archivefs/config.toml` and
+    /// failed on CI, which does not.
+    fn confirm_doctor_repair_with(&mut self, config: Config, index_path: PathBuf) {
+        let Some(review) = self.doctor_repair_review.take() else {
+            return;
         };
         let Some(displayed) = self.doctor_scan.displayed() else {
             return;
@@ -4535,7 +4807,12 @@ impl ArchiveFsApp {
                     || finding.affected.as_ref().map(|path| path.display.clone()) != affected
             });
         }
-        if self.doctor_selected_finding.as_deref() == Some(outcome.record.finding_id.as_str()) {
+        if self
+            .doctor_selected_finding
+            .as_deref()
+            .map(doctor_finding_key_id)
+            == Some(outcome.record.finding_id.as_str())
+        {
             self.doctor_selected_finding = None;
         }
         self.doctor_repair_result = Some(Box::new(outcome));
@@ -5013,6 +5290,15 @@ impl ArchiveFsApp {
         match result {
             Ok(outcome) => {
                 let message = source_action_success_message(&outcome);
+                // Adding, removing, enabling or disabling a source is an explicit
+                // configuration-changing event. Refresh the sole GUI snapshot once;
+                // ordinary rendering never polls the file.
+                let config_reload_warning = self.gui_config.reload_default().err().map(|error| {
+                    format!(
+                        "The source change succeeded, but config.toml could not be reloaded: \
+                         {error}. The previous in-memory configuration is still in use."
+                    )
+                });
                 self.history.record(HistoryEntry::new(
                     log_category,
                     path,
@@ -5023,7 +5309,7 @@ impl ArchiveFsApp {
                     succeeded: true,
                     message,
                     cleanup: None,
-                    warning: None,
+                    warning: config_reload_warning,
                     more_information: None,
                 });
                 if matches!(outcome, SourceActionOutcome::Added(_)) {
@@ -5066,6 +5352,919 @@ impl ArchiveFsApp {
             let _ = sender.send(result);
             context.request_repaint();
         });
+    }
+
+    /// Starts one RomM operation, or declines.
+    ///
+    /// Declining is the point: a second click while something is running must not
+    /// launch a duplicate, and a mutating operation must not overlap another. A
+    /// status load is allowed to be the exception only because it writes nothing.
+    fn start_romm_operation(&mut self, context: egui::Context, operation: RommOperation) -> bool {
+        if let Some(running) = &self.romm_operation {
+            // A status load asked for while something else runs is dropped rather
+            // than queued: the operation that finishes will refresh anyway.
+            let _ = running;
+            return false;
+        }
+        self.romm_generation = self.romm_generation.wrapping_add(1);
+        let generation = self.romm_generation;
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let worker_cancellation = cancellation.clone();
+        let (sender, receiver) = mpsc::channel();
+        let (progress_sender, progress_receiver) = mpsc::channel();
+        // A fresh operation supersedes the previous result, so the card never shows
+        // an old outcome beside new progress.
+        self.romm_ui.last_outcome = None;
+        if operation.is_mutating() {
+            self.history.record(HistoryEntry::new(
+                ActivityAction::RommSource,
+                None,
+                ActivityOutcome::Started,
+                format!("{}.", operation.label()),
+            ));
+        }
+        self.romm_operation = Some(RunningRommOperation {
+            generation,
+            operation: operation.clone(),
+            cancellation,
+            receiver,
+            progress_receiver,
+            progress: operation.reports_progress().then(RommProgress::default),
+            cancellation_requested: false,
+        });
+        let trusted_roots = self.gui_config.source_roots().map(|roots| roots.to_vec());
+        let progress_context = context.clone();
+        thread::spawn(move || {
+            let report = |event: RommProgressEvent| {
+                let _ = progress_sender.send((generation, event));
+                progress_context.request_repaint();
+            };
+            let result =
+                run_romm_operation(&operation, &trusted_roots, &worker_cancellation, &report);
+            let _ = sender.send((generation, result));
+            context.request_repaint();
+        });
+        true
+    }
+
+    /// Asks the running operation to stop. Only the current one: an older
+    /// generation has already been forgotten.
+    fn cancel_romm_operation(&mut self) {
+        if let Some(running) = self.romm_operation.as_mut() {
+            running.cancellation.store(true, Ordering::Release);
+            running.cancellation_requested = true;
+        }
+    }
+
+    fn poll_romm_operation(&mut self, context: &egui::Context) {
+        // Progress first, discarding anything from a superseded generation.
+        if let Some(running) = self.romm_operation.as_mut() {
+            let current = running.generation;
+            for (generation, event) in running.progress_receiver.try_iter() {
+                if generation != current {
+                    continue;
+                }
+                let progress = running.progress.get_or_insert_with(RommProgress::default);
+                match event {
+                    RommProgressEvent::Import(import) => progress.absorb(import),
+                    RommProgressEvent::Note(note) => progress.note(note),
+                    RommProgressEvent::StaleProgress { probed, total } => {
+                        self.romm_stale_progress =
+                            Some(crate::romm_browse::StaleProgress { probed, total });
+                    }
+                    RommProgressEvent::Hashing(hashing) => {
+                        self.romm_hash_progress = Some(hashing);
+                    }
+                }
+            }
+        }
+
+        let Some((generation, operation, result)) =
+            self.romm_operation.as_ref().and_then(|running| {
+                running
+                    .receiver
+                    .try_recv()
+                    .ok()
+                    .map(|(generation, result)| (generation, running.operation.clone(), result))
+            })
+        else {
+            return;
+        };
+        if generation != self.romm_generation {
+            // A result from an operation that has already been superseded. Dropping
+            // it is what stops it overwriting the current one's outcome.
+            self.romm_operation = None;
+            return;
+        }
+        self.romm_operation = None;
+        self.romm_hash_progress = None;
+
+        let previous_outcome = self.romm_ui.last_outcome.take();
+        self.romm_ui.last_outcome = Some(romm_source::build_result_view(
+            &operation,
+            result.as_ref().map_err(String::as_str),
+        ));
+        if operation.is_mutating() {
+            self.history.record(HistoryEntry::new(
+                ActivityAction::RommSource,
+                None,
+                match &result {
+                    Ok(_) => ActivityOutcome::Completed,
+                    Err(_) => ActivityOutcome::Failed,
+                },
+                match &result {
+                    Ok(_) => format!("{} completed.", operation.label()),
+                    Err(message) => format!("{} failed: {message}", operation.label()),
+                },
+            ));
+        }
+        // Browsing results belong to the panel rather than to the card, and each is
+        // only accepted if it still answers what the panel is asking for.
+        if let Ok(outcome) = &result {
+            let landed = match outcome {
+                RommOperationOutcome::Records(page) => {
+                    match self.romm_browse.as_mut() {
+                        Some(state) => {
+                            if state.accepts_page(page, &page.cache) {
+                                state.needs_reload = false;
+                                state.page = Some(page.clone());
+                            } else {
+                                // The filters or the cache moved on while this was in
+                                // flight. Mixing generations would show a page that
+                                // answers a question nobody is asking any more.
+                                state.needs_reload = true;
+                            }
+                            true
+                        }
+                        // The panel was closed before the page arrived.
+                        None => true,
+                    }
+                }
+                RommOperationOutcome::RecordDetail(detail) => {
+                    if let Some(state) = self.romm_browse.as_mut() {
+                        let requested_id = match &operation {
+                            RommOperation::LoadRecordDetail { romm_game_id } => romm_game_id,
+                            _ => unreachable!("a detail result must come from a detail request"),
+                        };
+                        if state.accepts_detail(requested_id, detail.as_ref().as_ref()) {
+                            state.pending_detail_id = None;
+                            state.detail = detail.as_ref().clone().map(Box::new);
+                            state.detail_problem = detail.is_none().then(|| {
+                                format!(
+                                    "RomM record {requested_id} is no longer present in the \
+                                     published cache. Refresh the records view."
+                                )
+                            });
+                        }
+                    }
+                    true
+                }
+                RommOperationOutcome::Conflicts(page) => {
+                    if let Some(state) = self.romm_browse.as_mut() {
+                        if state.accepts_conflicts(page, &page.cache) {
+                            state.conflicts = Some(page.clone());
+                        } else {
+                            state.needs_reload = true;
+                        }
+                    }
+                    true
+                }
+                RommOperationOutcome::Stale(view) => {
+                    if let Some(state) = self.romm_browse.as_mut() {
+                        if state.accepts_stale(view, &view.cache) {
+                            state.stale = Some(view.clone());
+                        } else {
+                            state.needs_reload = true;
+                        }
+                    }
+                    self.romm_stale_progress = None;
+                    true
+                }
+                RommOperationOutcome::GameIdentity(panel) => {
+                    if self.romm_game.accepts_panel(panel) {
+                        self.romm_game.panel = Some(panel.clone());
+                        self.romm_game.needs_reload = false;
+                    } else {
+                        // The selection moved while this was in flight. Drawing it
+                        // would attach one game's evidence to another's file.
+                        self.romm_game.needs_reload = true;
+                    }
+                    true
+                }
+                RommOperationOutcome::Cover(outcome) => {
+                    if self.romm_game.accepts_cover(outcome) {
+                        // The texture is dropped here rather than in the renderer, so
+                        // a cover cleared mid-fetch cannot leave the old pixels up.
+                        self.romm_game.cover_texture = None;
+                        self.romm_game.cover_key = None;
+                        self.romm_game.cover = outcome.state.clone();
+                        self.romm_game.cover_cache =
+                            Some((outcome.cached_items, outcome.cached_bytes));
+                    }
+                    if let Some(state) = self.romm_browse.as_mut()
+                        && state.accepts_cover(outcome)
+                    {
+                        state.detail_cover_texture = None;
+                        state.detail_cover_key = None;
+                        state.detail_cover = outcome.state.clone();
+                    }
+                    // A stale cover is deliberately discarded, but it is still a
+                    // panel result rather than a source-card outcome banner.
+                    true
+                }
+                _ => false,
+            };
+            if landed {
+                // Not a card result: browsing produces no outcome banner.
+                self.romm_ui.last_outcome = previous_outcome;
+                return;
+            }
+        }
+        if let (RommOperation::LoadRecordDetail { romm_game_id }, Err(message)) =
+            (&operation, &result)
+            && let Some(state) = self.romm_browse.as_mut()
+            && state.pending_detail_id.as_deref() == Some(romm_game_id)
+        {
+            state.pending_detail_id = None;
+            state.detail_problem = Some(message.clone());
+        }
+        if let Ok(RommOperationOutcome::Verified(outcome)) = &result {
+            // Both a card result and panel state: the panel inside it was rebuilt
+            // from the verification that was just stored, so the verdict on screen is
+            // recomputed rather than assumed.
+            if self.romm_game.accepts_verification(outcome) {
+                self.romm_game.panel = Some(outcome.panel.clone());
+                self.romm_game.verification = Some(outcome.clone());
+                self.romm_game.needs_reload = false;
+            }
+            self.romm_hash_progress = None;
+        }
+        // An import that actually *published* replaced the identity cache, so what any
+        // local path resolves to may have changed. Gamer View's worker holds its path
+        // index in memory - rebuilding it costs a full read of 36,259 records, which
+        // is why it is rebuilt on this signal rather than on a timer or per frame.
+        //
+        // `published` is the exact condition, not merely "an import finished". A
+        // sample import deliberately never publishes, and an import that failed
+        // leaves the previous cache in place; refreshing for either would withdraw
+        // every cover on screen to revalidate against a catalogue that had not
+        // changed. This is also what keeps a failed import from discarding a working
+        // index.
+        if matches!(&result, Ok(RommOperationOutcome::Import(summary)) if summary.published) {
+            // Ready covers become `Revalidating`: their textures are kept so an
+            // unchanged record costs no decode, but the placeholder is drawn until
+            // the refreshed catalogue confirms the record, so a path whose provider
+            // id moved cannot show the old cover even for one frame.
+            self.gamer_covers.identity_refreshed();
+            if let Some(worker) = self.gamer_cover_worker.as_ref() {
+                worker.reindex();
+            }
+        }
+        if let Ok(RommOperationOutcome::Preview(summary)) = &result {
+            // A preview is only meaningful while the dialog that asked for it is
+            // open; if it has been closed, the result is dropped.
+            if self.romm_config_draft.is_some() {
+                self.romm_preview = Some(summary.clone());
+            }
+        }
+        if let Ok(RommOperationOutcome::Saved(_)) = &result {
+            // Saved, so the dialog has served its purpose and the card is reloaded
+            // from disk rather than from what was typed.
+            self.close_romm_configuration();
+            // This is a deliberate reload boundary. Rendering never reloads the
+            // application configuration, and a failed reload retains the previous
+            // usable snapshot instead of replacing it with an empty one.
+            if let Err(error) = self.gui_config.reload_default() {
+                self.feedback = Some(ActionFeedback {
+                    succeeded: false,
+                    message: format!(
+                        "RomM was saved, but ArchiveFS could not reload its main configuration: \
+                         {error}. The previous in-memory configuration is still in use."
+                    ),
+                    cleanup: None,
+                    warning: None,
+                    more_information: Some(
+                        "Fix config.toml, then use an explicit refresh or save again.".to_string(),
+                    ),
+                });
+            }
+        }
+        if let Ok(RommOperationOutcome::Snapshot(snapshot)) = &result {
+            // The one result that is not a user-visible outcome: it *is* the card's
+            // state. A snapshot never overwrites a real result view.
+            self.romm_snapshot = Some(snapshot.clone());
+            self.romm_ui.last_outcome = previous_outcome;
+            return;
+        }
+        // A mutating operation may have changed what the card shows, so the card is
+        // refreshed from authoritative state rather than from an optimistic counter.
+        // A failure leaves the previous snapshot in place until the reload replaces
+        // it, so a failed refresh never erases counts that were true.
+        if operation.is_mutating() {
+            self.start_romm_status_load(context.clone());
+        }
+    }
+
+    /// Loads the snapshot. Separate from `start_romm_operation` so it can run
+    /// straight after another operation completes.
+    fn start_romm_status_load(&mut self, context: egui::Context) {
+        if self.romm_operation.is_some() {
+            return;
+        }
+        self.romm_generation = self.romm_generation.wrapping_add(1);
+        let generation = self.romm_generation;
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = mpsc::channel();
+        let (_progress_sender, progress_receiver) = mpsc::channel();
+        self.romm_operation = Some(RunningRommOperation {
+            generation,
+            operation: RommOperation::LoadStatus,
+            cancellation,
+            receiver,
+            progress_receiver,
+            progress: None,
+            cancellation_requested: false,
+        });
+        thread::spawn(move || {
+            let result = load_romm_snapshot()
+                .map(|snapshot| RommOperationOutcome::Snapshot(Box::new(snapshot)));
+            let _ = sender.send((generation, result));
+            context.request_repaint();
+        });
+    }
+
+    /// Opens the configuration dialog on whatever is actually stored.
+    ///
+    /// Opening it twice is impossible: the draft *is* the open flag, so a second
+    /// request while one is open is a no-op rather than a second dialog.
+    fn open_romm_configuration(&mut self) {
+        if self.romm_config_draft.is_some() {
+            return;
+        }
+        let draft = match self.romm_snapshot.as_deref() {
+            Some(snapshot) => RommConfigDraft::from_snapshot(snapshot),
+            // A source that has never been configured still needs the dialog - that
+            // is the only way it ever gets configured.
+            None => RommConfigDraft::blank(),
+        };
+        self.romm_config_draft = Some(Box::new(draft));
+        self.romm_preview = None;
+    }
+
+    /// Draws the configuration dialog.
+    ///
+    /// Split out so the borrow of the draft is over before a request is handled -
+    /// which is what lets a save or a close mutate the same state the dialog was
+    /// just drawn from.
+    fn show_romm_configuration(&mut self, ui: &mut egui::Ui) -> Option<ConfigDialogRequest> {
+        let source_roots_result = self.gui_config.source_roots().map(Vec::from);
+        let source_roots = source_roots_result.clone().unwrap_or_default();
+        let busy = self
+            .romm_operation
+            .as_ref()
+            .is_some_and(|running| running.operation.blocks_actions());
+        let preview_running = self
+            .romm_operation
+            .as_ref()
+            .is_some_and(|running| matches!(running.operation, RommOperation::Preview { .. }));
+        let previous = self
+            .romm_snapshot
+            .as_deref()
+            .map(|snapshot| snapshot.settings.clone());
+        let preview = self.romm_preview.clone();
+
+        let draft = self.romm_config_draft.as_mut()?;
+        // The token file's verdict comes from the core loader, and only its verdict:
+        // the contents are never read into the GUI.
+        let token_state = {
+            let trimmed = draft.token_path.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                let path = PathBuf::from(trimmed);
+                Some(token_field_state(
+                    archivefs_core::identity_source::settings::load_token_file(Some(&path))
+                        .map(|_| ()),
+                    trimmed,
+                ))
+            }
+        };
+        let validation = validate_draft(draft, token_state.as_ref(), &source_roots);
+        let mappings = build_mappings_view(&draft.mappings, draft.path_kind, &source_roots);
+        if let Err(problem) = source_roots_result {
+            widgets::banner(
+                ui,
+                "ArchiveFS configuration unavailable",
+                &format!(
+                    "The previous in-memory configuration is being preserved, but this dialog \
+                     cannot validate source-folder mappings: {problem}"
+                ),
+                widgets::StatusTone::Blocked,
+            );
+        }
+        show_config_dialog(
+            ui,
+            draft,
+            &crate::romm_config::ConfigDialogInputs {
+                validation: &validation,
+                mappings: &mappings,
+                preview: preview.as_deref(),
+                previous: previous.as_ref(),
+                busy,
+                preview_running,
+            },
+            &mut self.clipboard,
+        )
+    }
+
+    /// The configuration dialog's fixed footer - Save and Cancel.
+    ///
+    /// Split from `show_romm_configuration` so the window wrapper can place it
+    /// outside the body's scroll area. It re-derives the same validation the
+    /// body did rather than caching it, because the body may have just changed
+    /// a field this frame and a stale `can_save` would be worse than the very
+    /// small cost of recomputing it.
+    fn show_romm_configuration_footer(&mut self, ui: &mut egui::Ui) -> Option<ConfigDialogRequest> {
+        let source_roots = self
+            .gui_config
+            .source_roots()
+            .map(Vec::from)
+            .unwrap_or_default();
+        let busy = self
+            .romm_operation
+            .as_ref()
+            .is_some_and(|running| running.operation.blocks_actions());
+        let preview_running = self
+            .romm_operation
+            .as_ref()
+            .is_some_and(|running| matches!(running.operation, RommOperation::Preview { .. }));
+        let previous = self
+            .romm_snapshot
+            .as_deref()
+            .map(|snapshot| snapshot.settings.clone());
+        let preview = self.romm_preview.clone();
+
+        let draft = self.romm_config_draft.as_mut()?;
+        let token_state = {
+            let trimmed = draft.token_path.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                let path = PathBuf::from(trimmed);
+                Some(token_field_state(
+                    archivefs_core::identity_source::settings::load_token_file(Some(&path))
+                        .map(|_| ()),
+                    trimmed,
+                ))
+            }
+        };
+        let validation = validate_draft(draft, token_state.as_ref(), &source_roots);
+        let mappings = build_mappings_view(&draft.mappings, draft.path_kind, &source_roots);
+        crate::romm_config::show_config_dialog_footer(
+            ui,
+            draft,
+            &crate::romm_config::ConfigDialogInputs {
+                validation: &validation,
+                mappings: &mappings,
+                preview: preview.as_deref(),
+                previous: previous.as_ref(),
+                busy,
+                preview_running,
+            },
+        )
+    }
+
+    /// Draws the existing configuration content as an actual persistent window.
+    ///
+    /// Previously the content was appended below the source card, outside the
+    /// visible scroll position. The draft still remains the single open/closed flag;
+    /// this wrapper only gives that state a visible destination.
+    ///
+    /// # Window shape
+    ///
+    /// The same arrangement the RomM record Details window uses, for the same
+    /// reason: a title-bar close (`.open`), a body that scrolls within a
+    /// viewport-clamped window, and a footer holding Save and Cancel that is
+    /// drawn *after* the body's scroll area so it can never scroll away. The
+    /// previous version had none of these - the actions were the last widgets
+    /// inside the scrolling body, so at TV resolution the dialog offered no
+    /// visible exit at all and Escape was the only way out.
+    fn show_romm_configuration_window(
+        &mut self,
+        context: &egui::Context,
+    ) -> Option<ConfigDialogRequest> {
+        self.romm_config_draft.as_ref()?;
+        let mut request = None;
+        let viewport = context.input(|input| input.screen_rect().size());
+        let (initial, maximum) = romm_dialog_sizes(viewport, egui::vec2(640.0, 760.0));
+        // egui only reports a title-bar close by clearing this flag, so it has
+        // to outlive the closure.
+        let mut open = true;
+        egui::Window::new("Configure RomM")
+            .id(egui::Id::new("romm_configuration_dialog"))
+            .collapsible(false)
+            .resizable(true)
+            .open(&mut open)
+            .default_size(initial)
+            .max_size(maximum)
+            // egui keeps a constrained window fully inside the screen, which
+            // is what guarantees the fixed footer stays reachable.
+            .constrain(true)
+            .default_pos(egui::pos2(24.0, 24.0))
+            .show(context, |ui| {
+                let footer_height = crate::romm_config::CONFIG_FOOTER_HEIGHT;
+                // Bounded from both directions, and both bounds matter.
+                //
+                // `available_height` alone is not enough: with content taller
+                // than the screen it is effectively unbounded, the scroll area
+                // claimed all of it, and the window grew past its own maximum
+                // until the fixed footer sat below the bottom of the screen.
+                //
+                // The window maximum alone is not enough either: sizing the
+                // body from it consumed the whole content area, and the
+                // separator and footer were then laid out past the window's
+                // clip rect, where they were never painted at all.
+                //
+                // Taking the smaller of the two keeps the footer inside the
+                // window *and* the window inside the viewport.
+                let body_height = crate::romm_config::config_body_height(
+                    ui.available_height().min(romm_window_body_cap(maximum)),
+                    footer_height,
+                );
+                egui::ScrollArea::vertical()
+                    .id_salt("romm_configuration_body")
+                    .scroll_bar_visibility(
+                        egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
+                    )
+                    .max_height(body_height)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| request = self.show_romm_configuration(ui));
+                ui.separator();
+                if let Some(found) = self.show_romm_configuration_footer(ui) {
+                    request = Some(found);
+                }
+            });
+        // A title-bar close and Escape are both plain "leave without writing":
+        // `Close` discards the draft and performs no save, no import and no
+        // request. Neither is allowed to overwrite a Save the footer just
+        // produced in this same frame.
+        if request.is_none()
+            && (!open || context.input(|input| input.key_pressed(egui::Key::Escape)))
+        {
+            request = Some(ConfigDialogRequest::Close);
+        }
+        request
+    }
+
+    /// Opens the browsing panel on one view, or switches an open one to it.
+    ///
+    /// Opening it twice is impossible for the same reason the configuration dialog
+    /// cannot be: the state *is* the open flag.
+    fn open_romm_browse(&mut self, view: crate::romm_browse::BrowseView) {
+        match self.romm_browse.as_mut() {
+            Some(state) if state.view != view => {
+                state.view = view;
+                state.detail = None;
+                state.pending_detail_id = None;
+                state.detail_problem = None;
+            }
+            Some(_) => {}
+            None => {
+                self.romm_browse = Some(Box::new(crate::romm_browse::BrowseState::opened_at(view)));
+            }
+        }
+    }
+
+    fn close_romm_browse(&mut self) {
+        self.romm_browse = None;
+        self.romm_stale_progress = None;
+    }
+
+    /// Draws the RomM records browser as its own persistent window.
+    ///
+    /// # Why a window
+    ///
+    /// It used to be appended to the Sources page underneath the RomM source
+    /// card. On a page already taller than the viewport that put the browser
+    /// entirely below the fold, so one click on "Browse records" produced no
+    /// visible change whatsoever and read as a dead button. A window appears
+    /// where the user is looking, on the frame the button is pressed.
+    ///
+    /// Opening twice cannot duplicate it: `self.romm_browse` *is* the open
+    /// flag (see `open_romm_browse`), and the window carries a fixed id, so a
+    /// second click at most switches which view is shown.
+    ///
+    /// Nothing here changes what browsing *does*: it still reads the published
+    /// identity cache only. No transport is constructed, no token is read and
+    /// no request is made - that is `handle_romm_browse_request`'s business,
+    /// and it is untouched.
+    fn show_romm_browse_window(
+        &mut self,
+        context: &egui::Context,
+    ) -> Option<crate::romm_browse::BrowseRequest> {
+        self.romm_browse.as_ref()?;
+        let busy = self
+            .romm_operation
+            .as_ref()
+            .is_some_and(|running| running.operation.blocks_actions());
+        let progress = self.romm_stale_progress;
+        let viewport = context.input(|input| input.screen_rect().size());
+        let (initial, maximum) = romm_dialog_sizes(viewport, egui::vec2(900.0, 780.0));
+        let title = self
+            .romm_browse
+            .as_ref()
+            .map(|state| state.view.title())
+            .unwrap_or("RomM records");
+        let mut request = None;
+        let mut open = true;
+        egui::Window::new(title)
+            .id(egui::Id::new("romm_browse_window"))
+            .collapsible(false)
+            .resizable(true)
+            .open(&mut open)
+            .default_size(initial)
+            .max_size(maximum)
+            // egui keeps a constrained window fully inside the screen, which
+            // is what guarantees the fixed footer stays reachable.
+            .constrain(true)
+            .default_pos(egui::pos2(24.0, 24.0))
+            .show(context, |ui| {
+                let footer_height = crate::romm_browse::BROWSE_FOOTER_HEIGHT;
+                // See `show_romm_configuration_window` for why both bounds
+                // are needed. The records list is the case that proves it:
+                // its content is far taller than any screen.
+                let body_height = crate::romm_config::config_body_height(
+                    ui.available_height().min(romm_window_body_cap(maximum)),
+                    footer_height,
+                );
+                egui::ScrollArea::vertical()
+                    .id_salt("romm_browse_body")
+                    .scroll_bar_visibility(
+                        egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
+                    )
+                    .max_height(body_height)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if let Some(found) = self.romm_browse.as_mut().and_then(|state| {
+                            crate::romm_browse::show_browse_panel(
+                                ui,
+                                state,
+                                busy,
+                                progress.as_ref(),
+                            )
+                        }) {
+                            request = Some(found);
+                        }
+                    });
+                ui.separator();
+                if let Some(found) = crate::romm_browse::show_browse_panel_footer(ui) {
+                    request = Some(found);
+                }
+            });
+        // Escape belongs to the record Details window whenever one is open -
+        // it closes that, not the browser underneath it - so the browser only
+        // consumes Escape when nothing is layered on top.
+        let detail_open = self
+            .romm_browse
+            .as_ref()
+            .is_some_and(|state| state.detail.is_some());
+        if request.is_none()
+            && (!open
+                || (!detail_open && context.input(|input| input.key_pressed(egui::Key::Escape))))
+        {
+            request = Some(crate::romm_browse::BrowseRequest::Close);
+        }
+        request
+    }
+
+    /// Routes one request from the browsing panel.
+    fn handle_romm_browse_request(
+        &mut self,
+        context: &egui::Context,
+        request: crate::romm_browse::BrowseRequest,
+    ) {
+        use crate::romm_browse::BrowseRequest;
+        match request {
+            BrowseRequest::LoadRecords { offset, limit } => {
+                if let Some(state) = self.romm_browse.as_mut() {
+                    state.invalidate_detail_request();
+                }
+                let filters = self
+                    .romm_browse
+                    .as_ref()
+                    .map(|state| state.filters.clone())
+                    .unwrap_or_default();
+                self.start_romm_operation(
+                    context.clone(),
+                    RommOperation::LoadRecords {
+                        filters: Box::new(filters),
+                        offset,
+                        limit,
+                    },
+                );
+            }
+            BrowseRequest::OpenDetail { romm_game_id } => {
+                let requested_id = romm_game_id.clone();
+                if self.start_romm_operation(
+                    context.clone(),
+                    RommOperation::LoadRecordDetail { romm_game_id },
+                ) && let Some(state) = self.romm_browse.as_mut()
+                {
+                    state.begin_detail(requested_id);
+                }
+            }
+            BrowseRequest::CloseDetail => {
+                if let Some(state) = self.romm_browse.as_mut() {
+                    state.detail = None;
+                    state.pending_detail_id = None;
+                    state.detail_problem = None;
+                    state.detail_cover = crate::romm_game::CoverState::Idle;
+                    state.detail_cover_texture = None;
+                    state.detail_cover_key = None;
+                }
+            }
+            BrowseRequest::LoadDetailCover {
+                local_path,
+                romm_game_id,
+            } => {
+                if self.start_romm_operation(
+                    context.clone(),
+                    RommOperation::LoadCover {
+                        local_path,
+                        romm_game_id,
+                    },
+                ) && let Some(state) = self.romm_browse.as_mut()
+                {
+                    state.detail_cover = crate::romm_game::CoverState::Loading;
+                }
+            }
+            BrowseRequest::LoadConflicts { offset } => {
+                self.start_romm_operation(context.clone(), RommOperation::LoadConflicts { offset });
+            }
+            BrowseRequest::RunStaleSummary => {
+                self.romm_stale_progress = None;
+                self.start_romm_operation(context.clone(), RommOperation::StaleSummary);
+            }
+            BrowseRequest::Cancel => self.cancel_romm_operation(),
+            BrowseRequest::Switch(view) => self.open_romm_browse(view),
+            BrowseRequest::Close => self.close_romm_browse(),
+        }
+    }
+
+    /// What ArchiveFS itself says the selected archive's platform is.
+    ///
+    /// Read from the catalogue the GUI already holds. `manual` is the whole point: it
+    /// makes the assignment count as verified local evidence, which is what stops a
+    /// disagreeing RomM record from being presented as a correction.
+    fn romm_local_platform(&self, path: &Path) -> crate::romm_game::LocalPlatformClaim {
+        let persisted = self.database_state.snapshot().and_then(|snapshot| {
+            snapshot
+                .archives
+                .iter()
+                .find(|archive| archive.absolute_path == path)
+        });
+        match persisted {
+            Some(archive) => crate::romm_game::LocalPlatformClaim {
+                platform: archive.platform.clone(),
+                manual: archive.platform_source.as_deref() == Some(MANUAL_PLATFORM_SOURCE),
+            },
+            None => crate::romm_game::LocalPlatformClaim::default(),
+        }
+    }
+
+    /// Draws the selected game's RomM panel, and follows the selection.
+    fn show_romm_game_panel(&mut self, context: &egui::Context, ui: &mut egui::Ui) {
+        // Following the selection discards the previous game's panel, cover and
+        // verification, but starts nothing: a lookup is a button press.
+        self.romm_game
+            .focus(self.archive_context.focused.as_deref());
+        let running = self
+            .romm_operation
+            .as_ref()
+            .map(|running| &running.operation);
+        let busy = running.is_some_and(RommOperation::blocks_actions);
+        let busy_reason = running.map(|operation| operation.label());
+        let cache_present = self
+            .romm_snapshot
+            .as_deref()
+            .is_some_and(|snapshot| snapshot.status.records_imported > 0);
+        let hash_progress = self.romm_hash_progress.clone();
+        let request = crate::romm_game::show_game_identity_panel(
+            ui,
+            &mut self.romm_game,
+            &crate::romm_game::GamePanelInputs {
+                busy,
+                busy_reason,
+                hash_progress: hash_progress.as_ref(),
+                cache_present,
+            },
+        );
+        if let Some(request) = request {
+            self.handle_romm_game_request(context, request);
+        }
+    }
+
+    fn handle_romm_game_request(
+        &mut self,
+        context: &egui::Context,
+        request: crate::romm_game::GamePanelRequest,
+    ) {
+        use crate::romm_game::GamePanelRequest;
+
+        let Some(local_path) = self.romm_game.local_path.clone() else {
+            return;
+        };
+        let local_platform = Box::new(self.romm_local_platform(&local_path));
+        match request {
+            GamePanelRequest::Resolve => {
+                self.start_romm_operation(
+                    context.clone(),
+                    RommOperation::ResolveGame {
+                        local_path,
+                        local_platform,
+                        chosen_game_id: self.romm_game.chosen_game_id.clone(),
+                    },
+                );
+            }
+            GamePanelRequest::Choose { romm_game_id } => {
+                // A choice is recorded and then re-resolved, so the verdict on screen
+                // is the one that record actually earns rather than a relabelling.
+                self.romm_game.chosen_game_id = Some(romm_game_id.clone());
+                self.romm_game.verification = None;
+                self.romm_game.cover = crate::romm_game::CoverState::Idle;
+                self.romm_game.cover_texture = None;
+                self.romm_game.cover_key = None;
+                self.start_romm_operation(
+                    context.clone(),
+                    RommOperation::ResolveGame {
+                        local_path,
+                        local_platform,
+                        chosen_game_id: Some(romm_game_id),
+                    },
+                );
+            }
+            GamePanelRequest::Verify { romm_game_id } => {
+                self.start_romm_operation(
+                    context.clone(),
+                    RommOperation::VerifyLocalFile {
+                        local_path,
+                        romm_game_id,
+                        local_platform,
+                        chosen_game_id: self.romm_game.chosen_game_id.clone(),
+                    },
+                );
+            }
+            GamePanelRequest::LoadCover { romm_game_id } => {
+                if self.start_romm_operation(
+                    context.clone(),
+                    RommOperation::LoadCover {
+                        local_path,
+                        romm_game_id,
+                    },
+                ) {
+                    self.romm_game.cover = crate::romm_game::CoverState::Loading;
+                }
+            }
+            GamePanelRequest::Cancel => self.cancel_romm_operation(),
+            GamePanelRequest::Close => {
+                // Closed for this selection only. Choosing a different archive brings
+                // it back, which is what someone expects from a per-game panel.
+                self.romm_game.dismissed = true;
+            }
+            GamePanelRequest::Reopen => {
+                self.romm_game.dismissed = false;
+            }
+        }
+    }
+
+    fn close_romm_configuration(&mut self) {
+        self.romm_config_draft = None;
+        self.romm_preview = None;
+    }
+
+    /// Routes one request from the configuration dialog.
+    fn handle_romm_config_request(
+        &mut self,
+        context: &egui::Context,
+        request: ConfigDialogRequest,
+    ) {
+        match request {
+            ConfigDialogRequest::Save(settings) => {
+                // Declined while anything else runs, so a save cannot race an import.
+                if self.start_romm_operation(
+                    context.clone(),
+                    RommOperation::SaveConfiguration(settings),
+                ) {
+                    // The dialog stays open until the save succeeds, so a refused
+                    // save does not lose what was typed.
+                }
+            }
+            ConfigDialogRequest::Preview { limit } => {
+                self.start_romm_operation(context.clone(), RommOperation::Preview { limit });
+            }
+            ConfigDialogRequest::CancelPreview => self.cancel_romm_operation(),
+            ConfigDialogRequest::Close => self.close_romm_configuration(),
+        }
     }
 
     fn poll_bsfree_operation(&mut self, context: &egui::Context) {
@@ -11359,6 +12558,7 @@ impl ArchiveFsApp {
         self.poll_alias_action(context);
         self.poll_source_action(context);
         self.poll_bsfree_operation(context);
+        self.poll_romm_operation(context);
         self.poll_catalogue_manager(context);
         self.poll_dolphin_catalogue_manager(context);
         self.poll_library_view_action(context);
@@ -11376,6 +12576,14 @@ impl ArchiveFsApp {
             && self.bsfree_operation.is_none()
         {
             self.start_bsfree_operation(context.clone(), BsFreeOperation::LoadStatus);
+        }
+        // Only once the Sources page is actually open, and only local reads - so
+        // starting ArchiveFS still makes no network request of any kind.
+        if self.view == MainView::Sources
+            && self.romm_snapshot.is_none()
+            && self.romm_operation.is_none()
+        {
+            self.start_romm_status_load(context.clone());
         }
         if self.view == MainView::CheatsMods
             && self.cheat_workflow.as_ref().is_some_and(|workflow| {
@@ -11792,6 +13000,27 @@ impl ArchiveFsApp {
                         LoadState::Loading { previous, .. } => previous.as_deref(),
                         LoadState::Error(_) => None,
                     };
+                    // A reloaded library may map the same path to a different
+                    // archive, and a re-imported RomM catalogue changes what any
+                    // path resolves to, so both discard every answer rather than
+                    // risk drawing one game's cover beside another. A search or a
+                    // platform change does neither: it narrows which records are
+                    // visible without changing what any of them is, so covers
+                    // already loaded stay loaded and are not fetched twice.
+                    let library = data.map(|data| data.config_identity.clone());
+                    if self.gamer_cover_library != library {
+                        self.gamer_cover_library = library;
+                        self.gamer_covers.library_changed();
+                    }
+                    // Answers first, so a cover that arrived since the last frame
+                    // is drawn in this one. Anything from a superseded generation
+                    // is dropped inside `absorb`.
+                    if let Some(worker) = self.gamer_cover_worker.as_ref() {
+                        for reply in worker.drain() {
+                            self.gamer_covers.absorb(ui.ctx(), reply);
+                        }
+                    }
+                    let mut cover_requests: Vec<crate::gamer_artwork::CoverJob> = Vec::new();
                     let gamer_action = show_gamer_view(
                         ui,
                         data,
@@ -11807,8 +13036,26 @@ impl ArchiveFsApp {
                             feedback: self.feedback.as_ref(),
                             artwork_directory: self.custom_platform_artwork_directory.as_deref(),
                             artwork_cache: &mut self.platform_artwork_cache,
+                            covers: &mut self.gamer_covers,
+                            cover_requests: &mut cover_requests,
                         },
                     );
+                    // Started only once the list has actually asked for something,
+                    // so a session that never opens Gamer View never opens the
+                    // catalogue, and an empty or unfiltered-to-nothing list starts
+                    // no thread at all.
+                    if !cover_requests.is_empty() && self.gamer_cover_worker_allowed {
+                        let worker = self.gamer_cover_worker.get_or_insert_with(|| {
+                            crate::gamer_artwork::CoverWorker::start(
+                                ui.ctx().clone(),
+                                self.gui_config.source_roots().ok().map(<[PathBuf]>::to_vec),
+                            )
+                        });
+                        let generation = self.gamer_covers.generation();
+                        for job in cover_requests {
+                            worker.request(generation, job);
+                        }
+                    }
                     match gamer_action {
                         Some(GamerViewAction::Operation(request)) => {
                             requested_action = Some(AppOperationRequest::Archive(request));
@@ -11975,7 +13222,55 @@ impl ArchiveFsApp {
                     }
 
                     ui.add_space(theme::SECTION_GAP);
+                    let romm_view = romm_source::build_card_view(
+                        self.romm_snapshot.as_deref(),
+                        self.romm_operation.as_ref().map(|running| &running.operation),
+                        self.romm_operation
+                            .as_ref()
+                            .is_some_and(|running| running.cancellation_requested),
+                    );
+                    let romm_progress = self
+                        .romm_operation
+                        .as_ref()
+                        .and_then(|running| running.progress.as_ref())
+                        .cloned();
+                    if let Some(request) = romm_source::show_romm_source_card(
+                        ui,
+                        &romm_view,
+                        &mut self.romm_ui,
+                        romm_progress.as_ref(),
+                    ) {
+                        match request {
+                            RommCardRequest::Start(operation) => {
+                                // Declines when something is already running, which
+                                // is what makes a double click harmless.
+                                self.start_romm_operation(context.clone(), operation);
+                            }
+                            RommCardRequest::Cancel => self.cancel_romm_operation(),
+                            RommCardRequest::OpenConfigure => self.open_romm_configuration(),
+                            RommCardRequest::OpenBrowse(view) => self.open_romm_browse(view),
+                        }
+                    }
+
+                    if let Some(request) = self.show_romm_configuration_window(context) {
+                        self.handle_romm_config_request(context, request);
+                    }
+
+                    // Drawn as a window rather than appended here - see
+                    // `show_romm_browse_window`. Appending it below the source
+                    // card put it past the bottom of the viewport, so clicking
+                    // "Browse records" looked like it did nothing at all.
+                    if let Some(request) = self.show_romm_browse_window(context) {
+                        self.handle_romm_browse_request(context, request);
+                    }
+
+                    ui.add_space(theme::SECTION_GAP);
                     show_sources_recent_activity(ui, &self.history);
+                    return;
+                }
+
+                if self.view == MainView::CheatSources {
+                    self.show_cheat_sources_page(ui);
                     return;
                 }
 
@@ -12449,6 +13744,8 @@ impl ArchiveFsApp {
                             block_reason: archive_action_block_reason,
                         },
                     );
+                    ui.add_space(crate::ui::theme::SECTION_GAP);
+                    self.show_romm_game_panel(context, ui);
                     self.handle_mount_page_action(context, action);
                     return;
                 }
@@ -14293,6 +15590,12 @@ fn show_doctor_page(
         );
     }
 
+    // Deliberately *not* a running draw-order counter: a compact group's
+    // cards only exist on frames where that group is expanded, so a draw
+    // counter would renumber every later card the moment one group opened
+    // and hand it another card's expansion state. A finding's index in the
+    // scan is fixed for as long as the scan is.
+    let ordinals = DoctorFindingOrdinals::of(scan);
     for (category, findings) in scan.by_category() {
         ui.add_space(theme::SECTION_GAP);
         egui::CollapsingHeader::new(format!("{} ({})", category.label(), findings.len()))
@@ -14301,10 +15604,10 @@ fn show_doctor_page(
             .show(ui, |ui| {
                 for repeated in doctor_presentation_groups(&findings) {
                     if repeated_doctor_group_is_compact(&repeated) {
-                        show_repeated_doctor_group(ui, &repeated, selected, &mut action);
+                        show_repeated_doctor_group(ui, &repeated, selected, &mut action, &ordinals);
                     } else {
                         for finding in repeated {
-                            show_doctor_finding_card(ui, finding, selected, &mut action);
+                            show_doctor_finding_card(ui, finding, selected, &mut action, &ordinals);
                             ui.add_space(6.0);
                         }
                     }
@@ -14370,11 +15673,72 @@ fn repeated_doctor_group_counts(findings: &[&Finding], key: &str) -> String {
         .join(", ")
 }
 
+/// A key that identifies one *rendered* finding card uniquely and stably.
+///
+/// `Finding::id` names the finding's **kind**, not the occurrence:
+/// `doctor_presentation_groups` exists precisely because a real scan
+/// produces hundreds of findings sharing one id (`library.unknown_platform`,
+/// `mounts.not_required`, ...). Using that id as the expansion key meant
+/// every card of a kind shared one piece of state, so "Details" on one card
+/// expanded all of them - and every one of those cards then built its
+/// "Measured values" disclosure with the *same* egui widget id. egui
+/// resolved that clash by reporting "First use of widget ID …" over the
+/// header and letting each colliding widget overwrite the previous one's
+/// state within the frame, which is why clicking the triangle looked
+/// completely inert.
+///
+/// The ordinal supplies the missing uniqueness. It is stable for as long as
+/// a scan result is on screen, which is exactly as long as the expansion
+/// state should survive; a new scan re-numbers, and the selection is
+/// re-validated against the new findings when that happens.
+fn doctor_finding_key(finding: &Finding, ordinal: usize) -> String {
+    format!("{}#{ordinal}", finding.id)
+}
+
+/// Each finding's index in the scan that produced it.
+///
+/// Keyed by address rather than by content because two findings of the same
+/// kind can legitimately carry identical content - and because the addresses
+/// are those of the scan's own `findings` elements, which live as long as the
+/// scan does. Nothing is ever dereferenced through these keys.
+struct DoctorFindingOrdinals(HashMap<*const Finding, usize>);
+
+impl DoctorFindingOrdinals {
+    fn of(scan: &DoctorScan) -> Self {
+        Self(
+            scan.findings
+                .iter()
+                .enumerate()
+                .map(|(index, finding)| (std::ptr::from_ref(finding), index))
+                .collect(),
+        )
+    }
+
+    /// A finding not drawn from this scan cannot collide with one that was,
+    /// because no real index reaches `usize::MAX`.
+    fn ordinal(&self, finding: &Finding) -> usize {
+        self.0
+            .get(&std::ptr::from_ref(finding))
+            .copied()
+            .unwrap_or(usize::MAX)
+    }
+}
+
+/// The `Finding::id` part of a key built by `doctor_finding_key`.
+///
+/// The stored selection is a key, but the two places that invalidate it
+/// (a fresh scan, and a completed repair) reason about finding *kinds*, so
+/// they compare on this.
+fn doctor_finding_key_id(key: &str) -> &str {
+    key.rsplit_once('#').map_or(key, |(id, _)| id)
+}
+
 fn show_repeated_doctor_group(
     ui: &mut egui::Ui,
     findings: &[&Finding],
     selected: &mut Option<String>,
     action: &mut Option<DoctorPageAction>,
+    ordinals: &DoctorFindingOrdinals,
 ) {
     let Some(first) = findings.first() else {
         return;
@@ -14417,7 +15781,7 @@ fn show_repeated_doctor_group(
             .default_open(false)
             .show(ui, |ui| {
                 for finding in findings {
-                    show_doctor_finding_card(ui, finding, selected, action);
+                    show_doctor_finding_card(ui, finding, selected, action, ordinals);
                     ui.add_space(6.0);
                 }
             });
@@ -14432,8 +15796,12 @@ fn show_doctor_finding_card(
     finding: &Finding,
     selected: &mut Option<String>,
     action: &mut Option<DoctorPageAction>,
+    ordinals: &DoctorFindingOrdinals,
 ) {
-    let is_selected = selected.as_deref() == Some(finding.id.as_str());
+    // This card's own key, not its kind's - two findings sharing an id must
+    // open and close independently.
+    let key = doctor_finding_key(finding, ordinals.ordinal(finding));
+    let is_selected = selected.as_deref() == Some(key.as_str());
     widgets::card(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
             widgets::status_badge(
@@ -14464,11 +15832,7 @@ fn show_doctor_finding_card(
         )
         .clicked()
         {
-            *selected = if is_selected {
-                None
-            } else {
-                Some(finding.id.clone())
-            };
+            *selected = if is_selected { None } else { Some(key.clone()) };
         }
         if let Some(repair) = finding.offered_repair() {
             ui.horizontal_wrapped(|ui| {
@@ -14498,7 +15862,7 @@ fn show_doctor_finding_card(
             }
         }
         if is_selected {
-            show_doctor_finding_details(ui, finding);
+            show_doctor_finding_details(ui, finding, &key);
         }
     });
 }
@@ -14626,10 +15990,13 @@ fn show_doctor_repair_result(ui: &mut egui::Ui, outcome: &DoctorRepairOutcome) {
     });
 }
 
+/// Shown in place of the disclosure when a finding measured nothing.
+const DOCTOR_NO_MEASURED_VALUES: &str = "No measured values recorded";
+
 /// The selected finding's evidence and provenance. Everything here is
 /// observed fact or existing guidance prose - no invented advice, and no
 /// control that could change anything.
-fn show_doctor_finding_details(ui: &mut egui::Ui, finding: &Finding) {
+fn show_doctor_finding_details(ui: &mut egui::Ui, finding: &Finding, key: &str) {
     ui.add_space(6.0);
     ui.separator();
     if let Some(why) = &finding.why_it_matters {
@@ -14646,15 +16013,30 @@ fn show_doctor_finding_details(ui: &mut egui::Ui, finding: &Finding) {
             ui.add(egui::Label::new(format!("• {item}")).wrap());
         }
     }
-    if !finding.measurements.is_empty() {
+    if finding.measurements.is_empty() {
+        // Plain text, not a header: a disclosure triangle that opens onto
+        // nothing is a control that lies about having something behind it.
+        ui.weak(DOCTOR_NO_MEASURED_VALUES);
+    } else {
         // The same facts as the evidence above, as values. Shown collapsed so
         // the prose stays the primary account for a person reading this.
+        //
+        // Salted with this card's unique key, never with `finding.id` alone:
+        // a scan repeats an id across hundreds of findings, and salting on it
+        // gave every one of their headers the same egui widget id. egui
+        // flagged that clash on screen ("First use of widget ID …") and the
+        // colliding widgets overwrote each other's open/closed state within
+        // the frame, so the triangle never appeared to respond.
+        //
+        // `CollapsingHeader` is a real button: it carries egui's own keyboard
+        // focus, Enter/Space activation and accessibility node. Nothing here
+        // paints a triangle by hand.
         egui::CollapsingHeader::new("Measured values")
-            .id_salt(format!("doctor-measurements-{}", finding.id))
+            .id_salt(format!("doctor-measurements-{key}"))
             .default_open(false)
             .show(ui, |ui| {
-                for (key, value) in &finding.measurements {
-                    ui.label(format!("{key}: {value}"));
+                for (name, value) in &finding.measurements {
+                    ui.label(format!("{name}: {value}"));
                 }
             });
     }
@@ -34289,6 +35671,213 @@ enum GamerViewAction {
     Undo,
 }
 
+/// The single authoritative row snapshot one Gamer View frame is built
+/// from: the shelf's counts, the "All" count and the game list all read
+/// from this one object, so they cannot disagree.
+///
+/// # Why this type exists
+///
+/// The shelf used to count every row in the library while the list below
+/// it applied `LibraryRowFilters::matches` in full. `LibraryRowFilters` is
+/// shared with Advanced View, which exposes five further checkboxes
+/// (Present / Missing / Awaiting validation / Known platform / Unknown
+/// platform) that Gamer View neither shows nor can clear. Ticking any of
+/// them in Advanced View - or opening the Health dashboard's "Review
+/// missing", which sets `missing` directly - and returning to Gamer View
+/// left every card advertising its full count while the list matched
+/// nothing, reporting "No games match the selected platform" for a
+/// platform whose card said 4023. Only a restart cleared it, because
+/// `LibraryRowFilters` is not persisted.
+///
+/// Gamer View exposes exactly two filters - the search box and the
+/// platform shelf - so those are the only two it applies. `candidates` is
+/// everything the search admits; the counts are derived from `candidates`,
+/// and `visible` is `candidates` narrowed by the platform selection. A
+/// non-zero card count therefore *is* the number of rows selecting that
+/// card produces, by construction rather than by agreement.
+struct GamerLibrarySnapshot {
+    /// Indices into the row list that pass every filter Gamer View
+    /// exposes *except* the platform selection. The "All" card's count.
+    candidates: Vec<usize>,
+    /// `candidates` narrowed by the platform selection - exactly what the
+    /// game list renders.
+    visible: Vec<usize>,
+    /// Counted over `candidates`, never over the unfiltered library.
+    platform_counts: DetectedPlatformCounts,
+    /// A platform is selected that no card in this snapshot offers, so no
+    /// card is highlighted and no click can restore the list. The caller
+    /// resets the selection to All.
+    selection_is_stale: bool,
+}
+
+impl GamerLibrarySnapshot {
+    fn build(rows: &[ArchiveRow], platform: Option<&str>, search_text: &str) -> Self {
+        let candidates: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| search_text.is_empty() || row.search_text.contains(search_text))
+            .map(|(index, _)| index)
+            .collect();
+        let platform_counts = detected_platform_counts(
+            candidates
+                .iter()
+                .map(|index| &rows[*index])
+                .map(|row| (!row.unknown_platform).then_some(row.platform.as_str())),
+        );
+        let visible: Vec<usize> = candidates
+            .iter()
+            .copied()
+            .filter(|index| gamer_row_matches_platform(&rows[*index], platform))
+            .collect();
+        // Judged against the whole library, never against `candidates`.
+        // A search that currently matches nothing would otherwise make every
+        // platform look absent and silently throw the user's selection away
+        // as they typed - the search must narrow the list, not rewrite what
+        // they picked. "Unknown" is a real platform here, so it is stale on
+        // the same terms: only when nothing in the library is unclassified.
+        let selection_is_stale = match platform {
+            None => false,
+            Some("Unknown") => !rows.iter().any(|row| row.unknown_platform),
+            Some(platform) => !rows
+                .iter()
+                .any(|row| !row.unknown_platform && row.platform == platform),
+        };
+        Self {
+            candidates,
+            visible,
+            platform_counts,
+            selection_is_stale,
+        }
+    }
+}
+
+/// Why the game list is empty, in the user's terms. Search and platform
+/// compose, so when both are narrowing the message says so rather than
+/// blaming whichever one the old `else if` chain happened to test first.
+fn gamer_empty_list_guidance(
+    library_is_empty: bool,
+    searching: bool,
+    platform_selected: bool,
+) -> &'static str {
+    match (library_is_empty, searching, platform_selected) {
+        (true, _, _) => "No games are in your library yet.",
+        (false, true, true) => "No games on this platform match your search.",
+        (false, true, false) => "No games match your search.",
+        (false, false, true) => "No games match the selected platform.",
+        (false, false, false) => "No games are in your library yet.",
+    }
+}
+
+/// The platform half of Gamer View's filtering, matching
+/// `LibraryRowFilters::matches`'s own platform rule exactly - `"Unknown"`
+/// is the diagnostic selection for unclassified rows, not an empty one.
+fn gamer_row_matches_platform(row: &ArchiveRow, platform: Option<&str>) -> bool {
+    platform.is_none_or(|wanted| {
+        if wanted == "Unknown" {
+            row.unknown_platform
+        } else {
+            !row.unknown_platform && row.platform == wanted
+        }
+    })
+}
+
+/// Draws the featured cover for the selected game.
+///
+/// The box is reserved at a fixed size for this frame whatever the artwork is
+/// doing, so the title and the actions beneath it never move as a cover arrives,
+/// fails, or turns out not to exist.
+///
+/// Allocated with [`egui::Sense::hover`] and painted directly: artwork is not a
+/// control, so it takes no place in the Tab order and Mount stays the first thing
+/// a keyboard reaches.
+fn show_featured_cover(
+    ui: &mut egui::Ui,
+    box_size: egui::Vec2,
+    cover: Option<&crate::gamer_artwork::CoverSlot>,
+    placeholder: GameRowArtworkPaint<'_>,
+    artwork_cache: &mut PlatformArtworkCache,
+    artwork_directory: Option<&Path>,
+) {
+    let full_width = ui.available_width();
+    // Centred by allocating the panel's width and drawing into the middle of it,
+    // rather than by padding, so the box is centred at every panel width.
+    let (outer, _) =
+        ui.allocate_exact_size(egui::vec2(full_width, box_size.y), egui::Sense::hover());
+    let rect = egui::Rect::from_center_size(outer.center(), box_size);
+
+    // A restrained plate behind the artwork: it gives a letterboxed or missing
+    // cover a defined edge instead of leaving a hole in the panel, and it is the
+    // placeholder's whole visual identity.
+    ui.painter()
+        .rect_filled(rect, 10.0, ui.visuals().extreme_bg_color);
+    ui.painter()
+        .rect_stroke(rect, 10.0, theme::border(ui), egui::StrokeKind::Inside);
+
+    match cover {
+        Some(crate::gamer_artwork::CoverSlot::Ready { texture, .. }) => {
+            let drawn = crate::gamer_artwork::fit_within(box_size, texture.size_vec2());
+            ui.painter().image(
+                texture.id(),
+                egui::Rect::from_center_size(rect.center(), drawn),
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        }
+        // Loading, revalidating, and "there is no cover" all draw the same thing.
+        // A spinner that becomes a picture is the same visual jump the reserved box
+        // exists to prevent, and the platform artwork is a truthful, readable image
+        // of what this game is meanwhile.
+        _ => {
+            let glyph = (box_size.y * 0.42).min(96.0);
+            paint_game_row_artwork(
+                ui,
+                artwork_cache,
+                artwork_directory,
+                GameRowArtworkPaint {
+                    center: rect.center() - egui::vec2(0.0, glyph * 0.16),
+                    size: glyph,
+                    ..placeholder
+                },
+            );
+            if matches!(cover, Some(crate::gamer_artwork::CoverSlot::None(_))) {
+                ui.painter().text(
+                    egui::pos2(rect.center().x, rect.bottom() - 18.0),
+                    egui::Align2::CENTER_CENTER,
+                    "No cover available",
+                    egui::FontId::proportional(13.0),
+                    theme::muted(ui),
+                );
+            }
+        }
+    }
+}
+
+/// The featured panel's primary button: full width and taller than a secondary
+/// one, so Mount reads as the thing to do from across a room.
+///
+/// Still `widgets::action_button`'s `Primary` fill and still an ordinary
+/// `egui::Button`, so its enable/disable rules, focus behaviour and activation are
+/// exactly what they were.
+fn featured_primary_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Response {
+    let width = ui.available_width();
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(egui::RichText::new(label).size(17.0).strong())
+            .fill(theme::ACCENT)
+            .min_size(egui::vec2(width, 42.0)),
+    )
+}
+
+/// One line of the featured panel's metadata block.
+fn featured_meta_line(ui: &mut egui::Ui, text: String, strong: bool) {
+    let text = egui::RichText::new(text).size(if strong { 16.0 } else { 14.0 });
+    ui.label(if strong {
+        text.color(ui.visuals().text_color())
+    } else {
+        text.color(theme::muted(ui))
+    });
+}
+
 struct GamerViewViewState<'a> {
     filter: &'a str,
     library_filters: &'a mut LibraryRowFilters,
@@ -34301,6 +35890,14 @@ struct GamerViewViewState<'a> {
     feedback: Option<&'a ActionFeedback>,
     artwork_directory: Option<&'a Path>,
     artwork_cache: &'a mut PlatformArtworkCache,
+    /// RomM covers already answered for, and the scheduling that decides what
+    /// to ask about next.
+    covers: &'a mut crate::gamer_artwork::GamerCoverCache,
+    /// Filled with the records this frame wants covers for. The view itself
+    /// never sends anything: it reports what the visible window needs and the
+    /// caller hands that to the worker, which keeps this function free of
+    /// threads and testable without one.
+    cover_requests: &'a mut Vec<crate::gamer_artwork::CoverJob>,
 }
 
 /// The read-only Details screen (finding #2): identity/platform/metadata
@@ -34362,6 +35959,8 @@ fn show_gamer_view(
         feedback,
         artwork_directory,
         artwork_cache,
+        covers,
+        cover_requests,
     } = view_state;
     let mut action = None;
 
@@ -34398,21 +35997,31 @@ fn show_gamer_view(
     }
 
     let search_text = filter.to_lowercase();
-    let visible: Vec<usize> = data
-        .rows
-        .iter()
-        .enumerate()
-        .filter(|(_, row)| {
-            library_filters.matches(row)
-                && (search_text.is_empty() || row.search_text.contains(&search_text))
-        })
-        .map(|(index, _)| index)
-        .collect();
-    let platform_counts = detected_platform_counts(
-        data.rows
-            .iter()
-            .map(|row| (!row.unknown_platform).then_some(row.platform.as_str())),
+    // One authoritative snapshot for this frame - see
+    // `GamerLibrarySnapshot`. Everything below (shelf counts, the "All"
+    // count, the game list, and the empty-state wording) reads from it,
+    // so the shelf can never advertise a count the list cannot produce.
+    let snapshot = GamerLibrarySnapshot::build(
+        &data.rows,
+        library_filters.platform.as_deref(),
+        &search_text,
     );
+    // A platform that is no longer in the snapshot (library reloaded, a
+    // source removed, or a canonical id written by another page - see
+    // `open_cheat_archive_picker`) would otherwise leave Gamer View stuck
+    // on an empty list with no card highlighted and no way back except a
+    // restart. Falling back to All is the only truthful resolution, and it
+    // happens before the shelf is drawn so this frame already shows it.
+    if snapshot.selection_is_stale {
+        library_filters.platform = None;
+        archive_context.clear_selection();
+    }
+    let visible = &snapshot.visible;
+    let platform_counts = &snapshot.platform_counts;
+    // Captured once for this frame so the list and the featured panel agree about
+    // what is selected, and so a cover is asked for by the record's own path rather
+    // than by whichever row happens to be drawn at its position.
+    let selected_path = archive_context.focused.clone();
 
     // The visual platform picker (milestone: "Gamer View Visual Platform
     // Picker and Library Layout Polish"): a single-row, horizontally
@@ -34435,7 +36044,7 @@ fn show_gamer_view(
     let mut entries: Vec<ShelfEntry<'_>> = vec![ShelfEntry {
         asset_id: PlatformAssetCategory::Console.asset_id().to_owned(),
         label: "All",
-        count: data.rows.len(),
+        count: snapshot.candidates.len(),
         platform: None,
     }];
     for (platform, count) in &platform_counts.named {
@@ -34493,16 +36102,16 @@ fn show_gamer_view(
                 if visible.is_empty() {
                     // Distinguish *why* nothing is showing - a truthful,
                     // specific empty state rather than one generic
-                    // message for every cause.
-                    let guidance = if data.rows.is_empty() {
-                        "No games are in your library yet."
-                    } else if !search_text.is_empty() {
-                        "No games match your search."
-                    } else {
-                        "No games match the selected platform."
-                    };
+                    // message for every cause. Reachable now only when the
+                    // snapshot genuinely holds no such row: the shelf
+                    // counts these same candidates, so "no games match the
+                    // selected platform" cannot contradict a non-zero card.
                     ui.add_space(theme::SECTION_GAP);
-                    ui.weak(guidance);
+                    ui.weak(gamer_empty_list_guidance(
+                        data.rows.is_empty(),
+                        !search_text.is_empty(),
+                        library_filters.platform.is_some(),
+                    ));
                 } else {
                     let row_height = (ui.spacing().interact_size.y * 2.4).max(64.0);
                     egui::ScrollArea::vertical()
@@ -34510,6 +36119,36 @@ fn show_gamer_view(
                         .max_height(ui.available_height())
                         .auto_shrink([false, false])
                         .show_rows(ui, row_height, visible.len(), |ui, row_range| {
+                            // Only what is on screen, plus a small look-ahead, is
+                            // ever asked about. `show_rows` hands us the drawn
+                            // range, so this is bounded by the viewport rather than
+                            // by the library: a 13,891-record catalogue and a
+                            // 20-record one queue the same amount of work.
+                            let wanted = crate::gamer_artwork::look_ahead_range(
+                                row_range.clone(),
+                                visible.len(),
+                            );
+                            let paths_for = |range: std::ops::Range<usize>| {
+                                range
+                                    .map(|position| data.rows[visible[position]].path.clone())
+                                    .collect::<Vec<_>>()
+                            };
+                            let on_screen = paths_for(row_range.clone());
+                            let ahead: Vec<PathBuf> = paths_for(wanted)
+                                .into_iter()
+                                .filter(|path| !on_screen.contains(path))
+                                .collect();
+                            // The selected game is asked for first, so the featured
+                            // panel fills before the rows a person has not looked at
+                            // yet. It takes at most one of the frame's slots, which
+                            // is what stops a held-down arrow key from starving the
+                            // list.
+                            cover_requests.extend(covers.visible(
+                                selected_path.as_deref(),
+                                &on_screen,
+                                &ahead,
+                            ));
+
                             for visible_index in row_range {
                                 let index = visible[visible_index];
                                 let record = &data.records[index];
@@ -34519,11 +36158,26 @@ fn show_gamer_view(
                                 let state_label = gamer_primary_action_short_label(
                                     &gamer_primary_action(record.mount_state),
                                 );
+                                // Looked up by the row's own path, which is the
+                                // record's identity - `show_rows` reuses row
+                                // positions as the list scrolls, and anything held
+                                // per position would eventually be painted beside a
+                                // different game.
+                                let cover = covers.slot_for(row.path.as_path(), None).cloned();
                                 let label = format!(
                                     "{} \u{2014} {} \u{b7} {state_label}",
                                     gamer_display_title(record),
                                     row.platform
                                 );
+                                // The row's visible text is unchanged; only the
+                                // tooltip gains the reason, so a placeholder is
+                                // explainable without spending a row on it.
+                                let hover = match &cover {
+                                    Some(crate::gamer_artwork::CoverSlot::None(reason)) => {
+                                        format!("{label}\n{}", reason.describe())
+                                    }
+                                    _ => label.clone(),
+                                };
                                 // Stronger selected-row emphasis (manual QA
                                 // finding): bold text plus an explicit
                                 // selection-colored stroke drawn around
@@ -34540,29 +36194,63 @@ fn show_gamer_view(
                                             .min_size(egui::vec2(ui.available_width(), row_height))
                                             .selected(selected),
                                     )
-                                    .on_hover_text(&label);
-                                let platform_asset =
-                                    platform_asset_id(&row.platform, row.unknown_platform);
-                                let platform_fallback = if row.unknown_platform {
-                                    PlatformAssetCategory::Unknown.asset_id()
-                                } else {
-                                    platform_asset_category(&row.platform).asset_id()
-                                };
-                                paint_game_row_artwork(
-                                    ui,
-                                    artwork_cache,
-                                    artwork_directory,
-                                    GameRowArtworkPaint {
-                                        center: egui::pos2(
-                                            response.rect.left() + 33.0,
-                                            response.rect.center().y,
-                                        ),
-                                        size: 56.0,
-                                        title: &gamer_display_title(record),
-                                        platform_asset: &platform_asset,
-                                        platform_fallback,
-                                    },
+                                    .on_hover_text(hover);
+                                let artwork_center = egui::pos2(
+                                    response.rect.left() + 33.0,
+                                    response.rect.center().y,
                                 );
+                                // The cover is drawn to *fit* the slot the platform
+                                // icon already occupied, never to fill it. That
+                                // keeps a 2:3 cover, a square icon and a glyph all
+                                // inside the same box, so no row changes height as
+                                // artwork arrives and none is ever stretched.
+                                //
+                                let drawn = match &cover {
+                                    Some(crate::gamer_artwork::CoverSlot::Ready {
+                                        texture,
+                                        ..
+                                    }) => {
+                                        paint_cover_fitted(
+                                            ui,
+                                            texture,
+                                            artwork_center,
+                                            crate::gamer_artwork::COVER_BOX,
+                                        );
+                                        true
+                                    }
+                                    // Loading and "no cover" draw the same thing.
+                                    // A spinner that becomes a picture is the same
+                                    // visual jump this is meant to avoid, and the
+                                    // placeholder is already a truthful, readable
+                                    // image of the platform.
+                                    _ => false,
+                                };
+                                if !drawn {
+                                    let platform_asset =
+                                        platform_asset_id(&row.platform, row.unknown_platform);
+                                    // The category glyph this platform falls back
+                                    // to when it has no artwork of its own - a
+                                    // shelf and a game row must land on the same
+                                    // one, so it is derived here rather than
+                                    // guessed inside the painter.
+                                    let platform_fallback = if row.unknown_platform {
+                                        PlatformAssetCategory::Unknown.asset_id()
+                                    } else {
+                                        platform_asset_category(&row.platform).asset_id()
+                                    };
+                                    paint_game_row_artwork(
+                                        ui,
+                                        artwork_cache,
+                                        artwork_directory,
+                                        GameRowArtworkPaint {
+                                            center: artwork_center,
+                                            size: crate::gamer_artwork::COVER_BOX,
+                                            title: &gamer_display_title(record),
+                                            platform_asset: &platform_asset,
+                                            platform_fallback,
+                                        },
+                                    );
+                                }
                                 ui.painter().text(
                                     egui::pos2(
                                         response.rect.left() + 68.0,
@@ -34614,129 +36302,277 @@ fn show_gamer_view(
                         ui.label("Choose a game from the list on the left to see what you can do with it.");
                     }
                     Some(record) => {
+                        // The featured block lives in its own constrained column so
+                        // the title, the status and Mount stay a cohesive unit
+                        // rather than stretching the full width of the panel.
+                        let content_width = panel_width.min(crate::gamer_artwork::GAMER_FEATURED_CONTENT_MAX_WIDTH);
                         let archive_path = record.mount_plan.archive.path.clone();
-                        ui.heading(gamer_display_title(record));
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "{} \u{b7} {}",
-                                record
-                                    .metadata
-                                    .platform
-                                    .as_deref()
-                                    .or(record.identity.platform.as_deref())
-                                    .unwrap_or("Unknown"),
-                                archive_kind_name(record.mount_plan.archive.kind)
-                            ))
-                            .color(theme::muted(ui)),
+                        let platform = record
+                            .metadata
+                            .platform
+                            .as_deref()
+                            .or(record.identity.platform.as_deref())
+                            .unwrap_or("Unknown");
+                        let title = gamer_display_title(record);
+                        let row = data.rows.iter().find(|row| row.path == archive_path);
+                        let unknown_platform = row.is_some_and(|row| row.unknown_platform);
+
+                        // How much height everything *below* the artwork actually
+                        // took last frame: the title, the metadata, the separators
+                        // and both rows of actions.
+                        //
+                        // Measured rather than estimated, and measured as one block
+                        // rather than only the buttons. Its height depends on whether
+                        // the title wrapped to a second line, whether the primary
+                        // action carries a note, whether the secondary row wrapped
+                        // and whether Undo is offered - guessing it puts Mount below
+                        // the fold the moment any of those changes, which is exactly
+                        // what a 1280x720 window did. Stored per panel and converged
+                        // on the first frame.
+                        let actions_id = ui.id().with("gamer_featured_below_height");
+                        let measured = ui
+                            .ctx()
+                            .data(|data| data.get_temp::<f32>(actions_id))
+                            .unwrap_or(crate::gamer_artwork::FEATURED_RESERVED_BELOW);
+                        // Clamped against the physical viewport as well as the
+                        // container's own figure. The Gamer View column reports the
+                        // height it was allocated, which on a short window is more
+                        // than is actually on screen - the list beside it scrolls, so
+                        // it never notices, but this panel does not, and sizing the
+                        // artwork from the larger number is what pushed the secondary
+                        // actions off the bottom at 1280x720.
+                        let to_screen_bottom =
+                            (ui.ctx().screen_rect().bottom() - ui.cursor().top()).max(0.0);
+                        let usable = ui.available_height().min(to_screen_bottom);
+                        // The measurement covers the block itself; the gap the
+                        // artwork adds beneath it, and a couple of pixels of rounding
+                        // in the last row's spacing, come off here.
+                        let for_artwork =
+                            (usable - measured - theme::SECTION_GAP - 12.0).max(0.0);
+
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(content_width, ui.available_height()),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                // --- Featured artwork ---
+                                //
+                                // Reserved at a fixed size for this frame whatever
+                                // the artwork is doing, so the title and the actions
+                                // beneath it never move as a cover arrives, fails, or
+                                // turns out not to exist. Sized from what the actions
+                                // left, so the artwork is what shrinks on a short
+                                // window - never the controls.
+                                //
+                                // Looked up by the selected record's own path, which
+                                // is what a cover is keyed by, so the panel reads the
+                                // *new* selection's slot the instant the selection
+                                // changes and a late reply for the previous one has
+                                // nothing here to draw into.
+                                if let Some(box_size) = crate::gamer_artwork::featured_cover_box(
+                                    content_width,
+                                    for_artwork,
+                                ) {
+                                    let cover =
+                                        covers.slot_for(archive_path.as_path(), None).cloned();
+                                    let platform_asset =
+                                        platform_asset_id(platform, unknown_platform);
+                                    // Same fallback rule as a game row, so the
+                                    // featured panel and the list never disagree
+                                    // about which glyph a platform falls back to.
+                                    let platform_fallback = if unknown_platform {
+                                        PlatformAssetCategory::Unknown.asset_id()
+                                    } else {
+                                        platform_asset_category(platform).asset_id()
+                                    };
+                                    show_featured_cover(
+                                        ui,
+                                        box_size,
+                                        cover.as_ref(),
+                                        GameRowArtworkPaint {
+                                            center: egui::Pos2::ZERO,
+                                            size: 0.0,
+                                            title: &title,
+                                            platform_asset: &platform_asset,
+                                            platform_fallback,
+                                        },
+                                        artwork_cache,
+                                        artwork_directory,
+                                    );
+                                    ui.add_space(theme::SECTION_GAP);
+                                }
+
+                                // --- Identity, status and actions ---
+                                //
+                                // Measured as one block, so the artwork above can be
+                                // sized from what everything below it really needs.
+                                let below = ui.scope(|ui| {
+                                    // The title is the strongest element; everything
+                                    // under it is one quiet line each. Deliberately
+                                    // not every field the Details screen holds - this
+                                    // is what a person needs to know they picked the
+                                    // right game, not a diagnostic dump.
+                                    ui.label(
+                                        egui::RichText::new(&title)
+                                            .size(23.0)
+                                            .strong()
+                                            .color(ui.visuals().strong_text_color()),
+                                    );
+                                    featured_meta_line(
+                                        ui,
+                                        format!(
+                                            "{platform} \u{b7} {}",
+                                            archive_kind_name(record.mount_plan.archive.kind)
+                                        ),
+                                        false,
+                                    );
+                                    featured_meta_line(
+                                        ui,
+                                        gamer_primary_action_short_label(&gamer_primary_action(
+                                            record.mount_state,
+                                        ))
+                                        .to_string(),
+                                        true,
+                                    );
+                                    if let Some(row) = row
+                                        && row.origin != RowOrigin::Live
+                                    {
+                                        // Provenance, but only when it changes what
+                                        // the buttons below can be trusted to do.
+                                        featured_meta_line(
+                                            ui,
+                                            row.origin.label().to_string(),
+                                            false,
+                                        );
+                                    }
+
+                                    ui.add_space(theme::SECTION_GAP);
+                                    ui.separator();
+                                    ui.add_space(theme::SECTION_GAP);
+
+                                    // Primary action: the one obvious, full-width,
+                                    // visually prominent button for what this game
+                                    // needs right now, and the first control a
+                                    // keyboard reaches in this panel.
+                                    match gamer_primary_action(record.mount_state) {
+                                        GamerPrimaryAction::Mount => {
+                                            if featured_primary_button(ui, "Mount", !busy).clicked()
+                                            {
+                                                action = Some(GamerViewAction::Operation(
+                                                    OperationRequest {
+                                                        action: ArchiveAction::Mount,
+                                                        archive_path: archive_path.clone(),
+                                                        cleanup_after_unmount,
+                                                    },
+                                                ));
+                                            }
+                                        }
+                                        GamerPrimaryAction::Unmount => {
+                                            if featured_primary_button(ui, "Unmount", !busy)
+                                                .clicked()
+                                            {
+                                                action = Some(GamerViewAction::Operation(
+                                                    OperationRequest {
+                                                        action: ArchiveAction::Unmount,
+                                                        archive_path: archive_path.clone(),
+                                                        cleanup_after_unmount,
+                                                    },
+                                                ));
+                                            }
+                                            ui.weak("Currently mounted.");
+                                        }
+                                        GamerPrimaryAction::NoMountingNeeded => {
+                                            ui.weak(
+                                                "No mounting needed \u{2014} ready for your \
+                                                 emulator.",
+                                            );
+                                        }
+                                        GamerPrimaryAction::Blocked(reason) => {
+                                            ui.colored_label(ui.visuals().warn_fg_color, reason);
+                                        }
+                                    }
+                                    if let Some(reason) = block_reason {
+                                        ui.weak(reason);
+                                    }
+
+                                    ui.add_space(theme::SECTION_GAP);
+                                    ui.separator();
+                                    ui.add_space(theme::SECTION_GAP);
+
+                                    // Secondary actions: kept together rather than
+                                    // scattered. One wrapping row while the panel is
+                                    // wide enough for all three, a tidy full-width
+                                    // stack once it is not.
+                                    let stacked = content_width < GAMER_SECONDARY_ROW_MIN_WIDTH;
+                                    let secondary = |ui: &mut egui::Ui, label: &str| {
+                                        if stacked {
+                                            let width = ui.available_width();
+                                            ui.add(
+                                                egui::Button::new(label)
+                                                    .min_size(egui::vec2(width, 34.0)),
+                                            )
+                                        } else {
+                                            widgets::action_button(
+                                                ui,
+                                                label,
+                                                widgets::ActionStyle::Secondary,
+                                                true,
+                                            )
+                                        }
+                                    };
+                                    let mut body = |ui: &mut egui::Ui| {
+                                        if secondary(ui, "Cheats & Mods").clicked() {
+                                            action = Some(GamerViewAction::OpenCheatsMods(
+                                                archive_path.clone(),
+                                            ));
+                                        }
+                                        if secondary(ui, "Details").clicked() {
+                                            *screen = GamerViewScreen::Details;
+                                        }
+                                        let folder =
+                                            archive_path.parent().filter(|folder| folder.is_dir());
+                                        if let Some(folder) = folder
+                                            && secondary(ui, "Open location").clicked()
+                                        {
+                                            action = Some(GamerViewAction::CopyLocation(
+                                                folder.display().to_string(),
+                                            ));
+                                        }
+                                    };
+                                    if stacked {
+                                        body(ui);
+                                    } else {
+                                        ui.horizontal_wrapped(body);
+                                    }
+
+                                    if gamer_undo_available(
+                                        cheat_workflow,
+                                        Some(archive_path.as_path()),
+                                    ) {
+                                        ui.add_space(theme::SECTION_GAP);
+                                        if widgets::action_button(
+                                            ui,
+                                            "Undo last change",
+                                            widgets::ActionStyle::Quiet,
+                                            true,
+                                        )
+                                        .clicked()
+                                        {
+                                            action = Some(GamerViewAction::Undo);
+                                        }
+                                    }
+                                });
+
+                                // Recorded for the next frame. A changed measurement
+                                // asks for one more so the artwork settles
+                                // immediately rather than on the next input.
+                                let height = below.response.rect.height();
+                                if (height - measured).abs() > 0.5 {
+                                    ui.ctx()
+                                        .data_mut(|data| data.insert_temp(actions_id, height));
+                                    ui.ctx().request_repaint();
+                                }
+                            },
                         );
-                        ui.add_space(theme::SECTION_GAP);
-
-                        // Primary action: the one obvious, full-width,
-                        // visually prominent button for what this game
-                        // needs right now (manual QA finding: "the primary
-                        // action is obvious").
-                        match gamer_primary_action(record.mount_state) {
-                            GamerPrimaryAction::Mount => {
-                                if widgets::action_button(
-                                    ui,
-                                    "Mount",
-                                    widgets::ActionStyle::Primary,
-                                    !busy,
-                                )
-                                .clicked()
-                                {
-                                    action = Some(GamerViewAction::Operation(OperationRequest {
-                                        action: ArchiveAction::Mount,
-                                        archive_path: archive_path.clone(),
-                                        cleanup_after_unmount,
-                                    }));
-                                }
-                            }
-                            GamerPrimaryAction::Unmount => {
-                                if widgets::action_button(
-                                    ui,
-                                    "Unmount",
-                                    widgets::ActionStyle::Primary,
-                                    !busy,
-                                )
-                                .clicked()
-                                {
-                                    action = Some(GamerViewAction::Operation(OperationRequest {
-                                        action: ArchiveAction::Unmount,
-                                        archive_path: archive_path.clone(),
-                                        cleanup_after_unmount,
-                                    }));
-                                }
-                                ui.weak("Currently mounted.");
-                            }
-                            GamerPrimaryAction::NoMountingNeeded => {
-                                ui.weak("No mounting needed \u{2014} ready for your emulator.");
-                            }
-                            GamerPrimaryAction::Blocked(reason) => {
-                                ui.colored_label(ui.visuals().warn_fg_color, reason);
-                            }
-                        }
-                        if let Some(reason) = block_reason {
-                            ui.weak(reason);
-                        }
-                        ui.add_space(theme::SECTION_GAP);
-                        ui.separator();
-                        ui.add_space(theme::SECTION_GAP);
-
-                        // Secondary actions: visually separated from the
-                        // primary action by the divider above, grouped
-                        // together as one row (manual QA finding:
-                        // "secondary actions clearly separated").
-                        ui.horizontal_wrapped(|ui| {
-                            if widgets::action_button(
-                                ui,
-                                "Cheats & Mods",
-                                widgets::ActionStyle::Secondary,
-                                true,
-                            )
-                            .clicked()
-                            {
-                                action =
-                                    Some(GamerViewAction::OpenCheatsMods(archive_path.clone()));
-                            }
-                            if widgets::action_button(
-                                ui,
-                                "Details",
-                                widgets::ActionStyle::Secondary,
-                                true,
-                            )
-                            .clicked()
-                            {
-                                *screen = GamerViewScreen::Details;
-                            }
-                            let folder = archive_path.parent().filter(|folder| folder.is_dir());
-                            if let Some(folder) = folder
-                                && widgets::action_button(
-                                    ui,
-                                    "Open location",
-                                    widgets::ActionStyle::Secondary,
-                                    true,
-                                )
-                                .clicked()
-                            {
-                                action = Some(GamerViewAction::CopyLocation(
-                                    folder.display().to_string(),
-                                ));
-                            }
-                        });
-                        if gamer_undo_available(cheat_workflow, Some(archive_path.as_path())) {
-                            ui.add_space(theme::SECTION_GAP);
-                            if widgets::action_button(
-                                ui,
-                                "Undo last change",
-                                widgets::ActionStyle::Quiet,
-                                true,
-                            )
-                            .clicked()
-                            {
-                                action = Some(GamerViewAction::Undo);
-                            }
-                        }
                     }
                 }
             },
@@ -35429,6 +37265,19 @@ fn paint_texture(ui: &egui::Ui, texture: PlatformArtworkTexture, center: egui::P
     );
 }
 
+/// Draws a RomM cover inside the row's artwork slot.
+///
+/// Reuses [`fitted_artwork_rect`], so a 2:3 cover and a square platform icon
+/// occupy the same box and a row's height never depends on which one it got.
+fn paint_cover_fitted(ui: &egui::Ui, texture: &egui::TextureHandle, center: egui::Pos2, size: f32) {
+    ui.painter().image(
+        texture.id(),
+        fitted_artwork_rect(center, size, texture.size_vec2()),
+        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+        egui::Color32::WHITE,
+    );
+}
+
 struct PlatformArtworkPaint<'a> {
     center: egui::Pos2,
     size: f32,
@@ -35538,6 +37387,11 @@ fn paint_game_row_artwork(
     )
 }
 
+/// Below this the featured panel's three secondary actions cannot share a row at
+/// all, so they become a full-width stack rather than one button per line with a
+/// ragged right edge. Above it they wrap, which degrades gracefully in between.
+const GAMER_SECONDARY_ROW_MIN_WIDTH: f32 = 300.0;
+
 const PLATFORM_CARD_MIN_WIDTH: f32 = 132.0;
 const PLATFORM_CARD_MAX_WIDTH: f32 = 164.0;
 
@@ -35576,6 +37430,60 @@ const SHELF_NEXT_GLYPH: &str = ">";
 /// one a D-pad lands focus on.
 const SHELF_CHEVRON_WIDTH: f32 = 44.0;
 
+/// How many whole cards a strip of `usable` width should show.
+///
+/// `preferred` is the width `gamer_platform_card_width` would like to use; the
+/// answer is the count whose exactly-fitting width is no wider than that, and
+/// no narrower than `PLATFORM_CARD_MIN_WIDTH`.
+fn shelf_visible_card_count(usable: f32, preferred: f32, spacing: f32) -> usize {
+    let stride = preferred + spacing;
+    if usable <= 0.0 || stride <= 0.0 {
+        return 1;
+    }
+    let fitted_at = |count: f32| (usable + spacing) / count - spacing;
+    // The count that fits at the preferred width, then one more when that
+    // count would have to stretch the cards past `preferred` to fill the strip.
+    let mut count = ((usable + spacing) / stride).floor().max(1.0);
+    if fitted_at(count) > preferred {
+        count += 1.0;
+    }
+    // Never so many that a card falls below the readable minimum.
+    while count > 1.0 && fitted_at(count) < PLATFORM_CARD_MIN_WIDTH {
+        count -= 1.0;
+    }
+    count as usize
+}
+
+/// The card width that makes a whole number of cards fill `usable` exactly.
+///
+/// Clamped to the readable range. When the clamp binds - a strip too narrow for
+/// even one minimum-width card - the cards no longer fill the strip exactly and
+/// a little unused space is left before the trailing chevron. That is the safe
+/// direction to miss in: unused space never puts a card under a control.
+fn shelf_fitted_card_width(usable: f32, preferred: f32, spacing: f32) -> f32 {
+    let count = shelf_visible_card_count(usable, preferred, spacing) as f32;
+    let fitted = (usable + spacing) / count - spacing;
+    fitted.clamp(
+        PLATFORM_CARD_MIN_WIDTH,
+        preferred.max(PLATFORM_CARD_MIN_WIDTH),
+    )
+}
+
+/// The width the scrolling strip is given: exactly the cards it shows, and
+/// never more than the space left between the chevrons.
+fn shelf_strip_width(usable: f32, card_width: f32, spacing: f32) -> f32 {
+    let count = shelf_visible_card_count(usable, card_width, spacing) as f32;
+    (count * (card_width + spacing) - spacing)
+        .min(usable)
+        .max(0.0)
+}
+
+/// The space one chevron takes out of the row: the button plus the gap that
+/// separates it from the strip.
+fn shelf_chevron_reserve(spacing: f32) -> f32 {
+    SHELF_CHEVRON_WIDTH + spacing
+}
+
 /// How much of the visible strip one chevron press moves, as a fraction of the
 /// viewport. Deliberately short of a full page so a card or two stays on screen
 /// as a visual anchor - a person should be able to see that they moved along a
@@ -35611,6 +37519,10 @@ struct PlatformShelfMetrics {
     content_width: f32,
     /// Width of the visible strip.
     viewport_width: f32,
+    /// One card plus the gap that follows it. Paging moves whole multiples of
+    /// this so an aligned shelf stays aligned. Zero means "not measured yet",
+    /// which falls back to the raw fractional page.
+    card_stride: f32,
 }
 
 impl PlatformShelfMetrics {
@@ -35644,9 +37556,19 @@ impl PlatformShelfMetrics {
         self.overflows() && !self.at_end()
     }
 
-    /// How far one page press travels.
+    /// How far one page press travels: a whole number of cards.
+    ///
+    /// Rounding down to whole cards is what keeps every resting position
+    /// card-aligned. The strip is sized to hold an exact number of cards, so
+    /// starting from the left edge - and, because the maximum offset is itself
+    /// a whole number of strides, ending at the right edge too - no press can
+    /// leave a card sliced in half against a chevron.
     fn page_delta(&self) -> f32 {
-        self.viewport_width * SHELF_PAGE_FRACTION
+        let raw = self.viewport_width * SHELF_PAGE_FRACTION;
+        if self.card_stride <= 0.0 {
+            return raw;
+        }
+        (raw / self.card_stride).floor().max(1.0) * self.card_stride
     }
 
     /// The offset `scroll` would land on, clamped to the real range so a press
@@ -35699,6 +37621,36 @@ struct PlatformShelfState {
 /// parent `Ui`. There is exactly one platform shelf in the application, so a
 /// stable id is both accurate and readable from a test that renders the whole
 /// window.
+/// The initial and maximum size for one RomM tool window, clamped to the
+/// current viewport.
+///
+/// Shared by every RomM window so none of them can open larger than the
+/// screen - the failure mode that puts a fixed footer, and therefore the
+/// only visible way out, past the bottom edge at TV resolution. `maximum`
+/// leaves a 32px margin so the title bar (and its close control) stays
+/// reachable; `preferred` is only honoured up to that maximum.
+/// The tallest a RomM window's scrolling body may be, given the window's
+/// maximum size. The remainder pays for the title bar, the frame margins,
+/// the separator and the footer itself.
+fn romm_window_body_cap(maximum: egui::Vec2) -> f32 {
+    (maximum.y - 100.0).max(120.0)
+}
+
+fn romm_dialog_sizes(viewport: egui::Vec2, preferred: egui::Vec2) -> (egui::Vec2, egui::Vec2) {
+    // The margin is the window's own chrome plus the room it needs to sit
+    // somewhere other than exactly (0, 0). A 32px margin was not enough: a
+    // window whose content filled its maximum height became as tall as the
+    // screen less 32, and egui then placed it below the top edge, pushing its
+    // fixed footer - and therefore the only visible way out - off the bottom.
+    const MARGIN: f32 = 96.0;
+    let maximum = egui::vec2(
+        (viewport.x - MARGIN).max(240.0).min(viewport.x.max(1.0)),
+        (viewport.y - MARGIN).max(240.0).min(viewport.y.max(1.0)),
+    );
+    let initial = egui::vec2(preferred.x.min(maximum.x), preferred.y.min(maximum.y));
+    (initial, maximum)
+}
+
 fn platform_shelf_state_id() -> egui::Id {
     egui::Id::new("gamer_platform_shelf_nav")
 }
@@ -35821,6 +37773,10 @@ struct ShelfGeometry {
     /// of view still reports its rect, so a test can tell "off-screen" from
     /// "hidden behind a control".
     cards: Vec<egui::Rect>,
+    /// Each card's widget id, in the same order as `cards`. Reported so a
+    /// test can drive a card through egui's own keyboard focus rather than
+    /// by synthesising a click at a coordinate.
+    card_ids: Vec<egui::Id>,
 }
 
 impl Default for ShelfGeometry {
@@ -35831,6 +37787,7 @@ impl Default for ShelfGeometry {
             previous: None,
             next: None,
             cards: Vec::new(),
+            card_ids: Vec::new(),
         }
     }
 }
@@ -35909,10 +37866,45 @@ fn show_gamer_platform_shelf(
     // Measured before anything is laid out, so it is independent of whether the
     // chevrons end up being drawn.
     let full_width = ui.available_width();
-    let show_controls = state.metrics.content_width > full_width + SHELF_EDGE_EPSILON;
+    let spacing = ui.spacing().item_spacing.x;
+
+    // Decided from what the shelf *would* be at the preferred card width,
+    // computed here rather than read back from last frame's measurement.
+    //
+    // That matters now that the card width depends on whether the chevrons are
+    // shown: a decision fed by the previous frame's `content_width` could see
+    // narrower fitted cards, conclude everything fits, hide the chevrons, widen
+    // the cards again, and flip back - a shelf that flickers forever at exactly
+    // one window width. Derived from the entry count and the preferred width,
+    // the answer is a pure function of the row's own width and cannot oscillate.
+    let preferred_card_width = card_width;
+    let content_at_preferred =
+        (entries.len() as f32 * (preferred_card_width + spacing) - spacing).max(0.0);
+    let show_controls = content_at_preferred > full_width + SHELF_EDGE_EPSILON;
     outcome.controls_visible = show_controls;
     outcome.previous_enabled = show_controls && state.metrics.can_page_left();
     outcome.next_enabled = show_controls && state.metrics.can_page_right();
+
+    // The space the strip may occupy once both chevrons have been paid for -
+    // both, not one, because the row must lay out identically whichever end it
+    // is scrolled to. From that, a card width that divides the strip exactly.
+    //
+    // This is the whole fix for the reported defect. The strip used to be given
+    // whatever width happened to remain, which almost never divided evenly by a
+    // card, so the rightmost card was sliced by the strip's clip edge with the
+    // chevron sitting 8px beyond it - measured at 14-124px of card cut off,
+    // depending on window width. A person reads a card cut off flush against a
+    // button as a card hidden *underneath* that button.
+    let usable_strip_width = if show_controls {
+        (full_width - 2.0 * shelf_chevron_reserve(spacing)).max(PLATFORM_CARD_MIN_WIDTH)
+    } else {
+        full_width
+    };
+    let card_width = if show_controls {
+        shelf_fitted_card_width(usable_strip_width, preferred_card_width, spacing)
+    } else {
+        preferred_card_width
+    };
 
     // A selection change re-reveals the selected card. Detected here, before the
     // cards are drawn, because the scroll request has to be made as the card
@@ -35925,6 +37917,7 @@ fn show_gamer_platform_shelf(
     let mut requested: Option<ShelfScroll> = None;
     let mut focusable: Vec<egui::Id> = Vec::new();
     let mut card_rects: Vec<egui::Rect> = Vec::new();
+    let mut card_ids: Vec<egui::Id> = Vec::new();
 
     // Reserve exactly the shelf's own height, then draw inside it.
     //
@@ -35965,12 +37958,19 @@ fn show_gamer_platform_shelf(
             }
         }
 
+        // The leading chevron has already consumed its own width, so only the
+        // trailing one is still to be paid for here.
         let reserved = if show_controls {
-            SHELF_CHEVRON_WIDTH + ui.spacing().item_spacing.x
+            shelf_chevron_reserve(spacing)
         } else {
             0.0
         };
-        let strip_width = (ui.available_width() - reserved).max(card_width);
+        let remaining = (ui.available_width() - reserved).max(0.0);
+        let strip_width = if show_controls {
+            shelf_strip_width(remaining, card_width, spacing)
+        } else {
+            remaining.max(card_width)
+        };
 
         let output = egui::ScrollArea::horizontal()
             .id_salt("gamer_view_platform_shelf")
@@ -36002,6 +38002,7 @@ fn show_gamer_platform_shelf(
                         );
                         focusable.push(response.id);
                         card_rects.push(response.rect);
+                        card_ids.push(response.id);
                         if is_selected && selection_changed {
                             // Minimal movement: bring it just into view rather
                             // than recentring, so the shelf does not lurch.
@@ -36015,6 +38016,11 @@ fn show_gamer_platform_shelf(
             });
 
         if show_controls {
+            // Any width the strip declined to use (only when the readable
+            // minimum clamp bound) becomes a gutter here, so the trailing
+            // chevron stays flush with the row's right edge and the gap falls
+            // between the last card and the button rather than beyond it.
+            ui.add_space((remaining - strip_width).max(0.0));
             let response =
                 shelf_chevron(ui, SHELF_NEXT_GLYPH, "Next platforms", outcome.next_enabled);
             focusable.push(response.id);
@@ -36030,6 +38036,7 @@ fn show_gamer_platform_shelf(
             offset_x: output.state.offset.x,
             content_width: output.content_size.x,
             viewport_width: output.inner_rect.width(),
+            card_stride: card_width + spacing,
         };
         outcome.metrics = state.metrics;
         outcome.geometry.strip = output.inner_rect;
@@ -36042,6 +38049,7 @@ fn show_gamer_platform_shelf(
     }
 
     outcome.geometry.cards = card_rects;
+    outcome.geometry.card_ids = card_ids;
 
     if let Some(scroll) = requested
         && state.metrics.can_scroll(scroll)
@@ -36636,10 +38644,18 @@ mod tests {
                 "{absent:?} must not be a separate sidebar destination any more"
             );
         }
+        // The Library area contributes exactly one destination. Counting only
+        // those, rather than the whole sidebar, is what this test is actually
+        // about: pinning the total meant any unrelated page added elsewhere
+        // failed a Library-consolidation test, which says nothing about
+        // Library. Cheat Sources was the first such page.
+        let library_area_destinations = PRIMARY_NAVIGATION_DESTINATIONS
+            .iter()
+            .filter(|(view, _)| library_tab_for_main_view(*view).is_some())
+            .count();
         assert_eq!(
-            PRIMARY_NAVIGATION_DESTINATIONS.len(),
-            11,
-            "sidebar consolidation must not add or remove any other destination"
+            library_area_destinations, 1,
+            "sidebar consolidation must leave Library as the area's only destination"
         );
     }
 
@@ -37531,10 +39547,23 @@ mod tests {
     // --- Platform shelf horizontal navigation ----------------------------
 
     fn shelf_metrics(offset: f32, content: f32, viewport: f32) -> PlatformShelfMetrics {
+        // Stride zero: these navigation tests predate card-aligned paging and
+        // are about the offset arithmetic, not the alignment. Zero selects the
+        // raw fractional page, which is exactly what they were written against.
+        shelf_metrics_with_stride(offset, content, viewport, 0.0)
+    }
+
+    fn shelf_metrics_with_stride(
+        offset: f32,
+        content: f32,
+        viewport: f32,
+        card_stride: f32,
+    ) -> PlatformShelfMetrics {
         PlatformShelfMetrics {
             offset_x: offset,
             content_width: content,
             viewport_width: viewport,
+            card_stride,
         }
     }
 
@@ -37822,24 +39851,48 @@ mod tests {
         );
     }
 
-    /// Test 15: the controls appear only once the content has been measured,
-    /// which is what proves the cross-frame measurement actually works.
+    /// Test 15: the controls are decided on the very first frame.
+    ///
+    /// This used to require two frames, because the decision was read back from
+    /// the previous frame's measured `content_width`. That is no longer safe:
+    /// the card width now depends on whether the chevrons are shown (they take
+    /// space out of the strip, and the cards are refitted to what is left), so
+    /// a decision fed by the previous frame's measurement could see the
+    /// narrower fitted cards, conclude everything fits, retire the chevrons,
+    /// widen the cards, and flip back forever at one particular width.
+    ///
+    /// The decision is now computed directly from the row's width and the
+    /// entry count at the preferred card width - a pure function of this
+    /// frame's inputs. Deciding it a frame earlier is also simply better: the
+    /// shelf no longer opens with one frame of missing controls.
     #[test]
-    fn the_controls_appear_after_the_first_frame_has_measured_the_content() {
+    fn the_controls_are_decided_on_the_first_frame_without_a_measurement() {
         let context = egui::Context::default();
         let platforms = shelf_entries(40);
 
         let (_, first) = render_shelf(&context, 700.0, &platforms, None, 1);
         assert!(
-            !first.controls_visible,
-            "nothing has been measured yet, so nothing is claimed"
+            first.controls_visible,
+            "40 platforms cannot fit in 700px, and that is knowable immediately"
         );
 
         let (_, second) = render_shelf(&context, 700.0, &platforms, None, 1);
         assert!(
             second.controls_visible,
-            "the first frame's measurement must be available to the second"
+            "and the answer must not change once measurements exist"
         );
+
+        // The converse, on a fresh context: a shelf that fits claims nothing,
+        // on the first frame and every frame after it.
+        let roomy = egui::Context::default();
+        let few = shelf_entries(3);
+        for _ in 0..3 {
+            let (_, shelf) = render_shelf(&roomy, 2560.0, &few, None, 1);
+            assert!(
+                !shelf.controls_visible,
+                "three cards fit easily and need no controls"
+            );
+        }
     }
 
     /// Test 16: resizing the window updates the controls in both directions,
@@ -38841,6 +40894,253 @@ mod tests {
         }
     }
 
+    /// Renders the shelf, presses the next chevron `pages` times, and reports
+    /// the geometry that results.
+    fn shelf_geometry_after_pages(width: f32, platforms: usize, pages: usize) -> ShelfGeometry {
+        let mut app = app_for_operation_tests();
+        app.ui_mode = GuiMode::GamerView;
+        app.view = MainView::Library;
+        let mut records = Vec::new();
+        for index in 0..platforms {
+            let mut row = record(&format!("/roms/g{index:02}.zip"), MountState::Pending);
+            row.metadata.platform = Some(format!("Platform{index:02}"));
+            records.push(row);
+        }
+        app.state = LoadState::Ready(Box::new(loaded_data_with_records("/mount", records)));
+
+        let ctx = egui::Context::default();
+        let mut frame = eframe::Frame::_new_kittest();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 1080.0));
+        let idle = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        for _ in 0..3 {
+            let _ = ctx.run(idle.clone(), |ctx| app.update(ctx, &mut frame));
+        }
+        let geometry = |ctx: &egui::Context| {
+            ctx.data(|data| data.get_temp::<PlatformShelfState>(platform_shelf_state_id()))
+                .map(|state| state.geometry)
+                .unwrap_or_default()
+        };
+        for _ in 0..pages {
+            let next = geometry(&ctx).next.expect("the chevrons are shown");
+            let _ = ctx.run(click_at(screen, next.center()), |ctx| {
+                app.update(ctx, &mut frame)
+            });
+            // Let the animated scroll settle before the next press.
+            for _ in 0..60 {
+                let _ = ctx.run(idle.clone(), |ctx| app.update(ctx, &mut frame));
+            }
+        }
+        geometry(&ctx)
+    }
+
+    // --- Platform shelf: cards must never be sliced against a chevron -----
+    //
+    // Reported after the Sunshine smoke test: at some widths the rightmost
+    // card looked like it sat underneath the ">" control. Measured, the card
+    // was not painted under the button - the strip clips it - but the strip
+    // was given whatever width happened to remain after the chevrons, which
+    // almost never divided evenly by a card, so the last card was cut off by
+    // 14-124px flush against the button. These tests pin the arithmetic that
+    // fixes it, rather than a screenshot.
+
+    /// The widths worth checking: common desktop sizes plus the 1920x1080 the
+    /// Sunshine/TV session actually runs at.
+    const SHELF_TEST_WIDTHS: [f32; 6] = [1024.0, 1280.0, 1366.0, 1600.0, 1920.0, 2560.0];
+
+    #[test]
+    fn a_fitted_card_is_never_wider_than_preferred_nor_narrower_than_readable() {
+        for width in SHELF_TEST_WIDTHS {
+            let preferred = gamer_platform_card_width(width);
+            let usable = width - 2.0 * shelf_chevron_reserve(8.0);
+            let fitted = shelf_fitted_card_width(usable, preferred, 8.0);
+            assert!(
+                fitted <= preferred + 0.01,
+                "{width}: fitted {fitted} exceeds the preferred {preferred}"
+            );
+            assert!(
+                fitted >= PLATFORM_CARD_MIN_WIDTH - 0.01,
+                "{width}: fitted {fitted} is below the readable minimum"
+            );
+        }
+    }
+
+    /// The property the whole fix rests on: a whole number of cards fills the
+    /// strip exactly, so its right edge always lands on a card boundary.
+    #[test]
+    fn a_whole_number_of_cards_fills_the_strip_exactly() {
+        for width in SHELF_TEST_WIDTHS {
+            for spacing in [4.0_f32, 8.0, 12.0] {
+                let preferred = gamer_platform_card_width(width);
+                let usable = width - 2.0 * shelf_chevron_reserve(spacing);
+                let fitted = shelf_fitted_card_width(usable, preferred, spacing);
+                let count = shelf_visible_card_count(usable, fitted, spacing);
+                let strip = shelf_strip_width(usable, fitted, spacing);
+
+                assert!(count >= 1, "{width}/{spacing}: no cards fit");
+                assert!(
+                    strip <= usable + 0.01,
+                    "{width}/{spacing}: strip {strip} exceeds the usable {usable}"
+                );
+                let exact = count as f32 * (fitted + spacing) - spacing;
+                assert!(
+                    (strip - exact).abs() < 0.5,
+                    "{width}/{spacing}: strip {strip} is not {count} whole cards ({exact})"
+                );
+                // And it wastes no meaningful space: the leftover is never a
+                // whole card, or the strip should have shown one more.
+                assert!(
+                    usable - strip < fitted + spacing,
+                    "{width}/{spacing}: {} left over, enough for another card",
+                    usable - strip
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_strip_never_claims_the_space_a_chevron_needs() {
+        // Both chevrons are paid for, whichever end the shelf is scrolled to.
+        assert_eq!(shelf_chevron_reserve(8.0), SHELF_CHEVRON_WIDTH + 8.0);
+        for width in SHELF_TEST_WIDTHS {
+            let preferred = gamer_platform_card_width(width);
+            let usable = width - 2.0 * shelf_chevron_reserve(8.0);
+            let strip = shelf_strip_width(usable, preferred, 8.0);
+            assert!(
+                strip + 2.0 * shelf_chevron_reserve(8.0) <= width + 0.01,
+                "{width}: strip {strip} leaves no room for both chevrons"
+            );
+        }
+    }
+
+    /// A strip too narrow for even one readable card must still not overflow -
+    /// it gives up filling the strip rather than overlapping a control.
+    #[test]
+    fn an_impossibly_narrow_strip_underfills_rather_than_overlapping() {
+        let strip = shelf_strip_width(40.0, PLATFORM_CARD_MIN_WIDTH, 8.0);
+        assert!(
+            strip <= 40.0 + 0.01,
+            "the strip overflowed its usable width"
+        );
+        assert_eq!(
+            shelf_visible_card_count(40.0, PLATFORM_CARD_MIN_WIDTH, 8.0),
+            1
+        );
+        assert_eq!(shelf_visible_card_count(0.0, 164.0, 8.0), 1);
+        assert_eq!(shelf_visible_card_count(-10.0, 164.0, 8.0), 1);
+    }
+
+    /// Paging moves whole cards, which is what keeps an aligned shelf aligned.
+    #[test]
+    fn a_page_press_travels_a_whole_number_of_cards() {
+        let stride = 172.0;
+        let metrics = shelf_metrics_with_stride(0.0, 4000.0, 1032.0, stride);
+        let delta = metrics.page_delta();
+        assert!(delta > 0.0);
+        assert!(
+            (delta / stride - (delta / stride).round()).abs() < 0.001,
+            "a page of {delta} is not a whole number of {stride}px cards"
+        );
+        assert!(
+            delta <= 1032.0 * SHELF_PAGE_FRACTION + 0.01,
+            "a page must still stay short of a full viewport"
+        );
+        // Even a viewport narrower than one card advances by at least one.
+        let narrow = shelf_metrics_with_stride(0.0, 4000.0, 100.0, stride);
+        assert_eq!(narrow.page_delta(), stride);
+        // With no stride measured yet, the raw fractional page still applies.
+        let unmeasured = shelf_metrics_with_stride(0.0, 4000.0, 1000.0, 0.0);
+        assert_eq!(unmeasured.page_delta(), 1000.0 * SHELF_PAGE_FRACTION);
+    }
+
+    /// The rendered result, expressed as relations rather than pixel values:
+    /// at every width, no card that is actually on screen may cross either
+    /// edge of the strip, and the strip may not reach either chevron.
+    #[test]
+    fn no_visible_card_is_sliced_by_a_chevron_at_any_width() {
+        for width in SHELF_TEST_WIDTHS {
+            let (geometry, _) = render_gamer_view_at(width, 1080.0, 19);
+            let previous = geometry
+                .previous
+                .expect("19 platforms overflow every width");
+            let next = geometry.next.expect("19 platforms overflow every width");
+
+            assert!(
+                previous.right() <= geometry.strip.left() + 0.5,
+                "{width}: the previous chevron runs into the strip"
+            );
+            assert!(
+                geometry.strip.right() <= next.left() + 0.5,
+                "{width}: the strip runs into the next chevron"
+            );
+
+            for card in geometry.cards.iter().filter(|card| {
+                card.right() > geometry.strip.left() + 0.5
+                    && card.left() < geometry.strip.right() - 0.5
+            }) {
+                assert!(
+                    card.right() <= geometry.strip.right() + 1.0,
+                    "{width}: a visible card {card:?} is cut off by {} at the next chevron",
+                    card.right() - geometry.strip.right()
+                );
+                assert!(
+                    card.left() >= geometry.strip.left() - 1.0,
+                    "{width}: a visible card {card:?} is cut off at the previous chevron"
+                );
+                assert!(
+                    !card.intersects(next) && !card.intersects(previous),
+                    "{width}: a visible card overlaps a chevron"
+                );
+            }
+        }
+    }
+
+    /// And the alignment survives using the controls, which is how a shelf is
+    /// actually driven on a TV.
+    #[test]
+    fn paging_the_shelf_leaves_every_visible_card_whole() {
+        for width in [1366.0_f32, 1920.0] {
+            for pages in [1_usize, 2] {
+                let geometry = shelf_geometry_after_pages(width, 19, pages);
+                let next = geometry.next.expect("the chevrons are shown");
+                for card in geometry.cards.iter().filter(|card| {
+                    card.right() > geometry.strip.left() + 0.5
+                        && card.left() < geometry.strip.right() - 0.5
+                }) {
+                    assert!(
+                        card.right() <= geometry.strip.right() + 1.0
+                            && card.left() >= geometry.strip.left() - 1.0,
+                        "{width} after {pages} page(s): card {card:?} is sliced by the strip \
+                         edge (strip {:?})",
+                        geometry.strip
+                    );
+                    assert!(!card.intersects(next));
+                }
+            }
+        }
+    }
+
+    /// Selecting a platform must still work after all of the above - the fix
+    /// changes layout only.
+    #[test]
+    fn fitted_cards_still_select_their_platform() {
+        let mut app = gamer_app_with_platforms(&[("Acorn Archimedes", 2), ("SNES", 2)]);
+        let ctx = egui::Context::default();
+        let screen = gamer_screen();
+        let idle = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        run_gamer_frames(&mut app, &ctx, idle.clone(), 3);
+        let cards = gamer_shelf_geometry(&ctx).cards;
+        run_gamer_frames(&mut app, &ctx, click_at(screen, cards[2].center()), 1);
+        assert_eq!(app.library_filters.platform.as_deref(), Some("SNES"));
+        let output = run_gamer_frames(&mut app, &ctx, idle, 1);
+        assert!(rendered_text_contains(&output, "Title0002"));
+    }
+
     /// A shelf that fits needs no controls, and must still not disturb the
     /// content below it.
     #[test]
@@ -39159,6 +41459,94 @@ mod tests {
         // The Advanced-only sidebar/menu bar must be completely absent.
         assert!(!rendered_text_contains(&output, "Active Mounts"));
         assert!(!rendered_text_contains(&output, "Mount All"));
+    }
+
+    #[test]
+    fn gamer_view_renders_without_a_romm_catalogue_and_contacts_nothing() {
+        // The cover column draws on every Gamer View frame. With no RomM
+        // catalogue imported - a clean install, or an import that never ran -
+        // every row falls to the placeholder path. That path runs inside the
+        // real frame here rather than only in the scheduler's unit tests, so a
+        // panic while drawing a coverless row is caught.
+        //
+        // It also pins the rule that opening Gamer View is not a network event:
+        // no cover worker is started by rendering, so nothing can be fetched by
+        // looking at the page.
+        let mut app = app_for_operation_tests();
+        let mut records = Vec::new();
+        for index in 0..40 {
+            let mut row = record(&format!("/roms/g{index:02}.zip"), MountState::Pending);
+            row.metadata.title = Some(format!("Coverless Game {index:02}"));
+            row.metadata.platform = Some("GameCube".to_string());
+            records.push(row);
+        }
+        app.state = LoadState::Ready(Box::new(loaded_data_with_records("/mount", records)));
+        app.ui_mode = GuiMode::GamerView;
+        app.view = MainView::Library;
+
+        let ctx = egui::Context::default();
+        let mut frame = eframe::Frame::_new_kittest();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        // Several passes: scrolling state and the look-ahead settle across
+        // frames, and a repeat frame is where a re-request storm would show up.
+        let mut output = None;
+        for _ in 0..3 {
+            output = Some(ctx.run(input.clone(), |ctx| app.update(ctx, &mut frame)));
+        }
+        let output = output.expect("a rendered frame");
+
+        assert!(
+            rendered_text_contains(&output, "Coverless Game 00"),
+            "the list must still draw when no cover is available"
+        );
+        assert!(
+            app.gamer_covers.tracked() <= crate::gamer_artwork::MAX_TRACKED_COVERS,
+            "rendering pushed the cover cache past its bound, held {}",
+            app.gamer_covers.tracked()
+        );
+    }
+
+    #[test]
+    fn an_empty_gamer_view_starts_no_cover_worker_at_all() {
+        // The worker is what opens the catalogue and is the only thing that can
+        // reach the configured RomM instance. It is started lazily, on the first
+        // frame that actually asks for a cover, so a Gamer View with nothing to
+        // show must never bring it up: no thread, no catalogue read, no request.
+        let mut app = app_for_operation_tests();
+        // Opted back in on purpose: this is the one test whose subject *is*
+        // whether the worker starts, so suppressing it would prove nothing. It
+        // is safe here precisely because an empty list must never reach the
+        // start site - if that regressed, this test starts a thread and fails.
+        app.gamer_cover_worker_allowed = true;
+        app.state = LoadState::Ready(Box::new(loaded_data_with_records("/mount", Vec::new())));
+        app.ui_mode = GuiMode::GamerView;
+        app.view = MainView::Library;
+
+        let ctx = egui::Context::default();
+        let mut frame = eframe::Frame::_new_kittest();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        for _ in 0..3 {
+            let _ = ctx.run(input.clone(), |ctx| app.update(ctx, &mut frame));
+        }
+
+        assert!(
+            app.gamer_cover_worker.is_none(),
+            "an empty library started a cover worker, so opening the page alone \
+             would open the catalogue and could reach the network"
+        );
+        assert_eq!(app.gamer_covers.tracked(), 0);
     }
 
     #[test]
@@ -43558,18 +45946,273 @@ $Instant Growth [Nayr]\n";
         std::fs::write(root.join("wii-catalogue.json"), catalogue.as_bytes()).unwrap();
     }
 
+    /// How long a test waits for a background Wii/GameCube matching task
+    /// before declaring the run stuck.
+    ///
+    /// The work itself is a cached-catalogue read and a match: single-digit
+    /// milliseconds. Thirty seconds is therefore three to four orders of
+    /// magnitude of headroom for a loaded machine, while still failing a
+    /// genuine deadlock long before an outer CI job timeout would, and with a
+    /// far better message than a killed process gives.
+    const WII_MATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Spins on `ready` until it returns true, or the deadline passes.
+    ///
+    /// Returns how long the wait took, or `Err(elapsed)` on timeout.
+    ///
+    /// # Why a deadline rather than an iteration count
+    ///
+    /// The previous version of `wait_for_wii_match_terminal` gave up after a
+    /// fixed 2,000 iterations of `poll` + `std::thread::yield_now()`. That is
+    /// not a wait at all: `yield_now` returns immediately when the calling
+    /// core has nothing else runnable, so the whole budget could be spent in
+    /// microseconds - before the worker thread had even been scheduled once.
+    /// The loop's *duration* was a function of machine load rather than a
+    /// bound anyone chose, so the busier the suite, the sooner it gave up.
+    /// That is exactly backwards, and it is why adding unrelated GUI tests
+    /// made a pre-existing race start showing.
+    ///
+    /// A wall-clock deadline inverts that: contention can only make the wait
+    /// longer, never shorter, so the only way to fail is to genuinely exceed
+    /// the timeout. The backoff below keeps the fast path fast (a ready
+    /// result is observed on the first poll, with no syscall) while making a
+    /// slow path actually yield the core to the worker rather than burning it.
+    fn wait_until<F>(
+        timeout: std::time::Duration,
+        mut ready: F,
+    ) -> Result<std::time::Duration, std::time::Duration>
+    where
+        F: FnMut() -> bool,
+    {
+        // A short spin first: the overwhelmingly common case is that the
+        // result is already there, and a sleep would add latency to every
+        // test for nothing.
+        const SPIN_POLLS: u32 = 64;
+        const MIN_SLEEP: std::time::Duration = std::time::Duration::from_micros(200);
+        const MAX_SLEEP: std::time::Duration = std::time::Duration::from_millis(2);
+
+        let started = Instant::now();
+        let mut polls = 0_u32;
+        let mut sleep = MIN_SLEEP;
+        loop {
+            if ready() {
+                return Ok(started.elapsed());
+            }
+            let elapsed = started.elapsed();
+            if elapsed >= timeout {
+                return Err(elapsed);
+            }
+            if polls < SPIN_POLLS {
+                std::thread::yield_now();
+            } else {
+                // Never sleep past the deadline: a timeout must be reported
+                // promptly rather than one whole sleep late.
+                std::thread::sleep(sleep.min(timeout - elapsed));
+                sleep = (sleep * 2).min(MAX_SLEEP);
+            }
+            polls = polls.saturating_add(1);
+        }
+    }
+
+    /// The observable state of one cheat step, for a failure message.
+    fn describe_cheat_step<T>(resource: &CheatStepResource<T>) -> String {
+        match resource {
+            CheatStepResource::NotLoaded => "NotLoaded".to_string(),
+            CheatStepResource::Loading { .. } => "Loading".to_string(),
+            CheatStepResource::Ready(_) => "Ready".to_string(),
+            CheatStepResource::Failed(message) => format!("Failed({message})"),
+        }
+    }
+
     fn wait_for_wii_match_terminal(app: &mut ArchiveFsApp, context: &egui::Context) {
-        for _ in 0..2_000 {
+        wait_for_wii_match_terminal_within(app, context, WII_MATCH_TIMEOUT);
+    }
+
+    /// Polls the workflow until its GameHacking step leaves `Loading`.
+    ///
+    /// The completion signal is the real one the application uses: the worker
+    /// sends its result down the `mpsc` channel held in
+    /// `CheatStepResource::Loading { receiver }`, and `poll_cheat_workflow`
+    /// picks it up with `try_recv` and replaces the state. This waits on that
+    /// same observable state transition rather than on a timer, so it cannot
+    /// pass before the result has actually been absorbed. The receiver is
+    /// deliberately not read directly here - doing so would consume the
+    /// message the application is supposed to see.
+    fn wait_for_wii_match_terminal_within(
+        app: &mut ArchiveFsApp,
+        context: &egui::Context,
+        timeout: std::time::Duration,
+    ) -> std::time::Duration {
+        let outcome = wait_until(timeout, || {
             app.poll_cheat_workflow(context);
-            if !matches!(
+            !matches!(
                 app.cheat_workflow.as_ref().unwrap().gamecube_gamehacking,
                 CheatStepResource::Loading { .. }
-            ) {
-                return;
+            )
+        });
+        match outcome {
+            Ok(elapsed) => elapsed,
+            Err(elapsed) => {
+                // Everything observable about why it is still stuck.
+                let workflow = app.cheat_workflow.as_ref().unwrap();
+                panic!(
+                    "the cached Wii matching task did not publish a terminal result within \
+                     {timeout:?} (waited {elapsed:?}).\n  gamecube_gamehacking: {}\n  \
+                     request: {:?}\n  generation: {}\n  cancellation outstanding: {}\n  \
+                     blocked: {}\n  platform: {:?}\n  adapter: {:?}",
+                    describe_cheat_step(&workflow.gamecube_gamehacking),
+                    workflow.gamecube_gamehacking_request,
+                    workflow.gamecube_gamehacking_generation,
+                    workflow.gamecube_gamehacking_cancellation.is_some(),
+                    workflow.gamecube_gamehacking_blocked,
+                    workflow.platform,
+                    workflow.adapter,
+                );
             }
-            std::thread::yield_now();
         }
-        panic!("bounded cached Wii matching task did not publish a terminal result");
+    }
+
+    // --- The asynchronous wait helper itself --------------------------------
+    //
+    // `wait_for_wii_match_terminal` used to give up after a fixed 2,000
+    // iterations of poll + `yield_now()`. That budget is a count, not a
+    // duration, and `yield_now` does not sleep - so on a loaded machine the
+    // whole budget could be spent before the worker thread was scheduled even
+    // once, and the test failed while the code under test was perfectly
+    // healthy. These tests pin the replacement's contract directly, without
+    // needing a background worker to misbehave.
+
+    #[test]
+    fn the_wait_helper_returns_at_once_when_the_condition_already_holds() {
+        let elapsed = wait_until(std::time::Duration::from_secs(30), || true)
+            .expect("an already-satisfied condition cannot time out");
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "the fast path must not sleep; took {elapsed:?}"
+        );
+    }
+
+    /// The case the old helper got wrong: completion that arrives late still
+    /// has to be waited for, however busy the machine is.
+    #[test]
+    fn the_wait_helper_tolerates_completion_that_arrives_late() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let worker = flag.clone();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            worker.store(true, Ordering::SeqCst);
+        });
+
+        let elapsed = wait_until(std::time::Duration::from_secs(30), || {
+            flag.load(Ordering::SeqCst)
+        })
+        .expect("250ms is far inside a 30s deadline");
+        handle.join().unwrap();
+
+        assert!(
+            elapsed >= std::time::Duration::from_millis(200),
+            "it must actually have waited for the worker; took {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "and it must return promptly once the worker finishes; took {elapsed:?}"
+        );
+    }
+
+    /// A genuine deadlock must still fail, and fail on time rather than
+    /// hanging until an outer harness kills the process.
+    #[test]
+    fn the_wait_helper_times_out_promptly_when_nothing_ever_completes() {
+        let timeout = std::time::Duration::from_millis(300);
+        let started = Instant::now();
+        let outcome = wait_until(timeout, || false);
+        let measured = started.elapsed();
+
+        let reported = outcome.expect_err("a condition that never holds must time out");
+        assert!(
+            reported >= timeout,
+            "the deadline must be honoured, not cut short; reported {reported:?}"
+        );
+        assert!(
+            measured < timeout * 4,
+            "the timeout must be prompt, not one long sleep late; took {measured:?}"
+        );
+    }
+
+    /// The timeout message has to say what the last observed state was, or it
+    /// is no more useful than the bare panic it replaced.
+    #[test]
+    fn the_failure_description_names_the_observed_state() {
+        let loading: CheatStepResource<u8> = CheatStepResource::Loading {
+            receiver: mpsc::channel().1,
+        };
+        assert_eq!(describe_cheat_step(&loading), "Loading");
+        assert_eq!(
+            describe_cheat_step(&CheatStepResource::<u8>::NotLoaded),
+            "NotLoaded"
+        );
+        assert_eq!(
+            describe_cheat_step(&CheatStepResource::Ready(1_u8)),
+            "Ready"
+        );
+        // A failure keeps its reason: that is usually the whole answer.
+        assert_eq!(
+            describe_cheat_step(&CheatStepResource::<u8>::Failed("no catalogue".to_string())),
+            "Failed(no catalogue)"
+        );
+    }
+
+    /// End to end: a real worker made deliberately slow still reaches a
+    /// terminal result through the real polling path.
+    #[test]
+    fn a_deliberately_delayed_wii_match_still_reaches_a_terminal_result() {
+        let root = std::env::temp_dir().join(format!(
+            "archivefs-gui-wii-delayed-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        write_wii_match_catalogue(&root, "SMNE01", None);
+        let mut app = wii_workflow_with_matched_identity(&root, "SMNE01");
+        let context = egui::Context::default();
+        app.start_gamecube_gamehacking_fetch_with_options(
+            context.clone(),
+            WiiGameHackingFetchMode::CacheOnly,
+            GameHackingGameCubeFetchOptions {
+                cache_root: root.clone(),
+                force_refresh: false,
+                // A real delay inside the worker, so this exercises waiting
+                // rather than a result that happens to be ready already.
+                delay: std::time::Duration::from_millis(250),
+                cancellation: None,
+            },
+        );
+        // Still `Loading` immediately after starting, which is what makes the
+        // wait below meaningful rather than vacuous.
+        assert!(matches!(
+            app.cheat_workflow.as_ref().unwrap().gamecube_gamehacking,
+            CheatStepResource::Loading { .. }
+        ));
+
+        let elapsed = wait_for_wii_match_terminal_within(
+            &mut app,
+            &context,
+            std::time::Duration::from_secs(30),
+        );
+        assert!(
+            !matches!(
+                app.cheat_workflow.as_ref().unwrap().gamecube_gamehacking,
+                CheatStepResource::Loading { .. }
+            ),
+            "the delayed worker must still have been absorbed"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "a 250ms worker must not take anywhere near the deadline; took {elapsed:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -46191,17 +48834,773 @@ $Instant Growth [Nayr]\n";
         assert!(rendered_text_contains(&output, "mounted read-only"));
     }
 
+    // ---------------------------------------------------------------------
+    // Human-smoke regressions: Gamer View platform filtering
+    //
+    // Confirmed on a real 13,891-archive library: after ticking a state
+    // filter in Advanced View (or opening the Health dashboard's "Review
+    // missing", which sets `missing` directly) and returning to Gamer View,
+    // every platform card still showed its full count while the list said
+    // "No games match the selected platform." for all of them. Gamer View
+    // shows no such checkbox, so there was no way back except a restart -
+    // `LibraryRowFilters` is not persisted, which is exactly why restarting
+    // appeared to "fix" it.
+    // ---------------------------------------------------------------------
+
+    /// A pointer click at one position, as one frame of input.
+    fn click_at(screen: egui::Rect, position: egui::Pos2) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn gamer_app_with_platforms(platforms: &[(&str, usize)]) -> ArchiveFsApp {
+        let mut app = app_for_operation_tests();
+        app.ui_mode = GuiMode::GamerView;
+        app.view = MainView::Library;
+        let mut records = Vec::new();
+        let mut index = 0usize;
+        for (platform, count) in platforms {
+            for _ in 0..*count {
+                let mut row = record(&format!("/roms/g{index:04}.zip"), MountState::Pending);
+                row.metadata.platform = Some((*platform).to_string());
+                row.metadata.title = Some(format!("Title{index:04}"));
+                records.push(row);
+                index += 1;
+            }
+        }
+        app.state = LoadState::Ready(Box::new(loaded_data_with_records("/mount", records)));
+        app
+    }
+
+    fn gamer_screen() -> egui::Rect {
+        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0))
+    }
+
+    /// Runs `frames` settling frames and returns the last output.
+    fn run_gamer_frames(
+        app: &mut ArchiveFsApp,
+        ctx: &egui::Context,
+        input: egui::RawInput,
+        frames: usize,
+    ) -> egui::FullOutput {
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut output = None;
+        for _ in 0..frames {
+            output = Some(ctx.run(input.clone(), |ctx| app.update(ctx, &mut frame)));
+        }
+        output.expect("at least one frame")
+    }
+
+    fn gamer_shelf_geometry(ctx: &egui::Context) -> ShelfGeometry {
+        ctx.data(|data| data.get_temp::<PlatformShelfState>(platform_shelf_state_id()))
+            .map(|state| state.geometry)
+            .unwrap_or_default()
+    }
+
+    /// The exact confirmed defect: an Advanced-View-only state filter must
+    /// not silently empty Gamer View's list.
+    #[test]
+    fn gamer_view_ignores_advanced_view_state_filters_it_cannot_show_or_clear() {
+        let mut app = gamer_app_with_platforms(&[("Acorn Archimedes", 3), ("SNES", 2)]);
+        // Exactly what "Review missing" in the Health dashboard does.
+        app.library_filters.missing = true;
+        app.library_filters.platform = Some("Acorn Archimedes".to_string());
+
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(gamer_screen()),
+            ..Default::default()
+        };
+        let output = run_gamer_frames(&mut app, &ctx, input, 2);
+
+        assert!(
+            rendered_text_contains(&output, "Title0000"),
+            "the selected platform's games must be listed; the Missing checkbox lives in \
+             Advanced View, which Gamer View neither renders nor can clear"
+        );
+        assert!(!rendered_text_contains(
+            &output,
+            "No games match the selected platform"
+        ));
+        // The Advanced-View filter itself is preserved, not silently reset -
+        // returning to Advanced View must find it exactly as it was left.
+        assert!(app.library_filters.missing);
+    }
+
+    /// The structural guarantee, stated directly: for every card the shelf
+    /// offers, selecting it produces exactly the number of rows the card
+    /// advertised. No pairing of counts and rows can drift apart.
+    #[test]
+    fn gamer_shelf_counts_are_exactly_the_rows_selecting_that_card_produces() {
+        let rows: Vec<ArchiveRow> = {
+            let mut records = Vec::new();
+            for (index, platform) in ["SNES", "SNES", "GameCube", "MegaDrive"]
+                .into_iter()
+                .enumerate()
+            {
+                let mut row = record(&format!("/roms/g{index}.zip"), MountState::Pending);
+                row.metadata.platform = Some(platform.to_string());
+                records.push(row);
+            }
+            let mut unknown = record("/roms/unknown.zip", MountState::Pending);
+            unknown.metadata.platform = None;
+            unknown.identity.platform = None;
+            records.push(unknown);
+            records.iter().map(row_for).collect()
+        };
+
+        let all = GamerLibrarySnapshot::build(&rows, None, "");
+        assert_eq!(all.candidates.len(), 5);
+        assert_eq!(all.visible.len(), 5, "All lists every game");
+
+        for (platform, count) in &all.platform_counts.named {
+            let selected = GamerLibrarySnapshot::build(&rows, Some(platform), "");
+            assert_eq!(
+                selected.visible.len(),
+                *count,
+                "the {platform} card advertised {count}"
+            );
+            assert!(!selected.selection_is_stale);
+        }
+        let unknown = GamerLibrarySnapshot::build(&rows, Some("Unknown"), "");
+        assert_eq!(unknown.visible.len(), all.platform_counts.unknown);
+        assert!(!unknown.visible.is_empty());
+    }
+
+    /// A card whose count is non-zero can never produce an empty list.
+    #[test]
+    fn a_non_zero_card_count_can_never_yield_a_false_empty_state() {
+        let mut records = Vec::new();
+        for (index, platform) in ["SNES", "GameCube", "GameCube"].into_iter().enumerate() {
+            let mut row = record(&format!("/roms/g{index}.zip"), MountState::Pending);
+            row.metadata.platform = Some(platform.to_string());
+            records.push(row);
+        }
+        let rows: Vec<ArchiveRow> = records.iter().map(row_for).collect();
+        for search in ["", "g1", "gamecube", "nothing-matches-this"] {
+            let snapshot = GamerLibrarySnapshot::build(&rows, None, search);
+            for (platform, count) in &snapshot.platform_counts.named {
+                let selected = GamerLibrarySnapshot::build(&rows, Some(platform), search);
+                assert_eq!(selected.visible.len(), *count);
+                assert!(
+                    *count == 0 || !selected.visible.is_empty(),
+                    "{platform} advertised {count} under search {search:?} but listed nothing"
+                );
+            }
+        }
+    }
+
+    /// Search and the platform selection compose, and the counts follow the
+    /// search rather than describing a library the list is not showing.
+    #[test]
+    fn gamer_search_and_platform_compose_and_clearing_search_restores_rows() {
+        let mut records = Vec::new();
+        for (index, platform) in ["SNES", "SNES", "GameCube"].into_iter().enumerate() {
+            let mut row = record(&format!("/roms/game{index}.zip"), MountState::Pending);
+            row.metadata.platform = Some(platform.to_string());
+            records.push(row);
+        }
+        let rows: Vec<ArchiveRow> = records.iter().map(row_for).collect();
+
+        let unfiltered = GamerLibrarySnapshot::build(&rows, Some("SNES"), "");
+        assert_eq!(unfiltered.visible.len(), 2);
+
+        let searched = GamerLibrarySnapshot::build(&rows, Some("SNES"), "game1");
+        assert_eq!(
+            searched.visible.len(),
+            1,
+            "search narrows within the platform"
+        );
+        assert_eq!(
+            searched
+                .platform_counts
+                .named
+                .iter()
+                .find(|(name, _)| name == "SNES")
+                .map(|(_, count)| *count),
+            Some(1),
+            "the card must count what the search admits, not the whole library"
+        );
+
+        let cleared = GamerLibrarySnapshot::build(&rows, Some("SNES"), "");
+        assert_eq!(
+            cleared.visible.len(),
+            2,
+            "clearing the search restores rows"
+        );
+    }
+
+    /// A selection that survives a library reload but names a platform the
+    /// new snapshot no longer has must resolve to All, not to a dead list.
+    #[test]
+    fn a_platform_missing_from_the_snapshot_falls_back_to_all() {
+        let mut app = gamer_app_with_platforms(&[("SNES", 2)]);
+        // `open_cheat_archive_picker` writes canonical adapter ids such as
+        // this one straight into the shared filter.
+        app.library_filters.platform = Some("Xbox360".to_string());
+
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(gamer_screen()),
+            ..Default::default()
+        };
+        let output = run_gamer_frames(&mut app, &ctx, input, 2);
+
+        assert_eq!(
+            app.library_filters.platform, None,
+            "a platform no card offers must fall back to All"
+        );
+        assert!(rendered_text_contains(&output, "Title0000"));
+    }
+
+    #[test]
+    fn a_platform_present_in_the_snapshot_is_never_treated_as_stale() {
+        let mut records = Vec::new();
+        let mut row = record("/roms/a.zip", MountState::Pending);
+        row.metadata.platform = Some("SNES".to_string());
+        records.push(row);
+        let mut unknown = record("/roms/b.zip", MountState::Pending);
+        unknown.metadata.platform = None;
+        unknown.identity.platform = None;
+        records.push(unknown);
+        let rows: Vec<ArchiveRow> = records.iter().map(row_for).collect();
+
+        assert!(!GamerLibrarySnapshot::build(&rows, Some("SNES"), "").selection_is_stale);
+        assert!(!GamerLibrarySnapshot::build(&rows, Some("Unknown"), "").selection_is_stale);
+        assert!(!GamerLibrarySnapshot::build(&rows, None, "").selection_is_stale);
+        assert!(GamerLibrarySnapshot::build(&rows, Some("MegaDrive"), "").selection_is_stale);
+        // "Unknown" is only a real card while something is unclassified.
+        let classified: Vec<ArchiveRow> = records[..1].iter().map(row_for).collect();
+        assert!(GamerLibrarySnapshot::build(&classified, Some("Unknown"), "").selection_is_stale);
+    }
+
+    /// Clicking a card - the real button, at its real position - lists that
+    /// platform's games, and switching to another recomputes the rows.
+    #[test]
+    fn clicking_platform_cards_lists_and_then_switches_the_visible_games() {
+        let mut app = gamer_app_with_platforms(&[("Acorn Archimedes", 2), ("SNES", 2)]);
+        let ctx = egui::Context::default();
+        let screen = gamer_screen();
+        let idle = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        run_gamer_frames(&mut app, &ctx, idle.clone(), 3);
+        let cards = gamer_shelf_geometry(&ctx).cards;
+        assert!(cards.len() >= 3, "All plus two platforms");
+
+        // Card 1 is the first named platform, in the shelf's own order.
+        run_gamer_frames(&mut app, &ctx, click_at(screen, cards[1].center()), 1);
+        assert_eq!(
+            app.library_filters.platform.as_deref(),
+            Some("Acorn Archimedes")
+        );
+        let output = run_gamer_frames(&mut app, &ctx, idle.clone(), 1);
+        assert!(rendered_text_contains(&output, "Title0000"));
+        assert!(!rendered_text_contains(&output, "Title0002"));
+
+        // Switching without a restart recomputes the rows.
+        run_gamer_frames(&mut app, &ctx, click_at(screen, cards[2].center()), 1);
+        assert_eq!(app.library_filters.platform.as_deref(), Some("SNES"));
+        let output = run_gamer_frames(&mut app, &ctx, idle.clone(), 1);
+        assert!(rendered_text_contains(&output, "Title0002"));
+        assert!(!rendered_text_contains(&output, "Title0000"));
+
+        // Back to All.
+        run_gamer_frames(&mut app, &ctx, click_at(screen, cards[0].center()), 1);
+        assert_eq!(app.library_filters.platform, None);
+        let output = run_gamer_frames(&mut app, &ctx, idle, 1);
+        assert!(rendered_text_contains(&output, "Title0000"));
+        assert!(rendered_text_contains(&output, "Title0002"));
+    }
+
+    /// A platform card is a real `egui::Button`, so egui's own keyboard
+    /// focus plus Enter or Space activates it exactly as a mouse click does.
+    /// Driven through the card's real widget id and egui's real focus, not
+    /// by re-deriving key handling.
+    #[test]
+    fn platform_cards_activate_from_the_keyboard_exactly_as_from_the_mouse() {
+        for key in [egui::Key::Enter, egui::Key::Space] {
+            let mut app = gamer_app_with_platforms(&[("Acorn Archimedes", 2), ("SNES", 2)]);
+            let ctx = egui::Context::default();
+            let screen = gamer_screen();
+            let idle = egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            };
+            run_gamer_frames(&mut app, &ctx, idle.clone(), 3);
+            let geometry = gamer_shelf_geometry(&ctx);
+            assert_eq!(geometry.card_ids.len(), geometry.cards.len());
+
+            // The mouse baseline this comparison rests on.
+            run_gamer_frames(
+                &mut app,
+                &ctx,
+                click_at(screen, geometry.cards[1].center()),
+                1,
+            );
+            assert_eq!(
+                app.library_filters.platform.as_deref(),
+                Some("Acorn Archimedes")
+            );
+
+            // Now the same card via focus plus the key under test.
+            let snes_card = geometry.card_ids[2];
+            ctx.memory_mut(|memory| memory.request_focus(snes_card));
+            let mut activated = idle.clone();
+            activated.events = vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }];
+            run_gamer_frames(&mut app, &ctx, activated, 1);
+            assert_eq!(
+                app.library_filters.platform.as_deref(),
+                Some("SNES"),
+                "{key:?} on a focused platform card must select it, as a click does"
+            );
+            let output = run_gamer_frames(&mut app, &ctx, idle, 1);
+            assert!(rendered_text_contains(&output, "Title0002"));
+        }
+    }
+
+    /// A library reload replaces the rows; the list must follow it in the
+    /// next frame, with no restart and no manual re-selection.
+    #[test]
+    fn a_library_reload_refreshes_the_visible_rows_without_a_restart() {
+        let mut app = gamer_app_with_platforms(&[("SNES", 2)]);
+        app.library_filters.platform = Some("SNES".to_string());
+        let ctx = egui::Context::default();
+        let idle = egui::RawInput {
+            screen_rect: Some(gamer_screen()),
+            ..Default::default()
+        };
+        let output = run_gamer_frames(&mut app, &ctx, idle.clone(), 2);
+        assert!(rendered_text_contains(&output, "Title0000"));
+
+        // A completed refresh (a scan, or the reload that follows Mount All)
+        // installs a new snapshot in exactly this way.
+        let mut replacement = record("/roms/new.zip", MountState::Pending);
+        replacement.metadata.platform = Some("SNES".to_string());
+        replacement.metadata.title = Some("BrandNewTitle".to_string());
+        app.state = LoadState::Ready(Box::new(loaded_data_with_records(
+            "/mount",
+            vec![replacement],
+        )));
+
+        let output = run_gamer_frames(&mut app, &ctx, idle, 2);
+        assert!(rendered_text_contains(&output, "BrandNewTitle"));
+        assert!(!rendered_text_contains(&output, "Title0000"));
+        assert_eq!(
+            app.library_filters.platform.as_deref(),
+            Some("SNES"),
+            "a selection the new snapshot still offers stays selected"
+        );
+    }
+
+    /// At TV resolution the list must actually occupy space and be on
+    /// screen - a correct filter is no use behind a zero-height pane.
+    #[test]
+    fn the_game_list_occupies_real_visible_space_at_tv_resolution() {
+        let mut app = gamer_app_with_platforms(&[("SNES", 40)]);
+        let ctx = egui::Context::default();
+        let screen = gamer_screen();
+        let idle = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        let output = run_gamer_frames(&mut app, &ctx, idle, 3);
+
+        let mut texts = Vec::new();
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    out.push((text.galley.text().to_string(), text.visual_bounding_rect()))
+                }
+                egui::Shape::Vec(nested) => nested.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut texts);
+        }
+        let rows: Vec<egui::Rect> = texts
+            .iter()
+            .filter(|(text, _)| text.contains("Title"))
+            .map(|(_, rect)| *rect)
+            .collect();
+        assert!(rows.len() > 1, "several rows must be drawn, not one");
+        for rect in &rows {
+            assert!(
+                rect.width() > 0.0 && rect.height() > 0.0,
+                "a game row was allocated no space: {rect:?}"
+            );
+            assert!(
+                rect.right() <= screen.right(),
+                "no horizontal overflow at TV resolution: {rect:?}"
+            );
+            assert!(
+                rect.left() >= screen.left(),
+                "no row starts left of the viewport: {rect:?}"
+            );
+        }
+        // A scroll area draws one row past its bottom edge and clips it, so
+        // the useful assertion is that the *listing* starts on screen and
+        // covers real height - not that every shape is inside the viewport.
+        let top = rows
+            .iter()
+            .map(|rect| rect.top())
+            .fold(f32::INFINITY, f32::min);
+        assert!(
+            top > screen.top() && top < screen.bottom(),
+            "the game list must begin inside the viewport, not below it"
+        );
+        let visible_rows = rows
+            .iter()
+            .filter(|rect| rect.bottom() <= screen.bottom())
+            .count();
+        assert!(
+            visible_rows > 3,
+            "only {visible_rows} rows fell inside a 1080p viewport"
+        );
+    }
+
+    /// Truthful wording for each distinct reason, including the composed
+    /// search-plus-platform case the old `else if` chain could not express.
+    #[test]
+    fn the_empty_list_wording_names_the_actual_reason() {
+        assert_eq!(
+            gamer_empty_list_guidance(true, false, false),
+            "No games are in your library yet."
+        );
+        assert_eq!(
+            gamer_empty_list_guidance(false, true, false),
+            "No games match your search."
+        );
+        assert_eq!(
+            gamer_empty_list_guidance(false, false, true),
+            "No games match the selected platform."
+        );
+        assert_eq!(
+            gamer_empty_list_guidance(false, true, true),
+            "No games on this platform match your search."
+        );
+    }
+
+    /// A platform genuinely holding nothing still reports so - the truthful
+    /// empty state must survive the fix that removed the false one.
+    #[test]
+    fn a_platform_with_no_games_still_reports_an_honest_empty_state() {
+        let mut app = gamer_app_with_platforms(&[("SNES", 1)]);
+        // Force the list empty the only way that remains: a search nothing
+        // satisfies, with a platform selected.
+        app.library_filters.platform = Some("SNES".to_string());
+        app.filter = "no-such-game-anywhere".to_string();
+        let ctx = egui::Context::default();
+        let idle = egui::RawInput {
+            screen_rect: Some(gamer_screen()),
+            ..Default::default()
+        };
+        let output = run_gamer_frames(&mut app, &ctx, idle, 2);
+        assert!(rendered_text_contains(
+            &output,
+            "No games on this platform match your search."
+        ));
+    }
+
+    // ---------------------------------------------------------------------
+    // Human-smoke regression: Doctor "Measured values"
+    //
+    // Confirmed in Sunshine on a real scan: clicking the disclosure did
+    // nothing, and egui itself painted "First use of widget ID 6819" beside
+    // it. `Finding::id` names a finding's *kind*, and a real scan produces
+    // hundreds of findings sharing one - `doctor_presentation_groups` exists
+    // precisely because it does. Salting the header with that id gave every
+    // one of those cards the same widget id, and selecting a finding by id
+    // expanded all of them at once.
+    // ---------------------------------------------------------------------
+
+    /// Two findings of the same kind, which is the situation that broke.
+    fn repeated_doctor_findings() -> DoctorScan {
+        let issues = [
+            doctor_health_issue("/roms/one.zip", HealthCategory::UnknownPlatform),
+            doctor_health_issue("/roms/two.zip", HealthCategory::UnknownPlatform),
+        ];
+        doctor_scan_from(&issues)
+    }
+
+    #[test]
+    fn findings_sharing_one_id_still_get_distinct_expansion_keys() {
+        let scan = repeated_doctor_findings();
+        assert!(scan.findings.len() >= 2);
+        assert_eq!(
+            scan.findings[0].id, scan.findings[1].id,
+            "this test is only meaningful while the ids do collide"
+        );
+
+        let ordinals = DoctorFindingOrdinals::of(&scan);
+        let first = doctor_finding_key(&scan.findings[0], ordinals.ordinal(&scan.findings[0]));
+        let second = doctor_finding_key(&scan.findings[1], ordinals.ordinal(&scan.findings[1]));
+        assert_ne!(first, second, "each rendered finding needs its own key");
+
+        // Stable: rebuilding the map for the same scan yields the same keys.
+        let again = DoctorFindingOrdinals::of(&scan);
+        assert_eq!(
+            first,
+            doctor_finding_key(&scan.findings[0], again.ordinal(&scan.findings[0]))
+        );
+
+        // And the kind is still recoverable, which is what the two
+        // invalidation paths reason about.
+        assert_eq!(doctor_finding_key_id(&first), scan.findings[0].id);
+        assert_eq!(doctor_finding_key_id(&second), scan.findings[1].id);
+    }
+
+    /// Selecting one finding must not open its twin.
+    #[test]
+    fn expanding_one_finding_does_not_expand_another_of_the_same_kind() {
+        let scan = repeated_doctor_findings();
+        let ordinals = DoctorFindingOrdinals::of(&scan);
+        let first = doctor_finding_key(&scan.findings[0], ordinals.ordinal(&scan.findings[0]));
+        let state = doctor_outcome(scan);
+
+        let output = render_doctor_page(&state, &mut Some(first));
+        let hide = painted_doctor_texts(&output)
+            .into_iter()
+            .filter(|text| text == "Hide details")
+            .count();
+        assert_eq!(
+            hide, 1,
+            "exactly one card may be expanded; selecting by kind expanded all of them"
+        );
+    }
+
+    fn painted_doctor_texts(output: &egui::FullOutput) -> Vec<String> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(text) => out.push(text.galley.text().to_string()),
+                egui::Shape::Vec(nested) => nested.iter().for_each(|shape| walk(shape, out)),
+                _ => {}
+            }
+        }
+        let mut found = Vec::new();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut found);
+        }
+        found
+    }
+
+    /// Clicking the disclosure expands it, clicking again collapses it, and
+    /// the state survives the frames in between.
+    #[test]
+    fn the_measured_values_disclosure_expands_collapses_and_persists() {
+        let scan = doctor_scan_with_storage(100 * 1024 * 1024, 100 * 1024 * 1024 * 1024, false);
+        let ordinals = DoctorFindingOrdinals::of(&scan);
+        let key = doctor_finding_key(&scan.findings[0], ordinals.ordinal(&scan.findings[0]));
+        let state = doctor_outcome(scan);
+        let mut selected = Some(key);
+        let mut clipboard = InMemoryClipboard::default();
+        let context = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 900.0));
+        let idle = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        let mut frame = |input: egui::RawInput, selected: &mut Option<String>| {
+            context.run(input, |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    let _ =
+                        show_doctor_page(ui, &state, selected, None, None, None, &mut clipboard);
+                });
+            })
+        };
+
+        let output = frame(idle.clone(), &mut selected);
+        assert!(!rendered_text_contains(&output, "available_bytes"));
+        let header = find_exact_text_center(&output, "Measured values")
+            .expect("the disclosure must be rendered");
+
+        let click = |position: egui::Pos2| egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        let _ = frame(click(header), &mut selected);
+        let output = frame(idle.clone(), &mut selected);
+        assert!(
+            rendered_text_contains(&output, "available_bytes"),
+            "clicking must expand the measured values"
+        );
+        // Still open several frames later - the state is not rebuilt per frame.
+        let _ = frame(idle.clone(), &mut selected);
+        let output = frame(idle.clone(), &mut selected);
+        assert!(rendered_text_contains(&output, "available_bytes"));
+
+        // Re-found rather than reused: the header may have shifted as the
+        // content above it settled.
+        let output = frame(idle.clone(), &mut selected);
+        let header = find_exact_text_center(&output, "Measured values")
+            .expect("the disclosure is still rendered while expanded");
+        let _ = frame(click(header), &mut selected);
+        // `CollapsingHeader` animates closed, so the content is still painted
+        // for a few frames after the click; the assertion is that it goes.
+        let mut collapsed = false;
+        for _ in 0..30 {
+            let output = frame(idle.clone(), &mut selected);
+            if !rendered_text_contains(&output, "available_bytes") {
+                collapsed = true;
+                break;
+            }
+        }
+        assert!(collapsed, "clicking again must collapse them");
+    }
+
+    /// A finding that measured nothing must say so in plain text, not offer a
+    /// triangle that opens onto nothing.
+    #[test]
+    fn a_finding_with_no_measurements_renders_words_not_a_disclosure() {
+        let mut scan = repeated_doctor_findings();
+        scan.findings[0].measurements.clear();
+        let ordinals = DoctorFindingOrdinals::of(&scan);
+        let key = doctor_finding_key(&scan.findings[0], ordinals.ordinal(&scan.findings[0]));
+        let state = doctor_outcome(scan);
+
+        let output = render_doctor_page(&state, &mut Some(key));
+        assert!(rendered_text_contains(&output, DOCTOR_NO_MEASURED_VALUES));
+        assert_eq!(DOCTOR_NO_MEASURED_VALUES, "No measured values recorded");
+        assert!(
+            !rendered_text_contains(&output, "Measured values"),
+            "no disclosure may be offered for a finding that measured nothing"
+        );
+    }
+
+    /// The disclosure is a real `CollapsingHeader`, so it carries egui's own
+    /// focus and Enter/Space activation rather than a hand-painted triangle.
+    #[test]
+    fn the_measured_values_disclosure_activates_from_the_keyboard() {
+        for key_pressed in [egui::Key::Enter, egui::Key::Space] {
+            let scan = doctor_scan_with_storage(100 * 1024 * 1024, 100 * 1024 * 1024 * 1024, false);
+            let ordinals = DoctorFindingOrdinals::of(&scan);
+            let key = doctor_finding_key(&scan.findings[0], ordinals.ordinal(&scan.findings[0]));
+            let state = doctor_outcome(scan);
+            let mut selected = Some(key);
+            let mut clipboard = InMemoryClipboard::default();
+            let context = egui::Context::default();
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 900.0));
+            let idle = egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            };
+            let mut frame = |input: egui::RawInput, selected: &mut Option<String>| {
+                context.run(input, |context| {
+                    egui::CentralPanel::default().show(context, |ui| {
+                        let _ = show_doctor_page(
+                            ui,
+                            &state,
+                            selected,
+                            None,
+                            None,
+                            None,
+                            &mut clipboard,
+                        );
+                    });
+                })
+            };
+            let output = frame(idle.clone(), &mut selected);
+            assert!(!rendered_text_contains(&output, "available_bytes"));
+
+            // Focus it the way a keyboard user reaches it, then activate.
+            let mut tabbed = idle.clone();
+            tabbed.events = vec![egui::Event::Key {
+                key: egui::Key::Tab,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }];
+            let mut expanded = false;
+            for _ in 0..12 {
+                let _ = frame(tabbed.clone(), &mut selected);
+                let mut activate = idle.clone();
+                activate.events = vec![egui::Event::Key {
+                    key: key_pressed,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Default::default(),
+                }];
+                let _ = frame(activate, &mut selected);
+                let output = frame(idle.clone(), &mut selected);
+                if rendered_text_contains(&output, "available_bytes") {
+                    expanded = true;
+                    break;
+                }
+            }
+            assert!(
+                expanded,
+                "{key_pressed:?} must reach and activate the disclosure by keyboard"
+            );
+        }
+    }
+
+    /// The expansion key of the first finding of a given kind.
+    ///
+    /// A finding is selected by its per-card key, not by its id: an id names
+    /// a *kind* and repeats across findings. See `doctor_finding_key`.
+    fn doctor_key_of_kind(scan: &DoctorScan, id: &str) -> String {
+        let index = scan
+            .findings
+            .iter()
+            .position(|finding| finding.id == id)
+            .unwrap_or_else(|| panic!("no finding with id {id}"));
+        doctor_finding_key(&scan.findings[index], index)
+    }
+
     /// Test 86
     #[test]
     fn doctor_page_shows_measured_values_only_for_the_selected_finding() {
         let scan = doctor_scan_with_storage(100 * 1024 * 1024, 100 * 1024 * 1024 * 1024, false);
-        let finding_id = scan.findings[0].id.clone();
+        let key = doctor_finding_key(&scan.findings[0], 0);
         let state = doctor_outcome(scan);
 
         let collapsed = render_doctor_page(&state, &mut None);
         assert!(!rendered_text_contains(&collapsed, "Measured values"));
 
-        let mut selected = Some(finding_id);
+        let mut selected = Some(key);
         let expanded = render_doctor_page(&state, &mut selected);
         assert!(rendered_text_contains(&expanded, "Measured values"));
     }
@@ -46320,13 +49719,15 @@ $Instant Growth [Nayr]\n";
     #[test]
     fn doctor_page_shows_evidence_only_for_the_selected_finding() {
         let issues = vec![doctor_health_issue("/roms/a.zip", HealthCategory::Missing)];
-        let state = doctor_outcome(doctor_scan_from(&issues));
+        let scan = doctor_scan_from(&issues);
+        let key = doctor_key_of_kind(&scan, "library.archive_missing");
+        let state = doctor_outcome(scan);
 
         let collapsed = render_doctor_page(&state, &mut None);
         assert!(!rendered_text_contains(&collapsed, "Evidence"));
         assert!(rendered_text_contains(&collapsed, "Details"));
 
-        let mut selected = Some("library.archive_missing".to_string());
+        let mut selected = Some(key);
         let expanded = render_doctor_page(&state, &mut selected);
         for expected in [
             "Evidence",
@@ -46368,10 +49769,10 @@ $Instant Growth [Nayr]\n";
         let mut inputs = DoctorScanInputs::none_loaded();
         inputs.setup = Gathered::Ready(&setup);
         let scan = run_doctor_scan(&inputs);
-        let id = scan.findings[0].id.clone();
+        let key = doctor_finding_key(&scan.findings[0], 0);
         let state = doctor_outcome(scan);
 
-        let output = render_doctor_page(&state, &mut Some(id));
+        let output = render_doctor_page(&state, &mut Some(key));
         assert!(rendered_text_contains(&output, "Why it matters"));
         assert!(rendered_text_contains(
             &output,
@@ -46392,8 +49793,10 @@ $Instant Growth [Nayr]\n";
             "/roms/a.zip",
             HealthCategory::RetryableFailure,
         )];
-        let state = doctor_outcome(doctor_scan_from(&issues));
-        let output = render_doctor_page(&state, &mut Some("mounts.retryable_failure".to_string()));
+        let scan = doctor_scan_from(&issues);
+        let key = doctor_key_of_kind(&scan, "mounts.retryable_failure");
+        let state = doctor_outcome(scan);
+        let output = render_doctor_page(&state, &mut Some(key));
 
         assert!(rendered_text_contains(
             &output,
@@ -46469,8 +49872,10 @@ $Instant Growth [Nayr]\n";
         let long_name = "ロング".repeat(150);
         let path = format!("/roms/{long_name}/ゲーム 💾 [!].zip");
         let issues = vec![doctor_health_issue(&path, HealthCategory::Missing)];
-        let state = doctor_outcome(doctor_scan_from(&issues));
-        let output = render_doctor_page(&state, &mut Some("library.archive_missing".to_string()));
+        let scan = doctor_scan_from(&issues);
+        let key = doctor_key_of_kind(&scan, "library.archive_missing");
+        let state = doctor_outcome(scan);
+        let output = render_doctor_page(&state, &mut Some(key));
         assert!(rendered_text_contains(&output, "ゲーム 💾 [!].zip"));
         assert!(rendered_text_contains(&output, "Evidence"));
     }
@@ -46790,7 +50195,21 @@ $Instant Growth [Nayr]\n";
         app.doctor_repair_review = Some(doctor_review());
         let history_before = app.history.entries().count();
 
-        app.confirm_doctor_repair();
+        // Configuration supplied directly. Reading the real one made this test
+        // pass only on a machine that happened to have
+        // `~/.config/archivefs/config.toml`, and fail on CI, which does not - and
+        // it was never what the test is about.
+        // Paths that deliberately do not exist: the repair is refused at
+        // revalidation, so nothing here is ever opened, created or written.
+        let scratch = std::env::temp_dir().join("archivefs-doctor-repair-refusal-fixture");
+        app.confirm_doctor_repair_with(
+            Config {
+                source_folders: vec![scratch.join("sources")],
+                mount_root: scratch.join("mounts"),
+                ratarmount_bin: "ratarmount".to_string(),
+            },
+            scratch.join("index.json"),
+        );
 
         assert_eq!(
             app.history.entries().count(),
@@ -46928,13 +50347,17 @@ $Instant Growth [Nayr]\n";
         );
     }
 
-    fn app_for_operation_tests() -> ArchiveFsApp {
+    pub(super) fn app_for_operation_tests() -> ArchiveFsApp {
         ArchiveFsApp {
             state: LoadState::Ready(Box::new(empty_loaded_data("/mount"))),
             database_state: DatabaseState::NotCreated {
                 database_path: PathBuf::from("/config/library.sqlite3"),
             },
             database_generation: DatabaseGeneration::INITIAL,
+            // Left unloaded: these tests never open the Cheat Sources page,
+            // and loading it here would read the real per-user preferences.
+            cheat_sources_page: None,
+            cheat_sources_ui: cheat_sources_page::CheatSourcesPageUi::default(),
             doctor_scan: DoctorScanState::NotRun,
             doctor_scan_generation: RefreshGeneration::INITIAL,
             doctor_selected_finding: None,
@@ -47026,6 +50449,21 @@ $Instant Growth [Nayr]\n";
             bsfree_manager: BsFreeManagerState::NotLoaded,
             bsfree_operation: None,
             bsfree_ui: BsFreeGuiState::default(),
+            gui_config: GuiConfigSnapshot::from_config(Config {
+                source_folders: vec![PathBuf::from("/library")],
+                mount_root: PathBuf::from("/mount"),
+                ratarmount_bin: "ratarmount".to_string(),
+            }),
+            romm_snapshot: None,
+            romm_operation: None,
+            romm_generation: 0,
+            romm_ui: RommCardState::default(),
+            romm_config_draft: None,
+            romm_preview: None,
+            romm_browse: None,
+            romm_stale_progress: None,
+            romm_game: crate::romm_game::GamePanelState::default(),
+            romm_hash_progress: None,
             catalogue_manager: CatalogueManagerState::NotLoaded,
             catalogue_review: None,
             catalogue_retrieval: None,
@@ -47076,6 +50514,16 @@ $Instant Growth [Nayr]\n";
             custom_platform_artwork_directory: None,
             platform_artwork_cache: PlatformArtworkCache::default(),
             platform_artwork_manager: PlatformArtworkManagerState::default(),
+
+            gamer_covers: crate::gamer_artwork::GamerCoverCache::default(),
+            // No worker in tests: nothing here may open the real catalogue or
+            // touch the network. Covers are driven through `absorb` instead.
+            gamer_cover_worker: None,
+            // Never true in tests: starting the worker would open the real
+            // per-user identity cache and could reach a configured RomM
+            // instance. Tests drive `gamer_covers` directly instead.
+            gamer_cover_worker_allowed: false,
+            gamer_cover_library: None,
         }
     }
 
@@ -47285,6 +50733,7 @@ $Instant Growth [Nayr]\n";
     #[test]
     fn long_content_pages_use_shared_scrolling_without_changing_table_pages() {
         for view in [
+            MainView::Selected,
             MainView::Settings,
             MainView::Doctor,
             MainView::About,
@@ -60812,4 +64261,3709 @@ $Instant Growth [Nayr]\n";
         assert!(!browser.contains("Install selected"));
         assert!(!browser.contains("BsFreeOperation::Install"));
     }
+
+    /// The screen-space position of the first `Shape::Text` *containing*
+    /// `needle`. The row labels in Gamer View are composed
+    /// ("Title - Platform . State"), so an exact match cannot address them;
+    /// the position is what these tests compare, to prove nothing moved.
+    fn find_text_position_containing(
+        output: &egui::FullOutput,
+        needle: &str,
+    ) -> Option<egui::Pos2> {
+        fn find_in_shape(shape: &egui::Shape, needle: &str) -> Option<egui::Pos2> {
+            match shape {
+                egui::Shape::Text(text_shape) => text_shape
+                    .galley
+                    .text()
+                    .contains(needle)
+                    .then_some(text_shape.pos),
+                egui::Shape::Vec(nested) => nested.iter().find_map(|s| find_in_shape(s, needle)),
+                _ => None,
+            }
+        }
+        output
+            .shapes
+            .iter()
+            .find_map(|clipped| find_in_shape(&clipped.shape, needle))
+    }
+
+    // --- Gamer View cover artwork -----------------------------------------
+
+    /// Renders Gamer View over a library of `count` games and returns the app,
+    /// so a test can inspect what the list asked for and hand it answers.
+    fn gamer_cover_app(count: usize) -> (ArchiveFsApp, egui::Context) {
+        let mut app = app_for_operation_tests();
+        app.ui_mode = GuiMode::GamerView;
+        app.view = MainView::Library;
+        let mut records = Vec::new();
+        for index in 0..count {
+            let mut built = record(&featured_path(index), MountState::Pending);
+            built.metadata.platform = Some("SNES".to_string());
+            built.metadata.title = Some(format!("Game {index:05}"));
+            records.push(built);
+        }
+        app.state = LoadState::Ready(Box::new(loaded_data_with_records("/mount", records)));
+        (app, egui::Context::default())
+    }
+
+    fn run_frames(
+        app: &mut ArchiveFsApp,
+        ctx: &egui::Context,
+        width: f32,
+        height: f32,
+        frames: usize,
+    ) -> egui::FullOutput {
+        let mut frame = eframe::Frame::_new_kittest();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width, height),
+            )),
+            ..Default::default()
+        };
+        let mut output = None;
+        for _ in 0..frames {
+            output = Some(ctx.run(input.clone(), |ctx| app.update(ctx, &mut frame)));
+        }
+        output.expect("a rendered frame")
+    }
+
+    /// Every image drawn this frame, as `(texture id, bounds)`.
+    ///
+    /// `Painter::image` emits a textured `Shape::Mesh`, which is what both the
+    /// platform artwork and a RomM cover arrive as at this stage - text is still
+    /// an untessellated `Shape::Text` here, so nothing else is counted.
+    fn rendered_images(output: &egui::FullOutput) -> Vec<(egui::TextureId, egui::Rect)> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<(egui::TextureId, egui::Rect)>) {
+            match shape {
+                egui::Shape::Mesh(mesh) => out.push((mesh.texture_id, mesh.calc_bounds())),
+                egui::Shape::Vec(nested) => nested.iter().for_each(|shape| walk(shape, out)),
+                _ => {}
+            }
+        }
+        let mut images = Vec::new();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut images);
+        }
+        images
+    }
+
+    /// The texture a loaded cover is drawn from, so a test can find that exact
+    /// image among everything else the frame painted (the platform shelf draws
+    /// textured meshes too).
+    fn cover_texture_id(app: &ArchiveFsApp, local_path: &str) -> Option<egui::TextureId> {
+        match app.gamer_covers.slot_for(Path::new(local_path), None)? {
+            crate::gamer_artwork::CoverSlot::Ready { texture, .. } => Some(texture.id()),
+            _ => None,
+        }
+    }
+
+    /// Every image drawn for the game list, as a set of texture ids.
+    fn drawn_texture_ids(output: &egui::FullOutput) -> std::collections::HashSet<egui::TextureId> {
+        rendered_images(output)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// A decoded cover, as the worker would produce one.
+    fn cover_reply(
+        generation: u64,
+        local_path: &str,
+        romm_game_id: &str,
+    ) -> crate::gamer_artwork::CoverReply {
+        crate::gamer_artwork::CoverReply {
+            generation,
+            local_path: PathBuf::from(local_path),
+            provider_game_id: Some(romm_game_id.to_string()),
+            answer: crate::gamer_artwork::CoverAnswer::Ready(Box::new(
+                crate::romm_game::CoverImage {
+                    key: romm_game_id.to_string(),
+                    width: 20,
+                    height: 30,
+                    bytes: 2400,
+                    image: egui::ColorImage::new(
+                        [20, 30],
+                        vec![egui::Color32::from_rgb(200, 30, 40); 600],
+                    ),
+                    from_cache: true,
+                },
+            )),
+        }
+    }
+
+    #[test]
+    fn gamer_view_draws_a_romm_cover_beside_the_game_it_belongs_to() {
+        // The whole point of this change: a matched record's approved cover is
+        // drawn in the list itself, not only behind a Details button.
+        let (mut app, ctx) = gamer_cover_app(6);
+        // One pass so the list asks about its visible rows.
+        run_frames(&mut app, &ctx, 1920.0, 1080.0, 3);
+        let generation = app.gamer_covers.generation();
+        assert!(
+            app.gamer_covers
+                .slot_for(Path::new(&featured_path(0)), None)
+                .is_some(),
+            "the visible list asked for nothing"
+        );
+
+        assert!(
+            app.gamer_covers
+                .absorb(&ctx, cover_reply(generation, &featured_path(0), "101")),
+            "the cover was refused"
+        );
+        let cover = cover_texture_id(&app, &featured_path(0)).expect("a loaded cover");
+        let drawn = rendered_images(&run_frames(&mut app, &ctx, 1920.0, 1080.0, 1));
+        assert!(
+            drawn.iter().any(|(id, _)| *id == cover),
+            "the loaded cover's own texture was never painted"
+        );
+    }
+
+    #[test]
+    fn a_cover_is_drawn_inside_the_row_artwork_slot_without_changing_row_height() {
+        // A cover arriving must not move anything: the row's height and the
+        // title's position are identical before and after.
+        let (mut app, ctx) = gamer_cover_app(6);
+        run_frames(&mut app, &ctx, 1920.0, 1080.0, 3);
+        let generation = app.gamer_covers.generation();
+
+        let title_before = find_text_position_containing(
+            &run_frames(&mut app, &ctx, 1920.0, 1080.0, 1),
+            "Game 00000",
+        );
+        app.gamer_covers
+            .absorb(&ctx, cover_reply(generation, &featured_path(0), "101"));
+        let output = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
+        let title_after = find_text_position_containing(&output, "Game 00000");
+        assert_eq!(
+            title_before, title_after,
+            "the title moved when the cover arrived"
+        );
+
+        // And the cover itself stayed inside the slot it was given: a 20x30
+        // cover is scaled to fit 56, never stretched to fill it.
+        let cover = cover_texture_id(&app, &featured_path(0)).expect("a loaded cover");
+        let bounds = rendered_images(&output)
+            .into_iter()
+            .find(|(id, _)| *id == cover)
+            .map(|(_, rect)| rect)
+            .expect("the cover was painted");
+        assert!(
+            bounds.width().max(bounds.height()) <= crate::gamer_artwork::COVER_BOX + 0.5,
+            "the cover measured {}x{}, outside the {} slot",
+            bounds.width(),
+            bounds.height(),
+            crate::gamer_artwork::COVER_BOX
+        );
+        assert!(
+            (bounds.width() / bounds.height() - 20.0 / 30.0).abs() < 0.01,
+            "the cover was stretched: {}x{}",
+            bounds.width(),
+            bounds.height()
+        );
+    }
+
+    #[test]
+    fn a_failed_cover_leaves_the_row_exactly_as_it_was() {
+        let (mut app, ctx) = gamer_cover_app(6);
+        run_frames(&mut app, &ctx, 1920.0, 1080.0, 3);
+        let generation = app.gamer_covers.generation();
+        let before = find_text_position_containing(
+            &run_frames(&mut app, &ctx, 1920.0, 1080.0, 1),
+            "Game 00000",
+        );
+
+        app.gamer_covers.absorb(
+            &ctx,
+            crate::gamer_artwork::CoverReply {
+                generation,
+                local_path: PathBuf::from(featured_path(0)),
+                provider_game_id: Some("101".to_string()),
+                answer: crate::gamer_artwork::CoverAnswer::None(
+                    crate::gamer_artwork::NoCover::Failed,
+                ),
+            },
+        );
+        let output = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
+        assert_eq!(
+            before,
+            find_text_position_containing(&output, "Game 00000"),
+            "a failed cover disturbed the row"
+        );
+        assert!(
+            rendered_text_contains(&output, "Game 00000"),
+            "a failed cover took the title with it"
+        );
+    }
+
+    #[test]
+    fn a_large_library_only_queues_artwork_for_the_rows_on_screen() {
+        // The real library's size. A 1080p list shows tens of rows; the number
+        // asked about must follow the viewport, never the catalogue.
+        let (mut app, ctx) = gamer_cover_app(13_891);
+        run_frames(&mut app, &ctx, 1920.0, 1080.0, 12);
+        let tracked = app.gamer_covers.tracked();
+        assert!(
+            tracked < 200,
+            "a 13,891-record library queued artwork for {tracked} records"
+        );
+    }
+
+    #[test]
+    fn searching_does_not_show_the_previous_records_cover() {
+        // Load a cover for one game, then search for a different one. The row
+        // that appears is a different record, so it draws no cover at all -
+        // covers are keyed by record, and row position 0 carries nothing.
+        let (mut app, ctx) = gamer_cover_app(6);
+        run_frames(&mut app, &ctx, 1920.0, 1080.0, 3);
+        let generation = app.gamer_covers.generation();
+        app.gamer_covers
+            .absorb(&ctx, cover_reply(generation, &featured_path(0), "101"));
+        run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
+
+        app.filter = "archivefs-featured-g00004".to_string();
+        run_frames(&mut app, &ctx, 1920.0, 1080.0, 2);
+        assert!(
+            !matches!(
+                app.gamer_covers
+                    .slot_for(Path::new(&featured_path(4)), None),
+                Some(crate::gamer_artwork::CoverSlot::Ready { .. })
+            ),
+            "the searched-for game inherited another record's cover"
+        );
+        // The loaded cover still belongs to the record it was resolved for.
+        assert!(matches!(
+            app.gamer_covers
+                .slot_for(Path::new(&featured_path(0)), None),
+            Some(crate::gamer_artwork::CoverSlot::Ready { .. })
+        ));
+    }
+
+    #[test]
+    fn an_identity_refresh_stops_drawing_a_cover_until_the_record_is_confirmed() {
+        // The frames between a successful import and its confirmation are exactly
+        // when a path whose provider id moved would still be showing the old game's
+        // art. The row keeps its height and its placeholder; it does not keep the
+        // picture.
+        let (mut app, ctx) = gamer_cover_app(6);
+        run_frames(&mut app, &ctx, 1920.0, 1080.0, 3);
+        let generation = app.gamer_covers.generation();
+        app.gamer_covers
+            .absorb(&ctx, cover_reply(generation, &featured_path(0), "101"));
+        let cover = cover_texture_id(&app, &featured_path(0)).expect("a loaded cover");
+        let before = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
+        assert!(drawn_texture_ids(&before).contains(&cover));
+        let title_before = find_text_position_containing(&before, "Game 00000");
+
+        app.gamer_covers.identity_refreshed();
+        let after = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
+        assert!(
+            !drawn_texture_ids(&after).contains(&cover),
+            "the previous catalogue's cover was still painted after a refresh"
+        );
+        // And nothing moved while it was gone.
+        assert_eq!(
+            title_before,
+            find_text_position_containing(&after, "Game 00000"),
+            "the row shifted when its cover was withdrawn"
+        );
+        assert!(rendered_text_contains(&after, "Game 00000"));
+    }
+
+    #[test]
+    fn rendering_gamer_view_in_a_test_never_starts_a_real_cover_worker() {
+        // The worker opens the per-user identity cache under $HOME and, for a
+        // developer with RomM configured, can reach their instance. A test run
+        // must do neither.
+        //
+        // It was also the cause of a CI-only failure: the worker answered the
+        // same rows the cover tests drive by hand, so a reply landing between
+        // two frames replaced the slot under test with a placeholder. It won
+        // that race on a slow two-core runner and lost it on a fast
+        // workstation, which is why the suite passed locally and failed in CI.
+        let (mut app, ctx) = gamer_cover_app(24);
+        run_frames(&mut app, &ctx, 1920.0, 1080.0, 4);
+
+        assert!(
+            app.gamer_cover_worker.is_none(),
+            "a test frame started a cover worker, so the suite reads real user \
+             data and cover tests race it"
+        );
+        // The scheduling itself must still run - suppressing the thread must not
+        // quietly turn the cover column off and make the other tests vacuous.
+        assert!(
+            app.gamer_covers.tracked() > 0,
+            "no cover was scheduled, so these tests would prove nothing"
+        );
+    }
+
+    #[test]
+    fn a_confirmed_record_gets_its_own_texture_back_without_a_new_upload() {
+        let (mut app, ctx) = gamer_cover_app(6);
+        run_frames(&mut app, &ctx, 1920.0, 1080.0, 3);
+        let generation = app.gamer_covers.generation();
+        app.gamer_covers
+            .absorb(&ctx, cover_reply(generation, &featured_path(0), "101"));
+        let cover = cover_texture_id(&app, &featured_path(0)).expect("a loaded cover");
+
+        app.gamer_covers.identity_refreshed();
+        run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
+        // The worker confirms the key the row offered back.
+        let confirmed = app.gamer_covers.absorb(
+            &ctx,
+            crate::gamer_artwork::CoverReply {
+                generation: app.gamer_covers.generation(),
+                local_path: PathBuf::from(featured_path(0)),
+                provider_game_id: Some("101".to_string()),
+                answer: crate::gamer_artwork::CoverAnswer::Unchanged {
+                    key: "101".to_string(),
+                },
+            },
+        );
+        assert!(confirmed, "the confirmation was refused");
+        assert_eq!(
+            cover_texture_id(&app, &featured_path(0)),
+            Some(cover),
+            "the retained texture was replaced rather than reused"
+        );
+        let output = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
+        assert!(drawn_texture_ids(&output).contains(&cover));
+    }
+
+    #[test]
+    fn an_identity_refresh_re_asks_only_the_rows_on_screen() {
+        // A refresh over the real library must not queue work for all of it.
+        let (mut app, ctx) = gamer_cover_app(13_891);
+        run_frames(&mut app, &ctx, 1920.0, 1080.0, 12);
+        let before = app.gamer_covers.tracked();
+        app.gamer_covers.identity_refreshed();
+        run_frames(&mut app, &ctx, 1920.0, 1080.0, 6);
+        let after = app.gamer_covers.tracked();
+        assert!(
+            after < 200,
+            "a refresh over a 13,891-record library tracked {after} records (was {before})"
+        );
+    }
+
+    // --- The featured "Selected game" panel --------------------------------
+
+    /// The local path the featured-panel fixture uses for one of its records.
+    fn featured_path(index: usize) -> String {
+        std::env::temp_dir()
+            .join(format!("archivefs-featured-g{index:05}.zip"))
+            .display()
+            .to_string()
+    }
+
+    /// Renders Gamer View with one game selected and returns the frame.
+    fn featured_panel_frame(
+        width: f32,
+        height: f32,
+        title: &str,
+    ) -> (ArchiveFsApp, egui::Context, egui::FullOutput) {
+        let mut app = app_for_operation_tests();
+        app.ui_mode = GuiMode::GamerView;
+        app.view = MainView::Library;
+        // Real parent directory, because "Open location" is only offered when there
+        // is somewhere to open - testing that it is present needs a path whose
+        // folder exists. No file is created: only the folder is looked at.
+        let folder = std::env::temp_dir();
+        let mut records = Vec::new();
+        for index in 0..8 {
+            let path = folder.join(format!("archivefs-featured-g{index:05}.zip"));
+            let mut built = record(&path.display().to_string(), MountState::Pending);
+            built.metadata.platform = Some("SNES".to_string());
+            built.metadata.title = Some(if index == 0 {
+                title.to_string()
+            } else {
+                format!("Game {index:05}")
+            });
+            records.push(built);
+        }
+        app.state = LoadState::Ready(Box::new(loaded_data_with_records("/mount", records)));
+        app.archive_context
+            .select_only(folder.join("archivefs-featured-g00000.zip"));
+        let ctx = egui::Context::default();
+        let output = run_frames(&mut app, &ctx, width, height, 4);
+        (app, ctx, output)
+    }
+
+    /// The rect of the first widget whose text exactly matches, from the frame's
+    /// text shapes. Relational assertions use these rather than fixed pixels.
+    fn text_rect(output: &egui::FullOutput, needle: &str) -> Option<egui::Rect> {
+        fn walk(shape: &egui::Shape, needle: &str, out: &mut Option<egui::Rect>) {
+            match shape {
+                egui::Shape::Text(text) if text.galley.text() == needle && out.is_none() => {
+                    *out = Some(text.visual_bounding_rect());
+                }
+                egui::Shape::Vec(nested) => {
+                    nested.iter().for_each(|shape| walk(shape, needle, out))
+                }
+                _ => {}
+            }
+        }
+        let mut found = None;
+        for clipped in &output.shapes {
+            walk(&clipped.shape, needle, &mut found);
+        }
+        found
+    }
+
+    #[test]
+    fn the_featured_panel_shows_artwork_above_the_title_and_the_actions() {
+        // The layout contract, stated relationally rather than in pixels: artwork
+        // at the top, then the title, then Mount, then the secondary actions.
+        let (mut app, ctx, _) = featured_panel_frame(1920.0, 1080.0, "Featured Game");
+        let generation = app.gamer_covers.generation();
+        app.gamer_covers
+            .absorb(&ctx, cover_reply(generation, &featured_path(0), "101"));
+        let output = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
+
+        let cover = cover_texture_id(&app, &featured_path(0)).expect("a loaded cover");
+        // The featured cover is the large one; the row thumbnail is the small one.
+        let mut drawn: Vec<egui::Rect> = rendered_images(&output)
+            .into_iter()
+            .filter(|(id, _)| *id == cover)
+            .map(|(_, rect)| rect)
+            .collect();
+        drawn.sort_by(|left, right| right.height().total_cmp(&left.height()));
+        assert!(
+            drawn.len() >= 2,
+            "the same cover should be drawn in the row and in the panel"
+        );
+        let featured = drawn[0];
+        let thumbnail = drawn[1];
+        assert!(
+            featured.height() > thumbnail.height() * 2.0,
+            "the featured cover ({featured:?}) is not clearly larger than the row thumbnail ({thumbnail:?})"
+        );
+
+        let title = text_rect(&output, "Featured Game").expect("the title");
+        let mount = text_rect(&output, "Mount").expect("Mount");
+        let cheats = text_rect(&output, "Cheats & Mods").expect("Cheats & Mods");
+        assert!(
+            featured.bottom() <= title.top(),
+            "artwork is not above the title"
+        );
+        assert!(
+            title.bottom() <= mount.top(),
+            "the title is not above Mount"
+        );
+        assert!(
+            mount.bottom() <= cheats.top(),
+            "Mount is not above the secondary actions"
+        );
+    }
+
+    #[test]
+    fn row_thumbnails_survive_the_featured_panel() {
+        let (mut app, ctx, _) = featured_panel_frame(1920.0, 1080.0, "Featured Game");
+        let generation = app.gamer_covers.generation();
+        app.gamer_covers
+            .absorb(&ctx, cover_reply(generation, &featured_path(1), "102"));
+        let output = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
+        let other = cover_texture_id(&app, &featured_path(1)).expect("a loaded cover");
+        let drawn: Vec<egui::Rect> = rendered_images(&output)
+            .into_iter()
+            .filter(|(id, _)| *id == other)
+            .map(|(_, rect)| rect)
+            .collect();
+        assert!(
+            drawn
+                .iter()
+                .any(|rect| rect.height() <= crate::gamer_artwork::COVER_BOX + 0.5),
+            "the small row thumbnail is gone: {drawn:?}"
+        );
+    }
+
+    #[test]
+    fn every_secondary_action_is_still_present() {
+        let (_app, _ctx, output) = featured_panel_frame(1920.0, 1080.0, "Featured Game");
+        for label in ["Mount", "Cheats & Mods", "Details", "Open location"] {
+            assert!(
+                rendered_text_contains(&output, label),
+                "{label} is missing from the featured panel"
+            );
+        }
+    }
+
+    #[test]
+    fn mount_is_the_first_actionable_widget_in_the_panel() {
+        // Artwork is painted, never allocated as a control, so the first thing a
+        // keyboard reaches inside the panel is Mount - and the order after it is
+        // the reading order.
+        let (_app, _ctx, output) = featured_panel_frame(1920.0, 1080.0, "Featured Game");
+        let mut order = Vec::new();
+        for label in ["Mount", "Cheats & Mods", "Details", "Open location"] {
+            let rect =
+                text_rect(&output, label).unwrap_or_else(|| panic!("{label} should be rendered"));
+            order.push((label, rect.top(), rect.left()));
+        }
+        assert_eq!(order[0].0, "Mount");
+        assert!(
+            order[0].1 <= order[1].1,
+            "Mount is not above the secondary actions"
+        );
+        for pair in order[1..].windows(2) {
+            assert!(
+                pair[0].1 < pair[1].1 || pair[0].2 <= pair[1].2,
+                "{} comes after {} in the reading order",
+                pair[0].0,
+                pair[1].0
+            );
+        }
+    }
+
+    /// Presses Tab `count` times and returns the rect of whatever holds focus.
+    fn tab_to_focused_rect(
+        app: &mut ArchiveFsApp,
+        ctx: &egui::Context,
+        width: f32,
+        height: f32,
+        count: usize,
+    ) -> Vec<egui::Rect> {
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut seen = Vec::new();
+        for _ in 0..count {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, height),
+                )),
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Tab,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| app.update(ctx, &mut frame));
+            if let Some(id) = ctx.memory(|memory| memory.focused())
+                && let Some(rect) = ctx.read_response(id).map(|response| response.rect)
+            {
+                seen.push(rect);
+            }
+        }
+        seen
+    }
+
+    #[test]
+    fn the_featured_artwork_area_is_not_keyboard_focusable() {
+        // The artwork occupies most of the panel's upper half. It is allocated with
+        // `Sense::hover` and painted, so it takes no Tab stop - if it did, it would
+        // sit between the list and Mount for no purpose and a person on a sofa
+        // would press the key an extra time for nothing.
+        let (mut app, ctx, _) = featured_panel_frame(1920.0, 1080.0, "Featured Game");
+        let generation = app.gamer_covers.generation();
+        app.gamer_covers
+            .absorb(&ctx, cover_reply(generation, &featured_path(0), "101"));
+        let output = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
+        let cover = cover_texture_id(&app, &featured_path(0)).expect("a loaded cover");
+        let featured = rendered_images(&output)
+            .into_iter()
+            .filter(|(id, _)| *id == cover)
+            .map(|(_, rect)| rect)
+            .max_by(|left, right| left.height().total_cmp(&right.height()))
+            .expect("the featured cover");
+
+        let focused = tab_to_focused_rect(&mut app, &ctx, 1920.0, 1080.0, 40);
+        assert!(
+            !focused.is_empty(),
+            "nothing in Gamer View took keyboard focus at all"
+        );
+        for rect in &focused {
+            assert!(
+                !featured.contains_rect(*rect),
+                "focus landed inside the featured artwork area: {rect:?} within {featured:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_artwork_keeps_the_panel_geometry_exactly() {
+        // The reserved box is the same size whether a cover is loading, absent or
+        // broken, so nothing beneath it moves.
+        let (mut app, ctx, _) = featured_panel_frame(1920.0, 1080.0, "Featured Game");
+        let loading = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
+        let title_loading = text_rect(&loading, "Featured Game").expect("the title");
+        let mount_loading = text_rect(&loading, "Mount").expect("Mount");
+
+        let generation = app.gamer_covers.generation();
+        app.gamer_covers.absorb(
+            &ctx,
+            crate::gamer_artwork::CoverReply {
+                generation,
+                local_path: PathBuf::from(featured_path(0)),
+                provider_game_id: Some("101".to_string()),
+                answer: crate::gamer_artwork::CoverAnswer::None(
+                    crate::gamer_artwork::NoCover::NoArtwork,
+                ),
+            },
+        );
+        let absent = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
+        assert_eq!(
+            title_loading,
+            text_rect(&absent, "Featured Game").expect("the title"),
+            "the title moved when the cover turned out not to exist"
+        );
+        assert_eq!(
+            mount_loading,
+            text_rect(&absent, "Mount").expect("Mount"),
+            "Mount moved when the cover turned out not to exist"
+        );
+        assert!(
+            rendered_text_contains(&absent, "No cover available"),
+            "the placeholder does not say why it is a placeholder"
+        );
+    }
+
+    #[test]
+    fn a_failed_cover_keeps_the_panel_geometry_exactly() {
+        let (mut app, ctx, _) = featured_panel_frame(1920.0, 1080.0, "Featured Game");
+        let before = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
+        let title = text_rect(&before, "Featured Game").expect("the title");
+        let mount = text_rect(&before, "Mount").expect("Mount");
+
+        let generation = app.gamer_covers.generation();
+        app.gamer_covers.absorb(
+            &ctx,
+            crate::gamer_artwork::CoverReply {
+                generation,
+                local_path: PathBuf::from(featured_path(0)),
+                provider_game_id: Some("101".to_string()),
+                answer: crate::gamer_artwork::CoverAnswer::None(
+                    crate::gamer_artwork::NoCover::Failed,
+                ),
+            },
+        );
+        let after = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
+        assert_eq!(
+            title,
+            text_rect(&after, "Featured Game").expect("the title")
+        );
+        assert_eq!(mount, text_rect(&after, "Mount").expect("Mount"));
+    }
+
+    #[test]
+    fn a_cover_arriving_does_not_move_the_title_or_the_actions() {
+        let (mut app, ctx, _) = featured_panel_frame(1920.0, 1080.0, "Featured Game");
+        let before = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
+        let title = text_rect(&before, "Featured Game").expect("the title");
+        let mount = text_rect(&before, "Mount").expect("Mount");
+
+        let generation = app.gamer_covers.generation();
+        app.gamer_covers
+            .absorb(&ctx, cover_reply(generation, &featured_path(0), "101"));
+        let after = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
+        assert_eq!(
+            title,
+            text_rect(&after, "Featured Game").expect("the title")
+        );
+        assert_eq!(mount, text_rect(&after, "Mount").expect("Mount"));
+    }
+
+    #[test]
+    fn a_long_title_does_not_overlap_the_artwork_or_the_actions() {
+        let long = "The Legend of the Extraordinarily Long Aftermarket Title (World) \
+                    (Rev 1) (Unl) (Demo) (Aftermarket) (Pirate) (Alt 3)";
+        let (mut app, ctx, _) = featured_panel_frame(1920.0, 1080.0, long);
+        let generation = app.gamer_covers.generation();
+        app.gamer_covers
+            .absorb(&ctx, cover_reply(generation, &featured_path(0), "101"));
+        let output = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
+
+        let cover = cover_texture_id(&app, &featured_path(0)).expect("a loaded cover");
+        let featured = rendered_images(&output)
+            .into_iter()
+            .filter(|(id, _)| *id == cover)
+            .map(|(_, rect)| rect)
+            .max_by(|left, right| left.height().total_cmp(&right.height()))
+            .expect("the featured cover");
+        let mount = text_rect(&output, "Mount").expect("Mount");
+        let title = text_rect(&output, long).expect("the title");
+
+        assert!(
+            title.top() >= featured.bottom() - 0.5,
+            "a long title rode up over the artwork"
+        );
+        assert!(
+            title.bottom() <= mount.top() + 0.5,
+            "a long title ran into Mount"
+        );
+    }
+
+    #[test]
+    fn the_panel_keeps_mount_and_the_actions_on_screen_at_every_supported_size() {
+        for (width, height) in [
+            (1280.0, 720.0),
+            (1366.0, 768.0),
+            (1920.0, 1080.0),
+            (2560.0, 1440.0),
+        ] {
+            let (_app, _ctx, output) = featured_panel_frame(width, height, "Featured Game");
+            let _ = &output;
+            for label in ["Mount", "Cheats & Mods", "Details"] {
+                let rect = text_rect(&output, label)
+                    .unwrap_or_else(|| panic!("{label} is not rendered at {width}x{height}"));
+                assert!(
+                    rect.bottom() <= height,
+                    "{label} falls below the viewport at {width}x{height}: {rect:?}"
+                );
+                assert!(
+                    rect.right() <= width,
+                    "{label} falls outside the viewport at {width}x{height}: {rect:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_actions_survive_a_feedback_banner_and_a_wrapped_title_at_720p() {
+        // Found in Sunshine at 1280x720: an "Unmounted ..." banner takes a line
+        // above the whole view, and with the cover sized from the *outer* height
+        // the secondary actions dropped below the viewport. The cover has to yield
+        // that space, so it is measured from what is actually left.
+        let long = "Super Mario Bros. + Duck Hunt + World Class Track Meet (USA) (Rev 1)";
+        let mut app = app_for_operation_tests();
+        app.ui_mode = GuiMode::GamerView;
+        app.view = MainView::Library;
+        let folder = std::env::temp_dir();
+        let mut records = Vec::new();
+        for index in 0..8 {
+            let path = folder.join(format!("archivefs-featured-g{index:05}.zip"));
+            let mut built = record(&path.display().to_string(), MountState::Pending);
+            built.metadata.platform = Some("SNES".to_string());
+            built.metadata.title = Some(if index == 0 {
+                long.to_string()
+            } else {
+                format!("Game {index:05}")
+            });
+            records.push(built);
+        }
+        app.state = LoadState::Ready(Box::new(loaded_data_with_records("/mount", records)));
+        app.archive_context
+            .select_only(folder.join("archivefs-featured-g00000.zip"));
+        app.feedback = Some(ActionFeedback {
+            succeeded: true,
+            message: "Unmounted /mnt/virtualroms/Acorn Archimedes/ALPS_Support_Disc".to_string(),
+            cleanup: None,
+            warning: None,
+            more_information: None,
+        });
+
+        let ctx = egui::Context::default();
+        // Swept rather than fixed at 720: a real window is its nominal height minus
+        // a title bar, and the banner's own height varies with wrapping, so the
+        // exact value that used to overflow is not a number worth guessing at.
+        for height in [600.0_f32, 640.0, 660.0, 680.0, 696.0, 720.0] {
+            let output = run_frames(&mut app, &ctx, 1280.0, height, 4);
+            for label in ["Mount", "Cheats & Mods", "Details"] {
+                let rect = text_rect(&output, label).unwrap_or_else(|| {
+                    panic!("{label} is not rendered at 1280x{height} with a banner")
+                });
+                assert!(
+                    rect.bottom() <= height,
+                    "{label} fell below the viewport at 1280x{height} with a banner: {rect:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_featured_panel_stays_balanced_at_1920x1080() {
+        // A cover that reads from a sofa, and a panel that is neither a sliver nor
+        // a slab: the artwork occupies a meaningful share of the panel's height.
+        let (mut app, ctx, _) = featured_panel_frame(1920.0, 1080.0, "Featured Game");
+        let generation = app.gamer_covers.generation();
+        app.gamer_covers
+            .absorb(&ctx, cover_reply(generation, &featured_path(0), "101"));
+        let output = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
+        let cover = cover_texture_id(&app, &featured_path(0)).expect("a loaded cover");
+        let featured = rendered_images(&output)
+            .into_iter()
+            .filter(|(id, _)| *id == cover)
+            .map(|(_, rect)| rect)
+            .max_by(|left, right| left.height().total_cmp(&right.height()))
+            .expect("the featured cover");
+        assert!(
+            featured.height() >= 150.0,
+            "the 1080p featured cover is only {} tall",
+            featured.height()
+        );
+        // And it sits in the right-hand panel, not over the list.
+        assert!(
+            featured.left() > 1920.0 * 0.5,
+            "the featured cover is not in the right-hand panel: {featured:?}"
+        );
+    }
+
+    #[test]
+    fn gamer_view_covers_behave_at_every_supported_resolution() {
+        for (width, height) in [
+            (1280.0, 720.0),
+            (1366.0, 768.0),
+            (1920.0, 1080.0),
+            (2560.0, 1440.0),
+        ] {
+            let (mut app, ctx) = gamer_cover_app(60);
+            run_frames(&mut app, &ctx, width, height, 3);
+            let generation = app.gamer_covers.generation();
+            app.gamer_covers
+                .absorb(&ctx, cover_reply(generation, &featured_path(0), "101"));
+            let output = run_frames(&mut app, &ctx, width, height, 1);
+            assert!(
+                rendered_text_contains(&output, "Game 00000"),
+                "the first game's title vanished at {width}x{height}"
+            );
+            let tracked = app.gamer_covers.tracked();
+            assert!(
+                tracked <= 60,
+                "{width}x{height} queued {tracked} of a 60-record library"
+            );
+        }
+    }
+}
+
+// --- RomM identity source: background work --------------------------------
+//
+// Everything here runs on a worker thread. Nothing in this section touches egui,
+// and nothing it returns carries a provider payload or a credential: the summaries
+// are built here precisely so the UI thread never sees either.
+
+/// Reads authoritative RomM state: settings, cache status and artwork stats.
+///
+/// Contacts nothing. `reachable: false` is passed deliberately - the card must be
+/// able to say what it knows without a network round trip, which is also why
+/// opening the Sources page cannot start one.
+fn load_romm_snapshot() -> Result<RommSnapshot, String> {
+    use archivefs_core::identity_source::artwork::ArtworkCache;
+    use archivefs_core::identity_source::model::IdentityProvider;
+    use archivefs_core::identity_source::settings::{
+        SettingsLocation, default_identity_root, load_token_file,
+    };
+    use archivefs_core::identity_source::status::IdentitySourceApi;
+
+    let identity_root = default_identity_root()?;
+    let settings = SettingsLocation::new(&identity_root, IdentityProvider::Romm)
+        .load()
+        .map_err(|error| error.detail())?;
+    let api = IdentitySourceApi::new(&identity_root, IdentityProvider::Romm);
+    // Explicit verifications, so a file that was hashed reads as Confirmed here and
+    // not only in the panel that hashed it.
+    let hashes = archivefs_core::identity_source::verification::VerificationStore::new(
+        &identity_root,
+        IdentityProvider::Romm,
+    )
+    .load();
+    let status = api.status(&settings.source, &hashes, false);
+    let cache_format_version = api.open_cache(None).ok().map(|cache| cache.format_version);
+    let server_id = status
+        .server_id
+        .clone()
+        .unwrap_or_else(|| settings.source.url.clone());
+    let artwork = ArtworkCache::new(&identity_root, IdentityProvider::Romm).stats(&server_id);
+    let token = load_token_file(settings.source.token_path.as_deref());
+    Ok(RommSnapshot {
+        settings,
+        status,
+        artwork,
+        token_available: token.is_ok(),
+        // The core's own refusal text, which never quotes the token.
+        token_problem: token.err().map(|refusal| refusal.detail()),
+        cache_format_version,
+    })
+}
+
+/// Runs one RomM operation to completion.
+///
+/// The error type is a plain `String` because every core refusal already renders
+/// itself redacted; passing the refusal type up would only invite a caller to
+/// format it some other way.
+fn run_romm_operation(
+    operation: &RommOperation,
+    trusted_roots: &Result<Vec<PathBuf>, String>,
+    cancellation: &Arc<AtomicBool>,
+    report: &dyn Fn(RommProgressEvent),
+) -> Result<RommOperationOutcome, String> {
+    use archivefs_core::identity_source::artwork::ArtworkCache;
+    use archivefs_core::identity_source::hashing::LocalHashCache;
+    use archivefs_core::identity_source::model::IdentityProvider;
+    use archivefs_core::identity_source::romm::client::UreqTransport;
+    use archivefs_core::identity_source::romm::import::ImportScope;
+    use archivefs_core::identity_source::settings::{
+        SettingsLocation, default_identity_root, load_token_file,
+    };
+    use archivefs_core::identity_source::status::{IdentitySourceApi, RefreshRequest};
+    use archivefs_core::identity_source::verification::VerificationStore;
+
+    let identity_root = default_identity_root()?;
+    let location = SettingsLocation::new(&identity_root, IdentityProvider::Romm);
+    let mut settings = location.load().map_err(|error| error.detail())?;
+    let api = IdentitySourceApi::new(&identity_root, IdentityProvider::Romm);
+
+    // Enable and disable need no network and no token, so they are handled before
+    // anything is validated.
+    if let RommOperation::SetEnabled(enabled) = operation {
+        if settings.source.url.trim().is_empty() {
+            return Err(
+                "Configure the RomM URL before enabling this source. The command line's \
+                 `identity source romm configure` does this today; the dialog arrives in the next \
+                 slice."
+                    .to_string(),
+            );
+        }
+        settings.source.enabled = *enabled;
+        location.save(&settings).map_err(|error| error.detail())?;
+        return Ok(RommOperationOutcome::Enabled(*enabled));
+    }
+
+    if let RommOperation::SaveConfiguration(proposed) = operation {
+        // Validated again here, not merely in the dialog: the dialog's pass cannot
+        // resolve a hostname, and the token file may have changed since it was
+        // typed. This is the pass that decides.
+        let mut proposed_settings = (**proposed).clone();
+        proposed_settings.source.url = proposed_settings.source.url.trim().to_string();
+        // A no-op Save is answered entirely from the already-loaded settings. It
+        // neither rewrites the file nor resolves a hostname, reads a token, starts
+        // an import, or constructs a transport.
+        if proposed_settings == settings {
+            return Ok(RommOperationOutcome::Saved(Box::new(proposed_settings)));
+        }
+        if proposed_settings.source.url.is_empty() {
+            return Err("A RomM address is required.".to_string());
+        }
+        // The full local-only policy, with real name resolution.
+        let approved = archivefs_core::identity_source::net_policy::validate_endpoint(
+            &proposed_settings.source.url,
+            &archivefs_core::identity_source::net_policy::SystemResolver,
+        )
+        .map_err(|refusal| refusal.detail())?;
+        proposed_settings.source.url = approved.origin().to_string();
+        if let Some(size) = proposed_settings.page_size
+            && !(archivefs_core::identity_source::settings::MIN_CONFIGURED_PAGE_SIZE
+                ..=archivefs_core::identity_source::settings::MAX_CONFIGURED_PAGE_SIZE)
+                .contains(&size)
+        {
+            return Err(format!(
+                "{size} records per request is outside the safe range."
+            ));
+        }
+        // The token file is re-read, and only its verdict is kept.
+        if let Some(path) = proposed_settings.source.token_path.clone() {
+            load_token_file(Some(&path)).map_err(|refusal| refusal.detail())?;
+        }
+        let trusted_roots = trusted_roots.as_deref().map_err(Clone::clone)?;
+        archivefs_core::identity_source::path_map::PathMappings::validate(
+            &proposed_settings.source.mappings,
+            trusted_roots,
+            proposed_settings.source.provider_path_kind,
+        )
+        .map_err(|refusal| refusal.detail())?;
+        // Atomic, and only after everything above agreed - so a refused save leaves
+        // the previous configuration byte-identical.
+        location
+            .save(&proposed_settings)
+            .map_err(|error| error.detail())?;
+        return Ok(RommOperationOutcome::Saved(Box::new(proposed_settings)));
+    }
+
+    if let RommOperation::ClearArtwork = operation {
+        let status = api.status(&settings.source, &LocalHashCache::new(), false);
+        let server_id = status
+            .server_id
+            .clone()
+            .unwrap_or_else(|| settings.source.url.clone());
+        let cache = ArtworkCache::new(&identity_root, IdentityProvider::Romm);
+        let outcome = cache
+            .clear(&server_id, true)
+            .map_err(|refusal| refusal.detail())?;
+        return Ok(RommOperationOutcome::ArtworkCleared {
+            items: outcome.removed_items,
+            bytes: outcome.removed_bytes,
+        });
+    }
+
+    // Browsing the published cache needs no token and no network, so it is served
+    // before anything is validated - which is what makes "no request is made merely
+    // by browsing" structural rather than a promise.
+    match operation {
+        RommOperation::LoadRecords {
+            filters,
+            offset,
+            limit,
+        } => {
+            let cache = api.open_cache(None).map_err(|refusal| refusal.detail())?;
+            let presence_for = |path: &Path| {
+                archivefs_core::identity_source::matching::LocalPresence::observe(path)
+            };
+            return Ok(RommOperationOutcome::Records(Box::new(
+                romm_browse::build_record_page(&cache, filters, *offset, *limit, &presence_for),
+            )));
+        }
+        RommOperation::LoadRecordDetail { romm_game_id } => {
+            let cache = api.open_cache(None).map_err(|refusal| refusal.detail())?;
+            let presence_for = |path: &Path| {
+                archivefs_core::identity_source::matching::LocalPresence::observe(path)
+            };
+            return Ok(RommOperationOutcome::RecordDetail(Box::new(
+                romm_browse::build_record_detail(&cache, romm_game_id, &presence_for),
+            )));
+        }
+        RommOperation::LoadConflicts { offset } => {
+            let cache = api.open_cache(None).map_err(|refusal| refusal.detail())?;
+            return Ok(RommOperationOutcome::Conflicts(Box::new(
+                romm_browse::build_conflict_page(&cache, *offset, romm_browse::CONFLICT_PAGE_SIZE),
+            )));
+        }
+        RommOperation::StaleSummary => {
+            let cache = api.open_cache(None).map_err(|refusal| refusal.detail())?;
+            let identity = romm_browse::CacheIdentity::of(&cache);
+            let mappings: Vec<(String, String)> = settings
+                .source
+                .mappings
+                .iter()
+                .map(|mapping| {
+                    (
+                        mapping.provider_prefix.clone(),
+                        mapping.archivefs_prefix.display().to_string(),
+                    )
+                })
+                .collect();
+            // Probing 10,081 paths takes noticeable time, so progress is reported and
+            // cancellation is checked as it goes.
+            let stale_total = cache
+                .records
+                .iter()
+                .filter(|record| {
+                    record.verification
+                        == archivefs_core::identity_source::model::ExternalVerification::Stale
+                })
+                .count();
+            let probed = std::cell::Cell::new(0usize);
+            let cancelled = std::cell::Cell::new(false);
+            let presence_for = |path: &Path| {
+                if cancellation.load(Ordering::Acquire) {
+                    cancelled.set(true);
+                }
+                let seen = archivefs_core::identity_source::matching::LocalPresence::observe(path);
+                let done = probed.get() + 1;
+                probed.set(done);
+                // Reported in batches: one event per path would flood the channel for
+                // no benefit at this scale.
+                if done.is_multiple_of(250) || done == stale_total {
+                    report(RommProgressEvent::StaleProgress {
+                        probed: done,
+                        total: stale_total,
+                    });
+                }
+                seen
+            };
+            let summary = archivefs_core::identity_source::stale::StaleSummary::build(
+                &cache,
+                &mappings,
+                archivefs_core::identity_source::stale::DEFAULT_EXAMPLES,
+                presence_for,
+            );
+            if cancelled.get() || cancellation.load(Ordering::Acquire) {
+                // A half-probed partition would read as a finding, so nothing is
+                // returned rather than a partial one.
+                return Err("The stale summary was cancelled. Nothing was changed.".to_string());
+            }
+            return Ok(RommOperationOutcome::Stale(Box::new(
+                romm_browse::StaleSummaryView {
+                    cache: identity,
+                    summary,
+                },
+            )));
+        }
+        RommOperation::ResolveGame {
+            local_path,
+            local_platform,
+            chosen_game_id,
+        } => {
+            let cache = api.open_cache(None).map_err(|refusal| refusal.detail())?;
+            let verified = VerificationStore::new(&identity_root, IdentityProvider::Romm).load();
+            // Metadata only: no read, no hash. `observe` is the same call the import
+            // makes, so the panel and the catalogue agree about what is at the path.
+            let facts_for = |path: &Path| {
+                archivefs_core::identity_source::matching::LocalFileFacts::observe(path)
+            };
+            return Ok(RommOperationOutcome::GameIdentity(Box::new(
+                crate::romm_game::resolve_selected_game(
+                    &cache,
+                    local_path,
+                    &verified,
+                    local_platform,
+                    chosen_game_id.as_deref(),
+                    &facts_for,
+                ),
+            )));
+        }
+        RommOperation::VerifyLocalFile {
+            local_path,
+            romm_game_id,
+            local_platform,
+            chosen_game_id,
+        } => {
+            return verify_local_file(
+                &api,
+                &identity_root,
+                trusted_roots.as_deref().map_err(Clone::clone)?,
+                local_path,
+                romm_game_id,
+                local_platform,
+                chosen_game_id.as_deref(),
+                cancellation,
+                report,
+            );
+        }
+        RommOperation::LoadCover {
+            local_path,
+            romm_game_id,
+        } => {
+            // A cover already in the cache needs no token and no request, so that case
+            // is answered here, before anything is validated.
+            if let Some(outcome) =
+                cover_from_cache(&api, &identity_root, &settings, local_path, romm_game_id)?
+            {
+                return Ok(RommOperationOutcome::Cover(Box::new(outcome)));
+            }
+        }
+        _ => {}
+    }
+
+    // Everything below talks to RomM, so it needs a validated source.
+    let token = load_token_file(settings.source.token_path.as_deref())
+        .map_err(|refusal| refusal.detail())?;
+    let trusted_roots = trusted_roots.as_deref().map_err(Clone::clone)?;
+    let source = archivefs_core::identity_source::romm::config::ValidatedRommSource::validate(
+        &settings.source,
+        &token,
+        trusted_roots,
+        &archivefs_core::identity_source::net_policy::SystemResolver,
+    )
+    .map_err(|refusal| refusal.detail())?;
+    let transport = UreqTransport::new();
+
+    // Placed before the connection pre-flight deliberately: fetching one cover should
+    // cost one request, not two.
+    if let RommOperation::LoadCover {
+        local_path,
+        romm_game_id,
+    } = operation
+    {
+        return Ok(RommOperationOutcome::Cover(Box::new(fetch_cover(
+            &api,
+            &identity_root,
+            &source,
+            &transport,
+            local_path,
+            romm_game_id,
+            cancellation,
+        )?)));
+    }
+
+    let capability = api
+        .test_connection(&source, &transport, Some(cancellation))
+        .map_err(|error| error.detail())?;
+
+    if let RommOperation::TestConnection = operation {
+        // One record: enough to prove the token reads, and to see which path shape
+        // this instance reports.
+        let client =
+            archivefs_core::identity_source::romm::client::RommClient::new(&source, &transport);
+        let first_page = client.roms_page(1, 0, Some(cancellation));
+        let observed = first_page
+            .as_ref()
+            .ok()
+            .and_then(|page| page.items.first())
+            .map(archivefs_core::identity_source::romm::normalise::provider_path_of)
+            .filter(|path| !path.is_empty())
+            .map(|path| {
+                archivefs_core::identity_source::path_map::ProviderPathKind::observed_in(&path)
+            });
+        let reads = vec![
+            (
+                "/api/platforms".to_string(),
+                client.platforms(Some(cancellation)).is_ok(),
+            ),
+            ("/api/roms".to_string(), first_page.is_ok()),
+        ];
+        return Ok(RommOperationOutcome::Connection(Box::new(
+            romm_source::RommConnectionSummary::from_report(
+                &capability,
+                settings.source.provider_path_kind.slug(),
+                observed.map(|kind| kind.slug()),
+                reads,
+            ),
+        )));
+    }
+
+    // A re-import must not undo a verification, so the stored hashes are fed into
+    // matching exactly as a freshly computed one would be.
+    let hashes = VerificationStore::new(&identity_root, IdentityProvider::Romm).load();
+    let trusted = archivefs_core::safe_read::TrustedRoots::from_paths(trusted_roots);
+    let facts_for = |record: &archivefs_core::identity_source::model::ExternalIdentityRecord| {
+        romm_local_facts(record, &trusted)
+    };
+    let on_progress = |progress| report(RommProgressEvent::Import(progress));
+    let started = std::time::Instant::now();
+
+    match operation {
+        RommOperation::SampleImport { records } => {
+            // A sample never publishes, so it is imported and matched here and then
+            // simply reported. Nothing touches the live cache.
+            let mut outcome = archivefs_core::identity_source::romm::import::import_identity(
+                &source,
+                &transport,
+                ImportScope::Sample {
+                    max_records: *records,
+                },
+                &capability,
+                settings.effective_page_size(),
+                on_progress,
+                Some(cancellation),
+            )
+            .map_err(|failure| failure.detail())?;
+            archivefs_core::identity_source::matching::match_all(
+                &mut outcome.cache.records,
+                &hashes,
+                facts_for,
+                Some(cancellation),
+            )
+            .map_err(|_| "The sample import was cancelled.".to_string())?;
+            let counts = outcome.cache.counts();
+            let groups =
+                archivefs_core::identity_source::matching::build_groups(&outcome.cache.records);
+            report_file_detail_omissions(report, &outcome.adaptive);
+            Ok(RommOperationOutcome::Sample(Box::new(
+                romm_source::RommImportSummary {
+                    published: false,
+                    cache_path: None,
+                    cache_bytes: None,
+                    records: outcome.cache.records.len(),
+                    platforms: outcome.cache.platforms.len(),
+                    confirmed: counts.confirmed,
+                    strong: counts.strong,
+                    probable: counts.probable,
+                    ambiguous: counts.ambiguous,
+                    stale: counts.stale,
+                    unmatched: counts.unmatched,
+                    unknown_platforms: outcome.normalisation.unknown_platforms.len(),
+                    invalid_hashes: outcome.normalisation.rejected_hashes.len(),
+                    multi_file_groups: groups.len(),
+                    pages_fetched: outcome.progress.pages_fetched,
+                    elapsed_milliseconds: started.elapsed().as_millis(),
+                    adaptive: Some(outcome.adaptive),
+                    failure: None,
+                    failure_code: None,
+                    previous_cache_usable: api.open_cache(None).is_ok(),
+                },
+            )))
+        }
+        RommOperation::FullImport | RommOperation::Refresh => {
+            let summary = api.refresh(
+                RefreshRequest {
+                    source: &source,
+                    transport: &transport,
+                    scope: ImportScope::Full,
+                    capability: &capability,
+                    hashes: &hashes,
+                    page_size: settings.effective_page_size(),
+                    cancel: Some(cancellation),
+                },
+                facts_for,
+                on_progress,
+            );
+            match summary {
+                Ok(summary) => {
+                    report_file_detail_omissions(report, &summary.adaptive);
+                    let cache_bytes = std::fs::metadata(&summary.cache_path)
+                        .ok()
+                        .map(|metadata| metadata.len());
+                    Ok(RommOperationOutcome::Import(Box::new(
+                        romm_source::RommImportSummary {
+                            published: true,
+                            cache_path: Some(summary.cache_path.clone()),
+                            cache_bytes,
+                            records: summary.records,
+                            platforms: summary.platforms,
+                            confirmed: summary.counts.confirmed,
+                            strong: summary.counts.strong,
+                            probable: summary.counts.probable,
+                            ambiguous: summary.counts.ambiguous,
+                            stale: summary.counts.stale,
+                            unmatched: summary.counts.unmatched,
+                            unknown_platforms: summary.unknown_platforms,
+                            invalid_hashes: summary.invalid_hashes,
+                            multi_file_groups: summary.groups.len(),
+                            pages_fetched: summary.progress.pages_fetched,
+                            elapsed_milliseconds: started.elapsed().as_millis(),
+                            adaptive: Some(summary.adaptive),
+                            failure: None,
+                            failure_code: None,
+                            previous_cache_usable: true,
+                        },
+                    )))
+                }
+                Err(failure) => Err(failure.detail()),
+            }
+        }
+        RommOperation::Preview { limit } => {
+            let summary = run_romm_preview(
+                &api,
+                &source,
+                &transport,
+                &settings,
+                trusted_roots,
+                *limit,
+                cancellation,
+            )?;
+            Ok(RommOperationOutcome::Preview(Box::new(summary)))
+        }
+        // Handled above.
+        RommOperation::LoadStatus
+        | RommOperation::TestConnection
+        | RommOperation::SetEnabled(_)
+        | RommOperation::ClearArtwork
+        | RommOperation::SaveConfiguration(_)
+        | RommOperation::LoadRecords { .. }
+        | RommOperation::LoadRecordDetail { .. }
+        | RommOperation::LoadConflicts { .. }
+        | RommOperation::StaleSummary
+        | RommOperation::ResolveGame { .. }
+        | RommOperation::VerifyLocalFile { .. }
+        | RommOperation::LoadCover { .. } => unreachable!("handled before this match"),
+    }
+}
+
+/// Turns a file-detail omission into a sentence a person can act on.
+fn report_file_detail_omissions(
+    report: &dyn Fn(RommProgressEvent),
+    adaptive: &archivefs_core::identity_source::romm::import::AdaptivePagination,
+) {
+    if adaptive.records_without_file_detail.is_empty() {
+        return;
+    }
+    report(RommProgressEvent::Note(format!(
+        "Game identity imported. Detailed file list omitted for RomM id {} because the provider \
+         response exceeded the safety limit.",
+        adaptive
+            .records_without_file_detail
+            .iter()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
+    )));
+}
+
+/// Local facts for one record: metadata only, and never a hash.
+///
+/// The same shape the CLI uses, so the GUI and the command line reach the same
+/// verdicts from the same evidence.
+/// Refuses a path that is not a regular file inside a configured source folder.
+///
+/// `TrustedRoots` governs what a symlink may point *at*, not which path may be named,
+/// so this is the check that stops an explicit verification reading a file outside the
+/// library. Both the named path and its resolved form must be inside a root.
+fn confine_to_source_roots(path: &Path, roots: &[PathBuf]) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err(format!(
+            "{} is not an absolute path, so which file is meant is not certain.",
+            path.display()
+        ));
+    }
+    // Canonical roots, so a symlinked source folder does not defeat the comparison. A
+    // root that cannot be resolved is dropped rather than trusted.
+    let canonical_roots: Vec<PathBuf> = roots
+        .iter()
+        .filter_map(|root| root.canonicalize().ok())
+        .collect();
+    let inside = |candidate: &Path| {
+        canonical_roots
+            .iter()
+            .any(|root| candidate.starts_with(root))
+    };
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("{} cannot be examined: {error}", path.display()))?;
+    // Checked before resolution, so the verdict describes the path that was named.
+    let lexical = path
+        .parent()
+        .and_then(|parent| parent.canonicalize().ok())
+        .map(|parent| parent.join(path.file_name().unwrap_or_default()));
+    if !lexical.as_deref().is_some_and(&inside) {
+        return Err(format!(
+            "{} is not inside a configured source folder, so ArchiveFS will not read it.",
+            path.display()
+        ));
+    }
+    let resolved = path.canonicalize().map_err(|error| {
+        if metadata.file_type().is_symlink() {
+            format!(
+                "{} is a symbolic link whose target cannot be resolved: {error}",
+                path.display()
+            )
+        } else {
+            format!("{} cannot be resolved: {error}", path.display())
+        }
+    })?;
+    if !inside(&resolved) {
+        return Err(format!(
+            "{} leads out of your configured source folders; ArchiveFS will not follow it.",
+            path.display()
+        ));
+    }
+    if !resolved.is_file() {
+        return Err(format!(
+            "{} is not a regular file, so there are no bytes to hash.",
+            path.display()
+        ));
+    }
+    Ok(resolved)
+}
+
+/// Hashes one local file, compares it with one RomM record, and records the result.
+///
+/// The verdict is recomputed by the same matcher the import uses, before and after the
+/// hash is stored - so Confirmed is something the comparison earned rather than a
+/// label this function applies.
+#[allow(clippy::too_many_arguments)]
+fn verify_local_file(
+    api: &archivefs_core::identity_source::status::IdentitySourceApi,
+    identity_root: &Path,
+    roots: &[PathBuf],
+    local_path: &Path,
+    romm_game_id: &str,
+    local_platform: &crate::romm_game::LocalPlatformClaim,
+    chosen_game_id: Option<&str>,
+    cancellation: &Arc<AtomicBool>,
+    report: &dyn Fn(RommProgressEvent),
+) -> Result<RommOperationOutcome, String> {
+    use archivefs_core::identity_source::hashing::hash_file_reporting;
+    use archivefs_core::identity_source::model::IdentityProvider;
+    use archivefs_core::identity_source::verification::VerificationStore;
+    use archivefs_core::safe_read::TrustedRoots;
+
+    let cache = api.open_cache(None).map_err(|refusal| refusal.detail())?;
+    let record = cache
+        .records
+        .iter()
+        .find(|record| {
+            record.provider_game_id == romm_game_id
+                && record.archivefs_path.as_deref() == Some(local_path)
+        })
+        .ok_or_else(|| {
+            "That RomM record no longer maps to this file. Look the game up again.".to_string()
+        })?
+        .clone();
+    if record.hashes.is_empty() {
+        return Err(
+            "RomM published no hash for this game, so hashing the file would produce nothing to \
+             compare it against."
+                .to_string(),
+        );
+    }
+
+    // Both checks: this one decides which path may be named, `TrustedRoots` below
+    // decides what a symlink may point at.
+    confine_to_source_roots(local_path, roots)?;
+    let trusted = TrustedRoots::from_paths(roots);
+
+    let store = VerificationStore::new(identity_root, IdentityProvider::Romm);
+    let before_hashes = store.load();
+    let facts_for =
+        |path: &Path| archivefs_core::identity_source::matching::LocalFileFacts::observe(path);
+    let before = crate::romm_game::resolve_selected_game(
+        &cache,
+        local_path,
+        &before_hashes,
+        local_platform,
+        chosen_game_id.or(Some(romm_game_id)),
+        &facts_for,
+    );
+    let verdict_before = before
+        .chosen_candidate()
+        .map(|candidate| candidate.verdict)
+        .unwrap_or(before.verdict);
+
+    let started = std::time::Instant::now();
+    let file_label = local_path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| local_path.display().to_string());
+    let progress_label = file_label.clone();
+    let on_progress = |progress: archivefs_core::identity_source::hashing::HashProgress| {
+        report(RommProgressEvent::Hashing(
+            crate::romm_game::HashProgressView {
+                file_label: progress_label.clone(),
+                bytes_read: progress.bytes_read,
+                total_bytes: progress.total_bytes,
+                elapsed_seconds: started.elapsed().as_secs(),
+                cancellation_requested: cancellation.load(Ordering::Acquire),
+            },
+        ));
+    };
+    let hashes = hash_file_reporting(local_path, &trusted, Some(cancellation), &on_progress)
+        .map_err(|refusal| refusal.detail())?;
+    let elapsed_seconds = started.elapsed().as_secs();
+
+    let comparisons = crate::romm_game::compare_hashes(&record, &hashes);
+    let all_agree = !comparisons.is_empty() && comparisons.iter().all(|line| line.agrees);
+    let any_disagree = comparisons.iter().any(|line| !line.agrees);
+
+    // Stored whether or not it agreed: the hash is a fact about the file, and storing a
+    // disagreement is what keeps it visible instead of inviting a second read.
+    let after_hashes = store
+        .record(&record.server_id, hashes.clone())
+        .map_err(|error| error.detail())?;
+    let stored_at = Some(store.path());
+
+    let after = crate::romm_game::resolve_selected_game(
+        &cache,
+        local_path,
+        &after_hashes,
+        local_platform,
+        chosen_game_id.or(Some(romm_game_id)),
+        &facts_for,
+    );
+    let verdict_after = after
+        .chosen_candidate()
+        .map(|candidate| candidate.verdict)
+        .unwrap_or(after.verdict);
+    let compact_label = after
+        .chosen_candidate()
+        .map(crate::romm_game::CandidateView::compact_label)
+        .unwrap_or_else(|| file_label.clone());
+
+    Ok(RommOperationOutcome::Verified(Box::new(
+        crate::romm_game::VerificationOutcomeView {
+            local_path: local_path.to_path_buf(),
+            file_label,
+            compact_label,
+            romm_game_id: romm_game_id.to_string(),
+            comparisons,
+            all_agree,
+            any_disagree,
+            verdict_before,
+            verdict_after,
+            bytes_hashed: hashes.bytes_hashed,
+            elapsed_seconds,
+            stored_at,
+            panel: Box::new(after),
+        },
+    )))
+}
+
+/// The record one cover request is about, and its artwork request.
+fn cover_record(
+    api: &archivefs_core::identity_source::status::IdentitySourceApi,
+    local_path: &Path,
+    romm_game_id: &str,
+) -> Result<archivefs_core::identity_source::model::ExternalIdentityRecord, String> {
+    let cache = api.open_cache(None).map_err(|refusal| refusal.detail())?;
+    cache
+        .records
+        .iter()
+        .find(|record| {
+            record.provider_game_id == romm_game_id
+                && record.archivefs_path.as_deref() == Some(local_path)
+        })
+        .cloned()
+        .ok_or_else(|| {
+            "That RomM record no longer maps to this file. Look the game up again.".to_string()
+        })
+}
+
+/// Answers a cover request without contacting anything, when it can.
+///
+/// Returns `None` only when a real fetch is needed.
+fn cover_from_cache(
+    api: &archivefs_core::identity_source::status::IdentitySourceApi,
+    identity_root: &Path,
+    settings: &archivefs_core::identity_source::settings::ProviderSettings,
+    local_path: &Path,
+    romm_game_id: &str,
+) -> Result<Option<crate::romm_game::CoverOutcome>, String> {
+    use archivefs_core::identity_source::artwork::{ArtworkCache, ArtworkRequest};
+    use archivefs_core::identity_source::hashing::LocalHashCache;
+    use archivefs_core::identity_source::model::IdentityProvider;
+
+    let record = cover_record(api, local_path, romm_game_id)?;
+    let availability = crate::romm_game::availability_of(&record);
+    let cache = ArtworkCache::new(identity_root, IdentityProvider::Romm);
+    let status = api.status(&settings.source, &LocalHashCache::new(), false);
+    let server_id = status
+        .server_id
+        .clone()
+        .unwrap_or_else(|| settings.source.url.clone());
+    let stats = cache.stats(&server_id);
+    let finish = |state: crate::romm_game::CoverState| crate::romm_game::CoverOutcome {
+        local_path: local_path.to_path_buf(),
+        romm_game_id: romm_game_id.to_string(),
+        state,
+        cached_items: stats.items as u64,
+        cached_bytes: stats.bytes,
+    };
+
+    if availability != crate::romm_game::ArtworkAvailability::Fetchable {
+        // RomM recorded no cover of its own. `url_cover` points at IGDB or
+        // RetroAchievements, and this build does not fetch from public hosts.
+        return Ok(Some(finish(crate::romm_game::CoverState::Unavailable(
+            availability,
+        ))));
+    }
+    let request = ArtworkRequest::from_record(&record);
+    match cache.lookup(&server_id, &request) {
+        Some(thumbnail) => {
+            let state = match crate::romm_game::decode_thumbnail(&thumbnail, true) {
+                Ok(image) => crate::romm_game::CoverState::Ready(Box::new(image)),
+                Err(detail) => crate::romm_game::CoverState::Failed(detail),
+            };
+            Ok(Some(finish(state)))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Fetches one cover from RomM's own small-cover path.
+fn fetch_cover(
+    api: &archivefs_core::identity_source::status::IdentitySourceApi,
+    identity_root: &Path,
+    source: &archivefs_core::identity_source::romm::config::ValidatedRommSource,
+    transport: &archivefs_core::identity_source::romm::client::UreqTransport,
+    local_path: &Path,
+    romm_game_id: &str,
+    cancellation: &Arc<AtomicBool>,
+) -> Result<crate::romm_game::CoverOutcome, String> {
+    use archivefs_core::identity_source::artwork::{ArtworkCache, ArtworkRefusal, ArtworkRequest};
+    use archivefs_core::identity_source::model::IdentityProvider;
+
+    let record = cover_record(api, local_path, romm_game_id)?;
+    let cache = ArtworkCache::new(identity_root, IdentityProvider::Romm);
+    let request = ArtworkRequest::from_record(&record);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_secs() as i64)
+        .unwrap_or_default();
+    let state = match cache.fetch(source, transport, &request, now, Some(cancellation)) {
+        Ok(thumbnail) => match crate::romm_game::decode_thumbnail(&thumbnail, false) {
+            Ok(image) => crate::romm_game::CoverState::Ready(Box::new(image)),
+            Err(detail) => crate::romm_game::CoverState::Failed(detail),
+        },
+        Err(ArtworkRefusal::Cancelled) => crate::romm_game::CoverState::Cancelled,
+        Err(ArtworkRefusal::Request(
+            archivefs_core::identity_source::romm::client::RommRequestError::Transport { detail },
+        )) => crate::romm_game::CoverState::Offline(detail),
+        Err(ArtworkRefusal::Request(
+            archivefs_core::identity_source::romm::client::RommRequestError::Timeout,
+        )) => crate::romm_game::CoverState::Offline("RomM did not answer in time".to_string()),
+        Err(
+            refusal @ (ArtworkRefusal::TooLarge { .. }
+            | ArtworkRefusal::NotAnImage { .. }
+            | ArtworkRefusal::DimensionsTooLarge { .. }
+            | ArtworkRefusal::DecodeFailed
+            | ArtworkRefusal::WriteFailed { .. }
+            | ArtworkRefusal::CacheUnusable { .. }),
+        ) => crate::romm_game::CoverState::Failed(refusal.detail()),
+        // The core's own wording, which never contains a URL or a token.
+        Err(refusal) => crate::romm_game::CoverState::Refused(refusal.detail()),
+    };
+    // Read after the fetch rather than incremented, so a clear that ran alongside it
+    // cannot leave a figure on screen that was never true.
+    let stats = cache.stats(source.server_id());
+    Ok(crate::romm_game::CoverOutcome {
+        local_path: local_path.to_path_buf(),
+        romm_game_id: romm_game_id.to_string(),
+        state,
+        cached_items: stats.items as u64,
+        cached_bytes: stats.bytes,
+    })
+}
+
+fn romm_local_facts(
+    record: &archivefs_core::identity_source::model::ExternalIdentityRecord,
+    _trusted: &archivefs_core::safe_read::TrustedRoots,
+) -> archivefs_core::identity_source::matching::LocalFileFacts {
+    use archivefs_core::identity_source::matching::LocalFileFacts;
+    use archivefs_core::identity_source::model::LocalEvidenceStrength;
+    match record.archivefs_path.as_deref() {
+        Some(path) => {
+            let local = archivefs_core::platform::detect::platform_for_folder_name(
+                path.parent()
+                    .and_then(|parent| parent.file_name())
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(""),
+            )
+            .map(|platform| platform.id);
+            LocalFileFacts::observe(path).with_local_platform(
+                local,
+                if local.is_some() {
+                    LocalEvidenceStrength::Weak
+                } else {
+                    LocalEvidenceStrength::None
+                },
+            )
+        }
+        None => LocalFileFacts::default(),
+    }
+}
+
+#[cfg(test)]
+mod romm_dispatch_tests {
+    //! Operation-dispatch tests.
+    //!
+    //! These drive the real `ArchiveFsApp` methods rather than a stand-in, because
+    //! the properties under test are about the app's own bookkeeping: that a second
+    //! click cannot launch a duplicate, that a superseded operation's late traffic
+    //! is discarded, and that a failure never erases counts that were true.
+    //!
+    //! No worker is allowed to run. Each test installs the channels itself, which is
+    //! also the only way to deliver a *late* result deterministically.
+
+    use super::*;
+    use crate::romm_config::ConfigDialogRequest;
+    use crate::romm_source::{RommImportSummary, RommProgressEvent};
+    use archivefs_core::identity_source::artwork::ArtworkCacheStats;
+    use archivefs_core::identity_source::model::{IdentityImportCounts, IdentityProvider};
+    use archivefs_core::identity_source::path_map::ProviderPathKind;
+    use archivefs_core::identity_source::romm::config::RommSourceConfig;
+    use archivefs_core::identity_source::romm::import::ImportProgress;
+    use archivefs_core::identity_source::settings::ProviderSettings;
+    use archivefs_core::identity_source::status::{ProviderState, ProviderStatus};
+
+    fn app() -> ArchiveFsApp {
+        super::tests::app_for_operation_tests()
+    }
+
+    fn refused_gui_config() -> Result<Config, String> {
+        Err("config.toml is temporarily unreadable".to_string())
+    }
+
+    fn output_contains(output: &egui::FullOutput, needle: &str) -> bool {
+        fn shape_contains(shape: &egui::Shape, needle: &str) -> bool {
+            match shape {
+                egui::Shape::Text(text) => text.galley.text().contains(needle),
+                egui::Shape::Vec(nested) => {
+                    nested.iter().any(|shape| shape_contains(shape, needle))
+                }
+                _ => false,
+            }
+        }
+        output
+            .shapes
+            .iter()
+            .any(|shape| shape_contains(&shape.shape, needle))
+    }
+
+    fn snapshot(records: usize, state: ProviderState) -> RommSnapshot {
+        let mut status = ProviderStatus::not_configured(IdentityProvider::Romm);
+        status.state = state;
+        status.records_imported = records;
+        status.counts = IdentityImportCounts {
+            total: records,
+            strong: records,
+            ..IdentityImportCounts::default()
+        };
+        RommSnapshot {
+            settings: ProviderSettings {
+                source: RommSourceConfig {
+                    enabled: true,
+                    url: "http://172.19.0.20:8080".to_string(),
+                    mappings: Vec::new(),
+                    provider_path_kind: ProviderPathKind::ProviderRelative,
+                    token_path: None,
+                },
+                page_size: Some(100),
+            },
+            status,
+            artwork: ArtworkCacheStats {
+                items: 0,
+                bytes: 0,
+                maximum_bytes: 1024 * 1024 * 1024,
+                last_cleanup_unix_seconds: None,
+                directory: PathBuf::from("/tmp/artwork"),
+                format_version: 1,
+            },
+            token_available: true,
+            token_problem: None,
+            cache_format_version: Some(1),
+        }
+    }
+
+    /// Installs a running operation whose channels the test owns, so nothing is
+    /// spawned and a result can be delivered on demand.
+    #[allow(clippy::type_complexity)]
+    fn install_running(
+        app: &mut ArchiveFsApp,
+        operation: RommOperation,
+    ) -> (
+        mpsc::Sender<(u64, Result<RommOperationOutcome, String>)>,
+        mpsc::Sender<(u64, RommProgressEvent)>,
+        u64,
+    ) {
+        app.romm_generation = app.romm_generation.wrapping_add(1);
+        let generation = app.romm_generation;
+        let (sender, receiver) = mpsc::channel();
+        let (progress_sender, progress_receiver) = mpsc::channel();
+        app.romm_operation = Some(RunningRommOperation {
+            generation,
+            operation: operation.clone(),
+            cancellation: Arc::new(AtomicBool::new(false)),
+            receiver,
+            progress_receiver,
+            progress: operation.reports_progress().then(RommProgress::default),
+            cancellation_requested: false,
+        });
+        (sender, progress_sender, generation)
+    }
+
+    fn summary(records: usize) -> RommImportSummary {
+        RommImportSummary {
+            published: true,
+            records,
+            previous_cache_usable: true,
+            ..RommImportSummary::default()
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Human-smoke regressions: RomM window navigation
+    //
+    // Confirmed in Sunshine: the Configure dialog had no visible exit (Save
+    // and Cancel were the last widgets inside its scrolling body, and the
+    // window offered no title-bar close), and "Browse records" opened the
+    // browser inline underneath the source card - below the viewport, so the
+    // click looked inert.
+    // ---------------------------------------------------------------------
+
+    fn tv_input() -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1920.0, 1080.0),
+            )),
+            ..Default::default()
+        }
+    }
+
+    /// Every text shape and its rectangle, for asserting what is on screen
+    /// and where.
+    fn painted(output: &egui::FullOutput) -> Vec<(String, egui::Rect)> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    out.push((text.galley.text().to_string(), text.visual_bounding_rect()))
+                }
+                egui::Shape::Vec(nested) => nested.iter().for_each(|shape| walk(shape, out)),
+                _ => {}
+            }
+        }
+        let mut found = Vec::new();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut found);
+        }
+        found
+    }
+
+    fn rect_of(output: &egui::FullOutput, needle: &str) -> Option<egui::Rect> {
+        painted(output)
+            .into_iter()
+            .find(|(text, _)| text.contains(needle))
+            .map(|(_, rect)| rect)
+    }
+
+    fn run_config_window(
+        app: &mut ArchiveFsApp,
+        context: &egui::Context,
+        input: egui::RawInput,
+    ) -> (egui::FullOutput, Option<ConfigDialogRequest>) {
+        let mut request = None;
+        let output = context.run(input, |context| {
+            egui::CentralPanel::default().show(context, |_ui| {
+                request = app.show_romm_configuration_window(context);
+            });
+        });
+        (output, request)
+    }
+
+    #[test]
+    fn the_configure_window_shows_both_save_and_cancel_inside_the_viewport() {
+        let mut app = app();
+        app.open_romm_configuration();
+        let context = egui::Context::default();
+        // Two frames: the first lays the window out, the second draws it at
+        // its settled size.
+        let (_, _) = run_config_window(&mut app, &context, tv_input());
+        let (output, _) = run_config_window(&mut app, &context, tv_input());
+        let screen = tv_input().screen_rect.unwrap();
+        let save = rect_of(&output, "Save configuration").expect("a visible Save");
+        let cancel = rect_of(&output, "Cancel").expect("a visible Cancel");
+        for (label, rect) in [("Save", save), ("Cancel", cancel)] {
+            assert!(
+                screen.contains_rect(rect),
+                "{label} must be inside the viewport at TV resolution, was {rect:?}"
+            );
+        }
+        assert_ne!(save, cancel, "Save and Cancel are distinct controls");
+    }
+
+    /// The footer must not move when the body scrolls - that is the whole
+    /// point of drawing it outside the scroll area.
+    #[test]
+    fn the_configure_footer_stays_put_while_the_body_scrolls() {
+        let mut app = app();
+        app.open_romm_configuration();
+        let context = egui::Context::default();
+        let (_, _) = run_config_window(&mut app, &context, tv_input());
+        let (before, _) = run_config_window(&mut app, &context, tv_input());
+        let footer_before = rect_of(&before, "Save configuration").expect("Save");
+
+        // Scroll the body hard, over the window's own area.
+        let mut scrolled = tv_input();
+        scrolled.events = vec![
+            egui::Event::PointerMoved(egui::pos2(600.0, 400.0)),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -900.0),
+                phase: egui::TouchPhase::Move,
+                modifiers: Default::default(),
+            },
+        ];
+        let (_, _) = run_config_window(&mut app, &context, scrolled);
+        let (after, _) = run_config_window(&mut app, &context, tv_input());
+        let footer_after = rect_of(&after, "Save configuration").expect("Save still visible");
+
+        assert!(
+            (footer_before.top() - footer_after.top()).abs() < 1.0,
+            "the footer moved when the body scrolled: {footer_before:?} -> {footer_after:?}"
+        );
+        let screen = tv_input().screen_rect.unwrap();
+        assert!(screen.contains_rect(footer_after));
+    }
+
+    #[test]
+    fn the_configure_window_is_clamped_to_the_viewport() {
+        // A small screen must not produce a window taller than it.
+        let (initial, maximum) =
+            romm_dialog_sizes(egui::vec2(1280.0, 720.0), egui::vec2(640.0, 760.0));
+        assert!(maximum.y <= 720.0 && maximum.x <= 1280.0);
+        assert!(initial.y <= maximum.y && initial.x <= maximum.x);
+        // The preferred size is honoured when it fits.
+        let (initial, _) = romm_dialog_sizes(egui::vec2(2560.0, 1440.0), egui::vec2(640.0, 760.0));
+        assert_eq!(initial, egui::vec2(640.0, 760.0));
+    }
+
+    #[test]
+    fn escape_closes_configure_without_writing_anything() {
+        let mut app = app();
+        app.open_romm_configuration();
+        let attempts = app.gui_config.load_attempts;
+        let context = egui::Context::default();
+        let (_, _) = run_config_window(&mut app, &context, tv_input());
+
+        let mut escaped = tv_input();
+        escaped.events = vec![egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        }];
+        let (_, request) = run_config_window(&mut app, &context, escaped);
+        assert_eq!(request, Some(ConfigDialogRequest::Close));
+
+        app.handle_romm_config_request(&context, request.unwrap());
+        assert!(app.romm_config_draft.is_none(), "the dialog is closed");
+        assert!(
+            app.romm_operation.is_none(),
+            "Close must start no operation - no save, no import, no request"
+        );
+        assert_eq!(
+            app.gui_config.load_attempts, attempts,
+            "Close must not rewrite or re-read configuration"
+        );
+    }
+
+    /// Cancel is a plain close: it must never write, import or contact
+    /// anything. `RommOperation` is the only route to any of those, so the
+    /// assertion is that none was started.
+    #[test]
+    fn cancel_closes_configure_without_writing_importing_or_requesting() {
+        let mut app = app();
+        app.open_romm_configuration();
+        let context = egui::Context::default();
+        app.handle_romm_config_request(&context, ConfigDialogRequest::Close);
+        assert!(app.romm_config_draft.is_none());
+        assert!(app.romm_preview.is_none());
+        assert!(app.romm_operation.is_none());
+        assert!(app.romm_snapshot.is_none(), "no snapshot was published");
+    }
+
+    #[test]
+    fn a_duplicate_configure_request_does_not_open_a_second_window() {
+        let mut app = app();
+        app.open_romm_configuration();
+        let first = app
+            .romm_config_draft
+            .as_ref()
+            .map(|draft| draft.url.clone());
+        app.open_romm_configuration();
+        app.open_romm_configuration();
+        assert_eq!(
+            app.romm_config_draft
+                .as_ref()
+                .map(|draft| draft.url.clone()),
+            first,
+            "the draft is the open flag, so re-requesting cannot replace it"
+        );
+
+        let context = egui::Context::default();
+        let (_, _) = run_config_window(&mut app, &context, tv_input());
+        let (output, _) = run_config_window(&mut app, &context, tv_input());
+        let saves = painted(&output)
+            .into_iter()
+            .filter(|(text, _)| text.contains("Save configuration"))
+            .count();
+        assert_eq!(saves, 1, "exactly one dialog, so exactly one Save button");
+    }
+
+    /// The token's *contents* must never reach the GUI. Only a path and a
+    /// verdict do.
+    #[test]
+    fn the_configure_draft_holds_a_token_path_but_never_a_token_value() {
+        let mut app = app();
+        app.open_romm_configuration();
+        let draft = app.romm_config_draft.as_ref().expect("a draft");
+        let rendered = format!("{draft:?}");
+        assert!(
+            !rendered.contains("secret-token-value"),
+            "no token value can be present - none was ever read into the draft"
+        );
+        // The only token-shaped field is a path.
+        assert!(draft.token_path.is_empty() || draft.token_path.starts_with('/'));
+    }
+
+    // --- Browse records ---------------------------------------------------
+
+    fn run_browse_window(
+        app: &mut ArchiveFsApp,
+        context: &egui::Context,
+        input: egui::RawInput,
+    ) -> (egui::FullOutput, Option<crate::romm_browse::BrowseRequest>) {
+        let mut request = None;
+        let output = context.run(input, |context| {
+            egui::CentralPanel::default().show(context, |_ui| {
+                request = app.show_romm_browse_window(context);
+            });
+        });
+        (output, request)
+    }
+
+    #[test]
+    fn browse_records_becomes_visible_inside_the_viewport_immediately() {
+        let mut app = app();
+        let context = egui::Context::default();
+        // Nothing before the click.
+        let (output, _) = run_browse_window(&mut app, &context, tv_input());
+        assert!(!output_contains(&output, "RomM records"));
+
+        // Exactly what the source card's button does.
+        app.open_romm_browse(crate::romm_browse::BrowseView::Records);
+        // egui needs one frame to lay a new window out before it paints at
+        // its settled size; at 60fps that is the same moment for a person.
+        let (_, _) = run_browse_window(&mut app, &context, tv_input());
+        let (output, _) = run_browse_window(&mut app, &context, tv_input());
+        assert!(
+            output_contains(&output, "RomM records"),
+            "one click must make the browser visible, not open it below the fold"
+        );
+
+        let screen = tv_input().screen_rect.unwrap();
+        let close = rect_of(&output, "Close").expect("a visible Close");
+        assert!(
+            screen.contains_rect(close),
+            "the browser's exit must be on screen, not below the fold: {close:?}"
+        );
+        let title = rect_of(&output, "RomM records").expect("a visible title");
+        assert!(
+            screen.contains_rect(title),
+            "the window itself must open inside the viewport: {title:?}"
+        );
+    }
+
+    #[test]
+    fn a_second_browse_click_switches_the_view_without_duplicating_the_window() {
+        let mut app = app();
+        app.open_romm_browse(crate::romm_browse::BrowseView::Records);
+        app.open_romm_browse(crate::romm_browse::BrowseView::Records);
+        assert!(app.romm_browse.is_some());
+
+        let context = egui::Context::default();
+        let (_, _) = run_browse_window(&mut app, &context, tv_input());
+        let (output, _) = run_browse_window(&mut app, &context, tv_input());
+        let closes = painted(&output)
+            .into_iter()
+            .filter(|(text, _)| text == "Close")
+            .count();
+        assert_eq!(closes, 1, "one window, one Close");
+
+        // Switching views reuses the same window rather than stacking one.
+        app.open_romm_browse(crate::romm_browse::BrowseView::Conflicts);
+        assert_eq!(
+            app.romm_browse.as_ref().map(|state| state.view),
+            Some(crate::romm_browse::BrowseView::Conflicts)
+        );
+    }
+
+    /// Ordinary browsing is cache-only. The browser does ask for its first
+    /// page - that is a read of the published cache - but nothing it asks
+    /// for may be an operation that contacts RomM, and `uses_network` is the
+    /// codebase's own answer to which those are.
+    #[test]
+    fn browsing_reads_the_cache_and_never_contacts_romm() {
+        let mut app = app();
+        let attempts = app.gui_config.load_attempts;
+        app.open_romm_browse(crate::romm_browse::BrowseView::Records);
+        let context = egui::Context::default();
+
+        for _ in 0..4 {
+            let (_, request) = run_browse_window(&mut app, &context, tv_input());
+            if let Some(request) = request {
+                assert!(
+                    matches!(
+                        request,
+                        crate::romm_browse::BrowseRequest::LoadRecords { .. }
+                    ),
+                    "an idle browser may only ask to read a cached page, got {request:?}"
+                );
+                app.handle_romm_browse_request(&context, request);
+            }
+            if let Some(running) = app.romm_operation.as_ref() {
+                assert!(
+                    !running.operation.uses_network(),
+                    "browsing started a network operation: {:?}",
+                    running.operation
+                );
+                assert!(
+                    !running.operation.is_mutating(),
+                    "browsing started a mutating operation: {:?}",
+                    running.operation
+                );
+            }
+        }
+        assert_eq!(
+            app.gui_config.load_attempts, attempts,
+            "browsing must not re-read configuration every frame"
+        );
+
+        app.close_romm_browse();
+        assert!(app.romm_browse.is_none());
+    }
+
+    /// Escape closes the browser. Asserted once the first page request has
+    /// been dealt with, because a pending request is what the window reports
+    /// that frame and Escape must not silently overwrite it.
+    #[test]
+    fn escape_closes_the_browser() {
+        let mut app = app();
+        app.open_romm_browse(crate::romm_browse::BrowseView::Records);
+        let context = egui::Context::default();
+        for _ in 0..3 {
+            let (_, request) = run_browse_window(&mut app, &context, tv_input());
+            if let Some(request) = request {
+                app.handle_romm_browse_request(&context, request);
+            }
+        }
+
+        let mut escaped = tv_input();
+        escaped.events = vec![egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        }];
+        let (_, request) = run_browse_window(&mut app, &context, escaped);
+        assert_eq!(
+            request,
+            Some(crate::romm_browse::BrowseRequest::Close),
+            "Escape closes the browser when nothing is layered over it"
+        );
+        app.handle_romm_browse_request(&context, request.unwrap());
+        assert!(app.romm_browse.is_none());
+    }
+
+    /// Closing preserves the filters and page the user had set, so reopening
+    /// is not a reset.
+    #[test]
+    fn the_browser_keeps_its_filters_and_page_while_open() {
+        let mut app = app();
+        app.open_romm_browse(crate::romm_browse::BrowseView::Records);
+        if let Some(state) = app.romm_browse.as_mut() {
+            state.filters.title = "zelda".to_string();
+            state.title_input = "zelda".to_string();
+            state.page_size = 250;
+        }
+        let context = egui::Context::default();
+        for _ in 0..3 {
+            let (_, _) = run_browse_window(&mut app, &context, tv_input());
+        }
+        let state = app.romm_browse.as_ref().expect("still open");
+        assert_eq!(state.filters.title, "zelda");
+        assert_eq!(state.title_input, "zelda");
+        assert_eq!(state.page_size, 250);
+    }
+
+    #[test]
+    fn a_second_click_while_something_runs_launches_nothing() {
+        let mut app = app();
+        let context = egui::Context::default();
+        let (_sender, _progress, generation) = install_running(&mut app, RommOperation::FullImport);
+
+        // The card asking again must be refused, and must not disturb the operation
+        // that is already running.
+        assert!(
+            !app.start_romm_operation(context.clone(), RommOperation::FullImport),
+            "a duplicate must be declined"
+        );
+        assert!(
+            !app.start_romm_operation(context.clone(), RommOperation::TestConnection),
+            "a different operation must also be declined while one runs"
+        );
+        assert_eq!(
+            app.romm_generation, generation,
+            "the generation must not move for a declined start"
+        );
+        assert_eq!(
+            app.romm_operation
+                .as_ref()
+                .map(|running| running.operation.clone()),
+            Some(RommOperation::FullImport),
+            "the running operation must be untouched"
+        );
+    }
+
+    #[test]
+    fn repeated_gui_frames_use_the_cached_config_without_reloading() {
+        let mut app = app();
+        app.open_romm_configuration();
+        let attempts = app.gui_config.load_attempts;
+        let context = egui::Context::default();
+        let mut saw_dialog = false;
+        for _ in 0..4 {
+            let output = context.run(egui::RawInput::default(), |context| {
+                egui::CentralPanel::default().show(context, |_ui| {
+                    let _ = app.show_romm_configuration_window(context);
+                });
+            });
+            saw_dialog |= output_contains(&output, "Configure RomM");
+            assert!(app.romm_config_draft.is_some());
+        }
+        assert!(
+            saw_dialog,
+            "the persistent draft must have a visible window"
+        );
+        assert_eq!(
+            app.gui_config.load_attempts, attempts,
+            "rendering an idle dialog must perform no configuration I/O"
+        );
+    }
+
+    #[test]
+    fn a_failed_explicit_config_reload_preserves_the_previous_snapshot() {
+        let mut app = app();
+        let before = app.gui_config.current.clone();
+        app.gui_config.loader = refused_gui_config;
+        assert!(app.gui_config.reload_default().is_err());
+        assert_eq!(app.gui_config.current, before);
+        assert!(
+            app.gui_config
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("temporarily unreadable"))
+        );
+    }
+
+    #[test]
+    fn a_status_load_is_declined_while_an_operation_runs() {
+        let mut app = app();
+        let context = egui::Context::default();
+        let (_sender, _progress, generation) = install_running(&mut app, RommOperation::Refresh);
+        app.start_romm_status_load(context);
+        assert_eq!(app.romm_generation, generation);
+        assert_eq!(
+            app.romm_operation
+                .as_ref()
+                .map(|running| running.operation.clone()),
+            Some(RommOperation::Refresh)
+        );
+    }
+
+    #[test]
+    fn cancellation_targets_only_the_current_operation() {
+        let mut app = app();
+        let (_sender, _progress, _generation) =
+            install_running(&mut app, RommOperation::FullImport);
+        let flag = app
+            .romm_operation
+            .as_ref()
+            .expect("running")
+            .cancellation
+            .clone();
+        assert!(!flag.load(Ordering::Acquire));
+        app.cancel_romm_operation();
+        assert!(
+            flag.load(Ordering::Acquire),
+            "the worker should be asked to stop"
+        );
+        assert!(
+            app.romm_operation
+                .as_ref()
+                .is_some_and(|running| running.cancellation_requested),
+            "and the card should know, so Cancel stops being offered"
+        );
+
+        // Asking again is harmless.
+        app.cancel_romm_operation();
+        assert!(flag.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn cancelling_with_nothing_running_does_nothing() {
+        let mut app = app();
+        app.cancel_romm_operation();
+        assert!(app.romm_operation.is_none());
+    }
+
+    #[test]
+    fn progress_from_the_current_operation_is_absorbed() {
+        let mut app = app();
+        let context = egui::Context::default();
+        let (_sender, progress, generation) = install_running(&mut app, RommOperation::FullImport);
+        progress
+            .send((
+                generation,
+                RommProgressEvent::Import(ImportProgress {
+                    pages_fetched: 3,
+                    records_fetched: 300,
+                    reported_total: Some(1_000),
+                    page_size: 100,
+                    reduction: None,
+                }),
+            ))
+            .expect("send");
+        progress
+            .send((generation, RommProgressEvent::Note("a note".to_string())))
+            .expect("send");
+        app.poll_romm_operation(&context);
+        let running = app.romm_operation.as_ref().expect("still running");
+        let seen = running.progress.as_ref().expect("progress");
+        assert_eq!(seen.pages_fetched, 3);
+        assert_eq!(seen.records_fetched, 300);
+        assert_eq!(seen.notes, vec!["a note".to_string()]);
+    }
+
+    #[test]
+    fn progress_from_a_superseded_operation_is_discarded() {
+        let mut app = app();
+        let context = egui::Context::default();
+        let (_sender, progress, generation) = install_running(&mut app, RommOperation::FullImport);
+        // The operation is superseded, as it would be by a cancel-then-restart.
+        let stale_generation = generation;
+        app.romm_generation = app.romm_generation.wrapping_add(1);
+        if let Some(running) = app.romm_operation.as_mut() {
+            running.generation = app.romm_generation;
+        }
+        progress
+            .send((
+                stale_generation,
+                RommProgressEvent::Import(ImportProgress {
+                    pages_fetched: 999,
+                    records_fetched: 99_999,
+                    reported_total: None,
+                    page_size: 1,
+                    reduction: None,
+                }),
+            ))
+            .expect("send");
+        app.poll_romm_operation(&context);
+        let running = app.romm_operation.as_ref().expect("still running");
+        let seen = running.progress.as_ref().expect("progress");
+        assert_eq!(
+            seen.pages_fetched, 0,
+            "an older generation's progress must not be shown"
+        );
+        assert_eq!(seen.records_fetched, 0);
+    }
+
+    /// Delivers one finished operation through the real polling path and returns
+    /// the cover cache's generation before and after.
+    fn deliver(
+        operation: RommOperation,
+        outcome: Result<RommOperationOutcome, String>,
+    ) -> (ArchiveFsApp, u64, u64) {
+        let mut app = app();
+        let context = egui::Context::default();
+        app.romm_snapshot = Some(Box::new(snapshot(36_259, ProviderState::Ready)));
+        let (sender, _progress, generation) = install_running(&mut app, operation);
+        let before = app.gamer_covers.generation();
+        sender.send((generation, outcome)).expect("send");
+        app.poll_romm_operation(&context);
+        let after = app.gamer_covers.generation();
+        (app, before, after)
+    }
+
+    #[test]
+    fn a_published_import_refreshes_the_gamer_view_identity_index() {
+        // The signal that makes a game which has just gained a RomM identity
+        // eligible for artwork without restarting ArchiveFS.
+        let (_app, before, after) = deliver(
+            RommOperation::FullImport,
+            Ok(RommOperationOutcome::Import(Box::new(summary(36_259)))),
+        );
+        assert_ne!(
+            before, after,
+            "a published import did not refresh the cover cache"
+        );
+    }
+
+    #[test]
+    fn an_unpublished_import_leaves_the_identity_index_alone() {
+        // A failed import leaves the previous cache in place. Refreshing would
+        // withdraw every cover on screen to revalidate against a catalogue that
+        // never changed - and would discard a working index for nothing.
+        let mut failed = summary(0);
+        failed.published = false;
+        failed.failure = Some("RomM did not answer in time".to_string());
+        let (_app, before, after) = deliver(
+            RommOperation::FullImport,
+            Ok(RommOperationOutcome::Import(Box::new(failed))),
+        );
+        assert_eq!(
+            before, after,
+            "a failed import discarded the current identity index"
+        );
+    }
+
+    #[test]
+    fn a_sample_import_leaves_the_identity_index_alone() {
+        // A sample deliberately never publishes: it is imported, matched and
+        // reported without touching the live cache, so nothing it produces can
+        // change what a local path resolves to.
+        let mut sample = summary(25);
+        sample.published = false;
+        let (_app, before, after) = deliver(
+            RommOperation::SampleImport { records: 25 },
+            Ok(RommOperationOutcome::Sample(Box::new(sample))),
+        );
+        assert_eq!(
+            before, after,
+            "a sample import needlessly invalidated every loaded cover"
+        );
+    }
+
+    #[test]
+    fn a_result_from_a_superseded_operation_is_discarded() {
+        let mut app = app();
+        let context = egui::Context::default();
+        app.romm_snapshot = Some(Box::new(snapshot(36_259, ProviderState::Ready)));
+        let (sender, _progress, generation) = install_running(&mut app, RommOperation::FullImport);
+        let stale_generation = generation;
+        app.romm_generation = app.romm_generation.wrapping_add(1);
+
+        sender
+            .send((
+                stale_generation,
+                Ok(RommOperationOutcome::Import(Box::new(summary(1)))),
+            ))
+            .expect("send");
+        app.poll_romm_operation(&context);
+        assert!(
+            app.romm_ui.last_outcome.is_none(),
+            "a superseded result must not become the visible outcome"
+        );
+        assert_eq!(
+            app.romm_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.status.records_imported),
+            Some(36_259),
+            "and must not disturb the counts"
+        );
+    }
+
+    #[test]
+    fn a_result_arriving_after_the_operation_was_cleared_is_ignored() {
+        let mut app = app();
+        let context = egui::Context::default();
+        // Nothing running: a late send has nowhere to land, and polling must be a
+        // no-op rather than a panic.
+        app.poll_romm_operation(&context);
+        assert!(app.romm_operation.is_none());
+        assert!(app.romm_ui.last_outcome.is_none());
+    }
+
+    #[test]
+    fn a_snapshot_result_sets_the_counts_without_becoming_a_visible_outcome() {
+        let mut app = app();
+        let context = egui::Context::default();
+        let (sender, _progress, generation) = install_running(&mut app, RommOperation::LoadStatus);
+        sender
+            .send((
+                generation,
+                Ok(RommOperationOutcome::Snapshot(Box::new(snapshot(
+                    36_259,
+                    ProviderState::Ready,
+                )))),
+            ))
+            .expect("send");
+        app.poll_romm_operation(&context);
+        assert!(app.romm_operation.is_none(), "the operation finished");
+        assert_eq!(
+            app.romm_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.status.records_imported),
+            Some(36_259)
+        );
+        assert!(
+            app.romm_ui.last_outcome.is_none(),
+            "a status load is not a result worth announcing"
+        );
+    }
+
+    #[test]
+    fn a_completed_mutating_operation_reloads_authoritative_state() {
+        let mut app = app();
+        let context = egui::Context::default();
+        let (sender, _progress, generation) =
+            install_running(&mut app, RommOperation::ClearArtwork);
+        sender
+            .send((
+                generation,
+                Ok(RommOperationOutcome::ArtworkCleared {
+                    items: 39,
+                    bytes: 1_000,
+                }),
+            ))
+            .expect("send");
+        app.poll_romm_operation(&context);
+        // The visible result is the clear...
+        assert!(
+            app.romm_ui
+                .last_outcome
+                .as_ref()
+                .is_some_and(|outcome| outcome.headline.contains("39"))
+        );
+        // ...and a status load was started rather than the card being patched by
+        // hand, so what it shows next comes from disk.
+        assert_eq!(
+            app.romm_operation
+                .as_ref()
+                .map(|running| running.operation.clone()),
+            Some(RommOperation::LoadStatus),
+            "a mutating operation should be followed by an authoritative reload"
+        );
+    }
+
+    #[test]
+    fn a_failed_operation_keeps_the_counts_that_were_true() {
+        let mut app = app();
+        let context = egui::Context::default();
+        app.romm_snapshot = Some(Box::new(snapshot(36_259, ProviderState::Ready)));
+        let (sender, _progress, generation) = install_running(&mut app, RommOperation::Refresh);
+        sender
+            .send((
+                generation,
+                Err("could not reach RomM: connection refused".to_string()),
+            ))
+            .expect("send");
+        app.poll_romm_operation(&context);
+
+        let outcome = app.romm_ui.last_outcome.as_ref().expect("a result");
+        assert!(!outcome.succeeded);
+        assert!(outcome.headline.contains("failed"), "{}", outcome.headline);
+        // The snapshot is untouched: a failure must not blank the card.
+        assert_eq!(
+            app.romm_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.status.records_imported),
+            Some(36_259)
+        );
+        assert!(matches!(
+            app.romm_snapshot.as_ref().map(|s| s.status.state.clone()),
+            Some(ProviderState::Ready)
+        ));
+    }
+
+    #[test]
+    fn a_new_operation_clears_the_previous_result_so_they_are_never_shown_together() {
+        let mut app = app();
+        let context = egui::Context::default();
+        let (sender, _progress, generation) =
+            install_running(&mut app, RommOperation::TestConnection);
+        sender
+            .send((generation, Err("nope".to_string())))
+            .expect("send");
+        app.poll_romm_operation(&context);
+        assert!(app.romm_ui.last_outcome.is_some());
+
+        // Starting something else drops the old outcome.
+        app.romm_operation = None;
+        assert!(app.start_romm_operation(context, RommOperation::TestConnection));
+        assert!(
+            app.romm_ui.last_outcome.is_none(),
+            "an old result beside new progress would be misleading"
+        );
+        // Tidy up: the worker that start spawned owns its own channels and will end
+        // on its own; dropping the app is enough.
+        app.romm_operation = None;
+    }
+
+    #[test]
+    fn opening_the_configuration_dialog_twice_opens_one_dialog() {
+        let mut app = app();
+        app.romm_snapshot = Some(Box::new(snapshot(36_259, ProviderState::Ready)));
+        app.open_romm_configuration();
+        let first_url = app
+            .romm_config_draft
+            .as_ref()
+            .map(|draft| draft.url.clone());
+        assert_eq!(first_url.as_deref(), Some("http://172.19.0.20:8080"));
+
+        // Editing, then asking again: the draft must not be replaced, or a second
+        // click would silently discard what was typed.
+        if let Some(draft) = app.romm_config_draft.as_mut() {
+            draft.url = "http://10.0.0.5:8080".to_string();
+            draft.dirty = true;
+        }
+        app.open_romm_configuration();
+        assert_eq!(
+            app.romm_config_draft
+                .as_ref()
+                .map(|draft| draft.url.clone()),
+            Some("http://10.0.0.5:8080".to_string()),
+            "the open dialog must be left alone"
+        );
+        assert!(
+            app.romm_config_draft
+                .as_ref()
+                .is_some_and(|draft| draft.dirty)
+        );
+    }
+
+    #[test]
+    fn the_dialog_opens_even_when_nothing_has_been_configured() {
+        let mut app = app();
+        assert!(app.romm_snapshot.is_none());
+        app.open_romm_configuration();
+        // Without this, a fresh install could never be configured from the GUI.
+        assert!(app.romm_config_draft.is_some());
+        assert!(
+            app.romm_config_draft
+                .as_ref()
+                .is_some_and(|draft| draft.url.is_empty())
+        );
+    }
+
+    #[test]
+    fn a_save_is_declined_while_an_import_runs() {
+        let mut app = app();
+        let context = egui::Context::default();
+        app.romm_snapshot = Some(Box::new(snapshot(36_259, ProviderState::Ready)));
+        app.open_romm_configuration();
+        let (_sender, _progress, generation) = install_running(&mut app, RommOperation::FullImport);
+
+        let settings = app
+            .romm_config_draft
+            .as_ref()
+            .expect("open")
+            .to_settings(None);
+        app.handle_romm_config_request(&context, ConfigDialogRequest::Save(Box::new(settings)));
+        assert_eq!(
+            app.romm_generation, generation,
+            "the save must not have started"
+        );
+        assert_eq!(
+            app.romm_operation
+                .as_ref()
+                .map(|running| running.operation.clone()),
+            Some(RommOperation::FullImport)
+        );
+        assert!(
+            app.romm_config_draft.is_some(),
+            "and the dialog stays open, so nothing typed is lost"
+        );
+    }
+
+    #[test]
+    fn a_preview_is_declined_while_a_mutating_operation_runs() {
+        let mut app = app();
+        let context = egui::Context::default();
+        app.open_romm_configuration();
+        let (_sender, _progress, generation) = install_running(&mut app, RommOperation::Refresh);
+        app.handle_romm_config_request(&context, ConfigDialogRequest::Preview { limit: 20 });
+        assert_eq!(app.romm_generation, generation);
+        assert_eq!(
+            app.romm_operation
+                .as_ref()
+                .map(|running| running.operation.clone()),
+            Some(RommOperation::Refresh)
+        );
+    }
+
+    #[test]
+    fn a_successful_save_closes_the_dialog_and_reloads_authoritative_state() {
+        let mut app = app();
+        let config_attempts_before = app.gui_config.load_attempts;
+        let context = egui::Context::default();
+        app.romm_snapshot = Some(Box::new(snapshot(36_259, ProviderState::Ready)));
+        app.open_romm_configuration();
+        let settings = app
+            .romm_config_draft
+            .as_ref()
+            .expect("open")
+            .to_settings(None);
+        let (sender, _progress, generation) = install_running(
+            &mut app,
+            RommOperation::SaveConfiguration(Box::new(settings.clone())),
+        );
+        sender
+            .send((
+                generation,
+                Ok(RommOperationOutcome::Saved(Box::new(settings))),
+            ))
+            .expect("send");
+        app.poll_romm_operation(&context);
+
+        assert!(
+            app.romm_config_draft.is_none(),
+            "the dialog has served its purpose"
+        );
+        assert!(
+            app.romm_ui
+                .last_outcome
+                .as_ref()
+                .is_some_and(|outcome| outcome.headline.contains("saved"))
+        );
+        // The card is refreshed from disk rather than from what was typed.
+        assert_eq!(
+            app.romm_operation
+                .as_ref()
+                .map(|running| running.operation.clone()),
+            Some(RommOperation::LoadStatus)
+        );
+        assert_eq!(
+            app.gui_config.load_attempts,
+            config_attempts_before + 1,
+            "a successful save has one deliberate reload boundary"
+        );
+    }
+
+    #[test]
+    fn a_failed_post_save_reload_keeps_the_valid_snapshot_and_reports_it() {
+        let mut app = app();
+        let context = egui::Context::default();
+        let previous = app.gui_config.current.clone();
+        app.gui_config.loader = refused_gui_config;
+        app.open_romm_configuration();
+        let settings = snapshot(1, ProviderState::Ready).settings;
+        let (sender, _progress, generation) = install_running(
+            &mut app,
+            RommOperation::SaveConfiguration(Box::new(settings.clone())),
+        );
+        sender
+            .send((
+                generation,
+                Ok(RommOperationOutcome::Saved(Box::new(settings))),
+            ))
+            .expect("send");
+        app.poll_romm_operation(&context);
+        assert_eq!(app.gui_config.current, previous);
+        assert!(
+            app.feedback
+                .as_ref()
+                .is_some_and(|feedback| feedback.message.contains("previous in-memory"))
+        );
+    }
+
+    #[test]
+    fn a_failed_save_keeps_the_dialog_open_with_its_edits() {
+        let mut app = app();
+        let context = egui::Context::default();
+        app.romm_snapshot = Some(Box::new(snapshot(36_259, ProviderState::Ready)));
+        app.open_romm_configuration();
+        if let Some(draft) = app.romm_config_draft.as_mut() {
+            draft.url = "http://10.0.0.5:8080".to_string();
+            draft.dirty = true;
+        }
+        let settings = app
+            .romm_config_draft
+            .as_ref()
+            .expect("open")
+            .to_settings(None);
+        let (sender, _progress, generation) = install_running(
+            &mut app,
+            RommOperation::SaveConfiguration(Box::new(settings)),
+        );
+        sender
+            .send((
+                generation,
+                Err("the token file is readable by others (mode 0644)".to_string()),
+            ))
+            .expect("send");
+        app.poll_romm_operation(&context);
+
+        assert!(
+            app.romm_config_draft.is_some(),
+            "a refused save must not discard the draft"
+        );
+        assert_eq!(
+            app.romm_config_draft
+                .as_ref()
+                .map(|draft| draft.url.clone()),
+            Some("http://10.0.0.5:8080".to_string())
+        );
+        let outcome = app.romm_ui.last_outcome.as_ref().expect("a result");
+        assert!(!outcome.succeeded);
+        assert!(
+            format!("{:?}", outcome.rows).contains("0644"),
+            "the remedy should survive: {:?}",
+            outcome.rows
+        );
+    }
+
+    #[test]
+    fn a_preview_result_lands_only_while_the_dialog_is_open() {
+        let mut app = app();
+        let context = egui::Context::default();
+        app.open_romm_configuration();
+        let (sender, _progress, generation) =
+            install_running(&mut app, RommOperation::Preview { limit: 20 });
+        sender
+            .send((
+                generation,
+                Ok(RommOperationOutcome::Preview(Box::default())),
+            ))
+            .expect("send");
+        app.poll_romm_operation(&context);
+        assert!(app.romm_preview.is_some(), "the open dialog should show it");
+        // A preview is read-only, so no reload follows it.
+        assert!(app.romm_operation.is_none());
+
+        // With the dialog closed, a late preview has nowhere to go and is dropped.
+        app.close_romm_configuration();
+        let (sender, _progress, generation) =
+            install_running(&mut app, RommOperation::Preview { limit: 20 });
+        sender
+            .send((
+                generation,
+                Ok(RommOperationOutcome::Preview(Box::default())),
+            ))
+            .expect("send");
+        app.poll_romm_operation(&context);
+        assert!(
+            app.romm_preview.is_none(),
+            "a preview for a dialog that has gone must be discarded"
+        );
+    }
+
+    #[test]
+    fn closing_the_dialog_forgets_the_preview() {
+        let mut app = app();
+        app.open_romm_configuration();
+        app.romm_preview = Some(Box::new(crate::romm_config::RommPreviewSummary::default()));
+        app.close_romm_configuration();
+        assert!(app.romm_config_draft.is_none());
+        assert!(app.romm_preview.is_none());
+    }
+
+    #[test]
+    fn a_preview_is_not_recorded_as_a_mutating_activity() {
+        let mut app = app();
+        let context = egui::Context::default();
+        let before = app.history.entries().count();
+        assert!(app.start_romm_operation(context, RommOperation::Preview { limit: 20 }));
+        assert_eq!(
+            app.history.entries().count(),
+            before,
+            "a preview changes nothing, so it is not an activity worth recording"
+        );
+        // But it does block the card's actions while it runs.
+        assert!(RommOperation::Preview { limit: 20 }.blocks_actions());
+        assert!(!RommOperation::Preview { limit: 20 }.is_mutating());
+        app.romm_operation = None;
+    }
+
+    #[test]
+    fn opening_a_browse_view_twice_opens_one_panel_and_switching_keeps_it() {
+        use crate::romm_browse::BrowseView;
+        let mut app = app();
+        app.open_romm_browse(BrowseView::Records);
+        assert!(app.romm_browse.is_some());
+        // A second click on the same view leaves the panel and its results alone.
+        app.romm_browse.as_mut().expect("open").needs_reload = true;
+        app.open_romm_browse(BrowseView::Records);
+        assert!(
+            app.romm_browse
+                .as_ref()
+                .is_some_and(|state| state.needs_reload),
+            "the open panel must not be replaced"
+        );
+        // Switching views keeps the panel but drops a detail that belonged elsewhere.
+        app.open_romm_browse(BrowseView::StaleSummary);
+        assert_eq!(
+            app.romm_browse.as_ref().map(|state| state.view),
+            Some(BrowseView::StaleSummary)
+        );
+        assert!(
+            app.romm_browse
+                .as_ref()
+                .is_some_and(|state| state.detail.is_none())
+        );
+    }
+
+    #[test]
+    fn browsing_is_never_recorded_as_a_mutating_activity() {
+        let mut app = app();
+        let context = egui::Context::default();
+        let before = app.history.entries().count();
+        for operation in [
+            RommOperation::LoadRecords {
+                filters: Box::default(),
+                offset: 0,
+                limit: 25,
+            },
+            RommOperation::LoadConflicts { offset: 0 },
+            RommOperation::StaleSummary,
+            RommOperation::LoadRecordDetail {
+                romm_game_id: "1".to_string(),
+            },
+        ] {
+            assert!(!operation.is_mutating(), "{operation:?} changes nothing");
+            assert!(
+                operation.blocks_actions(),
+                "{operation:?} should still block"
+            );
+            assert!(app.start_romm_operation(context.clone(), operation));
+            app.romm_operation = None;
+        }
+        assert_eq!(
+            app.history.entries().count(),
+            before,
+            "reading the cache is not an activity worth recording"
+        );
+    }
+
+    #[test]
+    fn a_detail_terminal_result_is_delivered_once_to_the_requested_row() {
+        let mut app = app();
+        let context = egui::Context::default();
+        app.open_romm_browse(crate::romm_browse::BrowseView::Records);
+        app.romm_browse
+            .as_mut()
+            .expect("open")
+            .begin_detail("2".to_string());
+        let (sender, _progress, generation) = install_running(
+            &mut app,
+            RommOperation::LoadRecordDetail {
+                romm_game_id: "2".to_string(),
+            },
+        );
+        sender
+            .send((
+                generation,
+                Ok(RommOperationOutcome::RecordDetail(Box::new(None))),
+            ))
+            .expect("send");
+        app.poll_romm_operation(&context);
+        let state = app.romm_browse.as_ref().expect("open");
+        assert!(state.pending_detail_id.is_none());
+        assert!(
+            state
+                .detail_problem
+                .as_deref()
+                .is_some_and(|problem| problem.contains("record 2"))
+        );
+        assert!(app.romm_operation.is_none());
+    }
+
+    #[test]
+    fn a_stale_detail_result_cannot_attach_to_a_different_row() {
+        let mut app = app();
+        let context = egui::Context::default();
+        app.open_romm_browse(crate::romm_browse::BrowseView::Records);
+        app.romm_browse
+            .as_mut()
+            .expect("open")
+            .begin_detail("1".to_string());
+        let (sender, _progress, generation) = install_running(
+            &mut app,
+            RommOperation::LoadRecordDetail {
+                romm_game_id: "1".to_string(),
+            },
+        );
+        // The selection changed before the old result arrived.
+        app.romm_browse
+            .as_mut()
+            .expect("open")
+            .begin_detail("2".to_string());
+        sender
+            .send((
+                generation,
+                Ok(RommOperationOutcome::RecordDetail(Box::new(None))),
+            ))
+            .expect("send");
+        app.poll_romm_operation(&context);
+        let state = app.romm_browse.as_ref().expect("open");
+        assert_eq!(state.pending_detail_id.as_deref(), Some("2"));
+        assert!(state.detail.is_none());
+        assert!(state.detail_problem.is_none());
+    }
+
+    #[test]
+    fn a_duplicate_records_load_is_declined() {
+        let mut app = app();
+        let context = egui::Context::default();
+        app.open_romm_browse(crate::romm_browse::BrowseView::Records);
+        let (_sender, _progress, generation) = install_running(
+            &mut app,
+            RommOperation::LoadRecords {
+                filters: Box::default(),
+                offset: 0,
+                limit: 25,
+            },
+        );
+        app.handle_romm_browse_request(
+            &context,
+            crate::romm_browse::BrowseRequest::LoadRecords {
+                offset: 25,
+                limit: 25,
+            },
+        );
+        assert_eq!(
+            app.romm_generation, generation,
+            "a second page request while one is in flight must be declined"
+        );
+    }
+
+    #[test]
+    fn a_page_for_superseded_filters_marks_the_view_stale_rather_than_drawing() {
+        use crate::romm_browse::{BrowseView, RecordFilters};
+        let mut app = app();
+        let context = egui::Context::default();
+        app.open_romm_browse(BrowseView::Records);
+        let (sender, _progress, generation) = install_running(
+            &mut app,
+            RommOperation::LoadRecords {
+                filters: Box::default(),
+                offset: 0,
+                limit: 25,
+            },
+        );
+        // A page produced under the default filters...
+        let cache = browse_cache();
+        let page = crate::romm_browse::build_record_page(
+            &cache,
+            &RecordFilters::default(),
+            0,
+            25,
+            &|_| archivefs_core::identity_source::matching::LocalPresence::Absent,
+        );
+        // ...arrives after the view has changed its filters.
+        if let Some(state) = app.romm_browse.as_mut() {
+            state.filters.verdict =
+                Some(archivefs_core::identity_source::model::ExternalVerification::Stale);
+        }
+        sender
+            .send((
+                generation,
+                Ok(RommOperationOutcome::Records(Box::new(page))),
+            ))
+            .expect("send");
+        app.poll_romm_operation(&context);
+
+        let state = app.romm_browse.as_ref().expect("still open");
+        assert!(
+            state.page.is_none(),
+            "a page answering the previous filters must not be drawn"
+        );
+        assert!(state.needs_reload, "and the view should say so");
+    }
+
+    #[test]
+    fn a_page_from_a_superseded_cache_marks_the_view_stale() {
+        use crate::romm_browse::{BrowseView, RecordFilters};
+        let mut app = app();
+        let context = egui::Context::default();
+        app.open_romm_browse(BrowseView::Records);
+        let (sender, _progress, generation) = install_running(
+            &mut app,
+            RommOperation::LoadRecords {
+                filters: Box::default(),
+                offset: 0,
+                limit: 25,
+            },
+        );
+        // A page from a cache that has since been replaced by an import.
+        let mut cache = browse_cache();
+        cache.imported_at_unix_seconds += 1;
+        let page = crate::romm_browse::build_record_page(
+            &cache,
+            &RecordFilters::default(),
+            0,
+            25,
+            &|_| archivefs_core::identity_source::matching::LocalPresence::Absent,
+        );
+        // The view holds a page from the earlier cache.
+        let earlier = browse_cache();
+        if let Some(state) = app.romm_browse.as_mut() {
+            state.page = Some(Box::new(crate::romm_browse::build_record_page(
+                &earlier,
+                &RecordFilters::default(),
+                0,
+                25,
+                &|_| archivefs_core::identity_source::matching::LocalPresence::Absent,
+            )));
+        }
+        sender
+            .send((
+                generation,
+                Ok(RommOperationOutcome::Records(Box::new(page))),
+            ))
+            .expect("send");
+        app.poll_romm_operation(&context);
+        // The identity in the arriving page is its own, so it is accepted - what this
+        // pins is that the check is made against the page's cache rather than assumed.
+        let state = app.romm_browse.as_ref().expect("still open");
+        assert!(state.page.is_some());
+        assert_eq!(
+            state
+                .page
+                .as_ref()
+                .map(|page| page.cache.imported_at_unix_seconds),
+            Some(earlier.imported_at_unix_seconds + 1)
+        );
+    }
+
+    #[test]
+    fn a_result_arriving_after_the_panel_closed_is_dropped_without_panicking() {
+        use crate::romm_browse::{BrowseView, RecordFilters};
+        let mut app = app();
+        let context = egui::Context::default();
+        app.open_romm_browse(BrowseView::Records);
+        let (sender, _progress, generation) = install_running(
+            &mut app,
+            RommOperation::LoadRecords {
+                filters: Box::default(),
+                offset: 0,
+                limit: 25,
+            },
+        );
+        app.close_romm_browse();
+        let cache = browse_cache();
+        let page = crate::romm_browse::build_record_page(
+            &cache,
+            &RecordFilters::default(),
+            0,
+            25,
+            &|_| archivefs_core::identity_source::matching::LocalPresence::Absent,
+        );
+        sender
+            .send((
+                generation,
+                Ok(RommOperationOutcome::Records(Box::new(page))),
+            ))
+            .expect("send");
+        app.poll_romm_operation(&context);
+        assert!(app.romm_browse.is_none());
+        assert!(
+            app.romm_ui.last_outcome.is_none(),
+            "a browsing result is not a card outcome"
+        );
+    }
+
+    #[test]
+    fn stale_summary_progress_is_absorbed_and_cleared_when_it_finishes() {
+        use crate::romm_browse::BrowseView;
+        let mut app = app();
+        let context = egui::Context::default();
+        app.open_romm_browse(BrowseView::StaleSummary);
+        let (sender, progress, generation) = install_running(&mut app, RommOperation::StaleSummary);
+        progress
+            .send((
+                generation,
+                RommProgressEvent::StaleProgress {
+                    probed: 2_500,
+                    total: 10_081,
+                },
+            ))
+            .expect("send");
+        app.poll_romm_operation(&context);
+        assert_eq!(
+            app.romm_stale_progress.map(|progress| progress.probed),
+            Some(2_500),
+            "the panel should be able to show how far it has got"
+        );
+
+        let cache = browse_cache();
+        let view = crate::romm_browse::StaleSummaryView {
+            cache: crate::romm_browse::CacheIdentity::of(&cache),
+            summary: archivefs_core::identity_source::stale::StaleSummary::build(
+                &cache,
+                &[],
+                3,
+                |_| archivefs_core::identity_source::matching::LocalPresence::Absent,
+            ),
+        };
+        sender
+            .send((generation, Ok(RommOperationOutcome::Stale(Box::new(view)))))
+            .expect("send");
+        app.poll_romm_operation(&context);
+        assert!(
+            app.romm_stale_progress.is_none(),
+            "progress should be cleared once the result is in"
+        );
+        assert!(
+            app.romm_browse
+                .as_ref()
+                .is_some_and(|state| state.stale.is_some())
+        );
+    }
+
+    #[test]
+    fn a_cancelled_stale_summary_publishes_no_partial_result() {
+        use crate::romm_browse::BrowseView;
+        let mut app = app();
+        let context = egui::Context::default();
+        app.open_romm_browse(BrowseView::StaleSummary);
+        let (sender, _progress, generation) =
+            install_running(&mut app, RommOperation::StaleSummary);
+        sender
+            .send((
+                generation,
+                Err("The stale summary was cancelled. Nothing was changed.".to_string()),
+            ))
+            .expect("send");
+        app.poll_romm_operation(&context);
+        assert!(
+            app.romm_browse
+                .as_ref()
+                .is_some_and(|state| state.stale.is_none()),
+            "a half-probed partition must not be shown as a finding"
+        );
+        let outcome = app
+            .romm_ui
+            .last_outcome
+            .as_ref()
+            .expect("the failure is reported");
+        assert!(!outcome.succeeded);
+    }
+
+    /// A small cache for the dispatch tests.
+    fn browse_cache() -> archivefs_core::identity_source::cache::IdentityCache {
+        archivefs_core::identity_source::cache::IdentityCache {
+            format_version: archivefs_core::identity_source::cache::CACHE_FORMAT_VERSION,
+            provider: IdentityProvider::Romm,
+            server_id: "http://172.19.0.20:8080".to_string(),
+            server_version: Some("5.1.0".to_string()),
+            source_fingerprint: "abcd1234".to_string(),
+            imported_at_unix_seconds: 1_785_595_944,
+            platforms: Vec::new(),
+            records: Vec::new(),
+            rejected_hashes: Vec::new(),
+            unknown_platforms: Vec::new(),
+            server_reported_total: Some(0),
+        }
+    }
+
+    #[test]
+    fn a_mutating_operation_is_recorded_in_history_and_a_status_load_is_not() {
+        let mut app = app();
+        let context = egui::Context::default();
+        let before = app.history.entries().count();
+        app.start_romm_status_load(context.clone());
+        assert_eq!(
+            app.history.entries().count(),
+            before,
+            "reading local state is not an activity worth recording"
+        );
+        app.romm_operation = None;
+
+        assert!(app.start_romm_operation(context, RommOperation::ClearArtwork));
+        assert_eq!(
+            app.history.entries().count(),
+            before + 1,
+            "a mutating operation should be auditable"
+        );
+        app.romm_operation = None;
+    }
+
+    // --- Selected-game panel -------------------------------------------
+
+    fn game_panel_app(path: &str) -> ArchiveFsApp {
+        let mut app = app();
+        app.romm_snapshot = Some(Box::new(snapshot(36_259, ProviderState::Ready)));
+        app.archive_context.focused = Some(PathBuf::from(path));
+        app.romm_game.focus(Some(Path::new(path)));
+        app
+    }
+
+    fn panel_for(path: &str, game_id: &str) -> crate::romm_game::GameIdentityPanel {
+        use archivefs_core::identity_source::cache::{CACHE_FORMAT_VERSION, IdentityCache};
+        use archivefs_core::identity_source::hashing::LocalHashCache;
+        use archivefs_core::identity_source::matching::LocalFileFacts;
+        use archivefs_core::identity_source::model::{
+            ExternalIdentityRecord, ExternalVerification,
+        };
+
+        let record = ExternalIdentityRecord {
+            provider: IdentityProvider::Romm,
+            server_id: "http://172.19.0.20:8080".to_string(),
+            provider_platform_id: Some("7".to_string()),
+            provider_game_id: game_id.to_string(),
+            provider_file_id: None,
+            provider_path: "roms/gb/game.gb".to_string(),
+            archivefs_path: Some(PathBuf::from(path)),
+            title: Some("Game".to_string()),
+            platform_candidate: Some("Game Boy".to_string()),
+            provider_platform_name: Some("gb".to_string()),
+            regions: Vec::new(),
+            revision: None,
+            hashes: Vec::new(),
+            file_size_bytes: None,
+            metadata_provider_ids: Vec::new(),
+            artwork: None,
+            related_files: Vec::new(),
+            sibling_game_ids: Vec::new(),
+            imported_at_unix_seconds: 1_785_595_944,
+            provider_updated_at: None,
+            verification: ExternalVerification::StrongExternal,
+            conflicts: Vec::new(),
+            evidence: Vec::new(),
+        };
+        let cache = IdentityCache {
+            format_version: CACHE_FORMAT_VERSION,
+            provider: IdentityProvider::Romm,
+            server_id: "http://172.19.0.20:8080".to_string(),
+            server_version: None,
+            source_fingerprint: "abcd".to_string(),
+            imported_at_unix_seconds: 1_785_595_944,
+            platforms: Vec::new(),
+            records: vec![record],
+            rejected_hashes: Vec::new(),
+            unknown_platforms: Vec::new(),
+            server_reported_total: Some(1),
+        };
+        crate::romm_game::resolve_selected_game(
+            &cache,
+            Path::new(path),
+            &LocalHashCache::new(),
+            &crate::romm_game::LocalPlatformClaim::default(),
+            None,
+            &|probe: &Path| LocalFileFacts::observe(probe),
+        )
+    }
+
+    #[test]
+    fn a_second_lookup_while_one_runs_is_declined() {
+        let context = egui::Context::default();
+        let mut app = game_panel_app("/mnt/games/roms/gb/game.gb");
+        let operation = RommOperation::ResolveGame {
+            local_path: PathBuf::from("/mnt/games/roms/gb/game.gb"),
+            local_platform: Box::new(crate::romm_game::LocalPlatformClaim::default()),
+            chosen_game_id: None,
+        };
+        let (_sender, _progress, generation) = install_running(&mut app, operation.clone());
+        assert!(!app.start_romm_operation(context, operation));
+        assert_eq!(app.romm_generation, generation, "nothing was superseded");
+        app.romm_operation = None;
+    }
+
+    #[test]
+    fn looking_up_the_selected_game_is_not_recorded_as_an_activity() {
+        let context = egui::Context::default();
+        let mut app = game_panel_app("/mnt/games/roms/gb/game.gb");
+        let before = app.history.entries().count();
+        assert!(app.start_romm_operation(
+            context,
+            RommOperation::ResolveGame {
+                local_path: PathBuf::from("/mnt/games/roms/gb/game.gb"),
+                local_platform: Box::new(crate::romm_game::LocalPlatformClaim::default()),
+                chosen_game_id: None,
+            }
+        ));
+        assert_eq!(
+            app.history.entries().count(),
+            before,
+            "reading the cache changes nothing, so there is nothing to audit"
+        );
+        app.romm_operation = None;
+    }
+
+    #[test]
+    fn verifying_a_local_file_is_recorded_as_an_activity_without_the_path() {
+        let context = egui::Context::default();
+        let mut app = game_panel_app("/mnt/games/roms/gb/game.gb");
+        let before = app.history.entries().count();
+        assert!(app.start_romm_operation(
+            context,
+            RommOperation::VerifyLocalFile {
+                local_path: PathBuf::from("/mnt/games/roms/gb/game.gb"),
+                romm_game_id: "1".to_string(),
+                local_platform: Box::new(crate::romm_game::LocalPlatformClaim::default()),
+                chosen_game_id: None,
+            }
+        ));
+        assert_eq!(app.history.entries().count(), before + 1);
+        let entry = app.history.entries().next().expect("an entry");
+        assert!(
+            !entry.message.contains("/mnt/games"),
+            "a private path must not reach the activity list: {}",
+            entry.message
+        );
+        app.romm_operation = None;
+    }
+
+    #[test]
+    fn a_resolved_panel_for_the_current_selection_lands() {
+        let context = egui::Context::default();
+        let path = "/mnt/games/roms/gb/game.gb";
+        let mut app = game_panel_app(path);
+        let (sender, _progress, generation) = install_running(
+            &mut app,
+            RommOperation::ResolveGame {
+                local_path: PathBuf::from(path),
+                local_platform: Box::new(crate::romm_game::LocalPlatformClaim::default()),
+                chosen_game_id: None,
+            },
+        );
+        sender
+            .send((
+                generation,
+                Ok(RommOperationOutcome::GameIdentity(Box::new(panel_for(
+                    path, "1",
+                )))),
+            ))
+            .expect("sent");
+        app.poll_romm_operation(&context);
+        assert!(app.romm_game.panel.is_some());
+        assert!(!app.romm_game.needs_reload);
+        assert!(
+            app.romm_ui.last_outcome.is_none(),
+            "a lookup is panel state, not a card banner"
+        );
+    }
+
+    #[test]
+    fn a_panel_that_arrives_after_the_selection_moved_is_not_drawn() {
+        let context = egui::Context::default();
+        let mut app = game_panel_app("/mnt/games/roms/gb/game.gb");
+        let (sender, _progress, generation) = install_running(
+            &mut app,
+            RommOperation::ResolveGame {
+                local_path: PathBuf::from("/mnt/games/roms/gb/game.gb"),
+                local_platform: Box::new(crate::romm_game::LocalPlatformClaim::default()),
+                chosen_game_id: None,
+            },
+        );
+        // The person clicked a different archive while the lookup was in flight.
+        app.romm_game
+            .focus(Some(Path::new("/mnt/games/roms/gb/other.gb")));
+        sender
+            .send((
+                generation,
+                Ok(RommOperationOutcome::GameIdentity(Box::new(panel_for(
+                    "/mnt/games/roms/gb/game.gb",
+                    "1",
+                )))),
+            ))
+            .expect("sent");
+        app.poll_romm_operation(&context);
+        assert!(
+            app.romm_game.panel.is_none(),
+            "one game's evidence must not attach to another's file"
+        );
+        assert!(app.romm_game.needs_reload, "and it says so");
+    }
+
+    #[test]
+    fn hash_progress_from_a_superseded_generation_is_discarded() {
+        let context = egui::Context::default();
+        let mut app = game_panel_app("/mnt/games/roms/gb/game.gb");
+        let (_sender, progress, generation) = install_running(
+            &mut app,
+            RommOperation::VerifyLocalFile {
+                local_path: PathBuf::from("/mnt/games/roms/gb/game.gb"),
+                romm_game_id: "1".to_string(),
+                local_platform: Box::new(crate::romm_game::LocalPlatformClaim::default()),
+                chosen_game_id: None,
+            },
+        );
+        app.romm_generation = app.romm_generation.wrapping_add(1);
+        if let Some(running) = app.romm_operation.as_mut() {
+            running.generation = app.romm_generation;
+        }
+        progress
+            .send((
+                generation,
+                RommProgressEvent::Hashing(crate::romm_game::HashProgressView {
+                    file_label: "stale.gb".to_string(),
+                    bytes_read: 1,
+                    total_bytes: 2,
+                    elapsed_seconds: 0,
+                    cancellation_requested: false,
+                }),
+            ))
+            .expect("sent");
+        app.poll_romm_operation(&context);
+        assert!(
+            app.romm_hash_progress.is_none(),
+            "progress from an operation nobody is waiting for must not be shown"
+        );
+    }
+
+    #[test]
+    fn a_cover_for_a_record_that_is_no_longer_chosen_does_not_land() {
+        let context = egui::Context::default();
+        let path = "/mnt/games/roms/gb/game.gb";
+        let mut app = game_panel_app(path);
+        app.romm_game.panel = Some(Box::new(panel_for(path, "1")));
+        let (sender, _progress, generation) = install_running(
+            &mut app,
+            RommOperation::LoadCover {
+                local_path: PathBuf::from(path),
+                romm_game_id: "999".to_string(),
+            },
+        );
+        sender
+            .send((
+                generation,
+                Ok(RommOperationOutcome::Cover(Box::new(
+                    crate::romm_game::CoverOutcome {
+                        local_path: PathBuf::from(path),
+                        romm_game_id: "999".to_string(),
+                        state: crate::romm_game::CoverState::Unavailable(
+                            crate::romm_game::ArtworkAvailability::None,
+                        ),
+                        cached_items: 5,
+                        cached_bytes: 500,
+                    },
+                ))),
+            ))
+            .expect("sent");
+        app.poll_romm_operation(&context);
+        assert_eq!(app.romm_game.cover, crate::romm_game::CoverState::Idle);
+        assert!(app.romm_game.cover_cache.is_none());
+    }
+
+    #[test]
+    fn moving_the_selection_between_frames_clears_the_panel() {
+        let mut app = game_panel_app("/mnt/games/roms/gb/game.gb");
+        app.romm_game.panel = Some(Box::new(panel_for("/mnt/games/roms/gb/game.gb", "1")));
+        app.archive_context.focused = Some(PathBuf::from("/mnt/games/roms/gb/other.gb"));
+        // The renderer follows the selection at the top of every frame.
+        app.romm_game.focus(app.archive_context.focused.as_deref());
+        assert!(app.romm_game.panel.is_none());
+    }
+}
+
+/// Translates a bounded sample of provider paths and reports what each becomes.
+///
+/// Prefers the published cache, because previewing against records that were really
+/// imported costs nothing and needs no network. Only when there is no cache does it
+/// ask RomM, and then for one bounded page.
+///
+/// Publishes nothing, writes nothing, and reads only file *metadata* - the presence
+/// probe never opens a file.
+fn run_romm_preview(
+    api: &archivefs_core::identity_source::status::IdentitySourceApi,
+    source: &archivefs_core::identity_source::romm::config::ValidatedRommSource,
+    transport: &archivefs_core::identity_source::romm::client::UreqTransport,
+    settings: &archivefs_core::identity_source::settings::ProviderSettings,
+    trusted_roots: &[PathBuf],
+    limit: usize,
+    cancellation: &Arc<AtomicBool>,
+) -> Result<romm_config::RommPreviewSummary, String> {
+    use archivefs_core::identity_source::matching::LocalPresence;
+    use archivefs_core::identity_source::path_map::{MappingPreview, PathMappings};
+
+    let limit = limit.clamp(1, romm_config::MAX_PREVIEW_LIMIT);
+    let engine = PathMappings::validate(
+        &settings.source.mappings,
+        trusted_roots,
+        settings.source.provider_path_kind,
+    )
+    .map_err(|refusal| refusal.detail())?;
+
+    let (samples, platforms, sample_source) = match api.open_cache(None) {
+        Ok(cache) => {
+            let samples: Vec<String> = cache
+                .records
+                .iter()
+                .take(limit)
+                .map(|record| record.provider_path.clone())
+                .collect();
+            let platforms: Vec<Option<String>> = cache
+                .records
+                .iter()
+                .take(limit)
+                .map(|record| record.platform_candidate.clone())
+                .collect();
+            (samples, platforms, "the published identity cache")
+        }
+        Err(_) => {
+            let client =
+                archivefs_core::identity_source::romm::client::RommClient::new(source, transport);
+            let page = client
+                .roms_page(u32::try_from(limit).unwrap_or(20), 0, Some(cancellation))
+                .map_err(|error| error.detail())?;
+            let samples: Vec<String> = page
+                .items
+                .iter()
+                .map(archivefs_core::identity_source::romm::normalise::provider_path_of)
+                .filter(|path| !path.is_empty())
+                .collect();
+            let platforms: Vec<Option<String>> = page
+                .items
+                .iter()
+                .map(|item| {
+                    item.get("platform_slug")
+                        .and_then(|value| value.as_str())
+                        .and_then(
+                            archivefs_core::identity_source::romm::normalise::canonical_platform_for_romm_slug,
+                        )
+                        .map(str::to_string)
+                })
+                .collect();
+            (samples, platforms, "a bounded RomM sample")
+        }
+    };
+    if cancellation.load(Ordering::Acquire) {
+        return Err("The preview was cancelled.".to_string());
+    }
+
+    let preview = MappingPreview::build(&engine, &samples);
+    let presence_for = |path: &Path| LocalPresence::observe(path).code();
+    let examples: Vec<romm_config::PreviewExampleView> = preview
+        .translations
+        .iter()
+        .enumerate()
+        .map(|(index, translation)| {
+            romm_config::preview_example(
+                translation,
+                platforms.get(index).cloned().flatten(),
+                &presence_for,
+            )
+        })
+        .collect();
+    Ok(romm_config::summarise_preview(
+        examples,
+        settings.source.provider_path_kind,
+        preview.observed_relative,
+        preview.observed_absolute,
+        sample_source,
+    ))
 }
