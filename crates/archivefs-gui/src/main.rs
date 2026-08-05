@@ -3724,6 +3724,16 @@ struct ArchiveFsApp {
     /// actually draws the list so a session that never opens Gamer View never
     /// opens the catalogue. `None` until then.
     gamer_cover_worker: Option<crate::gamer_artwork::CoverWorker>,
+    /// Whether a cover worker may be started at all. Always true in the running
+    /// application.
+    ///
+    /// Tests set it false. Starting the worker opens the real per-user identity
+    /// cache under `$HOME` and, for a developer who has RomM configured, can
+    /// reach their instance - neither of which a `cargo test` run may do. It
+    /// also made cover tests racy: the worker answered the very rows the test
+    /// was driving by hand, so a reply could overwrite the slot under test
+    /// between one frame and the next.
+    gamer_cover_worker_allowed: bool,
     /// The `config_identity` the cover cache's answers were resolved against.
     /// A change means the same path may now be a different archive, so every
     /// answer is discarded - see `GamerCoverCache::library_changed`.
@@ -3900,6 +3910,7 @@ impl ArchiveFsApp {
                 .unwrap_or_default(),
             gamer_covers: crate::gamer_artwork::GamerCoverCache::default(),
             gamer_cover_worker: None,
+            gamer_cover_worker_allowed: true,
             gamer_cover_library: None,
         }
     }
@@ -12875,7 +12886,7 @@ impl ArchiveFsApp {
                     // so a session that never opens Gamer View never opens the
                     // catalogue, and an empty or unfiltered-to-nothing list starts
                     // no thread at all.
-                    if !cover_requests.is_empty() {
+                    if !cover_requests.is_empty() && self.gamer_cover_worker_allowed {
                         let worker = self.gamer_cover_worker.get_or_insert_with(|| {
                             crate::gamer_artwork::CoverWorker::start(
                                 ui.ctx().clone(),
@@ -40829,6 +40840,11 @@ mod tests {
         // frame that actually asks for a cover, so a Gamer View with nothing to
         // show must never bring it up: no thread, no catalogue read, no request.
         let mut app = app_for_operation_tests();
+        // Opted back in on purpose: this is the one test whose subject *is*
+        // whether the worker starts, so suppressing it would prove nothing. It
+        // is safe here precisely because an empty list must never reach the
+        // start site - if that regressed, this test starts a thread and fails.
+        app.gamer_cover_worker_allowed = true;
         app.state = LoadState::Ready(Box::new(loaded_data_with_records("/mount", Vec::new())));
         app.ui_mode = GuiMode::GamerView;
         app.view = MainView::Library;
@@ -49823,6 +49839,10 @@ $Instant Growth [Nayr]\n";
             // No worker in tests: nothing here may open the real catalogue or
             // touch the network. Covers are driven through `absorb` instead.
             gamer_cover_worker: None,
+            // Never true in tests: starting the worker would open the real
+            // per-user identity cache and could reach a configured RomM
+            // instance. Tests drive `gamer_covers` directly instead.
+            gamer_cover_worker_allowed: false,
             gamer_cover_library: None,
         }
     }
@@ -63869,6 +63889,33 @@ $Instant Growth [Nayr]\n";
             "the row shifted when its cover was withdrawn"
         );
         assert!(rendered_text_contains(&after, "Game 00000"));
+    }
+
+    #[test]
+    fn rendering_gamer_view_in_a_test_never_starts_a_real_cover_worker() {
+        // The worker opens the per-user identity cache under $HOME and, for a
+        // developer with RomM configured, can reach their instance. A test run
+        // must do neither.
+        //
+        // It was also the cause of a CI-only failure: the worker answered the
+        // same rows the cover tests drive by hand, so a reply landing between
+        // two frames replaced the slot under test with a placeholder. It won
+        // that race on a slow two-core runner and lost it on a fast
+        // workstation, which is why the suite passed locally and failed in CI.
+        let (mut app, ctx) = gamer_cover_app(24);
+        run_frames(&mut app, &ctx, 1920.0, 1080.0, 4);
+
+        assert!(
+            app.gamer_cover_worker.is_none(),
+            "a test frame started a cover worker, so the suite reads real user \
+             data and cover tests race it"
+        );
+        // The scheduling itself must still run - suppressing the thread must not
+        // quietly turn the cover column off and make the other tests vacuous.
+        assert!(
+            app.gamer_covers.tracked() > 0,
+            "no cover was scheduled, so these tests would prove nothing"
+        );
     }
 
     #[test]
