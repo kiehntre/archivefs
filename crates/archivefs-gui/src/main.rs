@@ -36730,12 +36730,72 @@ struct BundledPlatformArtwork {
 
 const BUNDLED_PLATFORM_ARTWORK: &[BundledPlatformArtwork] = &[
     BundledPlatformArtwork {
+        asset_id: "3do",
+        png: include_bytes!("../assets/platforms/3do.png"),
+    },
+    BundledPlatformArtwork {
         asset_id: "acornarchimedes",
         png: include_bytes!("../assets/platforms/acornarchimedes.png"),
     },
     BundledPlatformArtwork {
+        asset_id: "acornelectron",
+        png: include_bytes!("../assets/platforms/acornelectron.png"),
+    },
+    BundledPlatformArtwork {
         asset_id: "amiga",
         png: include_bytes!("../assets/platforms/amiga.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "amigacd32",
+        png: include_bytes!("../assets/platforms/amigacd32.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "amstradcpc",
+        png: include_bytes!("../assets/platforms/amstradcpc.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "appleii",
+        png: include_bytes!("../assets/platforms/appleii.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "arcade",
+        png: include_bytes!("../assets/platforms/arcade.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "atari2600",
+        png: include_bytes!("../assets/platforms/atari2600.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "atari5200",
+        png: include_bytes!("../assets/platforms/atari5200.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "atari7800",
+        png: include_bytes!("../assets/platforms/atari7800.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "atarijaguar",
+        png: include_bytes!("../assets/platforms/atarijaguar.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "atarilynx",
+        png: include_bytes!("../assets/platforms/atarilynx.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "atarist",
+        png: include_bytes!("../assets/platforms/atarist.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "bbcmicro",
+        png: include_bytes!("../assets/platforms/bbcmicro.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "colecovision",
+        png: include_bytes!("../assets/platforms/colecovision.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "commodore64",
+        png: include_bytes!("../assets/platforms/commodore64.png"),
     },
     BundledPlatformArtwork {
         asset_id: "dreamcast",
@@ -36746,8 +36806,20 @@ const BUNDLED_PLATFORM_ARTWORK: &[BundledPlatformArtwork] = &[
         png: include_bytes!("../assets/platforms/gameboy.png"),
     },
     BundledPlatformArtwork {
+        asset_id: "gameboyadvance",
+        png: include_bytes!("../assets/platforms/gameboyadvance.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "gameboycolor",
+        png: include_bytes!("../assets/platforms/gameboycolor.png"),
+    },
+    BundledPlatformArtwork {
         asset_id: "gamecube",
         png: include_bytes!("../assets/platforms/gamecube.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "gamegear",
+        png: include_bytes!("../assets/platforms/gamegear.png"),
     },
     BundledPlatformArtwork {
         asset_id: "megadrive",
@@ -36758,8 +36830,28 @@ const BUNDLED_PLATFORM_ARTWORK: &[BundledPlatformArtwork] = &[
         png: include_bytes!("../assets/platforms/n64.png"),
     },
     BundledPlatformArtwork {
-        asset_id: "psx",
-        png: include_bytes!("../assets/platforms/psx.png"),
+        asset_id: "neogeo",
+        png: include_bytes!("../assets/platforms/neogeo.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "neogeopocket",
+        png: include_bytes!("../assets/platforms/neogeopocket.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "nes",
+        png: include_bytes!("../assets/platforms/nes.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "nintendo3ds",
+        png: include_bytes!("../assets/platforms/nintendo3ds.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "philipscdi",
+        png: include_bytes!("../assets/platforms/philipscdi.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "playstationvita",
+        png: include_bytes!("../assets/platforms/playstationvita.png"),
     },
     BundledPlatformArtwork {
         asset_id: "ps2",
@@ -36770,8 +36862,28 @@ const BUNDLED_PLATFORM_ARTWORK: &[BundledPlatformArtwork] = &[
         png: include_bytes!("../assets/platforms/ps3.png"),
     },
     BundledPlatformArtwork {
+        asset_id: "psp",
+        png: include_bytes!("../assets/platforms/psp.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "psx",
+        png: include_bytes!("../assets/platforms/psx.png"),
+    },
+    BundledPlatformArtwork {
         asset_id: "saturn",
         png: include_bytes!("../assets/platforms/saturn.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "scummvm",
+        png: include_bytes!("../assets/platforms/scummvm.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "sega32x",
+        png: include_bytes!("../assets/platforms/sega32x.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "sharpx68000",
+        png: include_bytes!("../assets/platforms/sharpx68000.png"),
     },
     BundledPlatformArtwork {
         asset_id: "snes",
@@ -36782,12 +36894,28 @@ const BUNDLED_PLATFORM_ARTWORK: &[BundledPlatformArtwork] = &[
         png: include_bytes!("../assets/platforms/switch.png"),
     },
     BundledPlatformArtwork {
+        asset_id: "turbografx16",
+        png: include_bytes!("../assets/platforms/turbografx16.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "vic20",
+        png: include_bytes!("../assets/platforms/vic20.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "virtualboy",
+        png: include_bytes!("../assets/platforms/virtualboy.png"),
+    },
+    BundledPlatformArtwork {
         asset_id: "wii",
         png: include_bytes!("../assets/platforms/wii.png"),
     },
     BundledPlatformArtwork {
         asset_id: "wiiu",
         png: include_bytes!("../assets/platforms/wiiu.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "wonderswancolor",
+        png: include_bytes!("../assets/platforms/wonderswancolor.png"),
     },
     BundledPlatformArtwork {
         asset_id: "xbox",
@@ -36797,6 +36925,61 @@ const BUNDLED_PLATFORM_ARTWORK: &[BundledPlatformArtwork] = &[
         asset_id: "xbox360",
         png: include_bytes!("../assets/platforms/xbox360.png"),
     },
+    BundledPlatformArtwork {
+        asset_id: "zxspectrum",
+        png: include_bytes!("../assets/platforms/zxspectrum.png"),
+    },
+];
+
+/// Bundled artwork that is still fully opaque, pending visual cleanup.
+///
+/// The house style is transparent RGBA: artwork is drawn over a panel
+/// background, so an opaque square renders as a visible tile and does not adapt
+/// between light and dark themes. Every image here was imported for its
+/// *identity* - it puts the right logo on the right platform - and its
+/// background has deliberately not been machine-stripped, because automatic
+/// background removal damages artwork more often than it helps.
+///
+/// This list is the review queue, and
+/// `bundled_registry_is_complete_unique_and_decodable_without_filesystem_paths`
+/// keeps it honest in both directions: an entry that gains transparency must be
+/// removed from it, and a new opaque asset cannot be bundled without being
+/// added. It is expected to shrink to nothing.
+#[cfg(test)]
+const OPAQUE_ARTWORK_PENDING_VISUAL_REVIEW: &[&str] = &[
+    "3do",
+    "acornelectron",
+    "amigacd32",
+    "amstradcpc",
+    "appleii",
+    "arcade",
+    "atari2600",
+    "atari5200",
+    "atari7800",
+    "atarijaguar",
+    "atarilynx",
+    "atarist",
+    "bbcmicro",
+    "colecovision",
+    "commodore64",
+    "gameboyadvance",
+    "gameboycolor",
+    "gamegear",
+    "neogeo",
+    "neogeopocket",
+    "nes",
+    "nintendo3ds",
+    "philipscdi",
+    "playstationvita",
+    "psp",
+    "scummvm",
+    "sega32x",
+    "sharpx68000",
+    "turbografx16",
+    "vic20",
+    "virtualboy",
+    "wonderswancolor",
+    "zxspectrum",
 ];
 
 fn bundled_platform_artwork(asset_id: &str) -> Option<BundledPlatformArtwork> {
@@ -39402,7 +39585,7 @@ mod tests {
 
     #[test]
     fn bundled_registry_is_complete_unique_and_decodable_without_filesystem_paths() {
-        assert_eq!(BUNDLED_PLATFORM_ARTWORK.len(), 17);
+        assert_eq!(BUNDLED_PLATFORM_ARTWORK.len(), 50);
         let mut ids: Vec<_> = BUNDLED_PLATFORM_ARTWORK
             .iter()
             .map(|artwork| artwork.asset_id)
@@ -39414,14 +39597,75 @@ mod tests {
             let inspection = inspect_platform_png(artwork.png)
                 .unwrap_or_else(|error| panic!("{} failed validation: {error}", artwork.asset_id));
             assert_eq!((inspection.width, inspection.height), (1024, 1024));
-            assert_eq!(inspection.color_type, image::ColorType::Rgba8);
-            assert!(inspection.has_transparent_pixel);
             assert!(inspection.warnings.is_empty());
+            // Transparency is the house style and is required by default. The
+            // opaque imports are allowed only by being named in the review
+            // queue, and only until someone cleans them up.
+            let pending = OPAQUE_ARTWORK_PENDING_VISUAL_REVIEW.contains(&artwork.asset_id);
+            if pending {
+                assert!(
+                    !inspection.has_transparent_pixel,
+                    "{} is listed as opaque but now has transparency - remove it from \
+                     OPAQUE_ARTWORK_PENDING_VISUAL_REVIEW",
+                    artwork.asset_id
+                );
+            } else {
+                assert_eq!(inspection.color_type, image::ColorType::Rgba8);
+                assert!(
+                    inspection.has_transparent_pixel,
+                    "{} is opaque; either give it a transparent background or add it to \
+                     OPAQUE_ARTWORK_PENDING_VISUAL_REVIEW",
+                    artwork.asset_id
+                );
+            }
             let decoded = decode_bundled_platform_artwork(artwork.png)
                 .unwrap_or_else(|error| panic!("{} failed to decode: {error:?}", artwork.asset_id));
             assert_eq!(decoded.size, [1024, 1024]);
         }
         assert!(bundled_platform_artwork("missing-platform").is_none());
+
+        // The review queue cannot rot: every name in it must still be bundled.
+        for pending in OPAQUE_ARTWORK_PENDING_VISUAL_REVIEW {
+            assert!(
+                bundled_platform_artwork(pending).is_some(),
+                "{pending} is queued for visual review but is no longer bundled"
+            );
+        }
+    }
+
+    #[test]
+    fn every_bundled_asset_names_a_canonical_platform_and_the_two_registries_agree() {
+        // Artwork loads by exact canonical stem, so a bundled asset whose id is
+        // not a stem is dead weight that can never be drawn. And the core keeps
+        // its own list of which platforms ship artwork, used for the status
+        // report; if the two drift, the CLI tells the user a platform has
+        // artwork that the GUI cannot draw, or the reverse.
+        for artwork in BUNDLED_PLATFORM_ARTWORK {
+            assert!(
+                archivefs_core::platform_artwork::canonical_platform_for_stem(artwork.asset_id)
+                    .is_some(),
+                "bundled asset {:?} is not a canonical artwork stem, so nothing can load it",
+                artwork.asset_id
+            );
+        }
+
+        let mut from_gui: Vec<String> = BUNDLED_PLATFORM_ARTWORK
+            .iter()
+            .map(|artwork| artwork.asset_id.to_string())
+            .collect();
+        let mut from_core: Vec<String> = archivefs_core::platform_artwork::bundled_platform_ids()
+            .iter()
+            .map(|id| {
+                archivefs_core::platform_artwork::canonical_artwork_stem(id)
+                    .unwrap_or_else(|| panic!("{id:?} is not a canonical platform"))
+            })
+            .collect();
+        from_gui.sort();
+        from_core.sort();
+        assert_eq!(
+            from_gui, from_core,
+            "the GUI's bundled artwork and the core's bundled platform list disagree"
+        );
     }
 
     #[test]
@@ -40494,13 +40738,16 @@ mod tests {
             ("Custom", true)
         );
         write_test_png(&temp.join("console.png"), 2, 2, [1, 2, 3, 255]);
+        // MasterSystem deliberately: a console-category platform that still has
+        // no bundled artwork of its own, so the category rungs of the ladder are
+        // actually reached. NES used to serve here and now ships its own image.
         assert_eq!(
-            current_artwork_source(Some(&temp), "NES", None),
+            current_artwork_source(Some(&temp), "MasterSystem", None),
             ("Category fallback (custom)", false)
         );
         std::fs::remove_file(temp.join("console.png")).unwrap();
         assert_eq!(
-            current_artwork_source(Some(&temp), "NES", None),
+            current_artwork_source(Some(&temp), "MasterSystem", None),
             ("Category fallback", false)
         );
         let _ = std::fs::remove_dir_all(temp);

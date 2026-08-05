@@ -34,23 +34,56 @@ const CATEGORY_IDS: &[&str] = &[
     "cartridge",
 ];
 const BUNDLED_PLATFORM_IDS: &[&str] = &[
+    "3DO",
     "Acorn Archimedes",
+    "Acorn Electron",
     "Amiga",
+    "AmigaCD32",
+    "Amstrad CPC",
+    "Apple II",
+    "Arcade",
+    "Atari Jaguar",
+    "Atari Lynx",
+    "Atari2600",
+    "Atari5200",
+    "Atari7800",
+    "AtariST",
+    "BBC Micro",
+    "ColecoVision",
+    "Commodore 64",
     "Dreamcast",
     "Game Boy",
+    "Game Boy Advance",
+    "Game Boy Color",
     "GameCube",
+    "GameGear",
     "MegaDrive",
     "N64",
-    "PSX",
+    "NES",
+    "Neo Geo Pocket",
+    "NeoGeo",
+    "Nintendo 3DS",
     "PS2",
     "PS3",
-    "Saturn",
+    "PSP",
+    "PSX",
+    "Philips CD-i",
+    "PlayStation Vita",
     "SNES",
+    "Saturn",
+    "ScummVM",
+    "Sega 32X",
+    "Sharp X68000",
     "Switch",
+    "TurboGrafx-16",
+    "VIC-20",
+    "Virtual Boy",
     "Wii",
     "WiiU",
+    "WonderSwan Color",
     "Xbox",
     "Xbox360",
+    "ZX Spectrum",
 ];
 static ARTWORK_WRITE_LOCK: Mutex<()> = Mutex::new(());
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -192,6 +225,16 @@ pub fn canonical_artwork_stem(platform_id: &str) -> Option<String> {
             .map(|byte| byte.to_ascii_lowercase() as char)
             .collect()
     })
+}
+
+/// The canonical platforms this build ships artwork for.
+///
+/// Exposed so the GUI's own bundled table can be checked against it: the two are
+/// maintained by hand and, if they drift, the status report claims a platform
+/// has artwork that nothing can draw.
+#[must_use]
+pub fn bundled_platform_ids() -> &'static [&'static str] {
+    BUNDLED_PLATFORM_IDS
 }
 
 #[must_use]
