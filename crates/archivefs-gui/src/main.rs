@@ -3761,7 +3761,6 @@ struct PlatformArtworkManagerState {
     pending_remove: Option<String>,
     message: Option<(bool, String)>,
     task: Option<mpsc::Receiver<PlatformArtworkTaskResult>>,
-
 }
 
 impl ArchiveFsApp {
@@ -36228,16 +36227,10 @@ fn show_gamer_view(
                                 if !drawn {
                                     let platform_asset =
                                         platform_asset_id(&row.platform, row.unknown_platform);
-                                    // The category glyph this platform falls back
-                                    // to when it has no artwork of its own - a
-                                    // shelf and a game row must land on the same
-                                    // one, so it is derived here rather than
-                                    // guessed inside the painter.
-                                    let platform_fallback = if row.unknown_platform {
-                                        PlatformAssetCategory::Unknown.asset_id()
-                                    } else {
-                                        platform_asset_category(&row.platform).asset_id()
-                                    };
+                                    let platform_fallback = platform_fallback_asset_id(
+                                        &row.platform,
+                                        row.unknown_platform,
+                                    );
                                     paint_game_row_artwork(
                                         ui,
                                         artwork_cache,
@@ -36376,14 +36369,8 @@ fn show_gamer_view(
                                         covers.slot_for(archive_path.as_path(), None).cloned();
                                     let platform_asset =
                                         platform_asset_id(platform, unknown_platform);
-                                    // Same fallback rule as a game row, so the
-                                    // featured panel and the list never disagree
-                                    // about which glyph a platform falls back to.
-                                    let platform_fallback = if unknown_platform {
-                                        PlatformAssetCategory::Unknown.asset_id()
-                                    } else {
-                                        platform_asset_category(platform).asset_id()
-                                    };
+                                    let platform_fallback =
+                                        platform_fallback_asset_id(platform, unknown_platform);
                                     show_featured_cover(
                                         ui,
                                         box_size,
@@ -36714,6 +36701,18 @@ fn canonical_platform_asset_id(platform_id: &str) -> String {
 /// The exact canonical artwork key. Known platforms keep their own key even
 /// when no PNG is bundled, allowing `<canonical-id>.png` custom overrides;
 /// rendering then falls back deterministically to the platform category.
+/// The category glyph a platform falls back to when it has no artwork of its own.
+///
+/// One function on purpose. A game row and the featured panel beside it both need
+/// this, and deriving it separately in each is how the two drift into showing a
+/// different glyph for the same game.
+fn platform_fallback_asset_id(platform: &str, unknown_platform: bool) -> &'static str {
+    if unknown_platform {
+        return PlatformAssetCategory::Unknown.asset_id();
+    }
+    platform_asset_category(platform).asset_id()
+}
+
 fn platform_asset_id(platform: &str, unknown_platform: bool) -> String {
     if unknown_platform {
         return PlatformAssetCategory::Unknown.asset_id().to_owned();
@@ -64461,6 +64460,91 @@ $Instant Growth [Nayr]\n";
             "the cover was stretched: {}x{}",
             bounds.width(),
             bounds.height()
+        );
+    }
+
+    #[test]
+    fn a_game_cover_replaces_the_platform_icon_rather_than_drawing_over_it() {
+        // Both features draw into the same 56px slot, and the merge that brought
+        // them together had to pick an order. A ready cover wins; the platform
+        // icon is what a row falls back to. Drawing both would stack two images
+        // in one slot, and drawing the icon on top would hide the cover.
+        let (mut app, ctx) = gamer_cover_app(6);
+        run_frames(&mut app, &ctx, 1920.0, 1080.0, 3);
+        let generation = app.gamer_covers.generation();
+
+        // Before any cover: something is painted in the slot, and it is not a
+        // cover - that is the platform artwork fallback doing its job.
+        let before = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
+        let fallback_images = rendered_images(&before).len();
+        assert!(
+            fallback_images > 0,
+            "no platform artwork was drawn for a row with no cover"
+        );
+
+        app.gamer_covers
+            .absorb(&ctx, cover_reply(generation, &featured_path(0), "101"));
+        let after = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
+        let cover = cover_texture_id(&app, &featured_path(0)).expect("a loaded cover");
+        let drawn = rendered_images(&after);
+
+        assert!(
+            drawn.iter().any(|(id, _)| *id == cover),
+            "the cover was not painted once it was ready"
+        );
+        // The slot holds one image, not two: the count is unchanged because the
+        // cover took the icon's place rather than joining it.
+        assert_eq!(
+            drawn.len(),
+            fallback_images,
+            "the row painted {} images after the cover arrived and {fallback_images} before, \
+             so the platform icon and the cover are both in the slot",
+            drawn.len()
+        );
+    }
+
+    #[test]
+    fn a_row_and_the_featured_panel_agree_on_the_platform_fallback() {
+        // The row and the featured panel derive `platform_fallback` at two
+        // separate call sites. If they ever disagree, the same game shows one
+        // glyph in the list and a different one in the panel beside it.
+        // Every canonical platform, plus the cases that have no platform at all.
+        for platform in archivefs_core::platform::PLATFORMS
+            .iter()
+            .map(|platform| platform.id)
+            .chain(["definitely-not-a-platform", ""])
+        {
+            let unknown = canonical_platform_for_artwork(platform).is_none();
+            let fallback = platform_fallback_asset_id(platform, unknown);
+            assert!(
+                valid_platform_asset_id(fallback),
+                "{platform:?} fell back to {fallback:?}, which is not a drawable asset id"
+            );
+            // The last resort is a painted glyph, so the fallback must be one of
+            // the category ids the glyph painter actually recognises - otherwise
+            // a platform with no artwork lands on its default arm by accident
+            // rather than by choice.
+            assert!(
+                [
+                    PlatformAssetCategory::Console,
+                    PlatformAssetCategory::Handheld,
+                    PlatformAssetCategory::Computer,
+                    PlatformAssetCategory::Arcade,
+                    PlatformAssetCategory::OpticalDisc,
+                    PlatformAssetCategory::Cartridge,
+                    PlatformAssetCategory::Unknown,
+                ]
+                .iter()
+                .any(|category| category.asset_id() == fallback),
+                "{platform:?} falls back to {fallback:?}, which is not a drawable category"
+            );
+        }
+
+        // And an unrecognised platform lands on Unknown rather than on some
+        // category picked from a name nobody recognised.
+        assert_eq!(
+            platform_fallback_asset_id("definitely-not-a-platform", true),
+            PlatformAssetCategory::Unknown.asset_id()
         );
     }
 
