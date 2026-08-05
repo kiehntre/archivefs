@@ -82,6 +82,7 @@ use serde::Serialize;
 mod bsfree;
 mod cheat_source;
 mod dat;
+mod platform_artwork;
 mod retroarch_cheat_cache;
 mod retroarch_cheat_setup;
 mod retroarch_cheat_sources;
@@ -336,6 +337,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             input_args.drain(0..2);
             bsfree::run(input_args)?;
+        }
+        "platform-artwork" => {
+            platform_artwork::run(args.collect())?;
         }
         "cheat-source" => {
             let input_args = args.collect::<Vec<_>>();
@@ -5450,6 +5454,9 @@ fn print_help() {
     println!("  config-check   Validate ArchiveFS configuration");
     println!(
         "  cheats source bsfree <status|validate|download|import-local|enable|disable|remove|systems|devices|search|game>  Manage and browse the optional immutable BSFree Archive source; no command installs cheats"
+    );
+    println!(
+        "  platform-artwork <status|import|import-folder|rescan|remove|open-folder>  Manage local canonical platform artwork overrides; import-folder supports --dry-run and no command uses the network"
     );
     println!(
         "  cheat-source list  List all registered cheat sources ordered by priority; add --json for structured output"

@@ -35,6 +35,16 @@ scraper = { version = "0.27", default-features = false }
 # Decode provider HTML according to an explicit HTTP charset without ever
 # altering the original cached response bytes.
 encoding_rs = "0.8"
+# Two bounded, explicit uses share one entry: user-managed platform artwork,
+# normalised once at import time, and RomM cover thumbnails, decoded and
+# downscaled into the cache. Keeping it here rather than in the GUI is what lets
+# the thumbnail cache be tested without a window.
+#
+# Keep the codec surface deliberately limited; the GUI only ever reads
+# ArchiveFS-owned PNG output. `jpeg` is here because an imported artwork file
+# may be one. WebP is magic-detected and refused until its optional decoder can
+# be supplied by the build.
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 # Xenia Canary patch files (`*.patch.toml`): parsed as bounded, generic
 # TOML syntax via this crate, then mapped through our own strict,
 # schema-specific validator - see patch_manager::xenia_patch_document.
@@ -54,11 +64,6 @@ quick-xml = { version = "0.41", default-features = false }
 # codec feature (deflate/bzip2/lzma/zstd/aes-crypto/...) is enabled here;
 # see the `[dev-dependencies]` entry below for why tests need more.
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
-# Bounded decode, downscale and re-encode of RomM cover thumbnails. Exactly the
-# crate, version and feature set the GUI already resolves, so this adds no new
-# crate to the tree - and keeping it here rather than in the GUI is what lets the
-# thumbnail cache be tested without a window.
-image = { version = "0.25.10", default-features = false, features = ["png"] }
 
 [dev-dependencies]
 # Same crate, fuller feature set: only test fixtures need to *write* zip

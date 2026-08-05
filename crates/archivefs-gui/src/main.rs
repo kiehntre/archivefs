@@ -3704,18 +3704,13 @@ struct ArchiveFsApp {
     confirm_bulk_platform_action: Option<(Vec<PathBuf>, BulkPlatformActionKind)>,
     focus_bulk_platform_cancel: bool,
     bulk_platform_action_typed_count: String,
-    /// docs/PLATFORM_ARTWORK.md's custom-override directory - `None`
-    /// means built-in artwork only. Persisted independently (see
-    /// `load_custom_platform_artwork_directory`/
-    /// `save_custom_platform_artwork_directory`).
+    /// ArchiveFS-owned, upgrade-stable custom artwork directory. `None` is
+    /// possible only when the operating-system data root cannot be resolved.
     custom_platform_artwork_directory: Option<PathBuf>,
     /// Decoded local artwork and failed-decode fingerprints for this
     /// session. It is invalidated by directory or file-metadata changes.
     platform_artwork_cache: PlatformArtworkCache,
-    /// The Settings page's in-progress text-field value for the above -
-    /// never persisted directly; only what's confirmed via "Use this
-    /// directory" is.
-    custom_platform_artwork_directory_text: String,
+    platform_artwork_manager: PlatformArtworkManagerState,
     /// RomM cover artwork for the Gamer View game list: what has been asked
     /// for, what has been answered, and which library generation those
     /// answers belong to. Holds no thread of its own - see `gamer_cover_worker`.
@@ -3738,6 +3733,34 @@ struct ArchiveFsApp {
     /// A change means the same path may now be a different archive, so every
     /// answer is discarded - see `GamerCoverCache::library_changed`.
     gamer_cover_library: Option<ConfigIdentity>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ArtworkManagerFilter {
+    #[default]
+    All,
+    Missing,
+    Custom,
+    FallbackOnly,
+}
+
+enum PlatformArtworkTaskResult {
+    Status(Result<archivefs_core::platform_artwork::PlatformArtworkStatus, String>),
+    Mutation(Result<String, String>),
+    BulkPreview(Result<archivefs_core::platform_artwork::BulkArtworkPreview, String>),
+}
+
+#[derive(Default)]
+struct PlatformArtworkManagerState {
+    search: String,
+    filter: ArtworkManagerFilter,
+    status: Option<archivefs_core::platform_artwork::PlatformArtworkStatus>,
+    bulk_preview: Option<archivefs_core::platform_artwork::BulkArtworkPreview>,
+    replace_existing: bool,
+    pending_import: Option<(String, PathBuf)>,
+    pending_remove: Option<String>,
+    message: Option<(bool, String)>,
+    task: Option<mpsc::Receiver<PlatformArtworkTaskResult>>,
 }
 
 impl ArchiveFsApp {
@@ -3903,11 +3926,11 @@ impl ArchiveFsApp {
             confirm_bulk_platform_action: None,
             focus_bulk_platform_cancel: false,
             bulk_platform_action_typed_count: String::new(),
-            custom_platform_artwork_directory: load_custom_platform_artwork_directory(),
+            custom_platform_artwork_directory:
+                archivefs_core::platform_artwork::default_platform_artwork_root().ok(),
             platform_artwork_cache: PlatformArtworkCache::default(),
-            custom_platform_artwork_directory_text: load_custom_platform_artwork_directory()
-                .map(|path| path.display().to_string())
-                .unwrap_or_default(),
+            platform_artwork_manager: PlatformArtworkManagerState::default(),
+
             gamer_covers: crate::gamer_artwork::GamerCoverCache::default(),
             gamer_cover_worker: None,
             gamer_cover_worker_allowed: true,
@@ -12364,8 +12387,142 @@ impl Drop for ArchiveFsApp {
 }
 
 impl ArchiveFsApp {
+    fn start_platform_artwork_task(
+        &mut self,
+        context: egui::Context,
+        action: PlatformArtworkManagerAction,
+    ) {
+        if self.platform_artwork_manager.task.is_some() {
+            return;
+        }
+        let Some(root) = self.custom_platform_artwork_directory.clone() else {
+            self.platform_artwork_manager.message = Some((
+                false,
+                "ArchiveFS could not resolve its local data directory.".to_owned(),
+            ));
+            return;
+        };
+        if matches!(action, PlatformArtworkManagerAction::OpenFolder) {
+            if let Err(error) = std::fs::create_dir_all(&root)
+                .map_err(ArchiveFsError::from)
+                .and_then(|()| open_folder_in_file_manager(&root))
+            {
+                self.platform_artwork_manager.message = Some((false, error.to_string()));
+            }
+            return;
+        }
+        let preview = self.platform_artwork_manager.bulk_preview.clone();
+        let replace = self.platform_artwork_manager.replace_existing;
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            use archivefs_core::platform_artwork as artwork;
+            let result = match action {
+                PlatformArtworkManagerAction::Rescan => PlatformArtworkTaskResult::Status(
+                    artwork::inspect_platform_artwork(&root).map_err(|error| error.to_string()),
+                ),
+                PlatformArtworkManagerAction::Import {
+                    platform_id,
+                    source,
+                } => PlatformArtworkTaskResult::Mutation(
+                    artwork::import_platform_artwork(&root, &platform_id, &source, replace)
+                        .map(|result| {
+                            format!(
+                                "Imported {} as {}{}.",
+                                platform_id,
+                                result.destination.display(),
+                                result
+                                    .warnings
+                                    .first()
+                                    .map(|warning| format!(" Warning: {warning}"))
+                                    .unwrap_or_default()
+                            )
+                        })
+                        .map_err(|error| error.to_string()),
+                ),
+                PlatformArtworkManagerAction::PreviewFolder(source) => {
+                    PlatformArtworkTaskResult::BulkPreview(
+                        artwork::preview_import_folder(&root, &source)
+                            .map_err(|error| error.to_string()),
+                    )
+                }
+                PlatformArtworkManagerAction::ApplyFolder => PlatformArtworkTaskResult::Mutation(
+                    preview
+                        .ok_or_else(|| "Run folder preview before importing.".to_owned())
+                        .and_then(|preview| {
+                            artwork::apply_import_folder(&root, &preview, replace)
+                                .map_err(|error| error.to_string())
+                        })
+                        .map(|result| {
+                            format!(
+                                "Imported {} image(s); {} item(s) remained for review.",
+                                result.imported.len(),
+                                result.skipped.len()
+                            )
+                        }),
+                ),
+                PlatformArtworkManagerAction::Remove(platform_id) => {
+                    PlatformArtworkTaskResult::Mutation(
+                        artwork::remove_custom_platform_artwork(&root, &platform_id, true)
+                            .map(|removed| {
+                                if removed {
+                                    format!("Restored the default artwork for {platform_id}.")
+                                } else {
+                                    format!("No custom artwork existed for {platform_id}.")
+                                }
+                            })
+                            .map_err(|error| error.to_string()),
+                    )
+                }
+                PlatformArtworkManagerAction::OpenFolder => unreachable!(),
+            };
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+        self.platform_artwork_manager.task = Some(receiver);
+    }
+
+    fn poll_platform_artwork_task(&mut self, context: &egui::Context) {
+        let Some(receiver) = &self.platform_artwork_manager.task else {
+            return;
+        };
+        let Ok(result) = receiver.try_recv() else {
+            return;
+        };
+        self.platform_artwork_manager.task = None;
+        match result {
+            PlatformArtworkTaskResult::Status(result) => match result {
+                Ok(status) => {
+                    self.platform_artwork_manager.status = Some(status);
+                }
+                Err(error) => self.platform_artwork_manager.message = Some((false, error)),
+            },
+            PlatformArtworkTaskResult::BulkPreview(result) => match result {
+                Ok(preview) => {
+                    self.platform_artwork_manager.bulk_preview = Some(preview);
+                    self.platform_artwork_manager.message = Some((
+                        true,
+                        "Folder preview complete; nothing was written.".to_owned(),
+                    ));
+                }
+                Err(error) => self.platform_artwork_manager.message = Some((false, error)),
+            },
+            PlatformArtworkTaskResult::Mutation(result) => {
+                self.platform_artwork_cache.clear();
+                self.platform_artwork_manager.message = Some(match result {
+                    Ok(message) => (true, message),
+                    Err(error) => (false, error),
+                });
+                self.start_platform_artwork_task(
+                    context.clone(),
+                    PlatformArtworkManagerAction::Rescan,
+                );
+            }
+        }
+    }
+
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.reconcile_library_tab();
+        self.poll_platform_artwork_task(context);
         self.poll_shared_history();
         // Gamer View's "Undo last change" (docs/GUI_NAVIGATION_RESET_DESIGN.md
         // mandatory risk #2) drives this exact same `shared_rollback` state
@@ -13702,6 +13859,14 @@ impl ArchiveFsApp {
                 }
 
                 if self.view == MainView::Settings {
+                    if self.platform_artwork_manager.status.is_none()
+                        && self.platform_artwork_manager.task.is_none()
+                    {
+                        self.start_platform_artwork_task(
+                            context.clone(),
+                            PlatformArtworkManagerAction::Rescan,
+                        );
+                    }
                     let mount_root = match &self.state {
                         LoadState::Ready(data) => Some(data.mount_root.as_path()),
                         _ => None,
@@ -13714,8 +13879,9 @@ impl ArchiveFsApp {
                         mount_root,
                         busy,
                         &mut self.clipboard,
-                        &mut self.custom_platform_artwork_directory,
-                        &mut self.custom_platform_artwork_directory_text,
+                        self.custom_platform_artwork_directory.as_deref(),
+                        &mut self.platform_artwork_cache,
+                        &mut self.platform_artwork_manager,
                     );
                     match action {
                         Some(SettingsPageAction::OpenConfigFolder) => {
@@ -13731,11 +13897,8 @@ impl ArchiveFsApp {
                         Some(SettingsPageAction::RescanRetroArchProfiles) => {
                             self.start_retroarch_profile_scan(context.clone());
                         }
-                        Some(SettingsPageAction::CustomArtworkDirectoryChanged) => {
-                            self.platform_artwork_cache.clear();
-                            save_custom_platform_artwork_directory(
-                                self.custom_platform_artwork_directory.as_deref(),
-                            );
+                        Some(SettingsPageAction::PlatformArtwork(action)) => {
+                            self.start_platform_artwork_task(context.clone(), action);
                         }
                         None => {}
                     }
@@ -29525,11 +29688,367 @@ enum SettingsPageAction {
     ValidateConfiguration,
     OpenDiagnostics,
     RescanRetroArchProfiles,
-    /// The custom platform artwork directory field changed (set or
-    /// cleared) - persist it. Never touched on any frame the field
-    /// wasn't actually edited, matching "persist only on an explicit
-    /// mode change" (the same rule `GuiMode` already follows).
-    CustomArtworkDirectoryChanged,
+    PlatformArtwork(PlatformArtworkManagerAction),
+}
+
+enum PlatformArtworkManagerAction {
+    Rescan,
+    Import {
+        platform_id: String,
+        source: PathBuf,
+    },
+    PreviewFolder(PathBuf),
+    ApplyFolder,
+    Remove(String),
+    OpenFolder,
+}
+
+fn current_artwork_source(
+    root: Option<&Path>,
+    platform_id: &str,
+    status: Option<&archivefs_core::platform_artwork::PlatformArtworkStatus>,
+) -> (&'static str, bool) {
+    let is_valid = |path: &Path| {
+        !status.is_some_and(|status| {
+            status
+                .invalid_custom_files
+                .iter()
+                .any(|invalid| invalid.path == path)
+        })
+    };
+    let asset_id = canonical_platform_asset_id(platform_id);
+    if custom_platform_artwork_path(root, &asset_id).is_some_and(|path| is_valid(&path)) {
+        return ("Custom", true);
+    }
+    if bundled_platform_artwork(&asset_id).is_some() {
+        return ("Bundled", false);
+    }
+    let category = platform_asset_category(platform_id);
+    if category != PlatformAssetCategory::Unknown
+        && custom_platform_artwork_path(root, category.asset_id())
+            .is_some_and(|path| is_valid(&path))
+    {
+        return ("Category fallback (custom)", false);
+    }
+    if category == PlatformAssetCategory::Unknown {
+        ("Unknown fallback", false)
+    } else {
+        ("Category fallback", false)
+    }
+}
+
+fn show_platform_artwork_manager(
+    ui: &mut egui::Ui,
+    root: Option<&Path>,
+    artwork_cache: &mut PlatformArtworkCache,
+    manager: &mut PlatformArtworkManagerState,
+    action: &mut Option<SettingsPageAction>,
+) {
+    let running = manager.task.is_some();
+    widgets::card(ui, |ui| {
+        ui.label(format!(
+            "Managed folder: {}",
+            root.map_or_else(
+                || "Unavailable".to_owned(),
+                |path| path.display().to_string()
+            )
+        ));
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(!running, egui::Button::new("Open artwork folder"))
+                .clicked()
+            {
+                *action = Some(SettingsPageAction::PlatformArtwork(
+                    PlatformArtworkManagerAction::OpenFolder,
+                ));
+            }
+            if ui
+                .add_enabled(!running, egui::Button::new("Rescan custom artwork"))
+                .clicked()
+            {
+                *action = Some(SettingsPageAction::PlatformArtwork(
+                    PlatformArtworkManagerAction::Rescan,
+                ));
+            }
+            if ui
+                .add_enabled(!running, egui::Button::new("Preview folder import"))
+                .clicked()
+                && let Some(folder) = rfd::FileDialog::new().pick_folder()
+            {
+                *action = Some(SettingsPageAction::PlatformArtwork(
+                    PlatformArtworkManagerAction::PreviewFolder(folder),
+                ));
+            }
+            if running {
+                ui.spinner();
+                ui.label("Validating artwork…");
+            }
+        });
+        if let Some((succeeded, message)) = &manager.message {
+            widgets::banner(
+                ui,
+                if *succeeded {
+                    "Artwork updated"
+                } else {
+                    "Artwork error"
+                },
+                message,
+                if *succeeded {
+                    widgets::StatusTone::Success
+                } else {
+                    widgets::StatusTone::Blocked
+                },
+            );
+        }
+        if let Some(status) = &manager.status {
+            ui.label(format!(
+                "{} canonical platforms · {} custom · {} bundled · {} fallback-only · {} invalid · {} unknown · {} bytes",
+                status.total_canonical_platforms,
+                status.custom_images,
+                status.bundled_images,
+                status.fallback_only_platforms,
+                status.invalid_custom_files.len(),
+                status.unknown_files.len(),
+                status.total_custom_disk_bytes
+            ));
+            if !status.invalid_custom_files.is_empty() || !status.unknown_files.is_empty() {
+                ui.collapsing("Invalid and unknown files", |ui| {
+                    for invalid in &status.invalid_custom_files {
+                        ui.label(format!(
+                            "Invalid: {} — {}",
+                            invalid.path.display(),
+                            invalid.reason
+                        ));
+                    }
+                    for unknown in &status.unknown_files {
+                        ui.label(format!("Unknown: {}", unknown.display()));
+                    }
+                    ui.weak("Rescan never deletes these files.");
+                });
+            }
+        }
+        if let Some(preview) = &manager.bulk_preview {
+            let recognised = preview
+                .entries
+                .iter()
+                .filter(|entry| {
+                    entry.disposition
+                        == archivefs_core::platform_artwork::BulkArtworkDisposition::Recognised
+                })
+                .count();
+            let unknown = preview
+                .entries
+                .iter()
+                .filter(|entry| {
+                    entry.disposition
+                        == archivefs_core::platform_artwork::BulkArtworkDisposition::UnknownFilename
+                })
+                .count();
+            let invalid = preview
+                .entries
+                .iter()
+                .filter(|entry| {
+                    entry.disposition
+                        == archivefs_core::platform_artwork::BulkArtworkDisposition::Invalid
+                })
+                .count();
+            let duplicates = preview
+                .entries
+                .iter()
+                .filter(|entry| {
+                    entry.disposition
+                        == archivefs_core::platform_artwork::BulkArtworkDisposition::DuplicateTarget
+                })
+                .count();
+            ui.separator();
+            ui.label(format!("Folder preview: {recognised} recognised · {unknown} unknown · {invalid} invalid · {duplicates} duplicate target(s)."));
+            for entry in preview.entries.iter().take(10) {
+                ui.label(format!(
+                    "{:?}: {} — {}",
+                    entry.disposition,
+                    entry.source.display(),
+                    entry.detail
+                ));
+            }
+            if preview.entries.len() > 10 {
+                ui.collapsing(
+                    format!("Show all {} reviewed files", preview.entries.len()),
+                    |ui| {
+                        for entry in &preview.entries {
+                            ui.label(format!(
+                                "{:?}: {}",
+                                entry.disposition,
+                                entry.source.display()
+                            ));
+                        }
+                    },
+                );
+            }
+            ui.checkbox(
+                &mut manager.replace_existing,
+                "Replace existing custom artwork after confirmation",
+            );
+            if ui
+                .add_enabled(
+                    !running && recognised > 0,
+                    egui::Button::new("Import recognised images"),
+                )
+                .clicked()
+            {
+                *action = Some(SettingsPageAction::PlatformArtwork(
+                    PlatformArtworkManagerAction::ApplyFolder,
+                ));
+            }
+        }
+    });
+
+    ui.add_space(8.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Search platforms:");
+        ui.text_edit_singleline(&mut manager.search);
+        egui::ComboBox::from_id_salt("platform_artwork_filter")
+            .selected_text(match manager.filter {
+                ArtworkManagerFilter::All => "All platforms",
+                ArtworkManagerFilter::Missing => "Missing artwork",
+                ArtworkManagerFilter::Custom => "Custom artwork",
+                ArtworkManagerFilter::FallbackOnly => "Fallback only",
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut manager.filter,
+                    ArtworkManagerFilter::All,
+                    "All platforms",
+                );
+                ui.selectable_value(
+                    &mut manager.filter,
+                    ArtworkManagerFilter::Missing,
+                    "Missing artwork",
+                );
+                ui.selectable_value(
+                    &mut manager.filter,
+                    ArtworkManagerFilter::Custom,
+                    "Custom artwork",
+                );
+                ui.selectable_value(
+                    &mut manager.filter,
+                    ArtworkManagerFilter::FallbackOnly,
+                    "Fallback only",
+                );
+            });
+    });
+
+    let search = manager.search.trim().to_ascii_lowercase();
+    for platform in archivefs_core::platform::PLATFORMS {
+        let (source_label, custom) =
+            current_artwork_source(root, platform.id, manager.status.as_ref());
+        let fallback = source_label.contains("fallback");
+        let missing = bundled_platform_artwork(&canonical_platform_asset_id(platform.id)).is_none()
+            && !custom;
+        if !search.is_empty()
+            && !platform.display_name.to_ascii_lowercase().contains(&search)
+            && !platform.id.to_ascii_lowercase().contains(&search)
+        {
+            continue;
+        }
+        if !match manager.filter {
+            ArtworkManagerFilter::All => true,
+            ArtworkManagerFilter::Missing => missing,
+            ArtworkManagerFilter::Custom => custom,
+            ArtworkManagerFilter::FallbackOnly => fallback,
+        } {
+            continue;
+        }
+        widgets::card(ui, |ui| {
+            ui.horizontal(|ui| {
+                let (response, _) =
+                    ui.allocate_painter(egui::vec2(72.0, 72.0), egui::Sense::hover());
+                let asset_id = canonical_platform_asset_id(platform.id);
+                paint_platform_artwork_at(
+                    ui,
+                    artwork_cache,
+                    root,
+                    PlatformArtworkPaint {
+                        center: response.rect.center(),
+                        size: 64.0,
+                        color: ui.visuals().text_color().gamma_multiply(0.8),
+                        asset_id: &asset_id,
+                        fallback_asset_id: platform_asset_category(platform.id).asset_id(),
+                    },
+                );
+                ui.vertical(|ui| {
+                    ui.heading(platform.display_name);
+                    ui.label(format!("Canonical ID: {}", platform.id));
+                    ui.label(format!("Current source: {source_label}"));
+                    ui.horizontal_wrapped(|ui| {
+                        if ui
+                            .add_enabled(!running, egui::Button::new("Choose image"))
+                            .clicked()
+                            && let Some(source) = rfd::FileDialog::new()
+                                .add_filter("Static image", &["png", "jpg", "jpeg", "webp"])
+                                .pick_file()
+                        {
+                            if custom {
+                                manager.pending_import = Some((platform.id.to_owned(), source));
+                            } else {
+                                manager.replace_existing = false;
+                                *action = Some(SettingsPageAction::PlatformArtwork(
+                                    PlatformArtworkManagerAction::Import {
+                                        platform_id: platform.id.to_owned(),
+                                        source,
+                                    },
+                                ));
+                            }
+                        }
+                        if let Some((pending_platform, _)) = &manager.pending_import
+                            && pending_platform == platform.id
+                        {
+                            ui.label("Replace the existing custom image?");
+                            if ui
+                                .add_enabled(!running, egui::Button::new("Confirm replacement"))
+                                .clicked()
+                                && let Some((platform_id, source)) = manager.pending_import.take()
+                            {
+                                manager.replace_existing = true;
+                                *action = Some(SettingsPageAction::PlatformArtwork(
+                                    PlatformArtworkManagerAction::Import {
+                                        platform_id,
+                                        source,
+                                    },
+                                ));
+                            }
+                            if ui.button("Cancel replacement").clicked() {
+                                manager.pending_import = None;
+                            }
+                        }
+                        if custom
+                            && manager.pending_remove.as_deref() != Some(platform.id)
+                            && ui
+                                .add_enabled(!running, egui::Button::new("Remove custom image"))
+                                .clicked()
+                        {
+                            manager.pending_remove = Some(platform.id.to_owned());
+                        }
+                        if manager.pending_remove.as_deref() == Some(platform.id) {
+                            ui.label("Remove ArchiveFS's custom copy?");
+                            if ui
+                                .add_enabled(!running, egui::Button::new("Confirm restore default"))
+                                .clicked()
+                            {
+                                manager.pending_remove = None;
+                                *action = Some(SettingsPageAction::PlatformArtwork(
+                                    PlatformArtworkManagerAction::Remove(platform.id.to_owned()),
+                                ));
+                            }
+                            if ui.button("Cancel").clicked() {
+                                manager.pending_remove = None;
+                            }
+                        }
+                    });
+                });
+            });
+        });
+        ui.add_space(4.0);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -29541,8 +30060,9 @@ fn show_settings_page(
     mount_root: Option<&Path>,
     busy: bool,
     clipboard: &mut dyn ClipboardBackend,
-    custom_artwork_directory: &mut Option<PathBuf>,
-    custom_artwork_directory_text: &mut String,
+    custom_artwork_directory: Option<&Path>,
+    artwork_cache: &mut PlatformArtworkCache,
+    artwork_manager: &mut PlatformArtworkManagerState,
 ) -> Option<SettingsPageAction> {
     let mut action = None;
     widgets::page_header(
@@ -29809,59 +30329,18 @@ fn show_settings_page(
         ui,
         "5. Platform artwork",
         Some(
-            "ArchiveFS ships its own original, offline platform artwork - no image is ever \
-             downloaded. Optionally point at a folder of your own PNG files, named by canonical \
-             platform identifier (e.g. gamecube.png); a missing or invalid file falls back to the \
-             built-in artwork. See docs/PLATFORM_ARTWORK.md.",
+            "Manage local, upgrade-stable artwork overrides. ArchiveFS never identifies a machine \
+             from its picture: choose the canonical platform explicitly. Imports are normalised \
+             off the UI thread and never overwrite the selected original.",
         ),
     );
-    widgets::card(ui, |ui| {
-        ui.horizontal(|ui| {
-            ui.label("Custom artwork directory:");
-            ui.text_edit_singleline(custom_artwork_directory_text);
-        });
-        ui.horizontal(|ui| {
-            if ui.button("Use this directory").clicked()
-                && !custom_artwork_directory_text.trim().is_empty()
-            {
-                *custom_artwork_directory =
-                    Some(PathBuf::from(custom_artwork_directory_text.trim()));
-                action = Some(SettingsPageAction::CustomArtworkDirectoryChanged);
-            }
-            if ui
-                .add_enabled(
-                    custom_artwork_directory.is_some(),
-                    egui::Button::new("Use built-in only"),
-                )
-                .clicked()
-            {
-                *custom_artwork_directory = None;
-                custom_artwork_directory_text.clear();
-                action = Some(SettingsPageAction::CustomArtworkDirectoryChanged);
-            }
-        });
-        match custom_artwork_directory {
-            Some(directory) => {
-                let gamecube_resolved =
-                    custom_platform_artwork_path(Some(directory), "gamecube").is_some();
-                ui.horizontal(|ui| {
-                    paint_platform_glyph(ui, "gamecube", 28.0);
-                    ui.label(format!(
-                        "Currently: {}. Example check (gamecube.png): {}.",
-                        directory.display(),
-                        if gamecube_resolved {
-                            "found - used in Gamer View when valid"
-                        } else {
-                            "not found - built-in artwork will be used"
-                        }
-                    ));
-                });
-            }
-            None => {
-                ui.weak("Currently: built-in artwork only.");
-            }
-        }
-    });
+    show_platform_artwork_manager(
+        ui,
+        custom_artwork_directory,
+        artwork_cache,
+        artwork_manager,
+        &mut action,
+    );
 
     ui.add_space(theme::SECTION_GAP);
     widgets::section_header(ui, "6. Intentionally unavailable", None);
@@ -35109,46 +35588,6 @@ fn save_gui_mode(mode: GuiMode) {
     let _ = std::fs::write(path, gui_mode_file_contents(mode));
 }
 
-/// The custom platform artwork directory preference - its own small file,
-/// following the exact same precedent as `gui_mode_config_path` (and, in
-/// turn, `~/.config/archivefs/emulator_profiles.toml`): a dedicated file
-/// per preference rather than a shared one, so one preference's write
-/// can never race or corrupt another's.
-fn platform_artwork_directory_config_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
-    Some(
-        PathBuf::from(home)
-            .join(".config")
-            .join("archivefs")
-            .join("platform_artwork_directory.txt"),
-    )
-}
-
-/// A missing file, or one containing only whitespace, means "no custom
-/// directory configured" - not an error.
-fn load_custom_platform_artwork_directory() -> Option<PathBuf> {
-    let path = platform_artwork_directory_config_path()?;
-    let contents = std::fs::read_to_string(path).ok()?;
-    let trimmed = contents.trim();
-    (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
-}
-
-/// Best-effort, matching `save_gui_mode`: a failure to persist never
-/// blocks the in-memory setting from taking effect for the rest of the
-/// session.
-fn save_custom_platform_artwork_directory(directory: Option<&Path>) {
-    let Some(path) = platform_artwork_directory_config_path() else {
-        return;
-    };
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let contents = directory
-        .map(|directory| directory.display().to_string())
-        .unwrap_or_default();
-    let _ = std::fs::write(path, contents);
-}
-
 /// Gamer View's plain-language primary-action state for a selected game -
 /// see docs/GUI_NAVIGATION_RESET_DESIGN.md §2.3. Never exposes a raw
 /// `MountState` variant name (finding #4); Advanced View keeps the
@@ -35602,7 +36041,7 @@ fn show_gamer_view(
     // navigates. The order is the order a person sees: All, then each detected
     // platform, then Unknown last if any.
     let mut entries: Vec<ShelfEntry<'_>> = vec![ShelfEntry {
-        asset_id: PlatformAssetCategory::Console.asset_id(),
+        asset_id: PlatformAssetCategory::Console.asset_id().to_owned(),
         label: "All",
         count: snapshot.candidates.len(),
         platform: None,
@@ -35617,7 +36056,7 @@ fn show_gamer_view(
     }
     if platform_counts.unknown > 0 {
         entries.push(ShelfEntry {
-            asset_id: PlatformAssetCategory::Unknown.asset_id(),
+            asset_id: PlatformAssetCategory::Unknown.asset_id().to_owned(),
             label: "Unknown",
             count: platform_counts.unknown,
             platform: Some("Unknown"),
@@ -35788,6 +36227,10 @@ fn show_gamer_view(
                                 if !drawn {
                                     let platform_asset =
                                         platform_asset_id(&row.platform, row.unknown_platform);
+                                    let platform_fallback = platform_fallback_asset_id(
+                                        &row.platform,
+                                        row.unknown_platform,
+                                    );
                                     paint_game_row_artwork(
                                         ui,
                                         artwork_cache,
@@ -35796,8 +36239,8 @@ fn show_gamer_view(
                                             center: artwork_center,
                                             size: crate::gamer_artwork::COVER_BOX,
                                             title: &gamer_display_title(record),
-                                            platform_asset,
-                                            unknown_platform: row.unknown_platform,
+                                            platform_asset: &platform_asset,
+                                            platform_fallback,
                                         },
                                     );
                                 }
@@ -35926,6 +36369,8 @@ fn show_gamer_view(
                                         covers.slot_for(archive_path.as_path(), None).cloned();
                                     let platform_asset =
                                         platform_asset_id(platform, unknown_platform);
+                                    let platform_fallback =
+                                        platform_fallback_asset_id(platform, unknown_platform);
                                     show_featured_cover(
                                         ui,
                                         box_size,
@@ -35934,8 +36379,8 @@ fn show_gamer_view(
                                             center: egui::Pos2::ZERO,
                                             size: 0.0,
                                             title: &title,
-                                            platform_asset,
-                                            unknown_platform,
+                                            platform_asset: &platform_asset,
+                                            platform_fallback,
                                         },
                                         artwork_cache,
                                         artwork_directory,
@@ -36188,73 +36633,93 @@ impl PlatformAssetCategory {
 /// so a filter/search-derived platform string with different casing still
 /// resolves correctly.
 fn platform_asset_category(platform: &str) -> PlatformAssetCategory {
-    // Canonical names contain spaces and hyphens ("Game Boy Advance",
-    // "Sharp X68000", "TurboGrafx-16") - normalized away here so every
-    // match key below is a single lowercase word, exactly mirroring
-    // `platform_asset_id`'s own normalization for its dedicated-asset
-    // lookup.
-    let normalized = platform.to_lowercase().replace([' ', '-'], "");
-    match normalized.as_str() {
-        "gamecube" | "wii" | "wiiu" | "switch" | "n64" | "nes" | "snes" | "megadrive"
-        | "mastersystem" | "gamegear" | "saturn" | "dreamcast" | "psx" | "ps2" | "ps3" | "xbox"
-        | "xbox360" | "segacd" | "sega32x" | "3do" | "colecovision" | "intellivision"
-        | "neogeo" | "neogeo64" => PlatformAssetCategory::Console,
-        "gameboy" | "gameboycolor" | "gameboyadvance" | "nintendods" | "nintendo3ds" | "psp"
-        | "playstationvita" | "atarilynx" | "neogeopocket" | "neogeopocketcolor" | "wonderswan"
-        | "wonderswancolor" | "ngage" => PlatformAssetCategory::Handheld,
-        "pc" | "dos" | "scummvm" | "amiga" | "atarist" | "commodore64" | "zxspectrum"
-        | "acornarchimedes" | "sharpx68000" | "necpc8801" | "necpc9801" | "msx" | "msx2" => {
+    let Some(platform) = canonical_platform_for_artwork(platform) else {
+        return PlatformAssetCategory::Unknown;
+    };
+    match platform.id {
+        "3DO" | "ColecoVision" | "Dreamcast" | "GameCube" | "Intellivision" | "MasterSystem"
+        | "MegaDrive" | "N64" | "NeoGeo" | "NeoGeo64" | "NES" | "PSX" | "PS2" | "PS3"
+        | "Saturn" | "Sega 32X" | "SNES" | "Switch" | "Vectrex" | "Wii" | "WiiU" | "Xbox"
+        | "Xbox360" => PlatformAssetCategory::Console,
+        "Atari Lynx"
+        | "Game Boy"
+        | "Game Boy Advance"
+        | "Game Boy Color"
+        | "GameGear"
+        | "NGage"
+        | "Neo Geo Pocket"
+        | "Neo Geo Pocket Color"
+        | "Nintendo 3DS"
+        | "Nintendo DS"
+        | "PlayStation Vita"
+        | "PSP"
+        | "Virtual Boy"
+        | "WonderSwan"
+        | "WonderSwan Color" => PlatformAssetCategory::Handheld,
+        "Acorn Archimedes" | "Acorn Electron" | "Amiga" | "Amstrad CPC" | "Apple II"
+        | "Atari 8-bit" | "AtariST" | "BBC Micro" | "Commodore 128" | "Commodore 64" | "DOS"
+        | "FM Towns" | "Macintosh" | "MSX" | "MSX2" | "NEC PC-8801" | "NEC PC-9801" | "PC"
+        | "PC-98" | "ScummVM" | "Sharp X68000" | "VIC-20" | "ZX Spectrum" => {
             PlatformAssetCategory::Computer
         }
-        "arcade" => PlatformAssetCategory::Arcade,
-        "amigacd32" => PlatformAssetCategory::OpticalDisc,
-        "atari2600" | "atari5200" | "atari7800" | "atarijaguar" | "vectrex" | "turbografx16"
-        | "pcengine" => PlatformAssetCategory::Cartridge,
+        "Arcade" => PlatformAssetCategory::Arcade,
+        "AmigaCD32" | "Commodore CDTV" | "Neo Geo CD" | "PC Engine CD" | "Philips CD-i"
+        | "Sega CD" => PlatformAssetCategory::OpticalDisc,
+        "Atari2600" | "Atari5200" | "Atari7800" | "Atari Jaguar" | "PC Engine"
+        | "TurboGrafx-16" => PlatformAssetCategory::Cartridge,
         _ => PlatformAssetCategory::Unknown,
     }
 }
 
-/// Exact, deliberately narrow aliases for Platform Artwork Pack v1.
-/// Normalization is case-insensitive and ignores only spaces and hyphens;
-/// it does not perform substring or fuzzy matching.
-fn exact_platform_asset_id(platform: &str) -> Option<&'static str> {
-    let normalized = platform.to_lowercase().replace([' ', '-'], "");
-    match normalized.as_str() {
-        "acornarchimedes" | "archimedes" => Some("acornarchimedes"),
-        "amiga" | "commodoreamiga" => Some("amiga"),
-        "dreamcast" | "segadreamcast" => Some("dreamcast"),
-        "gameboy" | "nintendogameboy" => Some("gameboy"),
-        "gamecube" | "nintendogamecube" => Some("gamecube"),
-        "megadrive" | "segamegadrive" | "genesis" | "segagenesis" => Some("megadrive"),
-        "nintendo64" | "n64" => Some("n64"),
-        "playstation" | "playstation1" | "ps1" | "psx" => Some("playstation"),
-        "playstation2" | "ps2" => Some("playstation2"),
-        "playstation3" | "ps3" => Some("playstation3"),
-        "saturn" | "segasaturn" => Some("saturn"),
-        "supernintendo" | "supernintendoentertainmentsystem" | "snes" | "superfamicom" => {
-            Some("snes")
-        }
-        "nintendoswitch" | "switch" => Some("switch"),
-        "nintendowii" | "wii" => Some("wii"),
-        "nintendowiiu" | "wiiu" => Some("wiiu"),
-        "xbox" | "originalxbox" => Some("xbox"),
-        "xbox360" | "x360" => Some("xbox360"),
-        _ => None,
-    }
+/// Resolves through the one canonical platform registry. Exact persisted IDs,
+/// exact display names and exact registered aliases are accepted; filenames
+/// are never guessed from a display label and substring matching is forbidden.
+fn canonical_platform_for_artwork(
+    platform: &str,
+) -> Option<&'static archivefs_core::platform::Platform> {
+    archivefs_core::platform::platform_by_id(platform)
+        .or_else(|| {
+            archivefs_core::platform::PLATFORMS
+                .iter()
+                .find(|candidate| candidate.display_name.eq_ignore_ascii_case(platform))
+        })
+        .or_else(|| archivefs_core::platform::platform_for_alias(platform))
 }
 
-/// The asset identifier to look up artwork for - either an exact bundled
-/// platform PNG id or a category fallback id. `unknown_platform: true`
-/// (the row's own honest
-/// "we don't know this platform" flag, not a lookup miss) always maps to
-/// the Unknown fallback directly, without running the category
-/// heuristic on a meaningless empty string.
-fn platform_asset_id(platform: &str, unknown_platform: bool) -> &'static str {
+/// The stable filename stem for a persisted canonical platform identifier:
+/// lowercase ASCII alphanumerics only. Display-name changes therefore cannot
+/// rename artwork. Registry tests prove that all 74 current IDs remain unique
+/// under this convention.
+fn canonical_platform_asset_id(platform_id: &str) -> String {
+    platform_id
+        .bytes()
+        .filter(|byte| byte.is_ascii_alphanumeric())
+        .map(|byte| byte.to_ascii_lowercase() as char)
+        .collect()
+}
+
+/// The exact canonical artwork key. Known platforms keep their own key even
+/// when no PNG is bundled, allowing `<canonical-id>.png` custom overrides;
+/// rendering then falls back deterministically to the platform category.
+/// The category glyph a platform falls back to when it has no artwork of its own.
+///
+/// One function on purpose. A game row and the featured panel beside it both need
+/// this, and deriving it separately in each is how the two drift into showing a
+/// different glyph for the same game.
+fn platform_fallback_asset_id(platform: &str, unknown_platform: bool) -> &'static str {
     if unknown_platform {
         return PlatformAssetCategory::Unknown.asset_id();
     }
-    exact_platform_asset_id(platform)
-        .unwrap_or_else(|| platform_asset_category(platform).asset_id())
+    platform_asset_category(platform).asset_id()
+}
+
+fn platform_asset_id(platform: &str, unknown_platform: bool) -> String {
+    if unknown_platform {
+        return PlatformAssetCategory::Unknown.asset_id().to_owned();
+    }
+    canonical_platform_for_artwork(platform)
+        .map(|platform| canonical_platform_asset_id(platform.id))
+        .unwrap_or_else(|| PlatformAssetCategory::Unknown.asset_id().to_owned())
 }
 
 #[derive(Clone, Copy)]
@@ -36265,12 +36730,72 @@ struct BundledPlatformArtwork {
 
 const BUNDLED_PLATFORM_ARTWORK: &[BundledPlatformArtwork] = &[
     BundledPlatformArtwork {
+        asset_id: "3do",
+        png: include_bytes!("../assets/platforms/3do.png"),
+    },
+    BundledPlatformArtwork {
         asset_id: "acornarchimedes",
         png: include_bytes!("../assets/platforms/acornarchimedes.png"),
     },
     BundledPlatformArtwork {
+        asset_id: "acornelectron",
+        png: include_bytes!("../assets/platforms/acornelectron.png"),
+    },
+    BundledPlatformArtwork {
         asset_id: "amiga",
         png: include_bytes!("../assets/platforms/amiga.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "amigacd32",
+        png: include_bytes!("../assets/platforms/amigacd32.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "amstradcpc",
+        png: include_bytes!("../assets/platforms/amstradcpc.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "appleii",
+        png: include_bytes!("../assets/platforms/appleii.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "arcade",
+        png: include_bytes!("../assets/platforms/arcade.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "atari2600",
+        png: include_bytes!("../assets/platforms/atari2600.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "atari5200",
+        png: include_bytes!("../assets/platforms/atari5200.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "atari7800",
+        png: include_bytes!("../assets/platforms/atari7800.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "atarijaguar",
+        png: include_bytes!("../assets/platforms/atarijaguar.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "atarilynx",
+        png: include_bytes!("../assets/platforms/atarilynx.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "atarist",
+        png: include_bytes!("../assets/platforms/atarist.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "bbcmicro",
+        png: include_bytes!("../assets/platforms/bbcmicro.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "colecovision",
+        png: include_bytes!("../assets/platforms/colecovision.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "commodore64",
+        png: include_bytes!("../assets/platforms/commodore64.png"),
     },
     BundledPlatformArtwork {
         asset_id: "dreamcast",
@@ -36281,8 +36806,20 @@ const BUNDLED_PLATFORM_ARTWORK: &[BundledPlatformArtwork] = &[
         png: include_bytes!("../assets/platforms/gameboy.png"),
     },
     BundledPlatformArtwork {
+        asset_id: "gameboyadvance",
+        png: include_bytes!("../assets/platforms/gameboyadvance.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "gameboycolor",
+        png: include_bytes!("../assets/platforms/gameboycolor.png"),
+    },
+    BundledPlatformArtwork {
         asset_id: "gamecube",
         png: include_bytes!("../assets/platforms/gamecube.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "gamegear",
+        png: include_bytes!("../assets/platforms/gamegear.png"),
     },
     BundledPlatformArtwork {
         asset_id: "megadrive",
@@ -36293,20 +36830,60 @@ const BUNDLED_PLATFORM_ARTWORK: &[BundledPlatformArtwork] = &[
         png: include_bytes!("../assets/platforms/n64.png"),
     },
     BundledPlatformArtwork {
-        asset_id: "playstation",
-        png: include_bytes!("../assets/platforms/playstation.png"),
+        asset_id: "neogeo",
+        png: include_bytes!("../assets/platforms/neogeo.png"),
     },
     BundledPlatformArtwork {
-        asset_id: "playstation2",
-        png: include_bytes!("../assets/platforms/playstation2.png"),
+        asset_id: "neogeopocket",
+        png: include_bytes!("../assets/platforms/neogeopocket.png"),
     },
     BundledPlatformArtwork {
-        asset_id: "playstation3",
-        png: include_bytes!("../assets/platforms/playstation3.png"),
+        asset_id: "nes",
+        png: include_bytes!("../assets/platforms/nes.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "nintendo3ds",
+        png: include_bytes!("../assets/platforms/nintendo3ds.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "philipscdi",
+        png: include_bytes!("../assets/platforms/philipscdi.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "playstationvita",
+        png: include_bytes!("../assets/platforms/playstationvita.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "ps2",
+        png: include_bytes!("../assets/platforms/ps2.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "ps3",
+        png: include_bytes!("../assets/platforms/ps3.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "psp",
+        png: include_bytes!("../assets/platforms/psp.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "psx",
+        png: include_bytes!("../assets/platforms/psx.png"),
     },
     BundledPlatformArtwork {
         asset_id: "saturn",
         png: include_bytes!("../assets/platforms/saturn.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "scummvm",
+        png: include_bytes!("../assets/platforms/scummvm.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "sega32x",
+        png: include_bytes!("../assets/platforms/sega32x.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "sharpx68000",
+        png: include_bytes!("../assets/platforms/sharpx68000.png"),
     },
     BundledPlatformArtwork {
         asset_id: "snes",
@@ -36317,12 +36894,28 @@ const BUNDLED_PLATFORM_ARTWORK: &[BundledPlatformArtwork] = &[
         png: include_bytes!("../assets/platforms/switch.png"),
     },
     BundledPlatformArtwork {
+        asset_id: "turbografx16",
+        png: include_bytes!("../assets/platforms/turbografx16.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "vic20",
+        png: include_bytes!("../assets/platforms/vic20.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "virtualboy",
+        png: include_bytes!("../assets/platforms/virtualboy.png"),
+    },
+    BundledPlatformArtwork {
         asset_id: "wii",
         png: include_bytes!("../assets/platforms/wii.png"),
     },
     BundledPlatformArtwork {
         asset_id: "wiiu",
         png: include_bytes!("../assets/platforms/wiiu.png"),
+    },
+    BundledPlatformArtwork {
+        asset_id: "wonderswancolor",
+        png: include_bytes!("../assets/platforms/wonderswancolor.png"),
     },
     BundledPlatformArtwork {
         asset_id: "xbox",
@@ -36332,6 +36925,61 @@ const BUNDLED_PLATFORM_ARTWORK: &[BundledPlatformArtwork] = &[
         asset_id: "xbox360",
         png: include_bytes!("../assets/platforms/xbox360.png"),
     },
+    BundledPlatformArtwork {
+        asset_id: "zxspectrum",
+        png: include_bytes!("../assets/platforms/zxspectrum.png"),
+    },
+];
+
+/// Bundled artwork that is still fully opaque, pending visual cleanup.
+///
+/// The house style is transparent RGBA: artwork is drawn over a panel
+/// background, so an opaque square renders as a visible tile and does not adapt
+/// between light and dark themes. Every image here was imported for its
+/// *identity* - it puts the right logo on the right platform - and its
+/// background has deliberately not been machine-stripped, because automatic
+/// background removal damages artwork more often than it helps.
+///
+/// This list is the review queue, and
+/// `bundled_registry_is_complete_unique_and_decodable_without_filesystem_paths`
+/// keeps it honest in both directions: an entry that gains transparency must be
+/// removed from it, and a new opaque asset cannot be bundled without being
+/// added. It is expected to shrink to nothing.
+#[cfg(test)]
+const OPAQUE_ARTWORK_PENDING_VISUAL_REVIEW: &[&str] = &[
+    "3do",
+    "acornelectron",
+    "amigacd32",
+    "amstradcpc",
+    "appleii",
+    "arcade",
+    "atari2600",
+    "atari5200",
+    "atari7800",
+    "atarijaguar",
+    "atarilynx",
+    "atarist",
+    "bbcmicro",
+    "colecovision",
+    "commodore64",
+    "gameboyadvance",
+    "gameboycolor",
+    "gamegear",
+    "neogeo",
+    "neogeopocket",
+    "nes",
+    "nintendo3ds",
+    "philipscdi",
+    "playstationvita",
+    "psp",
+    "scummvm",
+    "sega32x",
+    "sharpx68000",
+    "turbografx16",
+    "vic20",
+    "virtualboy",
+    "wonderswancolor",
+    "zxspectrum",
 ];
 
 fn bundled_platform_artwork(asset_id: &str) -> Option<BundledPlatformArtwork> {
@@ -36341,7 +36989,7 @@ fn bundled_platform_artwork(asset_id: &str) -> Option<BundledPlatformArtwork> {
         .find(|artwork| artwork.asset_id == asset_id)
 }
 
-const MAX_CUSTOM_ARTWORK_FILE_BYTES: u64 = 1024 * 1024;
+const MAX_CUSTOM_ARTWORK_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_CUSTOM_ARTWORK_DIMENSION: u32 = 1024;
 const MAX_CUSTOM_ARTWORK_DECODE_BYTES: u64 =
     MAX_CUSTOM_ARTWORK_DIMENSION as u64 * MAX_CUSTOM_ARTWORK_DIMENSION as u64 * 4;
@@ -36578,16 +37226,87 @@ fn decode_bundled_platform_artwork(
     ))
 }
 
-/// Draws a small original vector fallback glyph for `asset_id` directly
-/// with egui's painter. Falls back to the Unknown glyph for any id it doesn't
-/// recognise, so a damaged or unrecognised custom-override asset id
-/// never renders as nothing at all (decision: "missing or damaged assets
-/// fail gracefully to the fallback icon").
-fn paint_platform_glyph(ui: &mut egui::Ui, asset_id: &str, size: f32) -> egui::Response {
-    let (response, painter) = ui.allocate_painter(egui::vec2(size, size), egui::Sense::hover());
-    let color = ui.visuals().text_color().gamma_multiply(0.8);
-    paint_platform_glyph_at(&painter, response.rect.center(), size, color, asset_id);
-    response
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlatformPngWarning {
+    LegacySourceDimensions { width: u32, height: u32 },
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PlatformPngInspection {
+    width: u32,
+    height: u32,
+    color_type: image::ColorType,
+    has_transparent_pixel: bool,
+    warnings: Vec<PlatformPngWarning>,
+}
+
+/// Validation used by the artwork audit tests. A legacy square image remains
+/// usable and produces a warning; malformed, animated, zero-sized, non-square
+/// or absurdly large images are refused. Production decoding independently
+/// retains its tighter 1024x1024 allocation ceiling.
+#[cfg(test)]
+fn inspect_platform_png(bytes: &[u8]) -> Result<PlatformPngInspection, &'static str> {
+    use image::ImageDecoder as _;
+
+    if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Err("invalid PNG signature");
+    }
+    let mut offset = 8usize;
+    while offset < bytes.len() {
+        let length_bytes = bytes.get(offset..offset + 4).ok_or("truncated PNG chunk")?;
+        let length = u32::from_be_bytes(
+            length_bytes
+                .try_into()
+                .map_err(|_| "truncated PNG chunk length")?,
+        ) as usize;
+        let kind = bytes
+            .get(offset + 4..offset + 8)
+            .ok_or("truncated PNG chunk type")?;
+        if kind == b"acTL" {
+            return Err("animated PNG artwork is unsupported");
+        }
+        offset = offset
+            .checked_add(12)
+            .and_then(|value| value.checked_add(length))
+            .ok_or("PNG chunk offset overflow")?;
+        if offset > bytes.len() {
+            return Err("PNG chunk extends beyond the file");
+        }
+        if kind == b"IEND" {
+            break;
+        }
+    }
+
+    let decoder = image::codecs::png::PngDecoder::new(std::io::Cursor::new(bytes))
+        .map_err(|_| "malformed PNG")?;
+    let (width, height) = decoder.dimensions();
+    if width == 0 || height == 0 {
+        return Err("zero-sized PNG");
+    }
+    if width > 8192 || height > 8192 {
+        return Err("absurd PNG dimensions");
+    }
+    if width != height {
+        return Err("platform artwork must be square");
+    }
+    let color_type = decoder.color_type();
+    let rgba = image::DynamicImage::from_decoder(decoder)
+        .map_err(|_| "malformed PNG pixels")?
+        .into_rgba8();
+    let has_transparent_pixel = rgba.pixels().any(|pixel| pixel.0[3] < u8::MAX);
+    let warnings = (width != 1024 || height != 1024)
+        .then_some(PlatformPngWarning::LegacySourceDimensions { width, height })
+        .into_iter()
+        .collect();
+    Ok(PlatformPngInspection {
+        width,
+        height,
+        color_type,
+        has_transparent_pixel,
+        warnings,
+    })
 }
 
 /// The allocation-free core of `paint_platform_glyph`, so a caller that
@@ -36764,6 +37483,16 @@ fn paint_platform_artwork_at(
         paint_texture(ui, texture, paint.center, paint.size);
         return PlatformArtworkSource::Bundled;
     }
+    // A category-level custom image remains a supported intentional fallback
+    // for canonical platforms without dedicated artwork. It is consulted only
+    // after the exact canonical filename and can therefore never mask it.
+    if paint.fallback_asset_id != paint.asset_id
+        && let Some(texture) =
+            artwork_cache.custom_texture(ui.ctx(), artwork_directory, paint.fallback_asset_id)
+    {
+        paint_texture(ui, texture, paint.center, paint.size);
+        return PlatformArtworkSource::Custom;
+    }
     paint_platform_glyph_at(
         ui.painter(),
         paint.center,
@@ -36808,7 +37537,7 @@ struct GameRowArtworkPaint<'a> {
     size: f32,
     title: &'a str,
     platform_asset: &'a str,
-    unknown_platform: bool,
+    platform_fallback: &'a str,
 }
 
 /// Game rows prefer a safe local per-game PNG, then the same exact
@@ -36835,11 +37564,7 @@ fn paint_game_row_artwork(
             size: paint.size,
             color: ui.visuals().text_color().gamma_multiply(0.8),
             asset_id: paint.platform_asset,
-            fallback_asset_id: if paint.unknown_platform {
-                PlatformAssetCategory::Unknown.asset_id()
-            } else {
-                paint.platform_asset
-            },
+            fallback_asset_id: paint.platform_fallback,
         },
     )
 }
@@ -37279,9 +38004,9 @@ impl ShelfGeometry {
 }
 
 /// One card in the platform shelf: what to draw, and what picking it selects.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ShelfEntry<'a> {
-    asset_id: &'a str,
+    asset_id: String,
     label: &'a str,
     count: usize,
     /// The platform filter this card applies. `None` is the "All" card.
@@ -37451,7 +38176,7 @@ fn show_gamer_platform_shelf(
                         let response = show_platform_shelf_item(
                             ui,
                             is_selected,
-                            entry.asset_id,
+                            &entry.asset_id,
                             entry.label,
                             entry.count,
                             card_width,
@@ -38765,14 +39490,14 @@ mod tests {
             ("Sega Genesis", "megadrive"),
             ("Nintendo 64", "n64"),
             ("N64", "n64"),
-            ("PlayStation", "playstation"),
-            ("PlayStation 1", "playstation"),
-            ("PS1", "playstation"),
-            ("PSX", "playstation"),
-            ("PlayStation 2", "playstation2"),
-            ("PS2", "playstation2"),
-            ("PlayStation 3", "playstation3"),
-            ("PS3", "playstation3"),
+            ("PlayStation", "psx"),
+            ("PlayStation 1", "psx"),
+            ("PS1", "psx"),
+            ("PSX", "psx"),
+            ("PlayStation 2", "ps2"),
+            ("PS2", "ps2"),
+            ("PlayStation 3", "ps3"),
+            ("PS3", "ps3"),
             ("Saturn", "saturn"),
             ("Sega Saturn", "saturn"),
             ("Super Nintendo", "snes"),
@@ -38787,9 +39512,7 @@ mod tests {
             ("Wii U", "wiiu"),
             ("WiiU", "wiiu"),
             ("Xbox", "xbox"),
-            ("Original Xbox", "xbox"),
             ("Xbox 360", "xbox360"),
-            ("X360", "xbox360"),
         ];
         for (alias, expected) in aliases {
             assert_eq!(platform_asset_id(alias, false), expected, "alias {alias}");
@@ -38806,16 +39529,30 @@ mod tests {
     }
 
     #[test]
-    fn platform_asset_id_falls_back_to_category_for_unmapped_specific_platforms() {
-        // NES has no dedicated asset - it must resolve to the Console
-        // category fallback, not to Unknown (it's a perfectly well-known
-        // platform, just without its own dedicated artwork yet - "do not
-        // block the feature on creating a unique image for every obscure
-        // platform").
-        assert_eq!(platform_asset_id("NES", false), "console");
-        assert_eq!(platform_asset_id("Game Boy Advance", false), "handheld");
-        assert_eq!(platform_asset_id("PC", false), "computer");
+    fn platforms_without_bundled_pngs_keep_exact_keys_and_explicit_fallbacks() {
+        assert_eq!(platform_asset_id("NES", false), "nes");
+        assert_eq!(
+            platform_asset_category("NES"),
+            PlatformAssetCategory::Console
+        );
+        assert_eq!(
+            platform_asset_id("Game Boy Advance", false),
+            "gameboyadvance"
+        );
+        assert_eq!(
+            platform_asset_category("Game Boy Advance"),
+            PlatformAssetCategory::Handheld
+        );
+        assert_eq!(platform_asset_id("PC", false), "pc");
+        assert_eq!(
+            platform_asset_category("PC"),
+            PlatformAssetCategory::Computer
+        );
         assert_eq!(platform_asset_id("Arcade", false), "arcade");
+        assert_eq!(
+            platform_asset_category("Arcade"),
+            PlatformAssetCategory::Arcade
+        );
     }
 
     #[test]
@@ -38831,7 +39568,7 @@ mod tests {
 
     #[test]
     fn exact_aliases_do_not_collapse_related_platforms() {
-        assert_eq!(platform_asset_id("PSX", false), "playstation");
+        assert_eq!(platform_asset_id("PSX", false), "psx");
         assert_eq!(platform_asset_id("Wii U", false), "wiiu");
         assert_ne!(
             platform_asset_id("Wii U", false),
@@ -38848,7 +39585,7 @@ mod tests {
 
     #[test]
     fn bundled_registry_is_complete_unique_and_decodable_without_filesystem_paths() {
-        assert_eq!(BUNDLED_PLATFORM_ARTWORK.len(), 17);
+        assert_eq!(BUNDLED_PLATFORM_ARTWORK.len(), 50);
         let mut ids: Vec<_> = BUNDLED_PLATFORM_ARTWORK
             .iter()
             .map(|artwork| artwork.asset_id)
@@ -38857,12 +39594,78 @@ mod tests {
         ids.dedup();
         assert_eq!(ids.len(), BUNDLED_PLATFORM_ARTWORK.len());
         for artwork in BUNDLED_PLATFORM_ARTWORK {
-            assert!(artwork.png.starts_with(b"\x89PNG\r\n\x1a\n"));
+            let inspection = inspect_platform_png(artwork.png)
+                .unwrap_or_else(|error| panic!("{} failed validation: {error}", artwork.asset_id));
+            assert_eq!((inspection.width, inspection.height), (1024, 1024));
+            assert!(inspection.warnings.is_empty());
+            // Transparency is the house style and is required by default. The
+            // opaque imports are allowed only by being named in the review
+            // queue, and only until someone cleans them up.
+            let pending = OPAQUE_ARTWORK_PENDING_VISUAL_REVIEW.contains(&artwork.asset_id);
+            if pending {
+                assert!(
+                    !inspection.has_transparent_pixel,
+                    "{} is listed as opaque but now has transparency - remove it from \
+                     OPAQUE_ARTWORK_PENDING_VISUAL_REVIEW",
+                    artwork.asset_id
+                );
+            } else {
+                assert_eq!(inspection.color_type, image::ColorType::Rgba8);
+                assert!(
+                    inspection.has_transparent_pixel,
+                    "{} is opaque; either give it a transparent background or add it to \
+                     OPAQUE_ARTWORK_PENDING_VISUAL_REVIEW",
+                    artwork.asset_id
+                );
+            }
             let decoded = decode_bundled_platform_artwork(artwork.png)
                 .unwrap_or_else(|error| panic!("{} failed to decode: {error:?}", artwork.asset_id));
             assert_eq!(decoded.size, [1024, 1024]);
         }
         assert!(bundled_platform_artwork("missing-platform").is_none());
+
+        // The review queue cannot rot: every name in it must still be bundled.
+        for pending in OPAQUE_ARTWORK_PENDING_VISUAL_REVIEW {
+            assert!(
+                bundled_platform_artwork(pending).is_some(),
+                "{pending} is queued for visual review but is no longer bundled"
+            );
+        }
+    }
+
+    #[test]
+    fn every_bundled_asset_names_a_canonical_platform_and_the_two_registries_agree() {
+        // Artwork loads by exact canonical stem, so a bundled asset whose id is
+        // not a stem is dead weight that can never be drawn. And the core keeps
+        // its own list of which platforms ship artwork, used for the status
+        // report; if the two drift, the CLI tells the user a platform has
+        // artwork that the GUI cannot draw, or the reverse.
+        for artwork in BUNDLED_PLATFORM_ARTWORK {
+            assert!(
+                archivefs_core::platform_artwork::canonical_platform_for_stem(artwork.asset_id)
+                    .is_some(),
+                "bundled asset {:?} is not a canonical artwork stem, so nothing can load it",
+                artwork.asset_id
+            );
+        }
+
+        let mut from_gui: Vec<String> = BUNDLED_PLATFORM_ARTWORK
+            .iter()
+            .map(|artwork| artwork.asset_id.to_string())
+            .collect();
+        let mut from_core: Vec<String> = archivefs_core::platform_artwork::bundled_platform_ids()
+            .iter()
+            .map(|id| {
+                archivefs_core::platform_artwork::canonical_artwork_stem(id)
+                    .unwrap_or_else(|| panic!("{id:?} is not a canonical platform"))
+            })
+            .collect();
+        from_gui.sort();
+        from_core.sort();
+        assert_eq!(
+            from_gui, from_core,
+            "the GUI's bundled artwork and the core's bundled platform list disagree"
+        );
     }
 
     #[test]
@@ -38874,11 +39677,105 @@ mod tests {
     }
 
     #[test]
+    fn animated_platform_png_is_rejected() {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend_from_slice(&8u32.to_be_bytes());
+        bytes.extend_from_slice(b"acTL");
+        bytes.extend_from_slice(&[0; 8]);
+        bytes.extend_from_slice(&[0; 4]);
+        assert_eq!(
+            inspect_platform_png(&bytes),
+            Err("animated PNG artwork is unsupported")
+        );
+    }
+
+    #[test]
+    fn platform_artwork_resolution_never_uses_substring_guessing() {
+        assert_eq!(platform_asset_id("NES Classics", false), "unknown");
+        assert_eq!(platform_asset_id("not-wiiu-backup", false), "unknown");
+        assert_eq!(
+            platform_asset_category("xbox360-old"),
+            PlatformAssetCategory::Unknown
+        );
+    }
+
+    #[test]
     fn platform_asset_id_handles_long_platform_names_without_panicking() {
         let long_name = "A".repeat(500);
         // Must not panic and must resolve to a real, valid asset id.
         let resolved = platform_asset_id(&long_name, false);
         assert!(!resolved.is_empty());
+    }
+
+    #[test]
+    fn every_canonical_platform_has_one_unique_filename_and_intentional_fallback() {
+        let mut asset_ids = std::collections::BTreeSet::new();
+        assert_eq!(archivefs_core::platform::PLATFORMS.len(), 74);
+        for platform in archivefs_core::platform::PLATFORMS {
+            let asset_id = platform_asset_id(platform.id, false);
+            assert!(
+                valid_platform_asset_id(&asset_id),
+                "{} -> {asset_id}",
+                platform.id
+            );
+            assert!(
+                asset_ids.insert(asset_id.clone()),
+                "duplicate artwork key {asset_id}"
+            );
+            assert_eq!(asset_id, canonical_platform_asset_id(platform.id));
+            assert_ne!(
+                platform_asset_category(platform.id),
+                PlatformAssetCategory::Unknown,
+                "{} needs an intentional fallback category",
+                platform.id
+            );
+        }
+    }
+
+    #[test]
+    fn bundled_png_directory_has_no_unused_or_case_colliding_platform_images() {
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/platforms");
+        let mut actual_pngs = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".png"))
+            .collect::<Vec<_>>();
+        actual_pngs.sort();
+        let mut expected_pngs = BUNDLED_PLATFORM_ARTWORK
+            .iter()
+            .map(|artwork| format!("{}.png", artwork.asset_id))
+            .collect::<Vec<_>>();
+        expected_pngs.sort();
+        assert_eq!(
+            actual_pngs, expected_pngs,
+            "unused or missing bundled platform PNG"
+        );
+
+        let mut lowercase = std::collections::BTreeSet::new();
+        for filename in actual_pngs {
+            assert_eq!(filename, filename.to_ascii_lowercase());
+            assert!(!filename.contains(' '));
+            assert!(!filename.contains("4448b039-69a6-4690-a61f-dfc5393c3069"));
+            assert!(lowercase.insert(filename.to_ascii_lowercase()));
+        }
+    }
+
+    #[test]
+    fn legacy_square_png_size_is_a_warning_not_a_rejection() {
+        use image::ImageEncoder as _;
+
+        let mut bytes = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut bytes)
+            .write_image(&[0, 0, 0, 0], 1, 1, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        let inspection = inspect_platform_png(&bytes).unwrap();
+        assert_eq!(
+            inspection.warnings,
+            vec![PlatformPngWarning::LegacySourceDimensions {
+                width: 1,
+                height: 1
+            }]
+        );
     }
 
     #[test]
@@ -39107,14 +40004,14 @@ mod tests {
                 cache: &mut cache,
             };
             let mut entries: Vec<ShelfEntry<'_>> = vec![ShelfEntry {
-                asset_id: PlatformAssetCategory::Console.asset_id(),
+                asset_id: PlatformAssetCategory::Console.asset_id().to_owned(),
                 label: "All",
                 count: 10,
                 platform: None,
             }];
             for (label, count) in platforms {
                 entries.push(ShelfEntry {
-                    asset_id: "unknown",
+                    asset_id: "unknown".to_owned(),
                     label: label.as_str(),
                     count: *count,
                     platform: Some(label.as_str()),
@@ -39291,14 +40188,14 @@ mod tests {
                 cache: &mut cache,
             };
             let mut entries: Vec<ShelfEntry<'_>> = vec![ShelfEntry {
-                asset_id: PlatformAssetCategory::Console.asset_id(),
+                asset_id: PlatformAssetCategory::Console.asset_id().to_owned(),
                 label: "All",
                 count: 10,
                 platform: None,
             }];
             for (label, count) in platforms {
                 entries.push(ShelfEntry {
-                    asset_id: "unknown",
+                    asset_id: "unknown".to_owned(),
                     label: label.as_str(),
                     count: *count,
                     platform: Some(label.as_str()),
@@ -39826,6 +40723,34 @@ mod tests {
             "a directory with no matching file must fall back to None (built-in artwork)"
         );
         let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn managed_artwork_source_order_is_custom_bundled_custom_category_then_category() {
+        let temp = artwork_test_directory("source-priority");
+        assert_eq!(
+            current_artwork_source(Some(&temp), "PS2", None),
+            ("Bundled", false)
+        );
+        write_test_png(&temp.join("ps2.png"), 2, 2, [1, 2, 3, 255]);
+        assert_eq!(
+            current_artwork_source(Some(&temp), "PS2", None),
+            ("Custom", true)
+        );
+        write_test_png(&temp.join("console.png"), 2, 2, [1, 2, 3, 255]);
+        // MasterSystem deliberately: a console-category platform that still has
+        // no bundled artwork of its own, so the category rungs of the ladder are
+        // actually reached. NES used to serve here and now ships its own image.
+        assert_eq!(
+            current_artwork_source(Some(&temp), "MasterSystem", None),
+            ("Category fallback (custom)", false)
+        );
+        std::fs::remove_file(temp.join("console.png")).unwrap();
+        assert_eq!(
+            current_artwork_source(Some(&temp), "MasterSystem", None),
+            ("Category fallback", false)
+        );
+        let _ = std::fs::remove_dir_all(temp);
     }
 
     #[test]
@@ -49834,7 +50759,8 @@ $Instant Growth [Nayr]\n";
             // this test-only constructor - never a real disk read.
             custom_platform_artwork_directory: None,
             platform_artwork_cache: PlatformArtworkCache::default(),
-            custom_platform_artwork_directory_text: String::new(),
+            platform_artwork_manager: PlatformArtworkManagerState::default(),
+
             gamer_covers: crate::gamer_artwork::GamerCoverCache::default(),
             // No worker in tests: nothing here may open the real catalogue or
             // touch the network. Covers are driven through `absorb` instead.
@@ -63781,6 +64707,91 @@ $Instant Growth [Nayr]\n";
             "the cover was stretched: {}x{}",
             bounds.width(),
             bounds.height()
+        );
+    }
+
+    #[test]
+    fn a_game_cover_replaces_the_platform_icon_rather_than_drawing_over_it() {
+        // Both features draw into the same 56px slot, and the merge that brought
+        // them together had to pick an order. A ready cover wins; the platform
+        // icon is what a row falls back to. Drawing both would stack two images
+        // in one slot, and drawing the icon on top would hide the cover.
+        let (mut app, ctx) = gamer_cover_app(6);
+        run_frames(&mut app, &ctx, 1920.0, 1080.0, 3);
+        let generation = app.gamer_covers.generation();
+
+        // Before any cover: something is painted in the slot, and it is not a
+        // cover - that is the platform artwork fallback doing its job.
+        let before = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
+        let fallback_images = rendered_images(&before).len();
+        assert!(
+            fallback_images > 0,
+            "no platform artwork was drawn for a row with no cover"
+        );
+
+        app.gamer_covers
+            .absorb(&ctx, cover_reply(generation, &featured_path(0), "101"));
+        let after = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
+        let cover = cover_texture_id(&app, &featured_path(0)).expect("a loaded cover");
+        let drawn = rendered_images(&after);
+
+        assert!(
+            drawn.iter().any(|(id, _)| *id == cover),
+            "the cover was not painted once it was ready"
+        );
+        // The slot holds one image, not two: the count is unchanged because the
+        // cover took the icon's place rather than joining it.
+        assert_eq!(
+            drawn.len(),
+            fallback_images,
+            "the row painted {} images after the cover arrived and {fallback_images} before, \
+             so the platform icon and the cover are both in the slot",
+            drawn.len()
+        );
+    }
+
+    #[test]
+    fn a_row_and_the_featured_panel_agree_on_the_platform_fallback() {
+        // The row and the featured panel derive `platform_fallback` at two
+        // separate call sites. If they ever disagree, the same game shows one
+        // glyph in the list and a different one in the panel beside it.
+        // Every canonical platform, plus the cases that have no platform at all.
+        for platform in archivefs_core::platform::PLATFORMS
+            .iter()
+            .map(|platform| platform.id)
+            .chain(["definitely-not-a-platform", ""])
+        {
+            let unknown = canonical_platform_for_artwork(platform).is_none();
+            let fallback = platform_fallback_asset_id(platform, unknown);
+            assert!(
+                valid_platform_asset_id(fallback),
+                "{platform:?} fell back to {fallback:?}, which is not a drawable asset id"
+            );
+            // The last resort is a painted glyph, so the fallback must be one of
+            // the category ids the glyph painter actually recognises - otherwise
+            // a platform with no artwork lands on its default arm by accident
+            // rather than by choice.
+            assert!(
+                [
+                    PlatformAssetCategory::Console,
+                    PlatformAssetCategory::Handheld,
+                    PlatformAssetCategory::Computer,
+                    PlatformAssetCategory::Arcade,
+                    PlatformAssetCategory::OpticalDisc,
+                    PlatformAssetCategory::Cartridge,
+                    PlatformAssetCategory::Unknown,
+                ]
+                .iter()
+                .any(|category| category.asset_id() == fallback),
+                "{platform:?} falls back to {fallback:?}, which is not a drawable category"
+            );
+        }
+
+        // And an unrecognised platform lands on Unknown rather than on some
+        // category picked from a name nobody recognised.
+        assert_eq!(
+            platform_fallback_asset_id("definitely-not-a-platform", true),
+            PlatformAssetCategory::Unknown.asset_id()
         );
     }
 

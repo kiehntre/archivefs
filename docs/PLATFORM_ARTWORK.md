@@ -4,16 +4,20 @@ Status: Platform Artwork Pack v1 adds exact hardware illustrations to the
 existing Gamer View platform shelf without changing its filtering, selection,
 scrolling, or fallback model.
 
+The complete 74-platform inventory, candidate-file audit, canonical filenames,
+and prompts for missing images live in
+[`PLATFORM_ARTWORK_STATUS.md`](PLATFORM_ARTWORK_STATUS.md).
+
 ## Runtime policy
 
 Artwork resolution is deterministic and strictly ordered:
 
-1. A valid PNG in the explicitly configured custom-artwork directory, named
-   for the resolved exact asset id (or fallback category id).
+1. A valid ArchiveFS-managed custom PNG named for the canonical platform ID.
 2. The exact Platform Artwork Pack v1 PNG compiled into the GUI executable.
-3. The existing category fallback native glyph: console, handheld, computer,
+3. A valid managed custom category PNG, when present.
+4. The existing category fallback native glyph: console, handheld, computer,
    arcade, optical-disc, or cartridge.
-4. The existing Unknown native glyph.
+5. The existing Unknown native glyph.
 
 Compact game-list rows use a related three-step chain: a valid custom
 `game-<normalised-title>.png`, the resolved platform artwork above, then the
@@ -49,9 +53,9 @@ same compile-time byte registry for identical inputs.
 | `gamecube.png` | GameCube; Nintendo GameCube; Nintendo Game Cube |
 | `megadrive.png` | Mega Drive; Sega Mega Drive; Genesis; Sega Genesis |
 | `n64.png` | Nintendo 64; N64 |
-| `playstation.png` | PlayStation; PlayStation 1; PS1; PSX |
-| `playstation2.png` | PlayStation 2; PS2 |
-| `playstation3.png` | PlayStation 3; PS3 |
+| `psx.png` | PlayStation; PlayStation 1; PS1; PSX |
+| `ps2.png` | PlayStation 2; PS2 |
+| `ps3.png` | PlayStation 3; PS3 |
 | `saturn.png` | Saturn; Sega Saturn |
 | `snes.png` | Super Nintendo; Super Nintendo Entertainment System; SNES; Super Famicom |
 | `switch.png` | Nintendo Switch; Switch |
@@ -60,9 +64,10 @@ same compile-time byte registry for identical inputs.
 | `xbox.png` | Xbox; Original Xbox |
 | `xbox360.png` | Xbox 360; X360 |
 
-Aliases determine both the bundled image and the filename for a higher
-priority custom override. For example, `PSX` resolves to
-`playstation.png`, not `psx.png`.
+Aliases first resolve through the canonical platform registry. The persisted
+canonical ID then determines the bundled image and higher-priority custom
+override filename. For example, PlayStation aliases resolve to canonical
+`PSX`, then to `psx.png`; no display-name guessing is involved.
 
 ## Inspection and PNG manifest
 
@@ -81,9 +86,9 @@ pixels from the alpha-content bounds to left/top/right/bottom canvas edges.
 | `gamecube.png` | 1,594,670 | 172/142/131/89 | No visible text or logo | Readable and well centred; accepted |
 | `megadrive.png` | 1,555,855 | 85/6/3/33 | No visible text or logo | Readable; complete console; accepted |
 | `n64.png` | 1,571,533 | 44/6/3/65 | No visible text or logo | Readable; complete console/controller; accepted |
-| `playstation.png` | 1,575,183 | 111/102/3/65 | No visible text or logo | Readable; right-heavy but complete; accepted |
-| `playstation2.png` | 1,483,067 | 108/93/3/89 | No visible text or logo | Readable; slim tower remains distinct; accepted |
-| `playstation3.png` | 1,520,358 | 92/142/3/89 | No visible text or logo | Readable; complete console/controller; accepted |
+| `psx.png` | 1,575,183 | 111/102/3/65 | No visible text or logo | Readable; right-heavy but complete; accepted |
+| `ps2.png` | 1,483,067 | 108/93/3/89 | No visible text or logo | Readable; slim tower remains distinct; accepted |
+| `ps3.png` | 1,520,358 | 92/142/3/89 | No visible text or logo | Readable; complete console/controller; accepted |
 | `saturn.png` | 1,537,579 | 184/142/80/58 | No visible text or logo | Readable and complete; accepted |
 | `snes.png` | 1,633,370 | 140/102/59/58 | No visible text or logo | Readable and complete; accepted |
 | `switch.png` | 1,509,672 | 92/142/19/89 | No visible text or logo | Readable and complete; accepted |
@@ -110,26 +115,43 @@ manufacturer approval, or endorsement. They are distributed under the same
 licence terms as the repository's own source unless a future provenance
 record says otherwise.
 
-## Custom artwork directory
+## User-managed artwork
 
-Advanced View → Settings → “5. Platform artwork” accepts an optional local
-directory. Custom PNGs remain higher priority than the bundled pack and
-retain the established safety limits:
+Advanced View → Settings → “5. Platform artwork” manages upgrade-stable user
+artwork under `~/.local/share/archivefs/platform-artwork/`. ArchiveFS never
+writes overrides into its installation or source tree. The manager supports
+search/filter, one explicit platform at a time, confirmed removal, folder
+preview/import, and a read-only rescan. Custom PNGs remain higher priority
+than the bundled pack.
 
-- regular files directly inside the configured directory only; symlinks,
-  invalid ids, and non-files are rejected;
-- PNG only; custom SVG is never parsed;
-- maximum encoded size 1 MiB;
-- maximum dimensions 1024×1024 and maximum decoded allocation 4 MiB;
-- malformed, oversized, missing, or unsupported files fall through safely;
-- successful textures and failed decode fingerprints are cached by directory,
-  asset id, length, and modification time;
-- custom files are read in place and never copied or modified.
+PNG and JPEG inputs are currently decoded by the built-in safe codec set.
+WebP magic is recognised but this build refuses it until the optional WebP
+decoder is available; the original is never altered and the old custom image
+is preserved. All accepted inputs use these limits:
 
-The directory preference is persisted in
-`~/.config/archivefs/platform_artwork_directory.txt` only when explicitly
-changed. Category custom filenames (`console.png`, `handheld.png`, etc.)
-continue to work for platforms without an exact bundled mapping.
+- direct regular input files only; symlinks and non-files are rejected;
+- magic bytes, not the extension, determine PNG/JPEG/WebP format;
+- animation is refused;
+- maximum encoded size 32 MiB, maximum dimension 8192px, and maximum decoded
+  area 40 million pixels;
+- images are aspect-fitted, centred, and atomically published as a clean
+  1024×1024 PNG with no imported metadata;
+- images smaller than the content area are not upscaled and produce a warning;
+- malformed or failed replacements leave the preceding custom image intact;
+- rendering caches length and modification time and is invalidated immediately
+  after a managed change.
+
+Bulk import accepts only exact lowercase canonical filenames with `.png`,
+`.jpg`, `.jpeg`, or `.webp`; unknown names and duplicate targets remain in a
+review list and are never silently assigned. Dry-run validates everything
+without creating the managed directory. Category custom filenames
+(`console.png`, `handheld.png`, etc.) remain a supported manual fallback when
+placed in the managed folder and validated by Rescan.
+
+The same operations are available through `archivefs-cli platform-artwork`.
+No artwork command uses the network, database, ROM library, or emulator
+profiles. Removing or restoring default artwork removes only ArchiveFS's
+normalised managed copy, never the source selected during import.
 
 ## SVG/category fallbacks
 

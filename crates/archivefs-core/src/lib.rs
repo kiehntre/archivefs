@@ -88,6 +88,9 @@ pub mod safe_read;
 
 pub mod platform;
 
+/// Explicit, offline management of user-owned platform artwork overrides.
+pub mod platform_artwork;
+
 pub mod patch_manager;
 
 pub mod emulator_environment;
