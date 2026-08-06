@@ -1141,6 +1141,17 @@ fn render(view: &DatSourcesPageView, ui_state: &mut DatSourcesPageUi) -> egui::F
     })
 }
 
+/// Draws only the running-job card, so the platform line can be asserted
+/// without the source card's own platform control interfering.
+fn render_running_card(running: &RunningJobView) -> egui::FullOutput {
+    let context = egui::Context::default();
+    context.run(egui::RawInput::default(), |context| {
+        egui::CentralPanel::default().show(context, |ui| {
+            let _ = show_running_job(ui, running);
+        });
+    })
+}
+
 /// The same helper the shared widgets' own tests use.
 fn rendered_text_contains(output: &egui::FullOutput, needle: &str) -> bool {
     fn shape_contains(shape: &egui::Shape, needle: &str) -> bool {
@@ -1485,8 +1496,10 @@ fn drill_down_shows_parser_location_when_available_and_unavailable_otherwise() {
     assert_eq!(located.occurrences[0].line, Some(3));
     assert_eq!(located.occurrences[0].column, Some(12));
 
-    let mut ui_state =
-        DatSourcesPageUi { open_diagnostic: Some(located.id.clone()), ..Default::default() };
+    let mut ui_state = DatSourcesPageUi {
+        open_diagnostic: Some(located.id.clone()),
+        ..Default::default()
+    };
     let located_output = render(&view, &mut ui_state);
     assert!(rendered_text_contains(&located_output, "line 3:12"));
 
@@ -2050,6 +2063,7 @@ fn draining_a_progress_backlog_keeps_the_eta_stable() {
         latest: "Starting…".to_string(),
         started_at: Instant::now() - Duration::from_secs(60),
         audit_progress: Some(AuditProgressTracker::new()),
+        platform_display: None,
     });
 
     let total = 1000;
@@ -2081,6 +2095,9 @@ fn draining_a_progress_backlog_keeps_the_eta_stable() {
     let running = page.view().running.expect("the job is still running");
     let progress = running.progress.as_ref().expect("audit progress");
     assert_eq!(progress.files_checked, 103);
+    // Coalescing: after draining a 101-message backlog in one pass, the detail
+    // line is the last event's, not the first's.
+    assert_eq!(running.detail, "Checking 103 of 1000: f103.bin");
     match &progress.eta {
         EtaView::About { seconds_remaining } => {
             // ~50 files/s with 897 left is on the order of 18 seconds. A
@@ -2168,6 +2185,7 @@ fn take_over_job(page: &mut DatSourcesPageState, latest: &str) -> SyncSender<Job
         latest: latest.to_string(),
         started_at: Instant::now(),
         audit_progress: Some(AuditProgressTracker::new()),
+        platform_display: None,
     });
     sender
 }
@@ -2303,4 +2321,80 @@ fn a_cancelled_audit_never_appears_complete() {
         "a cancelled audit never appears complete"
     );
     assert!(view.audit_error.is_none(), "cancelling is not a failure");
+}
+
+// ---------------------------------------------------------------------------
+// Richer live audit context
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_running_card_shows_the_platform_only_when_authoritative() {
+    let (_fixture, mut page, roms) = audit_fixture();
+    // An unassigned source gets no platform line at all.
+    page.apply(DatSourcesPageAction::Audit {
+        id: "collection".to_string(),
+        scan_root: roms.clone(),
+    });
+    let unassigned = page.view().running.expect("running").clone();
+    assert!(
+        unassigned.platform_display.is_none(),
+        "no platform may be claimed for an unassigned source"
+    );
+    assert!(!rendered_text_contains(
+        &render_running_card(&unassigned),
+        "Platform:"
+    ));
+    page.apply(DatSourcesPageAction::CancelJob);
+    run_to_completion(&mut page);
+
+    // A recognised assignment is authoritative and appears on the running card.
+    let canonical = archivefs_core::platform::canonical_ids()[0];
+    page.apply(DatSourcesPageAction::SetPlatform {
+        id: "collection".to_string(),
+        platform: Some(canonical.to_string()),
+    });
+    page.apply(DatSourcesPageAction::Audit {
+        id: "collection".to_string(),
+        scan_root: roms.clone(),
+    });
+
+    let assigned = page.view().running.expect("running").clone();
+    assert_eq!(
+        assigned.platform_display.as_deref(),
+        Some(archivefs_core::platform::display_name_for(canonical)),
+        "a resolved assignment must be shown"
+    );
+    assert!(rendered_text_contains(
+        &render_running_card(&assigned),
+        "Platform:"
+    ));
+    page.apply(DatSourcesPageAction::CancelJob);
+    run_to_completion(&mut page);
+}
+
+#[test]
+fn an_unresolved_platform_is_never_presented_on_the_running_card() {
+    // An assignment this build does not recognise is kept, but must not be
+    // presented as authoritative during a run.
+    let (_fixture, mut page, roms) = audit_fixture();
+    page.apply(DatSourcesPageAction::SetPlatform {
+        id: "collection".to_string(),
+        platform: Some("APlatformFromALaterBuild".to_string()),
+    });
+    page.apply(DatSourcesPageAction::Audit {
+        id: "collection".to_string(),
+        scan_root: roms,
+    });
+
+    let running = page.view().running.expect("running").clone();
+    assert!(
+        running.platform_display.is_none(),
+        "an unresolved platform must not be claimed"
+    );
+    assert!(!rendered_text_contains(
+        &render_running_card(&running),
+        "Platform:"
+    ));
+    page.apply(DatSourcesPageAction::CancelJob);
+    run_to_completion(&mut page);
 }

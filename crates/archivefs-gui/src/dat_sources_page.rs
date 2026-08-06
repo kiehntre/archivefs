@@ -270,6 +270,9 @@ pub(crate) struct RunningJobView {
     pub(crate) cancellation_requested: bool,
     /// Structured audit progress, when the running job is an audit.
     pub(crate) progress: Option<AuditProgressView>,
+    /// The source's assigned platform, shown only when it is authoritative
+    /// (assigned and recognised by this build). Never guessed from the path.
+    pub(crate) platform_display: Option<String>,
 }
 
 impl RunningJobView {
@@ -495,6 +498,9 @@ struct RunningJob {
     started_at: Instant,
     /// Structured progress for audit jobs. `None` for validation.
     audit_progress: Option<AuditProgressTracker>,
+    /// The source's resolved platform at job start, shown on the running card
+    /// only when it is authoritative (assigned and recognised).
+    platform_display: Option<String>,
 }
 
 /// Sends without blocking, dropping the message when the queue is full.
@@ -566,6 +572,18 @@ fn shorten_path(path: &str) -> String {
     }
     let kept: Vec<&str> = components.split_off(components.len() - 2);
     format!("…/{}", kept.join("/"))
+}
+
+/// The source's platform, shown on the running card only when it is
+/// authoritative: assigned by the user and recognised by this build. An
+/// unassigned source has no platform to claim, and an unresolved one is not
+/// presented as if it were real.
+fn authoritative_platform(entry: &DatSourceEntry) -> Option<String> {
+    entry
+        .platform
+        .as_ref()
+        .filter(|_| entry.platform_is_resolved())
+        .and_then(|_| entry.platform_display())
 }
 
 /// Groups the last validation's diagnostics by (severity, code, message),
@@ -954,6 +972,11 @@ impl DatSourcesPageState {
         // which clears `self.job` after the loop - so reading `job.started_at`
         // here is safe.
         let elapsed = job.started_at.elapsed().as_secs_f64();
+        // Coalescing: the detail line is derived once per drain pass from the
+        // last progress event, so a backlog of a thousand messages builds one
+        // string instead of a thousand. The tracker still ingests every event
+        // (that is what keeps the ETA smooth); only the string work is shared.
+        let mut last_audit_progress: Option<DatAuditProgress> = None;
         loop {
             match job.messages.try_recv() {
                 Ok(JobMessage::Progress(line)) => {
@@ -972,7 +995,7 @@ impl DatSourcesPageState {
                         && let Some(tracker) = job.audit_progress.as_mut()
                     {
                         tracker.update(&event, elapsed);
-                        job.latest = describe(&event);
+                        last_audit_progress = Some(event);
                     }
                     changed = true;
                 }
@@ -1035,6 +1058,10 @@ impl DatSourcesPageState {
                     break;
                 }
             }
+        }
+        // Derive the detail line once from the last progress event of the pass.
+        if let Some(event) = last_audit_progress {
+            job.latest = describe(&event);
         }
         if finished {
             self.job = None;
@@ -1163,6 +1190,7 @@ impl DatSourcesPageState {
         let cancel = Arc::new(AtomicBool::new(false));
         let limits = self.limits;
         let name = entry.display_name.clone();
+        let platform_display = authoritative_platform(&entry);
 
         std::thread::spawn(move || {
             send_progress(&sender, JobMessage::Progress(format!("Reading {name}…")));
@@ -1179,6 +1207,7 @@ impl DatSourcesPageState {
             latest: "Starting…".to_string(),
             started_at: Instant::now(),
             audit_progress: None,
+            platform_display,
         });
     }
 
@@ -1195,6 +1224,7 @@ impl DatSourcesPageState {
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = cancel.clone();
         let trusted = self.trusted.clone();
+        let platform_display = authoritative_platform(&entry);
         let request = DatAuditRequest {
             source_id: entry.id.clone(),
             source_display_name: entry.display_name.clone(),
@@ -1227,6 +1257,7 @@ impl DatSourcesPageState {
             latest: "Starting…".to_string(),
             started_at: Instant::now(),
             audit_progress: Some(AuditProgressTracker::new()),
+            platform_display,
         });
     }
 
@@ -1282,6 +1313,7 @@ impl DatSourcesPageState {
                     .audit_progress
                     .as_ref()
                     .map(|tracker| tracker.view(job.started_at.elapsed().as_secs())),
+                platform_display: job.platform_display.clone(),
             }),
             library_folders: self.library_folders.clone(),
             audit: self
@@ -1929,6 +1961,15 @@ fn show_running_job(ui: &mut egui::Ui, running: &RunningJobView) -> Option<DatSo
             }
         });
         ui.label(egui::RichText::new(&running.detail).color(theme::muted(ui)));
+        if let Some(platform) = &running.platform_display {
+            // Shown only when the source's assigned platform is authoritative;
+            // never guessed from the path.
+            ui.label(
+                egui::RichText::new(format!("Platform: {platform}"))
+                    .color(theme::muted(ui))
+                    .small(),
+            );
+        }
         if let Some(progress) = &running.progress {
             ui.add_space(4.0);
             ui.label(egui::RichText::new(progress.line()).color(theme::muted(ui)));
