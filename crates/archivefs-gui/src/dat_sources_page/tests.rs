@@ -1444,6 +1444,82 @@ fn a_frozen_tracker_keeps_the_eta_it_had_at_its_last_update() {
 }
 
 #[test]
+fn draining_a_progress_backlog_keeps_the_eta_stable() {
+    // Regression: poll() used to timestamp every drained AuditProgress message
+    // with its own `started_at.elapsed()`. A backlog queued between GUI frames
+    // is drained within microseconds, so EtaEstimator saw a large delta_files
+    // over a near-zero delta_seconds and spiked the throughput, collapsing the
+    // ETA toward zero. poll() now reads the clock once per drain pass: every
+    // message in the burst shares one elapsed value, the `delta_seconds > 0`
+    // guard skips the rest of the burst, and the rate stays where the normally
+    // spaced passes put it.
+    let (_fixture, mut page, roms) = audit_fixture();
+    page.apply(DatSourcesPageAction::Audit {
+        id: "collection".to_string(),
+        scan_root: roms,
+    });
+    // Drive the job through a controllable channel, backdating the clock so
+    // the confidence gates (100 files, 5 seconds) are already open. A larger
+    // channel than the production constant lets the burst queue entirely
+    // without a blocking send.
+    let cancel = page.job.as_ref().expect("a job is running").cancel.clone();
+    let (sender, messages) = sync_channel(256);
+    page.job = Some(RunningJob {
+        kind: JobKind::Audit,
+        source_id: "collection".to_string(),
+        cancel,
+        cancel_requested: false,
+        messages,
+        latest: "Starting…".to_string(),
+        started_at: Instant::now() - Duration::from_secs(60),
+        audit_progress: Some(AuditProgressTracker::new()),
+    });
+
+    let total = 1000;
+    let hash = |index: usize| {
+        JobMessage::AuditProgress(DatAuditProgress::Hashing {
+            index,
+            total,
+            file_name: format!("f{index}.bin"),
+        })
+    };
+
+    // Two normally spaced passes establish a steady rate (one file per 20 ms).
+    sender.send(hash(1)).unwrap();
+    page.poll();
+    std::thread::sleep(Duration::from_millis(20));
+    sender.send(hash(2)).unwrap();
+    page.poll();
+
+    // Queue a backlog, then drain all of it in a single poll() pass. The EMA
+    // (alpha 0.2) needs ~21 samples to converge toward a spike rate, so 101
+    // queued messages are plenty to make the old per-message timing collapse
+    // the ETA, while staying above the 100-file confidence gate.
+    std::thread::sleep(Duration::from_millis(20));
+    for index in 3..=103 {
+        sender.send(hash(index)).unwrap();
+    }
+    page.poll();
+
+    let running = page.view().running.expect("the job is still running");
+    let progress = running.progress.as_ref().expect("audit progress");
+    assert_eq!(progress.files_checked, 103);
+    match &progress.eta {
+        EtaView::About { seconds_remaining } => {
+            // ~50 files/s with 897 left is on the order of 18 seconds. A
+            // per-message timestamp on the drained backlog would compute
+            // millions of files per second and collapse this to ~1 second.
+            assert!(
+                *seconds_remaining >= 5,
+                "the ETA must not collapse toward zero after a drained backlog: \
+                 {seconds_remaining}s"
+            );
+        }
+        other => panic!("expected a real ETA after a stable run, got {other:?}"),
+    }
+}
+
+#[test]
 fn completed_progress_shows_one_hundred_percent() {
     assert_eq!(format_percentage(500, 500), Some(100));
     assert_eq!(format_percentage(500, 1000), Some(50));

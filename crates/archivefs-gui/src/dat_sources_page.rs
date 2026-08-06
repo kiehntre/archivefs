@@ -827,6 +827,16 @@ impl DatSourcesPageState {
         };
         let mut changed = false;
         let mut finished = false;
+        // Read the clock once per drain pass. Every queued message was produced
+        // between this pass and the last one, so they all share one elapsed
+        // value; timestamping each message afresh would make a drained backlog
+        // look like an enormous files-per-second rate and collapse the ETA to
+        // near zero. The `delta_seconds > 0` guard inside `EtaEstimator::update`
+        // then skips every message after the first of the burst. The job stays
+        // alive for the whole pass - terminal messages only flag `finished`,
+        // which clears `self.job` after the loop - so reading `job.started_at`
+        // here is safe.
+        let elapsed = job.started_at.elapsed().as_secs_f64();
         loop {
             match job.messages.try_recv() {
                 Ok(JobMessage::Progress(line)) => {
@@ -841,12 +851,11 @@ impl DatSourcesPageState {
                     // Once cancellation is requested, progress is frozen: the
                     // detail line, the position, and the ETA all stop moving so
                     // a stale report cannot restore an active-looking state.
-                    if !job.cancel_requested {
-                        let elapsed = job.started_at.elapsed().as_secs_f64();
-                        if let Some(tracker) = job.audit_progress.as_mut() {
-                            tracker.update(&event, elapsed);
-                            job.latest = describe(&event);
-                        }
+                    if !job.cancel_requested
+                        && let Some(tracker) = job.audit_progress.as_mut()
+                    {
+                        tracker.update(&event, elapsed);
+                        job.latest = describe(&event);
                     }
                     changed = true;
                 }
