@@ -47,6 +47,7 @@ use serde::Serialize;
 use super::{DatHealthState, DatSourceEntry, DatSourceHealth, DatSourceKind, now_unix};
 use crate::dat::limits::DatLimits;
 use crate::dat::model::{DatEcosystem, DatFormat};
+use crate::dat::parser::DiagnosticSeverity;
 use crate::dat::parsers::parse_dat_file;
 
 /// How many DAT files one folder source will take.
@@ -365,6 +366,14 @@ pub fn sniff_dat_format(path: &Path) -> Option<DatFormat> {
     None
 }
 
+/// One diagnostic attached to a parsed DAT file, reduced to what a report and
+/// the GUI show: the severity and the message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DatDiagnostic {
+    pub severity: crate::dat::parser::DiagnosticSeverity,
+    pub message: String,
+}
+
 /// What one DAT file in a source turned out to be.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "outcome")]
@@ -376,7 +385,9 @@ pub enum DatFileOutcome {
         version: Option<String>,
         entry_count: usize,
         rom_count: usize,
-        warnings: Vec<String>,
+        /// Every diagnostic the parser produced, each with its severity. A
+        /// parser note is expected behaviour and must not lower the verdict.
+        diagnostics: Vec<DatDiagnostic>,
     },
     /// The parser refused it, with the reason it gave.
     Failed { error: String },
@@ -533,6 +544,7 @@ pub fn validate_dat_source(entry: &DatSourceEntry, limits: DatLimits) -> DatVali
     let mut identities: Vec<(String, String)> = Vec::new();
     let mut failures = 0usize;
     let mut warned = false;
+    let mut errored = false;
 
     for path in &files {
         let file_name = path
@@ -554,14 +566,27 @@ pub fn validate_dat_source(entry: &DatSourceEntry, limits: DatLimits) -> DatVali
                 {
                     identities.push((identity, file_name.clone()));
                 }
-                // Both the parser's own accumulated notes and the structured
-                // warnings it returned; the two lists overlap but neither
-                // contains the other.
-                let mut warnings: Vec<String> = source.parse_warnings.clone();
-                warnings.extend(parsed.warnings.iter().map(ToString::to_string));
-                warnings.dedup();
-                if !warnings.is_empty() {
-                    warned = true;
+                // The structured warnings the parser returned carry a severity;
+                // the parser's own string copy (`source.parse_warnings`) holds
+                // the same messages, so it is not folded in again.
+                let mut diagnostics: Vec<DatDiagnostic> = parsed
+                    .warnings
+                    .iter()
+                    .map(|warning| DatDiagnostic {
+                        severity: warning.severity(),
+                        message: warning.to_string(),
+                    })
+                    .collect();
+                // The same message can legitimately be recorded several times
+                // (for example one per affected ROM); report it once.
+                let mut seen = std::collections::BTreeSet::new();
+                diagnostics.retain(|diagnostic| seen.insert(diagnostic.message.clone()));
+                for diagnostic in &diagnostics {
+                    match diagnostic.severity {
+                        DiagnosticSeverity::Note => {}
+                        DiagnosticSeverity::Warning => warned = true,
+                        DiagnosticSeverity::Error => errored = true,
+                    }
                 }
                 DatFileOutcome::Parsed {
                     format: source.format,
@@ -570,7 +595,7 @@ pub fn validate_dat_source(entry: &DatSourceEntry, limits: DatLimits) -> DatVali
                     version: source.version.clone(),
                     entry_count: source.entry_count,
                     rom_count: source.rom_count,
-                    warnings,
+                    diagnostics,
                 }
             }
             Err(error) => {
@@ -592,9 +617,13 @@ pub fn validate_dat_source(entry: &DatSourceEntry, limits: DatLimits) -> DatVali
     report.formats = formats;
     report.duplicate_identities = collect_duplicate_identities(identities);
 
+    // The verdict is the highest severity present. A file that failed to parse
+    // is an error; so is a diagnostic classified as an error. Warnings (but no
+    // errors) mean the source is valid but worth a look. Parser notes are
+    // expected behaviour and never lower a Valid verdict.
     report.state = if failures == files.len() {
         DatHealthState::Invalid
-    } else if failures > 0 {
+    } else if failures > 0 || errored {
         // A folder where some files parsed and some did not is not "valid":
         // the user asked for the folder, and part of what they asked for is
         // unusable.

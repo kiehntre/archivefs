@@ -19,7 +19,7 @@ use super::super::limits::DatLimits;
 use super::super::model::{
     DatEcosystem, DatFormat, DatGameEntry, DatRomEntry, DatSource, ParsedDat,
 };
-use super::super::parser::{ParseError, ParseOutcome, ParseWarning};
+use super::super::parser::{DiagnosticSeverity, ParseError, ParseOutcome, ParseWarning};
 
 pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, ParseError> {
     let metadata = std::fs::metadata(path).map_err(|error| ParseError::Io {
@@ -59,6 +59,7 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
                 column: None,
                 context: String::new(),
                 message: msg.to_string(),
+                severity: DiagnosticSeverity::Warning,
             });
         }
     };

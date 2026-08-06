@@ -17,8 +17,9 @@ use std::time::{Duration, Instant};
 
 use archivefs_core::dat::audit::{AuditReport, AuditSummary};
 use archivefs_core::dat::model::{DatEcosystem, DatFormat};
+use archivefs_core::dat::parser::DiagnosticSeverity;
 use archivefs_core::dat::sources::{
-    DatFileOutcome, DatFileReport, DatHealthState, DatSourceKind, DatSourceRegistry,
+    DatDiagnostic, DatFileOutcome, DatFileReport, DatHealthState, DatSourceKind, DatSourceRegistry,
     DatValidationReport, audit_run::DatAuditOutcome, load_dat_sources_config_from,
 };
 use archivefs_core::safe_read::TrustedRoots;
@@ -1044,11 +1045,29 @@ fn the_page_states_what_it_supports_and_what_it_will_never_do() {
 // Validation warning presentation
 // ---------------------------------------------------------------------------
 
+/// A warning-severity diagnostic for a test report.
+fn warn(message: impl Into<String>) -> DatDiagnostic {
+    DatDiagnostic {
+        severity: DiagnosticSeverity::Warning,
+        message: message.into(),
+    }
+}
+
+/// A parser-note-severity diagnostic for a test report.
+fn note(message: impl Into<String>) -> DatDiagnostic {
+    DatDiagnostic {
+        severity: DiagnosticSeverity::Note,
+        message: message.into(),
+    }
+}
+
 /// A page holding one folder source plus a stored validation report built by
-/// the test, so warning presentation can be driven without depending on parser
-/// wording.
+/// the test, so diagnostic presentation can be driven without depending on
+/// parser wording. The health state is supplied by the test because it now
+/// depends on the severities present.
 fn page_with_report(
-    per_file_warnings: Vec<Vec<String>>,
+    per_file_diagnostics: Vec<Vec<DatDiagnostic>>,
+    state: DatHealthState,
     truncated: bool,
     total_dat_files: Option<usize>,
 ) -> (Fixture, DatSourcesPageState) {
@@ -1059,10 +1078,10 @@ fn page_with_report(
         path: folder.clone(),
     });
     let id = "warn".to_string();
-    let files: Vec<DatFileReport> = per_file_warnings
+    let files: Vec<DatFileReport> = per_file_diagnostics
         .iter()
         .enumerate()
-        .map(|(index, warnings)| DatFileReport {
+        .map(|(index, diagnostics)| DatFileReport {
             path: format!("{}/warn-{index}.dat", folder.display()),
             file_name: format!("warn-{index}.dat"),
             outcome: DatFileOutcome::Parsed {
@@ -1072,7 +1091,7 @@ fn page_with_report(
                 version: Some("2026-01-01".to_string()),
                 entry_count: 1,
                 rom_count: 1,
-                warnings: warnings.clone(),
+                diagnostics: diagnostics.clone(),
             },
         })
         .collect();
@@ -1080,7 +1099,7 @@ fn page_with_report(
         source_id: id.clone(),
         path: folder.to_string_lossy().into_owned(),
         kind: "DAT folder",
-        state: DatHealthState::ValidWithWarnings,
+        state,
         files,
         duplicate_identities: Vec::new(),
         skipped: Vec::new(),
@@ -1130,7 +1149,9 @@ fn warnings_render_count_summary_and_expandable_details() {
         "The header version differs from the file's name".to_string(),
         "A ROM entry has no SHA-1 checksum; only CRC32 was compared".to_string(),
     ];
-    let (_fixture, page) = page_with_report(vec![warnings.clone()], false, None);
+    let diagnostics = vec![warnings.iter().map(warn).collect::<Vec<_>>()];
+    let (_fixture, page) =
+        page_with_report(diagnostics, DatHealthState::ValidWithWarnings, false, None);
     let view = page.view();
     assert_eq!(view.rows[0].warnings.len(), 2);
     assert_eq!(view.rows[0].health_state, DatHealthState::ValidWithWarnings);
@@ -1163,7 +1184,7 @@ fn warnings_render_count_summary_and_expandable_details() {
 
 #[test]
 fn zero_warnings_show_no_warning_details_control() {
-    let (_fixture, page) = page_with_report(vec![Vec::new()], false, None);
+    let (_fixture, page) = page_with_report(vec![Vec::new()], DatHealthState::Valid, false, None);
     let view = page.view();
     assert!(view.rows[0].warnings.is_empty());
 
@@ -1176,9 +1197,50 @@ fn zero_warnings_show_no_warning_details_control() {
 }
 
 #[test]
+fn warnings_and_parser_notes_render_as_separate_sections() {
+    // A parsed file carrying both a real warning and a parser note must show
+    // them as two distinct, labelled sections - the note must never be counted
+    // as a warning.
+    let note_text = "DOCTYPE declaration accepted as inert text";
+    let warning_text =
+        "crc attribute on a rom element is not a well-formed checksum and was dropped";
+    let (_fixture, page) = page_with_report(
+        vec![vec![warn(warning_text), note(note_text)]],
+        DatHealthState::ValidWithWarnings,
+        false,
+        None,
+    );
+    let view = page.view();
+    let row = &view.rows[0];
+    assert_eq!(row.warnings, vec![warning_text]);
+    assert_eq!(row.notes, vec![note_text]);
+
+    let mut ui_state = DatSourcesPageUi::default();
+    let output = render(&view, &mut ui_state);
+    assert!(rendered_text_contains(&output, "1 warning"));
+    assert!(rendered_text_contains(&output, "1 parser note"));
+    assert!(rendered_text_contains(&output, "View warning details"));
+    assert!(rendered_text_contains(&output, "View parser notes"));
+
+    // Expanding the notes reveals the reassurance and the full note text.
+    ui_state.open_notes = Some(view.rows[0].id.clone());
+    let expanded = render(&view, &mut ui_state);
+    assert!(rendered_text_contains(
+        &expanded,
+        "Parser notes are expected parser behaviour and need no action."
+    ));
+    assert!(rendered_text_contains(&expanded, note_text));
+}
+
+#[test]
 fn a_safety_limit_stop_is_labelled_incomplete_and_counts_are_exact() {
     // Both numbers genuinely known: the read count and the folder's real total.
-    let (_fixture, page) = page_with_report(vec![vec!["w".to_string()]], true, Some(2024));
+    let (_fixture, page) = page_with_report(
+        vec![vec![warn("w")]],
+        DatHealthState::ValidWithWarnings,
+        true,
+        Some(2024),
+    );
     let row = &page.view().rows[0];
     assert!(row.incomplete_load);
     assert_eq!(row.dat_files_read, Some(1));
@@ -1189,7 +1251,12 @@ fn a_safety_limit_stop_is_labelled_incomplete_and_counts_are_exact() {
     );
 
     // An unknown total never invents one: the safety limit is named instead.
-    let (_fixture, page) = page_with_report(vec![vec!["w".to_string()]], true, None);
+    let (_fixture, page) = page_with_report(
+        vec![vec![warn("w")]],
+        DatHealthState::ValidWithWarnings,
+        true,
+        None,
+    );
     let row = &page.view().rows[0];
     assert!(row.incomplete_load);
     assert_eq!(row.dat_files_total, None);
@@ -1201,7 +1268,12 @@ fn a_safety_limit_stop_is_labelled_incomplete_and_counts_are_exact() {
 
 #[test]
 fn an_incomplete_load_is_drawn_prominently_with_its_counts() {
-    let (_fixture, page) = page_with_report(vec![vec!["w".to_string()]], true, Some(2024));
+    let (_fixture, page) = page_with_report(
+        vec![vec![warn("w")]],
+        DatHealthState::ValidWithWarnings,
+        true,
+        Some(2024),
+    );
     let view = page.view();
     let mut ui_state = DatSourcesPageUi::default();
     let output = render(&view, &mut ui_state);
@@ -1217,7 +1289,12 @@ fn unknown_total_never_invents_a_count_or_percentage() {
     assert_eq!(format_percentage(5, 0), None);
     assert_eq!(format_percentage(0, 0), None);
 
-    let (_fixture, page) = page_with_report(vec![vec!["w".to_string()]], true, None);
+    let (_fixture, page) = page_with_report(
+        vec![vec![warn("w")]],
+        DatHealthState::ValidWithWarnings,
+        true,
+        None,
+    );
     let row = &page.view().rows[0];
     assert_eq!(row.dat_files_read, Some(1), "the read count is still known");
     assert_eq!(row.dat_files_total, None);
@@ -1231,10 +1308,11 @@ fn unknown_total_never_invents_a_count_or_percentage() {
 #[test]
 fn warning_order_is_deterministic() {
     let per_file = vec![
-        vec!["first-a".to_string(), "second-a".to_string()],
-        vec!["first-b".to_string(), "second-b".to_string()],
+        vec![warn("first-a"), warn("second-a")],
+        vec![warn("first-b"), warn("second-b")],
     ];
-    let (_fixture, page) = page_with_report(per_file, false, None);
+    let (_fixture, page) =
+        page_with_report(per_file, DatHealthState::ValidWithWarnings, false, None);
     let row = &page.view().rows[0];
     assert_eq!(
         row.warnings,
@@ -1245,7 +1323,12 @@ fn warning_order_is_deterministic() {
 
 #[test]
 fn the_history_and_logs_reference_is_only_drawn_when_details_are_recorded_there() {
-    let (_fixture, page) = page_with_report(vec![vec!["w".to_string()]], false, None);
+    let (_fixture, page) = page_with_report(
+        vec![vec![warn("w")]],
+        DatHealthState::ValidWithWarnings,
+        false,
+        None,
+    );
     let mut view = page.view();
     // Nothing is recorded in History & Logs today, so the honest card does not
     // point there.
@@ -1272,11 +1355,12 @@ fn warnings_are_prominent_on_the_card_not_buried_behind_inspect() {
     // the warning text was only reachable by opening Inspect and reading a
     // nested per-file list. The count and an expandable "View warning details"
     // control now sit on the card itself.
-    let warnings = vec![
-        "A ROM entry has no SHA-1 checksum; only CRC32 was compared".to_string(),
-        "The header declares a version that differs from the filename".to_string(),
-    ];
-    let (_fixture, page) = page_with_report(vec![warnings.clone()], false, None);
+    let diagnostics = vec![vec![
+        warn("A ROM entry has no SHA-1 checksum; only CRC32 was compared"),
+        warn("The header declares a version that differs from the filename"),
+    ]];
+    let (_fixture, page) =
+        page_with_report(diagnostics, DatHealthState::ValidWithWarnings, false, None);
     let view = page.view();
     assert_eq!(view.rows[0].health_state, DatHealthState::ValidWithWarnings);
 
@@ -1291,6 +1375,203 @@ fn warnings_are_prominent_on_the_card_not_buried_behind_inspect() {
         rendered_text_contains(&output, "View warning details"),
         "the expandable control must be visible without opening Inspect"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostic severity: the TOSEC DOCTYPE reproduction and its neighbours
+// ---------------------------------------------------------------------------
+
+/// A Logiqx XML DAT carrying the standard DOCTYPE plus `games` entries.
+///
+/// The DOCTYPE is expected parser behaviour and must surface as a parser note,
+/// never as a warning. This is the reproduction reported against the GUI: a
+/// single TOSEC DAT whose only diagnostic was the DOCTYPE, shown as "Valid,
+/// with warnings" and "1 warning".
+fn logiqx_with_doctype_and_entries(games: usize) -> String {
+    let mut xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <!DOCTYPE datafile PUBLIC \"-//Logiqx//DTD ROM Management Datafile//EN\" \
+         \"http://www.logiqx.com/Dats/datafile.dtd\">\n\
+         <datafile>\n\
+         <header><name>Test TOSEC Set</name><version>2026-01-01</version></header>\n",
+    );
+    for index in 0..games {
+        xml.push_str(&format!(
+            "<game name=\"Game {index}\"><rom name=\"g{index}.bin\" size=\"16\" crc=\"{index:08x}\"/></game>\n"
+        ));
+    }
+    xml.push_str("</datafile>\n");
+    xml
+}
+
+/// A Logiqx XML DAT whose checksum is malformed: the parser drops it and warns,
+/// so the DAT parses but carries a real warning.
+fn logiqx_with_malformed_checksum(doctype: bool) -> String {
+    let doctype = if doctype {
+        "<!DOCTYPE datafile PUBLIC \"-//Logiqx//DTD ROM Management Datafile//EN\" \
+         \"http://www.logiqx.com/Dats/datafile.dtd\">\n"
+    } else {
+        ""
+    };
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+{doctype}<datafile><game name="G"><rom name="a.bin" size="4" crc="not-a-checksum"/></game></datafile>"#
+    )
+}
+
+#[test]
+fn a_doctype_parser_note_shows_valid_with_no_warnings() {
+    // The exact reproduction: a single TOSEC DAT, 1005 entries, whose only
+    // diagnostic is the DOCTYPE parser note. It must read "Valid" and "1 parser
+    // note", never "Valid, with warnings" or "1 warning".
+    let fixture = Fixture::new();
+    let dat = fixture.write("tosec.dat", &logiqx_with_doctype_and_entries(1005));
+
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddFile { path: dat });
+    page.apply(DatSourcesPageAction::Validate {
+        id: "tosec".to_string(),
+    });
+    run_to_completion(&mut page);
+
+    let view = page.view();
+    let row = &view.rows[0];
+    assert_eq!(row.entry_count, Some(1005));
+    assert_eq!(row.rom_count, Some(1005));
+    assert_eq!(
+        row.health_state,
+        DatHealthState::Valid,
+        "a parser note must not lower the verdict"
+    );
+    assert!(
+        row.warnings.is_empty(),
+        "the DOCTYPE must not surface as a warning: {:?}",
+        row.warnings
+    );
+    assert_eq!(
+        row.notes.len(),
+        1,
+        "the DOCTYPE must be a single parser note"
+    );
+    assert!(row.notes[0].contains("DOCTYPE"), "{}", row.notes[0]);
+
+    let mut ui_state = DatSourcesPageUi::default();
+    let output = render(&view, &mut ui_state);
+    assert!(!rendered_text_contains(&output, "with warnings"));
+    assert!(
+        !rendered_text_contains(&output, "1 warning"),
+        "the note must not be called a warning"
+    );
+    assert!(rendered_text_contains(&output, "1 parser note"));
+    assert!(rendered_text_contains(&output, "View parser notes"));
+}
+
+#[test]
+fn a_real_warning_shows_valid_with_warnings() {
+    let fixture = Fixture::new();
+    let dat = fixture.write("warn.dat", &logiqx_with_malformed_checksum(false));
+
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddFile { path: dat });
+    page.apply(DatSourcesPageAction::Validate {
+        id: "warn".to_string(),
+    });
+    run_to_completion(&mut page);
+
+    let view = page.view();
+    let row = &view.rows[0];
+    assert_eq!(row.health_state, DatHealthState::ValidWithWarnings);
+    assert_eq!(row.warnings.len(), 1, "{:?}", row.warnings);
+    assert!(row.notes.is_empty());
+
+    let mut ui_state = DatSourcesPageUi::default();
+    let output = render(&view, &mut ui_state);
+    assert!(rendered_text_contains(&output, "Valid, with warnings"));
+    assert!(rendered_text_contains(&output, "1 warning"));
+    assert!(rendered_text_contains(&output, "View warning details"));
+}
+
+#[test]
+fn a_real_parser_failure_shows_invalid() {
+    let fixture = Fixture::new();
+    let dat = fixture.write("broken.dat", "<?xml version=\"1.0\"?><datafile><game");
+
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddFile { path: dat });
+    page.apply(DatSourcesPageAction::Validate {
+        id: "broken".to_string(),
+    });
+    run_to_completion(&mut page);
+
+    let view = page.view();
+    let row = &view.rows[0];
+    assert_eq!(row.health_state, DatHealthState::Invalid);
+    assert!(row.warnings.is_empty());
+    assert!(row.notes.is_empty());
+
+    let mut ui_state = DatSourcesPageUi::default();
+    let output = render(&view, &mut ui_state);
+    assert!(rendered_text_contains(&output, "Invalid"));
+    assert!(!rendered_text_contains(&output, "View warning details"));
+    assert!(!rendered_text_contains(&output, "View parser notes"));
+}
+
+#[test]
+fn mixed_warning_and_notes_shows_valid_with_warnings() {
+    let fixture = Fixture::new();
+    let dat = fixture.write("mixed.dat", &logiqx_with_malformed_checksum(true));
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddFile { path: dat });
+    page.apply(DatSourcesPageAction::Validate {
+        id: "mixed".to_string(),
+    });
+    run_to_completion(&mut page);
+
+    let view = page.view();
+    let row = &view.rows[0];
+    assert_eq!(
+        row.health_state,
+        DatHealthState::ValidWithWarnings,
+        "a warning overrides parser notes in the verdict"
+    );
+    assert_eq!(row.warnings.len(), 1, "{:?}", row.warnings);
+    assert_eq!(row.notes.len(), 1, "{:?}", row.notes);
+
+    let mut ui_state = DatSourcesPageUi::default();
+    let output = render(&view, &mut ui_state);
+    assert!(rendered_text_contains(&output, "Valid, with warnings"));
+    assert!(rendered_text_contains(&output, "1 warning"));
+    assert!(rendered_text_contains(&output, "1 parser note"));
+}
+
+#[test]
+fn mixed_errors_warnings_and_notes_shows_invalid() {
+    let fixture = Fixture::new();
+    let folder = fixture.dir("mixed");
+    std::fs::write(
+        folder.join("broken.dat"),
+        "<?xml version=\"1.0\"?><datafile><game",
+    )
+    .unwrap();
+    std::fs::write(folder.join("ok.dat"), logiqx_with_malformed_checksum(true)).unwrap();
+
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddFolder { path: folder });
+    page.apply(DatSourcesPageAction::Validate {
+        id: "mixed".to_string(),
+    });
+    run_to_completion(&mut page);
+
+    let view = page.view();
+    assert_eq!(
+        view.rows[0].health_state,
+        DatHealthState::Invalid,
+        "an error in any file makes the whole source invalid"
+    );
+
+    let mut ui_state = DatSourcesPageUi::default();
+    let output = render(&view, &mut ui_state);
+    assert!(rendered_text_contains(&output, "Invalid"));
 }
 
 // ---------------------------------------------------------------------------

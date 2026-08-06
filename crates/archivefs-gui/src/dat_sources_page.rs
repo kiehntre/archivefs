@@ -45,6 +45,7 @@ use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::time::Instant;
 
 use archivefs_core::dat::limits::DatLimits;
+use archivefs_core::dat::parser::DiagnosticSeverity;
 use archivefs_core::dat::sources::audit_run::{
     DatAuditOutcome, DatAuditProgress, DatAuditRequest, run_dat_audit,
 };
@@ -131,6 +132,10 @@ pub(crate) struct DatSourceRowView {
     /// Every warning the last validation found, flattened across files in the
     /// deterministic order the files were read. Empty when there were none.
     pub(crate) warnings: Vec<String>,
+    /// Parser notes from the last validation: expected parser behaviour that
+    /// needs no action. Flattened in the same deterministic order. These never
+    /// lower the health verdict and must not be presented as warnings.
+    pub(crate) notes: Vec<String>,
     /// The bounded safety limit stopped the last validation part-way through a
     /// folder, so the verdict covers only part of it. Must never be presented
     /// as "everything was checked".
@@ -171,6 +176,7 @@ pub(crate) struct InspectFileView {
     /// The format and counts, or the parser's error.
     pub(crate) detail: String,
     pub(crate) warnings: Vec<String>,
+    pub(crate) notes: Vec<String>,
 }
 
 /// What the last validation run found, in detail.
@@ -518,20 +524,25 @@ fn truncate_inline(text: &str) -> String {
     out
 }
 
-/// Every warning the last validation found, flattened across files in the
-/// deterministic order the files were read (files are sorted by name; each
-/// file's warnings keep the parser's own order).
-fn flatten_warnings(report: &DatValidationReport) -> Vec<String> {
-    report
-        .files
-        .iter()
-        .filter_map(|file| match &file.outcome {
-            DatFileOutcome::Parsed { warnings, .. } => Some(warnings.as_slice()),
-            DatFileOutcome::Failed { .. } => None,
-        })
-        .flatten()
-        .cloned()
-        .collect()
+/// The warnings and parser notes the last validation found, flattened across
+/// files in the deterministic order the files were read (files are sorted by
+/// name; each file's diagnostics keep the parser's own order).
+fn flatten_diagnostics(report: &DatValidationReport) -> (Vec<String>, Vec<String>) {
+    let mut warnings = Vec::new();
+    let mut notes = Vec::new();
+    for file in &report.files {
+        let DatFileOutcome::Parsed { diagnostics, .. } = &file.outcome else {
+            continue;
+        };
+        for diagnostic in diagnostics {
+            match diagnostic.severity {
+                DiagnosticSeverity::Warning => warnings.push(diagnostic.message.clone()),
+                DiagnosticSeverity::Note => notes.push(diagnostic.message.clone()),
+                DiagnosticSeverity::Error => warnings.push(diagnostic.message.clone()),
+            }
+        }
+    }
+    (warnings, notes)
 }
 
 /// How far a running audit has got, structurally.
@@ -1190,7 +1201,7 @@ impl DatSourcesPageState {
             Some(saved) => saved != entry,
         };
         let validation = self.validation(&entry.id);
-        let warnings = validation.map(flatten_warnings).unwrap_or_default();
+        let (warnings, notes) = validation.map(flatten_diagnostics).unwrap_or_default();
         let incomplete_load = validation.is_some_and(|report| report.truncated);
         let dat_files_read = incomplete_load.then(|| validation.unwrap().files.len() as u64);
         let dat_files_total = incomplete_load
@@ -1226,6 +1237,7 @@ impl DatSourcesPageState {
                 .is_some_and(|job| job.source_id == entry.id),
             detail: self.validation(&entry.id).map(inspect_view),
             warnings,
+            notes,
             incomplete_load,
             dat_files_read,
             dat_files_total,
@@ -1316,38 +1328,52 @@ fn inspect_view(report: &DatValidationReport) -> InspectView {
                     version,
                     entry_count,
                     rom_count,
-                    warnings,
-                } => InspectFileView {
-                    file_name: file.file_name.clone(),
-                    status: if warnings.is_empty() {
-                        "OK"
-                    } else {
-                        "OK, with warnings"
-                    },
-                    detail: {
-                        let mut parts = vec![
-                            format.label().to_string(),
-                            ecosystem.label().to_string(),
-                            format!("{entry_count} entries, {rom_count} ROMs"),
-                        ];
-                        if let Some(name) = name {
-                            parts.insert(
-                                0,
-                                match version {
-                                    Some(version) => format!("{name} ({version})"),
-                                    None => name.clone(),
-                                },
-                            );
-                        }
-                        parts.join(" · ")
-                    },
-                    warnings: warnings.clone(),
-                },
+                    diagnostics,
+                } => {
+                    let warnings: Vec<String> = diagnostics
+                        .iter()
+                        .filter(|diagnostic| diagnostic.severity != DiagnosticSeverity::Note)
+                        .map(|diagnostic| diagnostic.message.clone())
+                        .collect();
+                    let notes: Vec<String> = diagnostics
+                        .iter()
+                        .filter(|diagnostic| diagnostic.severity == DiagnosticSeverity::Note)
+                        .map(|diagnostic| diagnostic.message.clone())
+                        .collect();
+                    InspectFileView {
+                        file_name: file.file_name.clone(),
+                        status: if warnings.is_empty() {
+                            "OK"
+                        } else {
+                            "OK, with warnings"
+                        },
+                        detail: {
+                            let mut parts = vec![
+                                format.label().to_string(),
+                                ecosystem.label().to_string(),
+                                format!("{entry_count} entries, {rom_count} ROMs"),
+                            ];
+                            if let Some(name) = name {
+                                parts.insert(
+                                    0,
+                                    match version {
+                                        Some(version) => format!("{name} ({version})"),
+                                        None => name.clone(),
+                                    },
+                                );
+                            }
+                            parts.join(" · ")
+                        },
+                        warnings,
+                        notes,
+                    }
+                }
                 DatFileOutcome::Failed { error } => InspectFileView {
                     file_name: file.file_name.clone(),
                     status: "Failed",
                     detail: error.clone(),
                     warnings: Vec::new(),
+                    notes: Vec::new(),
                 },
             })
             .collect(),
@@ -1566,6 +1592,8 @@ pub(crate) struct DatSourcesPageUi {
     pub(crate) confirm_remove: Option<String>,
     /// Which source's warning-details disclosure is open.
     pub(crate) open_warnings: Option<String>,
+    /// Which source's parser-notes disclosure is open.
+    pub(crate) open_notes: Option<String>,
 }
 
 impl DatSourcesPageUi {
@@ -1577,6 +1605,7 @@ impl DatSourcesPageUi {
         self.open_audit_picker = None;
         self.confirm_remove = None;
         self.open_warnings = None;
+        self.open_notes = None;
     }
 }
 
@@ -1898,7 +1927,7 @@ fn show_source_row(
             );
         }
 
-        show_warning_summary(ui, row, ui_state);
+        show_diagnostics_summary(ui, row, ui_state);
 
         ui.add_space(6.0);
         if action.is_none()
@@ -2026,68 +2055,131 @@ fn health_label(row: &DatSourceRowView) -> String {
     }
 }
 
-/// The warning count, a concise inline summary, and the expandable warning
-/// details, drawn directly on the source card so "Valid, with warnings" is
-/// never a bare badge with the reasons hidden behind Inspect.
-fn show_warning_summary(
+/// Warnings and parser notes, each with a count, a concise inline summary, and
+/// an expandable list, drawn directly on the source card so the health badge is
+/// never the only thing the user can see.
+///
+/// Warnings are worth investigating; parser notes are expected behaviour and
+/// are never presented as if something is wrong.
+fn show_diagnostics_summary(
     ui: &mut egui::Ui,
     row: &DatSourceRowView,
     ui_state: &mut DatSourcesPageUi,
 ) {
-    if row.warnings.is_empty() {
-        return;
-    }
-    let open = ui_state.open_warnings.as_deref() == Some(row.id.as_str());
-    let count = row.warnings.len();
+    let warnings_open = ui_state.open_warnings.as_deref() == Some(row.id.as_str());
+    let notes_open = ui_state.open_notes.as_deref() == Some(row.id.as_str());
 
-    ui.add_space(6.0);
-    ui.horizontal(|ui| {
-        widgets::status_badge(
-            ui,
-            format!(
-                "{count} {}",
-                if count == 1 { "warning" } else { "warnings" }
-            ),
-            widgets::StatusTone::Warning,
-        );
-        let label = if open {
-            "Hide warning details"
-        } else {
-            "View warning details"
-        };
-        if widgets::action_button(ui, label, widgets::ActionStyle::Quiet, true).clicked() {
-            ui_state.open_warnings = if open { None } else { Some(row.id.clone()) };
-        }
-        if row.history_link_available {
-            // Only ever drawn when the full details really are recorded in
-            // History & Logs; today they are kept inline, so this is off.
+    if !row.warnings.is_empty() {
+        let count = row.warnings.len();
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            widgets::status_badge(
+                ui,
+                format!(
+                    "{count} {}",
+                    if count == 1 { "warning" } else { "warnings" }
+                ),
+                widgets::StatusTone::Warning,
+            );
+            let label = if warnings_open {
+                "Hide warning details"
+            } else {
+                "View warning details"
+            };
+            if widgets::action_button(ui, label, widgets::ActionStyle::Quiet, true).clicked() {
+                ui_state.open_warnings = if warnings_open {
+                    None
+                } else {
+                    Some(row.id.clone())
+                };
+            }
+        });
+        // Concise inline summary: the first warning, kept to one line.
+        if let Some(first) = row.warnings.first() {
             ui.label(
-                egui::RichText::new("Full details are recorded in History & Logs.")
+                egui::RichText::new(format!("Summary: {}", truncate_inline(first)))
                     .color(theme::muted(ui))
                     .small(),
             );
         }
-    });
+        if warnings_open {
+            for warning in &row.warnings {
+                ui.horizontal_top(|ui| {
+                    ui.label(
+                        egui::RichText::new("•").color(widgets::StatusTone::Warning.color(ui)),
+                    );
+                    // The original warning text is preserved verbatim; only the
+                    // inline summary is ever truncated.
+                    ui.add(egui::Label::new(warning).wrap());
+                });
+            }
+        }
+    }
 
-    // Concise inline summary: the first warning, kept to one line. The full
-    // text of every warning is in the expandable list below.
-    if let Some(first) = row.warnings.first() {
+    if !row.notes.is_empty() {
+        let count = row.notes.len();
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            widgets::status_badge(
+                ui,
+                format!(
+                    "{count} {}",
+                    if count == 1 {
+                        "parser note"
+                    } else {
+                        "parser notes"
+                    }
+                ),
+                widgets::StatusTone::Info,
+            );
+            let label = if notes_open {
+                "Hide parser notes"
+            } else {
+                "View parser notes"
+            };
+            if widgets::action_button(ui, label, widgets::ActionStyle::Quiet, true).clicked() {
+                ui_state.open_notes = if notes_open {
+                    None
+                } else {
+                    Some(row.id.clone())
+                };
+            }
+        });
+        // Concise inline summary: the first note, kept to one line.
+        if let Some(first) = row.notes.first() {
+            ui.label(
+                egui::RichText::new(format!("Note: {}", truncate_inline(first)))
+                    .color(theme::muted(ui))
+                    .small(),
+            );
+        }
+        if notes_open {
+            ui.label(
+                egui::RichText::new(
+                    "Parser notes are expected parser behaviour and need no action.",
+                )
+                .color(theme::muted(ui))
+                .small(),
+            );
+            for note in &row.notes {
+                ui.horizontal_top(|ui| {
+                    ui.label(egui::RichText::new("•").color(theme::muted(ui)));
+                    // The original note text is preserved verbatim.
+                    ui.add(egui::Label::new(note).wrap());
+                });
+            }
+        }
+    }
+
+    if row.history_link_available {
+        // Only ever drawn when the full details really are recorded in
+        // History & Logs; today they are kept inline, so this is off.
+        ui.add_space(6.0);
         ui.label(
-            egui::RichText::new(format!("Summary: {}", truncate_inline(first)))
+            egui::RichText::new("Full details are recorded in History & Logs.")
                 .color(theme::muted(ui))
                 .small(),
         );
-    }
-
-    if open {
-        for warning in &row.warnings {
-            ui.horizontal_top(|ui| {
-                ui.label(egui::RichText::new("•").color(widgets::StatusTone::Warning.color(ui)));
-                // The original warning text is preserved verbatim; only the
-                // inline summary is ever truncated.
-                ui.add(egui::Label::new(warning).wrap());
-            });
-        }
     }
 }
 
@@ -2384,6 +2476,13 @@ fn show_inspect(ui: &mut egui::Ui, row: &DatSourceRowView) {
                         ui.label(
                             egui::RichText::new(format!("warning: {warning}"))
                                 .color(widgets::StatusTone::Warning.color(ui))
+                                .small(),
+                        );
+                    }
+                    for note in file.notes.iter().take(20) {
+                        ui.label(
+                            egui::RichText::new(format!("note: {note}"))
+                                .color(theme::muted(ui))
                                 .small(),
                         );
                     }

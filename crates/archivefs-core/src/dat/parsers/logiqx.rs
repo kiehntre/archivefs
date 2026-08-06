@@ -93,10 +93,14 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                 // Accepting it as inert text is both safe and required: every
                 // real-world No-Intro and Redump DAT file carries this DOCTYPE,
                 // and rejecting it would mean supporting no DAT files at all.
-                record_warning(
+                // This is expected parser behaviour, so it is a parser note, not
+                // a warning: the DAT is fine and nothing needs to be done.
+                record_note(
                     &mut warnings,
                     limits.max_warnings,
-                    "DOCTYPE declaration accepted as inert text (no DTD fetched, no entity expansion)".to_string(),
+                    "DOCTYPE declaration accepted as inert text: external DTDs are \
+                     intentionally never fetched and no entity is expanded, for security"
+                        .to_string(),
                 );
             }
             Ok(Event::Start(ref start_bytes)) => {
@@ -563,6 +567,13 @@ fn checksum_attr(
 fn record_warning(warnings: &mut Vec<ParseWarning>, limit: usize, message: String) {
     if warnings.len() < limit {
         warnings.push(ParseWarning::new(message));
+    }
+}
+
+/// Records a parser note: expected parser behaviour that needs no action.
+fn record_note(warnings: &mut Vec<ParseWarning>, limit: usize, message: String) {
+    if warnings.len() < limit {
+        warnings.push(ParseWarning::note(message));
     }
 }
 

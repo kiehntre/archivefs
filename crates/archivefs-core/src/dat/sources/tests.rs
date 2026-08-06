@@ -23,6 +23,7 @@ use super::validation::{DatFileOutcome, sniff_dat_format};
 use super::*;
 use crate::dat::limits::DatLimits;
 use crate::dat::model::DatFormat;
+use crate::dat::parser::DiagnosticSeverity;
 use crate::safe_read::TrustedRoots;
 
 // ---------------------------------------------------------------------------
@@ -534,6 +535,178 @@ fn an_empty_folder_is_invalid_and_says_what_it_looked_for() {
     );
     assert_eq!(report.state, DatHealthState::Invalid);
     assert!(report.summary.contains(".dat"), "{}", report.summary);
+}
+
+/// A Logiqx XML DAT carrying the standard DOCTYPE plus `games` entries.
+///
+/// The DOCTYPE is expected parser behaviour and must be classified as a parser
+/// note, never as a warning.
+fn logiqx_with_doctype_and_entries(games: usize) -> String {
+    let mut xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <!DOCTYPE datafile PUBLIC \"-//Logiqx//DTD ROM Management Datafile//EN\" \
+         \"http://www.logiqx.com/Dats/datafile.dtd\">\n\
+         <datafile>\n\
+         <header><name>Test TOSEC Set</name><version>2026-01-01</version></header>\n",
+    );
+    for index in 0..games {
+        xml.push_str(&format!(
+            "<game name=\"Game {index}\"><rom name=\"g{index}.bin\" size=\"16\" crc=\"{index:08x}\"/></game>\n"
+        ));
+    }
+    xml.push_str("</datafile>\n");
+    xml
+}
+
+#[test]
+fn a_doctype_parser_note_keeps_the_source_valid() {
+    // Regression for the reported defect: a single TOSEC DAT whose only
+    // diagnostic is the DOCTYPE note must be Valid, not Valid-with-warnings.
+    let dir = temp();
+    let path = write(
+        dir.path(),
+        "tosec.dat",
+        &logiqx_with_doctype_and_entries(1005),
+    );
+
+    let report = validate_dat_source(&entry_for(&path, DatSourceKind::File), DatLimits::default());
+    assert_eq!(report.entry_count, 1005);
+    assert_eq!(report.rom_count, 1005);
+    assert_eq!(
+        report.state,
+        DatHealthState::Valid,
+        "a parser note must never lower the verdict: {}",
+        report.summary
+    );
+    let outcome = &report.files[0].outcome;
+    let DatFileOutcome::Parsed { diagnostics, .. } = outcome else {
+        panic!("the TOSEC DAT must parse");
+    };
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert_eq!(
+        diagnostics[0].severity,
+        DiagnosticSeverity::Note,
+        "{diagnostics:?}"
+    );
+    assert!(
+        diagnostics[0].message.contains("DOCTYPE"),
+        "{diagnostics:?}"
+    );
+}
+
+#[test]
+fn a_real_warning_produces_valid_with_warnings() {
+    // A malformed checksum is dropped and reported: the DAT is still usable but
+    // worth investigating, so the verdict is Valid-with-warnings.
+    let dir = temp();
+    let path = write(
+        dir.path(),
+        "warn.dat",
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<datafile><game name="G"><rom name="a.bin" size="4" crc="not-a-checksum"/></game></datafile>"#,
+    );
+
+    let report = validate_dat_source(&entry_for(&path, DatSourceKind::File), DatLimits::default());
+    assert_eq!(
+        report.state,
+        DatHealthState::ValidWithWarnings,
+        "{}",
+        report.summary
+    );
+    let DatFileOutcome::Parsed { diagnostics, .. } = &report.files[0].outcome else {
+        panic!("the DAT must parse");
+    };
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.severity == DiagnosticSeverity::Warning),
+        "{diagnostics:?}"
+    );
+}
+
+#[test]
+fn a_real_parser_failure_is_invalid() {
+    let dir = temp();
+    let path = write(
+        dir.path(),
+        "broken.dat",
+        "<?xml version=\"1.0\"?><datafile><game",
+    );
+
+    let report = validate_dat_source(&entry_for(&path, DatSourceKind::File), DatLimits::default());
+    assert_eq!(report.state, DatHealthState::Invalid);
+    assert!(matches!(
+        report.files[0].outcome,
+        DatFileOutcome::Failed { .. }
+    ));
+}
+
+#[test]
+fn mixed_warnings_and_notes_produce_valid_with_warnings() {
+    // A DOCTYPE (note) plus a dropped checksum (warning) in one file: the
+    // warning is what decides, so the verdict is Valid-with-warnings.
+    let dir = temp();
+    let path = write(
+        dir.path(),
+        "mixed.dat",
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE datafile PUBLIC "-//Logiqx//DTD ROM Management Datafile//EN" "http://www.logiqx.com/Dats/datafile.dtd">
+<datafile><game name="G"><rom name="a.bin" size="4" crc="not-a-checksum"/></game></datafile>"#,
+    );
+
+    let report = validate_dat_source(&entry_for(&path, DatSourceKind::File), DatLimits::default());
+    assert_eq!(
+        report.state,
+        DatHealthState::ValidWithWarnings,
+        "{}",
+        report.summary
+    );
+    let DatFileOutcome::Parsed { diagnostics, .. } = &report.files[0].outcome else {
+        panic!("the DAT must parse");
+    };
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.severity == DiagnosticSeverity::Warning),
+        "{diagnostics:?}"
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.severity == DiagnosticSeverity::Note),
+        "{diagnostics:?}"
+    );
+}
+
+#[test]
+fn mixed_errors_warnings_and_notes_produce_invalid() {
+    // A folder where one file fails to parse is Invalid even when the other
+    // file parses with warnings and notes.
+    let dir = temp();
+    let folder = dir.path().join("mixed");
+    std::fs::create_dir(&folder).unwrap();
+    write(
+        &folder,
+        "broken.dat",
+        "<?xml version=\"1.0\"?><datafile><game",
+    );
+    write(
+        &folder,
+        "ok.dat",
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE datafile PUBLIC "-//Logiqx//DTD ROM Management Datafile//EN" "http://www.logiqx.com/Dats/datafile.dtd">
+<datafile><game name="G"><rom name="a.bin" size="4" crc="not-a-checksum"/></game></datafile>"#,
+    );
+
+    let report = validate_dat_source(
+        &entry_for(&folder, DatSourceKind::Folder),
+        DatLimits::default(),
+    );
+    assert_eq!(
+        report.state,
+        DatHealthState::Invalid,
+        "an error in any file makes the whole source invalid"
+    );
 }
 
 #[test]
