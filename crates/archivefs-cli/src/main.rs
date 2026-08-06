@@ -164,6 +164,58 @@ fn parse_cli_args(args: impl IntoIterator<Item = String>) -> CliArgs {
     }
 }
 
+/// Whether `path` has no directory entry at all (not merely unreadable, and
+/// not a symlink whose target is gone - a dangling symlink is a real
+/// misconfiguration, not the ordinary state of a fresh install, so it must
+/// not be offered this hint). Mirrors the "confirmed missing" distinction
+/// `SetupDiagnostics`/Doctor already apply to the same config path (see
+/// `docs/design/FIRST_RUN_AND_EMPTY_STATES.md`), so a plain CLI command
+/// agrees with what `doctor`/`config-check` already tell a new user.
+fn config_confirmed_missing(path: &std::path::Path) -> bool {
+    matches!(
+        std::fs::symlink_metadata(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+/// Loads the default config, adding a first-run hint when it is genuinely
+/// absent.
+///
+/// Every command below `config-check` and `doctor` needs a config the same
+/// way they do, but until now only those two gave an actionable message -
+/// everything else surfaced the bare OS error (e.g. "archivefs:
+/// /home/user/.config/archivefs/config.toml: No such file or directory (os
+/// error 2)") with no indication of what to do next. This appends the same
+/// guidance those two already give, without changing the underlying error
+/// text itself, so nothing that already inspects that text (Doctor's
+/// first-run softening, `config-check`'s own report) is affected.
+fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
+    Config::load_default().map_err(explain_config_load_error)
+}
+
+/// Appends a first-run hint to a config-load failure when (and only when) it
+/// is a confirmed-missing config file; otherwise passes the error through
+/// unchanged. Split out from [`load_config`] so the decision can be tested
+/// directly against constructed errors, without needing an isolated `HOME`.
+fn explain_config_load_error(error: ArchiveFsError) -> Box<dyn std::error::Error> {
+    if let ArchiveFsError::Io {
+        path: Some(path),
+        source,
+    } = &error
+        && source.kind() == std::io::ErrorKind::NotFound
+        && config_confirmed_missing(path)
+    {
+        return format!(
+            "{error}\nNo configuration file yet - this is normal for a new install. Run \
+             `archivefs config-check` to see what's needed, or copy config.toml.example to {} \
+             to get started.",
+            path.display()
+        )
+        .into();
+    }
+    error.into()
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = parse_cli_args(env::args().skip(1));
     init_logging(cli.log_level);
@@ -172,14 +224,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     match command.as_str() {
         "scan" => {
-            let config = Config::load_default()?;
+            let config = load_config()?;
             let scanner = ArchiveScanner::new(&config);
             for archive in scanner.scan_archives()? {
                 println!("{}", archive.path.display());
             }
         }
         "mount" => {
-            let config = Config::load_default()?;
+            let config = load_config()?;
             print_statuses(&mount_archives(&config)?);
         }
         "mount-one" => {
@@ -190,12 +242,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .chain(args)
                 .collect::<Vec<_>>()
                 .join(" ");
-            let config = Config::load_default()?;
+            let config = load_config()?;
             print_mount_one(&mount_one_archive(&config, &input)?);
             warn_if_index_refresh_failed(&config);
         }
         "unmount" => {
-            let config = Config::load_default()?;
+            let config = load_config()?;
             print_statuses(&unmount_archives(&config)?);
         }
         "unmount-one" => {
@@ -206,7 +258,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .chain(args)
                 .collect::<Vec<_>>()
                 .join(" ");
-            let config = Config::load_default()?;
+            let config = load_config()?;
             let plan = unmount_one_archive(&config, &input)?;
             print_unmount_one(&plan);
             warn_if_mount_dir_cleanup_failed(&config, &plan);
@@ -214,7 +266,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         "status" => {
             let json = args.any(|arg| arg == "--json");
-            let config = Config::load_default()?;
+            let config = load_config()?;
             let statuses = current_statuses(&config)?;
             if json {
                 print_statuses_json(&statuses)?;
@@ -224,7 +276,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         "stats" => {
             let json = args.any(|arg| arg == "--json");
-            let config = Config::load_default()?;
+            let config = load_config()?;
             let stats = current_archive_stats(&config)?;
             if json {
                 print_archive_stats_json(&stats)?;
@@ -234,7 +286,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         "duplicates" => {
             let json = args.any(|arg| arg == "--json");
-            let config = Config::load_default()?;
+            let config = load_config()?;
             let report = build_duplicate_report(&config)?;
             if json {
                 print_duplicate_report_json(&report)?;
@@ -255,7 +307,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             if input.is_empty() {
                 return Err("info requires an archive path or name".into());
             }
-            let config = Config::load_default()?;
+            let config = load_config()?;
             let info = current_archive_info(&config, &input)?;
             if json {
                 print_archive_info_json(&info)?;
@@ -1040,7 +1092,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         "index-build" => {
-            let config = Config::load_default()?;
+            let config = load_config()?;
             let index = build_and_write_archive_index(&config)?;
             println!(
                 "Wrote index: {} ({} archives)",
@@ -1105,7 +1157,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         "library-scan" => {
             let json = args.any(|arg| arg == "--json");
-            let config = Config::load_default()?;
+            let config = load_config()?;
             let database_path = default_database_path()?;
             let report = run_library_scan(&config, &database_path, "cli-library-scan")?;
             if json {
@@ -1361,11 +1413,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         "clean" => {
-            let config = Config::load_default()?;
+            let config = load_config()?;
             print_cleaned_dirs(&clean_mount_root(&config)?);
         }
         "watch" => {
-            let config = Config::load_default()?;
+            let config = load_config()?;
             watch_archive_index(
                 &config,
                 || println!("Watching configured source folders for archive changes."),
@@ -4771,7 +4823,7 @@ fn run_doctor_repair(
     confirmed: bool,
     dry_run: bool,
 ) -> Result<DoctorRepairOutcome, Box<dyn std::error::Error>> {
-    let config = Config::load_default()?;
+    let config = load_config()?;
     let index_path = default_index_path()?;
     // A fresh scan, so the finding is resolved against current state rather
     // than against whatever a previous `--findings` run reported.
@@ -5739,6 +5791,90 @@ mod tests {
         GameMatch, HypotheticalDestination, InstallationCandidate, MatchConfidence,
         PatchMetadataRecord, SourceSnapshot, VerificationLevel,
     };
+
+    /// Before this fix, every one of `scan`, `mount`, `status`, and a dozen
+    /// other commands surfaced only the bare OS error
+    /// (`"<path>: No such file or directory (os error 2)"`) on a fresh
+    /// install, while `doctor`/`config-check` already explained the same
+    /// condition. This reproduces that bare error and checks the hint
+    /// `explain_config_load_error` is now expected to add.
+    #[test]
+    fn confirmed_missing_config_gets_a_first_run_hint() {
+        let missing = std::env::temp_dir()
+            .join("archivefs-cli-test-confirmed-missing-config-does-not-exist.toml");
+        let _ = std::fs::remove_file(&missing);
+        let source = std::io::Error::new(std::io::ErrorKind::NotFound, "No such file or directory");
+        let original_text = format!("{}: {source}", missing.display());
+        let error = ArchiveFsError::Io {
+            path: Some(missing.clone()),
+            source,
+        };
+        assert_eq!(error.to_string(), original_text);
+
+        let explained = explain_config_load_error(error).to_string();
+
+        assert!(
+            explained.starts_with(&original_text),
+            "the original error text must still be present, got: {explained}"
+        );
+        assert!(
+            explained.contains("normal for a new install"),
+            "expected a first-run hint, got: {explained}"
+        );
+        assert!(
+            explained.contains("archivefs config-check"),
+            "expected the hint to point at config-check, got: {explained}"
+        );
+    }
+
+    /// A dangling symlink at the config path is a real misconfiguration
+    /// (something *is* there, pointing nowhere), not the ordinary state of a
+    /// fresh install - it must not get the reassuring first-run hint.
+    #[test]
+    fn dangling_symlink_config_path_gets_no_first_run_hint() {
+        let dir = std::env::temp_dir().join(format!(
+            "archivefs-cli-test-dangling-symlink-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let link = dir.join("config.toml");
+        let target = dir.join("gone.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let source = std::io::Error::new(std::io::ErrorKind::NotFound, "No such file or directory");
+        let original_text = format!("{}: {source}", link.display());
+        let error = ArchiveFsError::Io {
+            path: Some(link.clone()),
+            source,
+        };
+
+        let explained = explain_config_load_error(error).to_string();
+
+        assert_eq!(
+            explained, original_text,
+            "a dangling symlink must not be reported as a fresh install"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A permission error at the config path is a real, actionable problem,
+    /// not a fresh-install absence - the hint must not paper over it.
+    #[test]
+    fn permission_denied_config_path_gets_no_first_run_hint() {
+        let path = std::path::PathBuf::from("/etc/shadow-archivefs-test-config.toml");
+        let source = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Permission denied");
+        let original_text = format!("{}: {source}", path.display());
+        let error = ArchiveFsError::Io {
+            path: Some(path),
+            source,
+        };
+
+        let explained = explain_config_load_error(error).to_string();
+
+        assert_eq!(explained, original_text);
+    }
 
     fn example_statuses() -> Vec<ArchiveStatus> {
         vec![

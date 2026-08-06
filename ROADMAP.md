@@ -123,7 +123,9 @@ These are implemented, tested, and in current use today:
   [`docs/RETROARCH_CHEAT_CATALOGUE.md`](docs/RETROARCH_CHEAT_CATALOGUE.md).
 
 - Safe, journal-driven rollback for RetroArch cheat installations is now
-  available via `retroarch-cheat-rollback`; GUI support remains out of scope.
+  available via `retroarch-cheat-rollback`, and also from the GUI's History
+  & Logs page through the shared rollback transaction (see the GUI
+  apply/history/rollback item further down this list).
 - Read-only RetroArch cheat installation history and journal inspection are
   available via `retroarch-cheat-history` and `retroarch-cheat-inspect`, with
   destination/backup hash assessment, strongly bound rollback-journal
@@ -183,6 +185,12 @@ These are implemented, tested, and in current use today:
   and expanded (1 GiB) size limits were raised to match the real official
   catalogue; the stale "Archive matching and cheat installation are not yet
   implemented" Cheats & Mods copy was removed.
+- An optional RomM server as a read-only external identity source:
+  configuration, bounded catalogue import, browsing, per-archive identity
+  matching, and cover artwork, from both the CLI (`identity source romm
+  ...`) and the GUI (Sources → RomM). Only loopback/private-LAN addresses
+  are accepted, and no command writes to RomM, triggers a scan on it, or
+  touches a ROM.
 
 ## Current development
 
