@@ -103,8 +103,14 @@ pub enum DatAuditProgress {
     ReadingCatalogue { file_name: String },
     /// The catalogue is indexed and the walk is about to start.
     CatalogueReady { entries: usize, roms: usize },
-    /// Walking the folder, before any hashing.
-    Scanning { files_found: usize },
+    /// Walking the folder, before any hashing. `files_found` is how many have
+    /// been collected so far; `current_dir` is the directory currently being
+    /// walked, as full text for the display layer to shorten - never as a path
+    /// that must be shown verbatim.
+    Scanning {
+        files_found: usize,
+        current_dir: Option<String>,
+    },
     /// Hashing one file. `index` is 1-based over `total`.
     Hashing {
         index: usize,
@@ -454,6 +460,7 @@ fn scan_local_files(
 
         on_progress(DatAuditProgress::Scanning {
             files_found: files.len(),
+            current_dir: Some(directory.to_string_lossy().into_owned()),
         });
         if truncated && files.len() >= MAX_SCAN_FILES {
             break;

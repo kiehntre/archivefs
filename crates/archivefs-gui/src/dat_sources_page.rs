@@ -42,6 +42,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::time::Instant;
 
 use archivefs_core::dat::limits::DatLimits;
 use archivefs_core::dat::sources::audit_run::{
@@ -73,6 +74,17 @@ pub(crate) const SUPPORTED_FORMATS: &str = "Logiqx XML (No-Intro, Redump) and Cl
 /// free - the next message supersedes it - so the send is non-blocking and a
 /// full channel simply means the display is a little behind.
 const PROGRESS_QUEUE_DEPTH: usize = 64;
+
+/// Files that must be processed before an ETA can be trusted at all.
+const ETA_MIN_FILES: u64 = 100;
+
+/// Seconds that must have elapsed before an ETA can be trusted at all.
+const ETA_MIN_SECONDS: f64 = 5.0;
+
+/// Blend for the exponential moving average of throughput: a single frame's
+/// speed moves the estimate by this fraction of the way, so one fast sample
+/// cannot make the ETA jump.
+const ETA_SMOOTHING_ALPHA: f64 = 0.2;
 
 // ---------------------------------------------------------------------------
 // View model
@@ -116,6 +128,39 @@ pub(crate) struct DatSourceRowView {
     pub(crate) busy: bool,
     /// The last validation run's per-file breakdown, if one has been run.
     pub(crate) detail: Option<InspectView>,
+    /// Every warning the last validation found, flattened across files in the
+    /// deterministic order the files were read. Empty when there were none.
+    pub(crate) warnings: Vec<String>,
+    /// The bounded safety limit stopped the last validation part-way through a
+    /// folder, so the verdict covers only part of it. Must never be presented
+    /// as "everything was checked".
+    pub(crate) incomplete_load: bool,
+    /// How many DAT files the last (incomplete) validation actually read.
+    pub(crate) dat_files_read: Option<u64>,
+    /// How many DAT files the folder holds, when genuinely known.
+    pub(crate) dat_files_total: Option<u64>,
+    /// Whether the full warning details are recorded in History & Logs. The
+    /// card only ever points there when this is true; today the details are
+    /// kept inline instead, so this stays false.
+    pub(crate) history_link_available: bool,
+}
+
+impl DatSourceRowView {
+    /// The line describing an incomplete catalogue load, or `None` when the
+    /// load was complete.
+    ///
+    /// "512 of 2,024 DAT files read" is shown only when both numbers are
+    /// genuinely known; otherwise the safety limit is named without inventing
+    /// a total.
+    pub(crate) fn incomplete_load_line(&self) -> Option<String> {
+        if !self.incomplete_load {
+            return None;
+        }
+        match (self.dat_files_read, self.dat_files_total) {
+            (Some(read), Some(total)) => Some(format!("{read} of {total} DAT files read")),
+            _ => Some("Processing stopped at the configured safety limit".to_string()),
+        }
+    }
 }
 
 /// One DAT file inside a source, as the Inspect panel lists it.
@@ -157,6 +202,86 @@ pub(crate) struct RunningJobView {
     pub(crate) what: &'static str,
     pub(crate) detail: String,
     pub(crate) cancellable: bool,
+    /// True from the moment Cancel is pressed until the worker confirms it is
+    /// gone. The card reads "Stopping…" while this is set, and the job stays
+    /// busy until then - a stale progress line cannot restore an active look.
+    pub(crate) cancellation_requested: bool,
+    /// Structured audit progress, when the running job is an audit.
+    pub(crate) progress: Option<AuditProgressView>,
+}
+
+impl RunningJobView {
+    /// The heading: "Auditing 'collection'" normally, "Stopping 'collection'…"
+    /// the moment Cancel has been pressed.
+    pub(crate) fn heading(&self) -> String {
+        let verb = if self.cancellation_requested {
+            "Stopping"
+        } else {
+            self.what
+        };
+        format!("{verb} '{}'", self.source_id)
+    }
+}
+
+/// The ETA, in the only three states a running card can honestly show.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EtaView {
+    /// No estimate is possible yet - no samples, no total, or nothing left to
+    /// estimate. Draw nothing.
+    None,
+    /// The run is progressing but has not gone far or long enough to trust a
+    /// number. Draw "Estimating time remaining…".
+    Estimating,
+    /// A concrete estimate, in whole seconds remaining.
+    About { seconds_remaining: u64 },
+}
+
+/// Structured progress for a running audit, ready to draw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AuditProgressView {
+    pub(crate) phase: &'static str,
+    pub(crate) files_checked: u64,
+    pub(crate) total_files: Option<u64>,
+    /// The current folder or file, shortened for display. The full private
+    /// path is never turned into a display string.
+    pub(crate) current_path: Option<String>,
+    pub(crate) elapsed_seconds: u64,
+    pub(crate) percent: Option<u8>,
+    pub(crate) eta: EtaView,
+}
+
+impl AuditProgressView {
+    /// The position: "42 of 100" when the total is known, "42 files so far"
+    /// when it is not. Never invents a count the run has not produced.
+    pub(crate) fn position(&self) -> String {
+        match self.total_files {
+            Some(total) => format!("{} of {total}", self.files_checked),
+            None => format!("{} files so far", self.files_checked),
+        }
+    }
+
+    /// One line describing where the run is and how long it has taken.
+    pub(crate) fn line(&self) -> String {
+        let percentage = self
+            .percent
+            .map(|percent| format!(" ({percent}%)"))
+            .unwrap_or_default();
+        format!(
+            "{} · {}{percentage} · {} elapsed",
+            self.phase,
+            self.position(),
+            format_elapsed(self.elapsed_seconds)
+        )
+    }
+
+    /// The ETA line, or `None` when nothing should be drawn.
+    pub(crate) fn eta_line(&self) -> Option<String> {
+        match &self.eta {
+            EtaView::None => None,
+            EtaView::Estimating => Some("Estimating time remaining…".to_string()),
+            EtaView::About { seconds_remaining } => Some(format_eta_remaining(*seconds_remaining)),
+        }
+    }
 }
 
 /// Everything the page draws.
@@ -278,6 +403,9 @@ pub(crate) enum DatSourcesPageAction {
 
 enum JobMessage {
     Progress(String),
+    /// Structured audit progress, kept structured so the page can compute
+    /// percentages and an ETA instead of only echoing text.
+    AuditProgress(DatAuditProgress),
     Validated(Box<DatValidationReport>),
     Audited(Box<DatAuditOutcome>),
     Failed(String),
@@ -294,8 +422,17 @@ struct RunningJob {
     kind: JobKind,
     source_id: String,
     cancel: Arc<AtomicBool>,
+    /// Set by [`DatSourcesPageAction::CancelJob`]. The visible card switches
+    /// to "Stopping…" immediately; the job itself keeps running until the
+    /// worker sends a terminal message, and anything that arrives afterwards
+    /// is ignored rather than allowed to restore an active-looking state.
+    cancel_requested: bool,
     messages: Receiver<JobMessage>,
     latest: String,
+    /// When the job started, for elapsed time.
+    started_at: Instant,
+    /// Structured progress for audit jobs. `None` for validation.
+    audit_progress: Option<AuditProgressTracker>,
 }
 
 /// Sends without blocking, dropping the message when the queue is full.
@@ -307,6 +444,266 @@ fn send_progress(sender: &SyncSender<JobMessage>, message: JobMessage) {
     match sender.try_send(message) {
         Ok(()) | Err(TrySendError::Full(_)) => {}
         Err(TrySendError::Disconnected(_)) => {}
+    }
+}
+
+/// The percentage, as a whole number, or `None` when the total is unknown or
+/// zero. A total that is not known is never replaced by a guessed one.
+fn format_percentage(checked: u64, total: u64) -> Option<u8> {
+    if total == 0 {
+        return None;
+    }
+    let percent = ((checked as f64 / total as f64) * 100.0).round() as i64;
+    Some(percent.clamp(0, 100) as u8)
+}
+
+/// Seconds as a person would read an elapsed time: "42s", "3m 12s", "1h 5m".
+fn format_elapsed(seconds: u64) -> String {
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3600 {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{}h {}m", seconds / 3600, (seconds % 3600) / 60)
+    }
+}
+
+/// Remaining seconds as an approximate ETA: "About 12 minutes remaining".
+fn format_eta_remaining(seconds: u64) -> String {
+    if seconds < 60 {
+        format!("About {} seconds remaining", seconds.max(1))
+    } else if seconds < 3600 {
+        let minutes = ((seconds + 30) / 60).max(1);
+        format!(
+            "About {minutes} {} remaining",
+            if minutes == 1 { "minute" } else { "minutes" }
+        )
+    } else {
+        let hours = ((seconds + 1800) / 3600).max(1);
+        format!(
+            "About {hours} {} remaining",
+            if hours == 1 { "hour" } else { "hours" }
+        )
+    }
+}
+
+/// A path shortened for display: the last two components, with the private
+/// leading part elided.
+///
+/// The user picked the folder, so showing part of it on the card is fine; the
+/// point is that a long absolute path never takes over the running card, and
+/// that a full private path is never turned into a display string. Short paths
+/// are returned as they are.
+fn shorten_path(path: &str) -> String {
+    let mut components: Vec<&str> = path
+        .split(['/', '\\'])
+        .filter(|part| !part.is_empty())
+        .collect();
+    if components.len() <= 2 {
+        return path.to_string();
+    }
+    let kept: Vec<&str> = components.split_off(components.len() - 2);
+    format!("…/{}", kept.join("/"))
+}
+
+/// A warning's text cut to a bounded length so the inline summary stays one
+/// readable line. The full text is always preserved in the expandable details.
+fn truncate_inline(text: &str) -> String {
+    const MAX_INLINE_CHARS: usize = 120;
+    let mut chars = text.chars();
+    let mut out: String = chars.by_ref().take(MAX_INLINE_CHARS).collect();
+    if chars.next().is_some() {
+        out.push('…');
+    }
+    out
+}
+
+/// Every warning the last validation found, flattened across files in the
+/// deterministic order the files were read (files are sorted by name; each
+/// file's warnings keep the parser's own order).
+fn flatten_warnings(report: &DatValidationReport) -> Vec<String> {
+    report
+        .files
+        .iter()
+        .filter_map(|file| match &file.outcome {
+            DatFileOutcome::Parsed { warnings, .. } => Some(warnings.as_slice()),
+            DatFileOutcome::Failed { .. } => None,
+        })
+        .flatten()
+        .cloned()
+        .collect()
+}
+
+/// How far a running audit has got, structurally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuditPhase {
+    ReadingCatalogue,
+    Scanning,
+    Hashing,
+    Comparing,
+}
+
+impl AuditPhase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::ReadingCatalogue => "Reading catalogue",
+            Self::Scanning => "Scanning",
+            Self::Hashing => "Checking files",
+            Self::Comparing => "Comparing",
+        }
+    }
+}
+
+/// The GUI-side record of a running audit's progress.
+///
+/// Kept off the view so the drawing function only draws. The ETA's smoothing
+/// lives here because it is state across frames; the pure formatting helpers
+/// stay free functions so tests can drive them without a clock. The ETA view
+/// is computed at update time and cached, so a frozen run (a stall, or a run
+/// being cancelled) shows the estimate it had at its last update rather than
+/// one that keeps drifting as the wall clock moves.
+#[derive(Debug)]
+struct AuditProgressTracker {
+    phase: AuditPhase,
+    files_checked: u64,
+    total_files: Option<u64>,
+    current_path: Option<String>,
+    eta: EtaEstimator,
+    eta_view: EtaView,
+}
+
+impl AuditProgressTracker {
+    fn new() -> Self {
+        Self {
+            phase: AuditPhase::ReadingCatalogue,
+            files_checked: 0,
+            total_files: None,
+            current_path: None,
+            eta: EtaEstimator::new(),
+            eta_view: EtaView::None,
+        }
+    }
+
+    /// Feeds one progress event. `elapsed_seconds` is the time since the run
+    /// started, read by the caller so tests can supply a controlled clock.
+    fn update(&mut self, event: &DatAuditProgress, elapsed_seconds: f64) {
+        match event {
+            DatAuditProgress::ReadingCatalogue { .. } => {
+                self.phase = AuditPhase::ReadingCatalogue;
+                self.files_checked = 0;
+                self.total_files = None;
+                self.current_path = None;
+                self.eta_view = EtaView::None;
+            }
+            DatAuditProgress::CatalogueReady { .. } => {
+                // Between phases; nothing new about files.
+            }
+            DatAuditProgress::Scanning {
+                files_found,
+                current_dir,
+            } => {
+                self.phase = AuditPhase::Scanning;
+                self.files_checked = *files_found as u64;
+                // The discovery phase does not know the total yet; an ETA is
+                // impossible and none is invented.
+                self.total_files = None;
+                self.current_path = current_dir.clone();
+                self.eta = EtaEstimator::new();
+                self.eta_view = EtaView::None;
+            }
+            DatAuditProgress::Hashing {
+                index,
+                total,
+                file_name,
+            } => {
+                self.phase = AuditPhase::Hashing;
+                self.files_checked = *index as u64;
+                self.total_files = Some(*total as u64);
+                self.current_path = Some(file_name.clone());
+                self.eta.update(*index as u64, elapsed_seconds);
+                self.eta_view = self.eta.eta(*index as u64, *total as u64, elapsed_seconds);
+            }
+            DatAuditProgress::Comparing { files } => {
+                self.phase = AuditPhase::Comparing;
+                self.files_checked = *files as u64;
+                self.total_files = Some(*files as u64);
+                self.eta_view = EtaView::None;
+            }
+        }
+    }
+
+    /// The view for one frame. `elapsed_seconds` is supplied by the caller so
+    /// tests do not depend on a real clock; it only feeds the elapsed label.
+    fn view(&self, elapsed_seconds: u64) -> AuditProgressView {
+        let percent = match self.total_files {
+            Some(total) if total > 0 => format_percentage(self.files_checked, total),
+            _ => None,
+        };
+        AuditProgressView {
+            phase: self.phase.label(),
+            files_checked: self.files_checked,
+            total_files: self.total_files,
+            current_path: self.current_path.as_deref().map(shorten_path),
+            elapsed_seconds,
+            percent,
+            eta: self.eta_view.clone(),
+        }
+    }
+}
+
+/// Exponential-moving-average throughput, so the ETA does not jump from one
+/// frame's speed.
+#[derive(Debug, Clone, PartialEq)]
+struct EtaEstimator {
+    smoothed_files_per_second: Option<f64>,
+    last: Option<(u64, f64)>,
+}
+
+impl EtaEstimator {
+    fn new() -> Self {
+        Self {
+            smoothed_files_per_second: None,
+            last: None,
+        }
+    }
+
+    /// Feeds one sample. `elapsed_seconds` is the time since the run started.
+    ///
+    /// A stall (no new files between two samples) or a non-advancing clock
+    /// leaves the smoothed rate untouched: the estimate freezes rather than
+    /// decaying, which is what "if progress stalls, stop updating the ETA"
+    /// means.
+    fn update(&mut self, checked: u64, elapsed_seconds: f64) {
+        if let Some((last_checked, last_elapsed)) = self.last {
+            let delta_seconds = elapsed_seconds - last_elapsed;
+            let delta_files = checked.saturating_sub(last_checked) as f64;
+            if delta_seconds > 0.0 && delta_files > 0.0 {
+                let rate = delta_files / delta_seconds;
+                self.smoothed_files_per_second = Some(match self.smoothed_files_per_second {
+                    Some(previous) => {
+                        ETA_SMOOTHING_ALPHA * rate + (1.0 - ETA_SMOOTHING_ALPHA) * previous
+                    }
+                    None => rate,
+                });
+            }
+        }
+        self.last = Some((checked, elapsed_seconds));
+    }
+
+    /// The ETA for the current position, applying the confidence gates.
+    fn eta(&self, checked: u64, total: u64, elapsed_seconds: f64) -> EtaView {
+        let Some(rate) = self.smoothed_files_per_second else {
+            return EtaView::None;
+        };
+        if checked < ETA_MIN_FILES || elapsed_seconds < ETA_MIN_SECONDS {
+            return EtaView::Estimating;
+        }
+        if rate <= 0.0 || total <= checked {
+            // Nothing left to estimate, or no forward movement.
+            return EtaView::None;
+        }
+        let seconds_remaining = ((total - checked) as f64 / rate).ceil() as u64;
+        EtaView::About { seconds_remaining }
     }
 }
 
@@ -430,37 +827,83 @@ impl DatSourcesPageState {
         };
         let mut changed = false;
         let mut finished = false;
+        // Read the clock once per drain pass. Every queued message was produced
+        // between this pass and the last one, so they all share one elapsed
+        // value; timestamping each message afresh would make a drained backlog
+        // look like an enormous files-per-second rate and collapse the ETA to
+        // near zero. The `delta_seconds > 0` guard inside `EtaEstimator::update`
+        // then skips every message after the first of the burst. The job stays
+        // alive for the whole pass - terminal messages only flag `finished`,
+        // which clears `self.job` after the loop - so reading `job.started_at`
+        // here is safe.
+        let elapsed = job.started_at.elapsed().as_secs_f64();
         loop {
             match job.messages.try_recv() {
                 Ok(JobMessage::Progress(line)) => {
-                    job.latest = line;
+                    // Once cancellation has been requested, stale progress must
+                    // not restore an active-looking detail line.
+                    if !job.cancel_requested {
+                        job.latest = line;
+                    }
+                    changed = true;
+                }
+                Ok(JobMessage::AuditProgress(event)) => {
+                    // Once cancellation is requested, progress is frozen: the
+                    // detail line, the position, and the ETA all stop moving so
+                    // a stale report cannot restore an active-looking state.
+                    if !job.cancel_requested
+                        && let Some(tracker) = job.audit_progress.as_mut()
+                    {
+                        tracker.update(&event, elapsed);
+                        job.latest = describe(&event);
+                    }
                     changed = true;
                 }
                 Ok(JobMessage::Validated(report)) => {
-                    let id = report.source_id.clone();
-                    // The health the run observed is written onto the *draft*,
-                    // so it becomes an unsaved change like any other and the
-                    // user chooses whether to keep it.
-                    if let Some(entry) = self.draft.get_mut(&id) {
-                        entry.health = report.to_health(&entry.path.clone(), entry.kind);
+                    if job.cancel_requested {
+                        // A result that lands after cancellation was requested
+                        // must not repopulate state: the user stopped this job.
+                        finished = true;
+                    } else {
+                        let id = report.source_id.clone();
+                        // The health the run observed is written onto the
+                        // *draft*, so it becomes an unsaved change like any
+                        // other and the user chooses whether to keep it.
+                        if let Some(entry) = self.draft.get_mut(&id) {
+                            entry.health = report.to_health(&entry.path.clone(), entry.kind);
+                        }
+                        self.validations.insert(id, *report);
+                        changed = true;
+                        finished = true;
                     }
-                    self.validations.insert(id, *report);
-                    changed = true;
-                    finished = true;
                 }
                 Ok(JobMessage::Audited(outcome)) => {
-                    self.audit = Some(outcome);
-                    self.audit_error = None;
-                    changed = true;
-                    finished = true;
+                    if job.cancel_requested {
+                        // A cancelled audit never appears complete - even when
+                        // the worker finished before it observed the flag, the
+                        // page must not present the late result as a completed
+                        // audit.
+                        finished = true;
+                    } else {
+                        self.audit = Some(outcome);
+                        self.audit_error = None;
+                        changed = true;
+                        finished = true;
+                    }
                 }
                 Ok(JobMessage::Failed(error)) => {
                     match job.kind {
                         JobKind::Audit => {
                             self.audit = None;
-                            self.audit_error = Some(error);
+                            if !job.cancel_requested {
+                                self.audit_error = Some(error);
+                            }
                         }
-                        JobKind::Validate => self.action_error = Some(error),
+                        JobKind::Validate => {
+                            if !job.cancel_requested {
+                                self.action_error = Some(error);
+                            }
+                        }
                     }
                     changed = true;
                     finished = true;
@@ -530,8 +973,11 @@ impl DatSourcesPageState {
             DatSourcesPageAction::Validate { id } => self.start_validate(id),
             DatSourcesPageAction::Audit { id, scan_root } => self.start_audit(id, scan_root),
             DatSourcesPageAction::CancelJob => {
-                if let Some(job) = self.job.as_ref() {
+                if let Some(job) = self.job.as_mut() {
                     job.cancel.store(true, Ordering::Relaxed);
+                    // The visible card flips to "Stopping…" this frame; the job
+                    // stays busy until the worker confirms termination.
+                    job.cancel_requested = true;
                 }
             }
             DatSourcesPageAction::Revert => {
@@ -611,8 +1057,11 @@ impl DatSourcesPageState {
             kind: JobKind::Validate,
             source_id: id,
             cancel,
+            cancel_requested: false,
             messages,
             latest: "Starting…".to_string(),
+            started_at: Instant::now(),
+            audit_progress: None,
         });
     }
 
@@ -641,7 +1090,7 @@ impl DatSourcesPageState {
         std::thread::spawn(move || {
             let report_sender = sender.clone();
             let outcome = run_dat_audit(&request, &trusted, &worker_cancel, &|progress| {
-                send_progress(&report_sender, JobMessage::Progress(describe(&progress)));
+                send_progress(&report_sender, JobMessage::AuditProgress(progress));
             });
             let _ = match outcome {
                 Ok(outcome) => sender.send(JobMessage::Audited(Box::new(outcome))),
@@ -656,8 +1105,11 @@ impl DatSourcesPageState {
             kind: JobKind::Audit,
             source_id: id,
             cancel,
+            cancel_requested: false,
             messages,
             latest: "Starting…".to_string(),
+            started_at: Instant::now(),
+            audit_progress: Some(AuditProgressTracker::new()),
         });
     }
 
@@ -668,7 +1120,8 @@ impl DatSourcesPageState {
     }
 
     /// Builds the view model. Pure: no I/O beyond a metadata check for
-    /// staleness, no clock beyond formatting a stored timestamp.
+    /// staleness, no clock beyond formatting a stored timestamp (and the
+    /// running job's elapsed time, read from the instant the job started).
     pub(crate) fn view(&self) -> DatSourcesPageView {
         let rows: Vec<DatSourceRowView> = self
             .draft
@@ -704,6 +1157,14 @@ impl DatSourcesPageState {
                 // offering a Cancel that the parser does not check would be a
                 // button that lies.
                 cancellable: job.kind == JobKind::Audit,
+                cancellation_requested: job.cancel_requested,
+                // The elapsed clock is read here rather than at poll time so
+                // the running card keeps ticking between progress messages; it
+                // is still a pure function of state with no I/O.
+                progress: job
+                    .audit_progress
+                    .as_ref()
+                    .map(|tracker| tracker.view(job.started_at.elapsed().as_secs())),
             }),
             library_folders: self.library_folders.clone(),
             audit: self
@@ -721,6 +1182,17 @@ impl DatSourcesPageState {
             None => true,
             Some(saved) => saved != entry,
         };
+        let validation = self.validation(&entry.id);
+        let warnings = validation.map(flatten_warnings).unwrap_or_default();
+        let incomplete_load = validation.is_some_and(|report| report.truncated);
+        let dat_files_read = incomplete_load.then(|| validation.unwrap().files.len() as u64);
+        let dat_files_total = incomplete_load
+            .then(|| {
+                validation
+                    .and_then(|report| report.total_dat_files)
+                    .map(|n| n as u64)
+            })
+            .flatten();
         DatSourceRowView {
             id: entry.id.clone(),
             display_name: entry.display_name.clone(),
@@ -746,6 +1218,13 @@ impl DatSourcesPageState {
                 .as_ref()
                 .is_some_and(|job| job.source_id == entry.id),
             detail: self.validation(&entry.id).map(inspect_view),
+            warnings,
+            incomplete_load,
+            dat_files_read,
+            dat_files_total,
+            // The full warning details are kept inline on this card; nothing is
+            // recorded in History & Logs today, so nothing points there.
+            history_link_available: false,
         }
     }
 
@@ -893,9 +1372,19 @@ fn describe(progress: &DatAuditProgress) -> String {
         DatAuditProgress::CatalogueReady { entries, roms } => {
             format!("Catalogue ready: {entries} entries, {roms} ROMs")
         }
-        DatAuditProgress::Scanning { files_found } => {
-            format!("Looking for files… {files_found} so far")
-        }
+        DatAuditProgress::Scanning {
+            files_found,
+            current_dir,
+        } => match current_dir {
+            // The full directory is never put into the detail line: only a
+            // shortened form, so no private path leaks into text that could be
+            // logged.
+            Some(dir) => format!(
+                "Looking for files… {files_found} so far · in {}",
+                shorten_path(dir)
+            ),
+            None => format!("Looking for files… {files_found} so far"),
+        },
         DatAuditProgress::Hashing {
             index,
             total,
@@ -1068,6 +1557,8 @@ pub(crate) struct DatSourcesPageUi {
     pub(crate) open_audit_picker: Option<String>,
     /// Which source is awaiting removal confirmation.
     pub(crate) confirm_remove: Option<String>,
+    /// Which source's warning-details disclosure is open.
+    pub(crate) open_warnings: Option<String>,
 }
 
 impl DatSourcesPageUi {
@@ -1078,6 +1569,7 @@ impl DatSourcesPageUi {
         self.platform_query.clear();
         self.open_audit_picker = None;
         self.confirm_remove = None;
+        self.open_warnings = None;
     }
 }
 
@@ -1283,10 +1775,12 @@ fn show_running_job(ui: &mut egui::Ui, running: &RunningJobView) -> Option<DatSo
     widgets::card(ui, |ui| {
         ui.horizontal(|ui| {
             ui.spinner();
-            ui.label(
-                egui::RichText::new(format!("{} '{}'", running.what, running.source_id)).strong(),
-            );
-            if running.cancellable
+            ui.label(egui::RichText::new(running.heading()).strong());
+            if running.cancellation_requested {
+                // Cancel has been pressed; the button is gone and the wording
+                // says so. The job stays busy until the worker confirms.
+                widgets::status_badge(ui, "Stopping…", widgets::StatusTone::Warning);
+            } else if running.cancellable
                 && widgets::action_button(ui, "Cancel", widgets::ActionStyle::Secondary, true)
                     .clicked()
             {
@@ -1294,6 +1788,25 @@ fn show_running_job(ui: &mut egui::Ui, running: &RunningJobView) -> Option<DatSo
             }
         });
         ui.label(egui::RichText::new(&running.detail).color(theme::muted(ui)));
+        if let Some(progress) = &running.progress {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(progress.line()).color(theme::muted(ui)));
+            if let Some(path) = &progress.current_path {
+                ui.label(
+                    egui::RichText::new(format!("In: {path}"))
+                        .color(theme::muted(ui))
+                        .small(),
+                );
+            }
+            // No ETA while stopping: the run is ending, so a remaining-time is
+            // meaningless, and the frozen estimate must not keep being shown
+            // next to "Stopping…".
+            if !running.cancellation_requested
+                && let Some(eta) = progress.eta_line()
+            {
+                ui.label(egui::RichText::new(eta).color(theme::muted(ui)).small());
+            }
+        }
     });
     ui.add_space(8.0);
     action
@@ -1364,6 +1877,21 @@ fn show_source_row(
                 .small(),
             );
         }
+
+        // An incomplete catalogue load is a distinct, prominent result: the
+        // safety limit stopped the check part-way, so the verdict covers only
+        // part of the folder and nothing may imply all of it was read.
+        if row.incomplete_load {
+            ui.add_space(6.0);
+            widgets::banner(
+                ui,
+                "Incomplete catalogue load",
+                &row.incomplete_load_line().unwrap_or_default(),
+                widgets::StatusTone::Warning,
+            );
+        }
+
+        show_warning_summary(ui, row, ui_state);
 
         ui.add_space(6.0);
         if action.is_none()
@@ -1488,6 +2016,71 @@ fn health_label(row: &DatSourceRowView) -> String {
         format!("{} (out of date)", row.health_state.label())
     } else {
         row.health_state.label().to_string()
+    }
+}
+
+/// The warning count, a concise inline summary, and the expandable warning
+/// details, drawn directly on the source card so "Valid, with warnings" is
+/// never a bare badge with the reasons hidden behind Inspect.
+fn show_warning_summary(
+    ui: &mut egui::Ui,
+    row: &DatSourceRowView,
+    ui_state: &mut DatSourcesPageUi,
+) {
+    if row.warnings.is_empty() {
+        return;
+    }
+    let open = ui_state.open_warnings.as_deref() == Some(row.id.as_str());
+    let count = row.warnings.len();
+
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        widgets::status_badge(
+            ui,
+            format!(
+                "{count} {}",
+                if count == 1 { "warning" } else { "warnings" }
+            ),
+            widgets::StatusTone::Warning,
+        );
+        let label = if open {
+            "Hide warning details"
+        } else {
+            "View warning details"
+        };
+        if widgets::action_button(ui, label, widgets::ActionStyle::Quiet, true).clicked() {
+            ui_state.open_warnings = if open { None } else { Some(row.id.clone()) };
+        }
+        if row.history_link_available {
+            // Only ever drawn when the full details really are recorded in
+            // History & Logs; today they are kept inline, so this is off.
+            ui.label(
+                egui::RichText::new("Full details are recorded in History & Logs.")
+                    .color(theme::muted(ui))
+                    .small(),
+            );
+        }
+    });
+
+    // Concise inline summary: the first warning, kept to one line. The full
+    // text of every warning is in the expandable list below.
+    if let Some(first) = row.warnings.first() {
+        ui.label(
+            egui::RichText::new(format!("Summary: {}", truncate_inline(first)))
+                .color(theme::muted(ui))
+                .small(),
+        );
+    }
+
+    if open {
+        for warning in &row.warnings {
+            ui.horizontal_top(|ui| {
+                ui.label(egui::RichText::new("•").color(widgets::StatusTone::Warning.color(ui)));
+                // The original warning text is preserved verbatim; only the
+                // inline summary is ever truncated.
+                ui.add(egui::Label::new(warning).wrap());
+            });
+        }
     }
 }
 

@@ -210,6 +210,12 @@ pub struct FolderScan {
     /// The folder held more DAT files than [`MAX_FOLDER_DAT_FILES`], so this
     /// listing is the first of them and not all of them.
     pub truncated: bool,
+    /// How many DAT files the folder actually holds, when that is genuinely
+    /// known. `Some` only when the folder was fully examined (the
+    /// [`MAX_FOLDER_ENTRIES_EXAMINED`] ceiling was not hit), so a report can
+    /// say "512 of 2,024 DAT files read" instead of inventing a total. `None`
+    /// when the scan stopped early and the true count is not known.
+    pub total_dat_files: Option<usize>,
 }
 
 /// Lists the DAT files directly inside `folder`, in a deterministic order.
@@ -238,12 +244,16 @@ pub fn discover_dat_files(folder: &Path) -> Result<FolderScan, DatPathRefusal> {
     let mut skipped: Vec<SkippedFolderEntry> = Vec::new();
     let mut truncated = false;
     let mut examined = 0usize;
+    // Whether the folder was looked at to the end. When this is false the DAT
+    // count below is a partial one and must not be reported as a total.
+    let mut scan_was_complete = true;
 
     for entry in read_dir {
         let Ok(entry) = entry else { continue };
         examined += 1;
         if examined > MAX_FOLDER_ENTRIES_EXAMINED {
             truncated = true;
+            scan_was_complete = false;
             break;
         }
         let path = entry.path();
@@ -298,6 +308,10 @@ pub fn discover_dat_files(folder: &Path) -> Result<FolderScan, DatPathRefusal> {
     candidates.sort();
     skipped.sort_by(|left, right| left.file_name.cmp(&right.file_name));
 
+    // The total is only honest when the whole folder was examined; a scan cut
+    // short by the entries ceiling has only seen part of it.
+    let total_dat_files = scan_was_complete.then_some(candidates.len());
+
     if candidates.len() > MAX_FOLDER_DAT_FILES {
         candidates.truncate(MAX_FOLDER_DAT_FILES);
         truncated = true;
@@ -307,6 +321,7 @@ pub fn discover_dat_files(folder: &Path) -> Result<FolderScan, DatPathRefusal> {
         files: candidates,
         skipped,
         truncated,
+        total_dat_files,
     })
 }
 
@@ -403,6 +418,10 @@ pub struct DatValidationReport {
     pub duplicate_identities: Vec<DuplicateDatIdentity>,
     pub skipped: Vec<SkippedFolderEntry>,
     pub truncated: bool,
+    /// How many DAT files the folder actually holds, when genuinely known
+    /// (`None` when the scan stopped before seeing all of them). Only
+    /// meaningful for a folder source whose listing was truncated.
+    pub total_dat_files: Option<usize>,
     /// One line, suitable for a status row.
     pub summary: String,
     pub entry_count: usize,
@@ -466,6 +485,7 @@ pub fn validate_dat_source(entry: &DatSourceEntry, limits: DatLimits) -> DatVali
         duplicate_identities: Vec::new(),
         skipped: Vec::new(),
         truncated: false,
+        total_dat_files: None,
         summary: String::new(),
         entry_count: 0,
         rom_count: 0,
@@ -485,6 +505,7 @@ pub fn validate_dat_source(entry: &DatSourceEntry, limits: DatLimits) -> DatVali
             Ok(scan) => {
                 report.skipped = scan.skipped;
                 report.truncated = scan.truncated;
+                report.total_dat_files = scan.total_dat_files;
                 scan.files
             }
             Err(refusal) => {

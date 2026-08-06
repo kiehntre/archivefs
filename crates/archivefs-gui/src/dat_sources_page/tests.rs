@@ -12,10 +12,14 @@
 //! is no network surface anywhere in this page or the core it calls.
 
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant};
 
+use archivefs_core::dat::audit::{AuditReport, AuditSummary};
+use archivefs_core::dat::model::{DatEcosystem, DatFormat};
 use archivefs_core::dat::sources::{
-    DatHealthState, DatSourceRegistry, load_dat_sources_config_from,
+    DatFileOutcome, DatFileReport, DatHealthState, DatSourceKind, DatSourceRegistry,
+    DatValidationReport, audit_run::DatAuditOutcome, load_dat_sources_config_from,
 };
 use archivefs_core::safe_read::TrustedRoots;
 
@@ -862,6 +866,11 @@ fn an_audit_changes_nothing_on_disk() {
 
 #[test]
 fn an_audit_can_be_cancelled_from_the_page() {
+    // Deterministic by construction: `CancelJob` flips the page's own
+    // `cancel_requested` flag, and `poll()` drops any terminal result that
+    // arrives after it - so whatever the worker does (observe the flag and
+    // send `Cancelled`, or finish first and send `Audited`), a cancelled audit
+    // can never land in `view.audit`.
     let (_fixture, mut page, roms) = audit_fixture();
     page.apply(DatSourcesPageAction::Audit {
         id: "collection".to_string(),
@@ -874,7 +883,19 @@ fn an_audit_can_be_cancelled_from_the_page() {
         "an audit must offer a Cancel that actually does something"
     );
 
+    // Cancel flips the visible state immediately, while the worker is still
+    // running.
     page.apply(DatSourcesPageAction::CancelJob);
+    let running = page.view().running.expect("still busy while stopping");
+    assert!(
+        running.cancellation_requested,
+        "the card must read 'Stopping…' the moment Cancel is pressed"
+    );
+    assert!(
+        page.is_busy(),
+        "the operation remains busy until the worker confirms termination"
+    );
+
     run_to_completion(&mut page);
 
     let view = page.view();
@@ -1017,4 +1038,692 @@ fn the_page_states_what_it_supports_and_what_it_will_never_do() {
     assert!(READ_ONLY_PROMISE.contains("deletes"));
     assert!(SUPPORTED_FORMATS.contains("Logiqx"));
     assert!(SUPPORTED_FORMATS.contains("ClrMamePro"));
+}
+
+// ---------------------------------------------------------------------------
+// Validation warning presentation
+// ---------------------------------------------------------------------------
+
+/// A page holding one folder source plus a stored validation report built by
+/// the test, so warning presentation can be driven without depending on parser
+/// wording.
+fn page_with_report(
+    per_file_warnings: Vec<Vec<String>>,
+    truncated: bool,
+    total_dat_files: Option<usize>,
+) -> (Fixture, DatSourcesPageState) {
+    let fixture = Fixture::new();
+    let folder = fixture.dir("warn");
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddFolder {
+        path: folder.clone(),
+    });
+    let id = "warn".to_string();
+    let files: Vec<DatFileReport> = per_file_warnings
+        .iter()
+        .enumerate()
+        .map(|(index, warnings)| DatFileReport {
+            path: format!("{}/warn-{index}.dat", folder.display()),
+            file_name: format!("warn-{index}.dat"),
+            outcome: DatFileOutcome::Parsed {
+                format: DatFormat::Logiqx,
+                ecosystem: DatEcosystem::GenericLogiqx,
+                name: Some("Test Catalogue".to_string()),
+                version: Some("2026-01-01".to_string()),
+                entry_count: 1,
+                rom_count: 1,
+                warnings: warnings.clone(),
+            },
+        })
+        .collect();
+    let report = DatValidationReport {
+        source_id: id.clone(),
+        path: folder.to_string_lossy().into_owned(),
+        kind: "DAT folder",
+        state: DatHealthState::ValidWithWarnings,
+        files,
+        duplicate_identities: Vec::new(),
+        skipped: Vec::new(),
+        truncated,
+        total_dat_files,
+        summary: "1 DAT files, 1 entries, 1 ROMs".to_string(),
+        entry_count: 1,
+        rom_count: 1,
+        formats: vec!["Logiqx XML".to_string()],
+        path_refusal: None,
+    };
+    page.validations.insert(id.clone(), report.clone());
+    if let Some(entry) = page.draft.get_mut(&id) {
+        entry.health = report.to_health(&folder, DatSourceKind::Folder);
+    }
+    (fixture, page)
+}
+
+/// Draws the page headlessly, the way the cheat-sources page's tests do.
+fn render(view: &DatSourcesPageView, ui_state: &mut DatSourcesPageUi) -> egui::FullOutput {
+    let context = egui::Context::default();
+    context.run(egui::RawInput::default(), |context| {
+        egui::CentralPanel::default().show(context, |ui| {
+            let _ = show_dat_sources_page(ui, view, ui_state);
+        });
+    })
+}
+
+/// The same helper the shared widgets' own tests use.
+fn rendered_text_contains(output: &egui::FullOutput, needle: &str) -> bool {
+    fn shape_contains(shape: &egui::Shape, needle: &str) -> bool {
+        match shape {
+            egui::Shape::Text(text_shape) => text_shape.galley.text().contains(needle),
+            egui::Shape::Vec(nested) => nested.iter().any(|shape| shape_contains(shape, needle)),
+            _ => false,
+        }
+    }
+    output
+        .shapes
+        .iter()
+        .any(|clipped| shape_contains(&clipped.shape, needle))
+}
+
+#[test]
+fn warnings_render_count_summary_and_expandable_details() {
+    let warnings = vec![
+        "The header version differs from the file's name".to_string(),
+        "A ROM entry has no SHA-1 checksum; only CRC32 was compared".to_string(),
+    ];
+    let (_fixture, page) = page_with_report(vec![warnings.clone()], false, None);
+    let view = page.view();
+    assert_eq!(view.rows[0].warnings.len(), 2);
+    assert_eq!(view.rows[0].health_state, DatHealthState::ValidWithWarnings);
+
+    let mut ui_state = DatSourcesPageUi::default();
+    let collapsed = render(&view, &mut ui_state);
+    assert!(
+        rendered_text_contains(&collapsed, "2 warnings"),
+        "the count must sit on the card"
+    );
+    assert!(
+        rendered_text_contains(&collapsed, "View warning details"),
+        "an expandable control must be offered"
+    );
+    assert!(
+        !rendered_text_contains(&collapsed, &warnings[1]),
+        "the details list must stay hidden until the user expands it"
+    );
+
+    ui_state.open_warnings = Some(view.rows[0].id.clone());
+    let expanded = render(&view, &mut ui_state);
+    assert!(rendered_text_contains(&expanded, "Hide warning details"));
+    for warning in &warnings {
+        assert!(
+            rendered_text_contains(&expanded, warning),
+            "the full original text must appear when expanded"
+        );
+    }
+}
+
+#[test]
+fn zero_warnings_show_no_warning_details_control() {
+    let (_fixture, page) = page_with_report(vec![Vec::new()], false, None);
+    let view = page.view();
+    assert!(view.rows[0].warnings.is_empty());
+
+    let mut ui_state = DatSourcesPageUi::default();
+    let output = render(&view, &mut ui_state);
+    assert!(
+        !rendered_text_contains(&output, "View warning details"),
+        "no warnings means no details control"
+    );
+}
+
+#[test]
+fn a_safety_limit_stop_is_labelled_incomplete_and_counts_are_exact() {
+    // Both numbers genuinely known: the read count and the folder's real total.
+    let (_fixture, page) = page_with_report(vec![vec!["w".to_string()]], true, Some(2024));
+    let row = &page.view().rows[0];
+    assert!(row.incomplete_load);
+    assert_eq!(row.dat_files_read, Some(1));
+    assert_eq!(row.dat_files_total, Some(2024));
+    assert_eq!(
+        row.incomplete_load_line().as_deref(),
+        Some("1 of 2024 DAT files read")
+    );
+
+    // An unknown total never invents one: the safety limit is named instead.
+    let (_fixture, page) = page_with_report(vec![vec!["w".to_string()]], true, None);
+    let row = &page.view().rows[0];
+    assert!(row.incomplete_load);
+    assert_eq!(row.dat_files_total, None);
+    assert_eq!(
+        row.incomplete_load_line().as_deref(),
+        Some("Processing stopped at the configured safety limit")
+    );
+}
+
+#[test]
+fn an_incomplete_load_is_drawn_prominently_with_its_counts() {
+    let (_fixture, page) = page_with_report(vec![vec!["w".to_string()]], true, Some(2024));
+    let view = page.view();
+    let mut ui_state = DatSourcesPageUi::default();
+    let output = render(&view, &mut ui_state);
+    assert!(
+        rendered_text_contains(&output, "Incomplete catalogue load"),
+        "the incompleteness must be a headline, not body text"
+    );
+    assert!(rendered_text_contains(&output, "1 of 2024 DAT files read"));
+}
+
+#[test]
+fn unknown_total_never_invents_a_count_or_percentage() {
+    assert_eq!(format_percentage(5, 0), None);
+    assert_eq!(format_percentage(0, 0), None);
+
+    let (_fixture, page) = page_with_report(vec![vec!["w".to_string()]], true, None);
+    let row = &page.view().rows[0];
+    assert_eq!(row.dat_files_read, Some(1), "the read count is still known");
+    assert_eq!(row.dat_files_total, None);
+    assert!(
+        !row.incomplete_load_line().unwrap().contains("of"),
+        "no invented total may appear: {:?}",
+        row.incomplete_load_line()
+    );
+}
+
+#[test]
+fn warning_order_is_deterministic() {
+    let per_file = vec![
+        vec!["first-a".to_string(), "second-a".to_string()],
+        vec!["first-b".to_string(), "second-b".to_string()],
+    ];
+    let (_fixture, page) = page_with_report(per_file, false, None);
+    let row = &page.view().rows[0];
+    assert_eq!(
+        row.warnings,
+        vec!["first-a", "second-a", "first-b", "second-b"],
+        "warnings must come in file order, files in name order, never in read_dir order"
+    );
+}
+
+#[test]
+fn the_history_and_logs_reference_is_only_drawn_when_details_are_recorded_there() {
+    let (_fixture, page) = page_with_report(vec![vec!["w".to_string()]], false, None);
+    let mut view = page.view();
+    // Nothing is recorded in History & Logs today, so the honest card does not
+    // point there.
+    assert!(!view.rows[0].history_link_available);
+
+    let mut ui_state = DatSourcesPageUi::default();
+    assert!(
+        !rendered_text_contains(&render(&view, &mut ui_state), "History & Logs"),
+        "no link may be offered when the details are not recorded there"
+    );
+
+    // If the flag is ever set because the details genuinely are recorded there,
+    // the reference is drawn.
+    view.rows[0].history_link_available = true;
+    assert!(rendered_text_contains(
+        &render(&view, &mut ui_state),
+        "History & Logs"
+    ));
+}
+
+#[test]
+fn warnings_are_prominent_on_the_card_not_buried_behind_inspect() {
+    // Regression: the old card showed the "Valid, with warnings" badge, but
+    // the warning text was only reachable by opening Inspect and reading a
+    // nested per-file list. The count and an expandable "View warning details"
+    // control now sit on the card itself.
+    let warnings = vec![
+        "A ROM entry has no SHA-1 checksum; only CRC32 was compared".to_string(),
+        "The header declares a version that differs from the filename".to_string(),
+    ];
+    let (_fixture, page) = page_with_report(vec![warnings.clone()], false, None);
+    let view = page.view();
+    assert_eq!(view.rows[0].health_state, DatHealthState::ValidWithWarnings);
+
+    let mut ui_state = DatSourcesPageUi::default();
+    let output = render(&view, &mut ui_state);
+    assert!(rendered_text_contains(&output, "Valid, with warnings"));
+    assert!(
+        rendered_text_contains(&output, "2 warnings"),
+        "the count must be visible without any disclosure click"
+    );
+    assert!(
+        rendered_text_contains(&output, "View warning details"),
+        "the expandable control must be visible without opening Inspect"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Audit progress: ETA and formatting
+// ---------------------------------------------------------------------------
+
+#[test]
+fn no_eta_before_one_hundred_files() {
+    let mut estimator = EtaEstimator::new();
+    estimator.update(50, 6.0);
+    estimator.update(90, 12.0);
+    let eta = estimator.eta(90, 1000, 12.0);
+    assert!(
+        !matches!(eta, EtaView::About { .. }),
+        "an ETA must not appear before 100 files: {eta:?}"
+    );
+    assert_eq!(eta, EtaView::Estimating);
+}
+
+#[test]
+fn no_eta_before_five_seconds() {
+    let mut estimator = EtaEstimator::new();
+    estimator.update(50, 0.0);
+    estimator.update(150, 3.0);
+    let eta = estimator.eta(150, 1000, 3.0);
+    assert!(
+        !matches!(eta, EtaView::About { .. }),
+        "an ETA must not appear before 5 seconds: {eta:?}"
+    );
+    assert_eq!(eta, EtaView::Estimating);
+}
+
+#[test]
+fn unknown_total_produces_no_eta() {
+    let mut tracker = AuditProgressTracker::new();
+    tracker.update(
+        &DatAuditProgress::Scanning {
+            files_found: 42,
+            current_dir: Some("/home/user/roms".to_string()),
+        },
+        12.0,
+    );
+    let view = tracker.view(12);
+    assert_eq!(view.total_files, None);
+    assert_eq!(view.eta, EtaView::None);
+    assert_eq!(view.percent, None);
+    // The position must not invent a denominator.
+    assert_eq!(view.position(), "42 files so far");
+}
+
+#[test]
+fn stable_progress_produces_an_approximate_eta() {
+    let mut estimator = EtaEstimator::new();
+    estimator.update(100, 10.0);
+    estimator.update(200, 20.0);
+    estimator.update(300, 30.0);
+    // 100 files per 10 seconds, 700 remaining -> about 70 seconds.
+    match estimator.eta(300, 1000, 30.0) {
+        EtaView::About { seconds_remaining } => {
+            assert!(
+                (55..=85).contains(&seconds_remaining),
+                "{seconds_remaining}"
+            );
+            let line = format_eta_remaining(seconds_remaining);
+            assert!(line.starts_with("About "), "{line}");
+            assert!(line.ends_with("remaining"), "{line}");
+        }
+        other => panic!("expected an approximate ETA, got {other:?}"),
+    }
+}
+
+#[test]
+fn eta_is_smoothed_not_jumping_from_one_sample() {
+    let mut estimator = EtaEstimator::new();
+    estimator.update(100, 10.0);
+    estimator.update(200, 20.0);
+    estimator.update(300, 30.0);
+    // One fast frame: 100 files in 1 second (100/s). A naive estimate would
+    // drop to ~6 seconds remaining; the smoothed one moves only partway.
+    estimator.update(400, 31.0);
+    match estimator.eta(400, 1000, 31.0) {
+        EtaView::About { seconds_remaining } => {
+            assert!(
+                seconds_remaining >= 15,
+                "the ETA must not jump to the single-frame speed: {seconds_remaining}s"
+            );
+            assert!(
+                seconds_remaining < 60,
+                "the ETA must move toward the spike, not ignore it: {seconds_remaining}s"
+            );
+        }
+        other => panic!("expected an approximate ETA, got {other:?}"),
+    }
+}
+
+#[test]
+fn zero_progress_cannot_divide_by_zero() {
+    assert_eq!(format_percentage(0, 0), None);
+    assert_eq!(format_percentage(5, 0), None);
+
+    let mut estimator = EtaEstimator::new();
+    estimator.update(0, 0.0);
+    estimator.update(0, 5.0);
+    assert_eq!(estimator.eta(0, 500, 5.0), EtaView::None);
+
+    let mut tracker = AuditProgressTracker::new();
+    tracker.update(
+        &DatAuditProgress::Hashing {
+            index: 0,
+            total: 0,
+            file_name: "x".to_string(),
+        },
+        6.0,
+    );
+    let view = tracker.view(6);
+    assert_eq!(view.percent, None);
+    assert_eq!(view.eta, EtaView::None);
+}
+
+#[test]
+fn a_frozen_tracker_keeps_the_eta_it_had_at_its_last_update() {
+    // Regression: the ETA must be a snapshot from the last progress update,
+    // not recomputed from the live wall clock - otherwise a stalled or
+    // cancelled run could flip from "Estimating…" to a number purely because
+    // seconds passed.
+    let mut tracker = AuditProgressTracker::new();
+    tracker.update(
+        &DatAuditProgress::Hashing {
+            index: 50,
+            total: 1000,
+            file_name: "a".to_string(),
+        },
+        2.0,
+    );
+    tracker.update(
+        &DatAuditProgress::Hashing {
+            index: 200,
+            total: 1000,
+            file_name: "b".to_string(),
+        },
+        6.0,
+    );
+    let eta_at_6 = tracker.view(6).eta.clone();
+    assert!(matches!(eta_at_6, EtaView::About { .. }));
+
+    let eta_at_600 = tracker.view(600).eta;
+    assert_eq!(
+        eta_at_600, eta_at_6,
+        "a tracker that has not been fed must not change its ETA as the clock moves"
+    );
+}
+
+#[test]
+fn draining_a_progress_backlog_keeps_the_eta_stable() {
+    // Regression: poll() used to timestamp every drained AuditProgress message
+    // with its own `started_at.elapsed()`. A backlog queued between GUI frames
+    // is drained within microseconds, so EtaEstimator saw a large delta_files
+    // over a near-zero delta_seconds and spiked the throughput, collapsing the
+    // ETA toward zero. poll() now reads the clock once per drain pass: every
+    // message in the burst shares one elapsed value, the `delta_seconds > 0`
+    // guard skips the rest of the burst, and the rate stays where the normally
+    // spaced passes put it.
+    let (_fixture, mut page, roms) = audit_fixture();
+    page.apply(DatSourcesPageAction::Audit {
+        id: "collection".to_string(),
+        scan_root: roms,
+    });
+    // Drive the job through a controllable channel, backdating the clock so
+    // the confidence gates (100 files, 5 seconds) are already open. A larger
+    // channel than the production constant lets the burst queue entirely
+    // without a blocking send.
+    let cancel = page.job.as_ref().expect("a job is running").cancel.clone();
+    let (sender, messages) = sync_channel(256);
+    page.job = Some(RunningJob {
+        kind: JobKind::Audit,
+        source_id: "collection".to_string(),
+        cancel,
+        cancel_requested: false,
+        messages,
+        latest: "Starting…".to_string(),
+        started_at: Instant::now() - Duration::from_secs(60),
+        audit_progress: Some(AuditProgressTracker::new()),
+    });
+
+    let total = 1000;
+    let hash = |index: usize| {
+        JobMessage::AuditProgress(DatAuditProgress::Hashing {
+            index,
+            total,
+            file_name: format!("f{index}.bin"),
+        })
+    };
+
+    // Two normally spaced passes establish a steady rate (one file per 20 ms).
+    sender.send(hash(1)).unwrap();
+    page.poll();
+    std::thread::sleep(Duration::from_millis(20));
+    sender.send(hash(2)).unwrap();
+    page.poll();
+
+    // Queue a backlog, then drain all of it in a single poll() pass. The EMA
+    // (alpha 0.2) needs ~21 samples to converge toward a spike rate, so 101
+    // queued messages are plenty to make the old per-message timing collapse
+    // the ETA, while staying above the 100-file confidence gate.
+    std::thread::sleep(Duration::from_millis(20));
+    for index in 3..=103 {
+        sender.send(hash(index)).unwrap();
+    }
+    page.poll();
+
+    let running = page.view().running.expect("the job is still running");
+    let progress = running.progress.as_ref().expect("audit progress");
+    assert_eq!(progress.files_checked, 103);
+    match &progress.eta {
+        EtaView::About { seconds_remaining } => {
+            // ~50 files/s with 897 left is on the order of 18 seconds. A
+            // per-message timestamp on the drained backlog would compute
+            // millions of files per second and collapse this to ~1 second.
+            assert!(
+                *seconds_remaining >= 5,
+                "the ETA must not collapse toward zero after a drained backlog: \
+                 {seconds_remaining}s"
+            );
+        }
+        other => panic!("expected a real ETA after a stable run, got {other:?}"),
+    }
+}
+
+#[test]
+fn completed_progress_shows_one_hundred_percent() {
+    assert_eq!(format_percentage(500, 500), Some(100));
+    assert_eq!(format_percentage(500, 1000), Some(50));
+
+    let mut tracker = AuditProgressTracker::new();
+    tracker.update(
+        &DatAuditProgress::Hashing {
+            index: 500,
+            total: 500,
+            file_name: "last.bin".to_string(),
+        },
+        30.0,
+    );
+    let view = tracker.view(30);
+    assert_eq!(view.percent, Some(100));
+    assert_eq!(view.position(), "500 of 500");
+}
+
+#[test]
+fn the_current_path_is_shortened_safely() {
+    assert_eq!(
+        shorten_path("/home/user/private/games/platform"),
+        "…/games/platform"
+    );
+    assert_eq!(shorten_path("/a/b/c/d/e/f"), "…/e/f");
+    // Short paths are returned as they are; nothing panics on edge cases.
+    assert_eq!(shorten_path("/roms"), "/roms");
+    assert_eq!(shorten_path(""), "");
+}
+
+#[test]
+fn a_private_path_never_enters_the_detail_or_progress_text() {
+    let private = "/home/user/private";
+    let description = describe(&DatAuditProgress::Scanning {
+        files_found: 7,
+        current_dir: Some(format!("{private}/platform")),
+    });
+    assert!(!description.contains(private), "{description}");
+
+    let mut tracker = AuditProgressTracker::new();
+    tracker.update(
+        &DatAuditProgress::Scanning {
+            files_found: 7,
+            current_dir: Some(format!("{private}/platform")),
+        },
+        3.0,
+    );
+    let view = tracker.view(3);
+    let shown = view.current_path.expect("a current path is shown");
+    assert!(!shown.contains(private), "{shown}");
+    assert_eq!(shown, "…/private/platform");
+}
+
+// ---------------------------------------------------------------------------
+// Cancellation
+// ---------------------------------------------------------------------------
+
+/// Replaces the running job with a controllable one on a fresh channel, so a
+/// test can drive the exact message sequence without racing a worker thread.
+fn take_over_job(page: &mut DatSourcesPageState, latest: &str) -> SyncSender<JobMessage> {
+    let cancel = page.job.as_ref().expect("a job is running").cancel.clone();
+    let (sender, messages) = sync_channel(PROGRESS_QUEUE_DEPTH);
+    page.job = Some(RunningJob {
+        kind: JobKind::Audit,
+        source_id: "collection".to_string(),
+        cancel,
+        cancel_requested: false,
+        messages,
+        latest: latest.to_string(),
+        started_at: Instant::now(),
+        audit_progress: Some(AuditProgressTracker::new()),
+    });
+    sender
+}
+
+/// A completed-audit outcome, for proving a late result after cancellation is
+/// dropped rather than presented.
+fn minimal_outcome() -> DatAuditOutcome {
+    DatAuditOutcome {
+        source_id: "collection".to_string(),
+        source_display_name: "collection.dat".to_string(),
+        dat_path: "/tmp/collection.dat".to_string(),
+        scan_root: "/tmp/roms".to_string(),
+        catalogue_names: vec!["Test No-Intro Collection".to_string()],
+        catalogue_entries: 1,
+        catalogue_roms: 1,
+        unreadable_catalogues: Vec::new(),
+        report: AuditReport {
+            entries: Vec::new(),
+            summary: AuditSummary::default(),
+        },
+        unhashed: Vec::new(),
+        files_scanned: 2,
+        bytes_hashed: 4,
+        truncated: false,
+    }
+}
+
+#[test]
+fn cancellation_changes_the_wording_to_stopping() {
+    let (_fixture, mut page, roms) = audit_fixture();
+    page.apply(DatSourcesPageAction::Audit {
+        id: "collection".to_string(),
+        scan_root: roms,
+    });
+    let sender = take_over_job(&mut page, "Checking 10 of 100: a.bin");
+
+    let running = page.view().running.expect("a job is running");
+    assert_eq!(running.heading(), "Auditing 'collection'");
+    assert!(!running.cancellation_requested);
+
+    page.apply(DatSourcesPageAction::CancelJob);
+
+    let running = page.view().running.expect("still busy while stopping");
+    assert!(running.cancellation_requested);
+    assert!(
+        running.heading().contains("Stopping"),
+        "{}",
+        running.heading()
+    );
+    assert!(
+        page.is_busy(),
+        "the operation stays busy until the worker confirms termination"
+    );
+
+    // The worker's confirmation ends it without any result.
+    sender.send(JobMessage::Cancelled).unwrap();
+    page.poll();
+    assert!(page.view().running.is_none());
+    assert!(page.view().audit.is_none());
+}
+
+#[test]
+fn stale_progress_after_cancellation_is_ignored() {
+    let (_fixture, mut page, roms) = audit_fixture();
+    page.apply(DatSourcesPageAction::Audit {
+        id: "collection".to_string(),
+        scan_root: roms,
+    });
+    let sender = take_over_job(&mut page, "Starting…");
+
+    // A real progress update before cancellation, so there is something to
+    // freeze.
+    sender
+        .send(JobMessage::AuditProgress(DatAuditProgress::Hashing {
+            index: 10,
+            total: 100,
+            file_name: "a.bin".to_string(),
+        }))
+        .unwrap();
+    page.poll();
+    let before = page.view().running.expect("running");
+    assert_eq!(before.detail, "Checking 10 of 100: a.bin");
+    assert_eq!(before.progress.as_ref().unwrap().files_checked, 10);
+
+    page.apply(DatSourcesPageAction::CancelJob);
+
+    // The worker has not observed the flag yet and goes on reporting. None of
+    // it may move the shown state.
+    sender
+        .send(JobMessage::AuditProgress(DatAuditProgress::Hashing {
+            index: 11,
+            total: 100,
+            file_name: "c.bin".to_string(),
+        }))
+        .unwrap();
+    page.poll();
+
+    let running = page.view().running.expect("still busy");
+    assert!(running.cancellation_requested);
+    assert_eq!(
+        running.detail, before.detail,
+        "stale progress after cancellation must not change the shown detail"
+    );
+    assert_eq!(
+        running.progress.as_ref().unwrap().files_checked,
+        10,
+        "stale progress after cancellation must not move the position or ETA"
+    );
+}
+
+#[test]
+fn a_cancelled_audit_never_appears_complete() {
+    let (_fixture, mut page, roms) = audit_fixture();
+    page.apply(DatSourcesPageAction::Audit {
+        id: "collection".to_string(),
+        scan_root: roms,
+    });
+    let sender = take_over_job(&mut page, "Starting…");
+
+    page.apply(DatSourcesPageAction::CancelJob);
+
+    // Even if the worker finished the whole audit before it noticed the flag,
+    // the page must not present that as a completed audit.
+    sender
+        .send(JobMessage::Audited(Box::new(minimal_outcome())))
+        .unwrap();
+    page.poll();
+
+    let view = page.view();
+    assert!(view.running.is_none());
+    assert!(
+        view.audit.is_none(),
+        "a cancelled audit never appears complete"
+    );
+    assert!(view.audit_error.is_none(), "cancelling is not a failure");
 }
