@@ -132,6 +132,7 @@ pub(crate) mod cheat_sources_page;
 pub(crate) mod dat_sources_page;
 pub mod game_presentation;
 pub(crate) mod gamer_artwork;
+pub(crate) mod home_page;
 pub(crate) mod romm_browse;
 pub(crate) mod romm_config;
 pub(crate) mod romm_game;
@@ -2875,6 +2876,7 @@ struct HealthReportCache {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 enum MainView {
     #[default]
+    Home,
     Library,
     RecentlyFound,
     Health,
@@ -2945,6 +2947,24 @@ enum LibraryTab {
 /// The `MainView` destination that currently renders `tab`'s content -
 /// the inverse of `library_tab_for_main_view`. Used by
 /// `ArchiveFsApp::navigate_to_library_tab`.
+/// Which `MainView` a Home card's action leads to. A pure mapping,
+/// separate from `show_home_page`'s rendering, so every card's
+/// destination is directly assertable without a frame buffer. `BuildLibrary`
+/// and `RomM` both land on Sources - there is no dedicated RomM `MainView`,
+/// since RomM is a card embedded on the Sources page, not its own
+/// destination.
+fn main_view_for_home_card(card: home_page::HomeCard) -> MainView {
+    match card {
+        home_page::HomeCard::BuildLibrary | home_page::HomeCard::RomM => MainView::Sources,
+        home_page::HomeCard::BrowseGames => MainView::Library,
+        home_page::HomeCard::CheatsAndMods => MainView::CheatsMods,
+        home_page::HomeCard::CheatSources => MainView::CheatSources,
+        home_page::HomeCard::DatSources => MainView::DatSources,
+        home_page::HomeCard::CheckSetup => MainView::Doctor,
+        home_page::HomeCard::Settings => MainView::Settings,
+    }
+}
+
 fn main_view_for_library_tab(tab: LibraryTab) -> MainView {
     match tab {
         LibraryTab::Archives => MainView::Library,
@@ -3106,7 +3126,8 @@ impl ArchiveInspectorState {
 }
 
 const DEFAULT_INSPECTOR_PATH_COLUMN_WIDTH: f32 = 520.0;
-const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 13] = [
+const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 14] = [
+    (MainView::Home, "Home"),
     (MainView::Mount, "Mount"),
     (MainView::Selected, "Selected"),
     (MainView::CheatsMods, "Cheats & Mods"),
@@ -3169,6 +3190,7 @@ fn catalogue_status_load_needed(view: MainView, catalogue_manager: &CatalogueMan
 
 fn main_view_title(view: MainView) -> &'static str {
     match view {
+        MainView::Home => "Home",
         MainView::Library => "Library",
         MainView::RecentlyFound => "Recently Found",
         MainView::Health => "Health",
@@ -3190,7 +3212,8 @@ fn main_view_title(view: MainView) -> &'static str {
 
 fn main_view_content_width(view: MainView) -> ui_layout::ContentWidth {
     match view {
-        MainView::Mount
+        MainView::Home
+        | MainView::Mount
         | MainView::Selected
         | MainView::CheatsMods
         | MainView::ActiveMounts
@@ -3237,7 +3260,8 @@ fn main_view_content_width(view: MainView) -> ui_layout::ContentWidth {
 fn main_view_uses_page_scroll(view: MainView) -> bool {
     matches!(
         view,
-        MainView::Selected
+        MainView::Home
+            | MainView::Selected
             | MainView::Sources
             | MainView::CheatSources
             | MainView::DatSources
@@ -3247,6 +3271,32 @@ fn main_view_uses_page_scroll(view: MainView) -> bool {
             | MainView::About
     )
 }
+
+/// Maps a RomM `ProviderState` to the three-bucket readiness Home shows,
+/// without pulling `archivefs_core::identity_source` into `home_page`
+/// itself. `NeverImported`/`Disabled`/`Importing`/`Stale`/`Error` are all
+/// "configured, but not currently serving" - distinct both from "never set
+/// up" and from "ready" - matching `ProviderState`'s own doc comments on
+/// why each of those is not conflated with an error or with not-configured.
+fn romm_readiness_label(
+    state: &archivefs_core::identity_source::status::ProviderState,
+) -> home_page::RommReadinessLabel {
+    use archivefs_core::identity_source::status::ProviderState;
+    use home_page::RommReadinessLabel;
+    match state {
+        ProviderState::NotConfigured => RommReadinessLabel::NotConfigured("Not configured"),
+        ProviderState::Disabled => RommReadinessLabel::Unavailable("Disabled"),
+        ProviderState::NeverImported => {
+            RommReadinessLabel::Unavailable("Enabled, nothing imported yet")
+        }
+        ProviderState::Importing => RommReadinessLabel::Unavailable("Importing"),
+        ProviderState::Ready => RommReadinessLabel::Ready("Ready"),
+        ProviderState::ReadyOffline => RommReadinessLabel::Ready("Ready (offline)"),
+        ProviderState::Stale { .. } => RommReadinessLabel::Unavailable("Stale"),
+        ProviderState::Error { .. } => RommReadinessLabel::Unavailable("Error"),
+    }
+}
+
 fn show_primary_navigation(
     ui: &mut egui::Ui,
     current: MainView,
@@ -3978,6 +4028,41 @@ impl ArchiveFsApp {
     fn navigate_to_library_tab(&mut self, tab: LibraryTab) {
         self.view = main_view_for_library_tab(tab);
         self.library_tab = tab;
+        self.tools_overlay = ToolsOverlay::None;
+    }
+
+    /// The one sanctioned way to change `self.view` in response to a user
+    /// action (a sidebar click, a Home card, a menu item) - shared so
+    /// every navigation source applies the same special cases
+    /// (`CheatsMods` clears any open tools overlay; `Library` restores
+    /// whichever tab was last selected rather than resetting to Archives)
+    /// instead of each call site re-deriving them, and so the *last*
+    /// navigation call in a frame always wins over anything set earlier
+    /// that frame.
+    fn navigate_to_main_view(&mut self, target: MainView) {
+        if target == MainView::CheatsMods {
+            self.view = MainView::CheatsMods;
+            self.tools_overlay = ToolsOverlay::None;
+        } else if target == MainView::Library {
+            self.navigate_to_library_tab(self.library_tab);
+        } else {
+            self.view = target;
+            self.tools_overlay = ToolsOverlay::None;
+        }
+    }
+
+    /// Gamer View's gear menu has no sidebar behind it, so "Advanced View"
+    /// is the only realistic path a genuine first-run user has to reach
+    /// the task list. It must always land on Home, never on whatever
+    /// `self.view` happened to hold from an earlier Advanced View visit.
+    ///
+    /// Deliberately does not persist `ui_mode` itself - the caller does
+    /// that (see the gear menu's "Advanced View" handler) - so this method
+    /// stays a pure state transition, callable from a test without writing
+    /// to the real per-user GUI-mode file.
+    fn switch_to_advanced_view_at_home(&mut self) {
+        self.ui_mode = GuiMode::AdvancedView;
+        self.view = MainView::Home;
         self.tools_overlay = ToolsOverlay::None;
     }
 
@@ -12912,7 +12997,7 @@ impl ArchiveFsApp {
                         }
                         ui.menu_button("\u{2699}", |ui| {
                             if ui.button("Advanced View").clicked() {
-                                self.ui_mode = GuiMode::AdvancedView;
+                                self.switch_to_advanced_view_at_home();
                                 save_gui_mode(self.ui_mode);
                                 ui.close();
                             }
@@ -12922,23 +13007,7 @@ impl ArchiveFsApp {
             });
         }
         if let Some(clicked) = navigation_request {
-            if clicked == MainView::CheatsMods {
-                // `reconcile_cheats_mods_context`, called below every frame
-                // this page is open, does the actual sync against
-                // `selected_archive` - navigating here never needs its own
-                // copy of that logic.
-                self.view = MainView::CheatsMods;
-                self.tools_overlay = ToolsOverlay::None;
-            } else if clicked == MainView::Library {
-                // The sidebar's one Library button must restore whichever
-                // Library tab was last selected (Archives, Health,
-                // Duplicates, or Views), not always reset to Archives -
-                // see LibraryTab's doc comment.
-                self.navigate_to_library_tab(self.library_tab);
-            } else {
-                self.view = clicked;
-                self.tools_overlay = ToolsOverlay::None;
-            }
+            self.navigate_to_main_view(clicked);
         }
 
         if self.ui_mode == GuiMode::AdvancedView
@@ -13201,6 +13270,54 @@ impl ArchiveFsApp {
                 if let Some(batch) = self.unmount_all.as_ref() {
                     stop_unmount_all = show_unmount_all_progress(ui, &batch.progress);
                     ui.separator();
+                }
+
+                if self.view == MainView::Home {
+                    let source_folder_count = self
+                        .gui_config
+                        .source_roots()
+                        .map(|roots| roots.len())
+                        .unwrap_or(0);
+                    let has_database = self.database_state.snapshot().is_some();
+                    let (diagnostics_checks, config_missing) = match &self.diagnostics {
+                        DiagnosticsState::Ready { report, .. } => {
+                            (Some(report.checks.as_slice()), report.config_missing)
+                        }
+                        DiagnosticsState::Loading { .. } | DiagnosticsState::Error { .. } => {
+                            (None, false)
+                        }
+                    };
+                    let first_run = missing_config_is_first_run(self.config_previously_confirmed);
+                    // Never triggers the load these pages themselves start
+                    // on first visit - `None` here means "not visited yet
+                    // this session", not "not configured".
+                    let cheat_sources_enabled_count = self
+                        .cheat_sources_page
+                        .as_ref()
+                        .map(|page| page.enabled_source_count());
+                    let dat_sources_registered_count = self
+                        .dat_sources_page
+                        .as_ref()
+                        .map(|page| page.registered_source_count());
+                    let romm_state_label = self
+                        .romm_snapshot
+                        .as_ref()
+                        .map(|snapshot| romm_readiness_label(&snapshot.status.state));
+
+                    let home_inputs = home_page::HomeInputs {
+                        source_folder_count,
+                        has_database,
+                        diagnostics: diagnostics_checks,
+                        config_missing,
+                        first_run,
+                        cheat_sources_enabled_count,
+                        dat_sources_registered_count,
+                        romm_state_label,
+                    };
+                    let home_view = home_page::build_home_view(&home_inputs);
+                    if let Some(card) = home_page::show_home_page(ui, &home_view) {
+                        self.navigate_to_main_view(main_view_for_home_card(card));
+                    }
                 }
 
                 if self.view == MainView::Sources {
@@ -38635,6 +38752,90 @@ mod tests {
         for (view, label) in PRIMARY_NAVIGATION_DESTINATIONS {
             assert_eq!(main_view_title(view), label);
             let _ = main_view_content_width(view);
+        }
+    }
+
+    #[test]
+    fn home_is_the_default_view_and_the_first_sidebar_entry() {
+        assert_eq!(MainView::default(), MainView::Home);
+        assert_eq!(app_for_operation_tests().view, MainView::Home);
+        assert_eq!(PRIMARY_NAVIGATION_DESTINATIONS[0].0, MainView::Home);
+    }
+
+    #[test]
+    fn every_home_card_maps_to_its_real_existing_destination() {
+        // Every card must land on a destination that already exists and is
+        // reachable some other way - none of these are invented for Home.
+        let expected = [
+            (home_page::HomeCard::BuildLibrary, MainView::Sources),
+            (home_page::HomeCard::BrowseGames, MainView::Library),
+            (home_page::HomeCard::CheatsAndMods, MainView::CheatsMods),
+            (home_page::HomeCard::CheatSources, MainView::CheatSources),
+            (home_page::HomeCard::DatSources, MainView::DatSources),
+            (home_page::HomeCard::RomM, MainView::Sources),
+            (home_page::HomeCard::CheckSetup, MainView::Doctor),
+            (home_page::HomeCard::Settings, MainView::Settings),
+        ];
+        for (card, expected_view) in expected {
+            assert_eq!(main_view_for_home_card(card), expected_view, "{card:?}");
+        }
+    }
+
+    #[test]
+    fn navigate_to_main_view_for_a_home_card_click_matches_a_sidebar_click() {
+        // A Home card click and the equivalent sidebar click must both
+        // route through `navigate_to_main_view`, so a card can never behave
+        // differently from the button that already exists for the same
+        // destination - in particular Library's tab-restoring behaviour.
+        let mut app = app_for_operation_tests();
+        app.library_tab = LibraryTab::Duplicates;
+        app.navigate_to_main_view(main_view_for_home_card(home_page::HomeCard::BrowseGames));
+        assert_eq!(app.view, MainView::Duplicates);
+
+        let mut app = app_for_operation_tests();
+        app.tools_overlay = ToolsOverlay::PlatformAliases;
+        app.navigate_to_main_view(main_view_for_home_card(home_page::HomeCard::CheatsAndMods));
+        assert_eq!(app.view, MainView::CheatsMods);
+        assert_eq!(app.tools_overlay, ToolsOverlay::None);
+    }
+
+    #[test]
+    fn a_later_navigation_call_always_wins_over_an_earlier_one_in_the_same_tick() {
+        // Guards against a dispatch-ordering regression: if Home's block
+        // and the sidebar's click handler ever both ran in one frame, the
+        // later call must be the one that sticks - never a stale `self.view`
+        // set earlier in the same tick silently surviving.
+        let mut app = app_for_operation_tests();
+        app.navigate_to_main_view(MainView::Sources);
+        app.navigate_to_main_view(main_view_for_home_card(home_page::HomeCard::CheatsAndMods));
+        assert_eq!(app.view, MainView::CheatsMods);
+    }
+
+    #[test]
+    fn gamer_view_gear_menu_always_lands_on_home_regardless_of_prior_view() {
+        let mut app = app_for_operation_tests();
+        app.ui_mode = GuiMode::GamerView;
+        app.view = MainView::Doctor; // stale from an earlier Advanced View visit
+        app.switch_to_advanced_view_at_home();
+        assert_eq!(app.ui_mode, GuiMode::AdvancedView);
+        assert_eq!(app.view, MainView::Home);
+        assert_eq!(app.tools_overlay, ToolsOverlay::None);
+    }
+
+    #[test]
+    fn returning_home_from_any_destination_is_reliable() {
+        let mut app = app_for_operation_tests();
+        for destination in [
+            MainView::Sources,
+            MainView::CheatsMods,
+            MainView::Doctor,
+            MainView::Settings,
+            MainView::DatSources,
+        ] {
+            app.navigate_to_main_view(destination);
+            assert_eq!(app.view, destination);
+            app.navigate_to_main_view(MainView::Home);
+            assert_eq!(app.view, MainView::Home);
         }
     }
 
