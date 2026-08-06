@@ -573,24 +573,38 @@ pub fn validate_dat_source(entry: &DatSourceEntry, limits: DatLimits) -> DatVali
                 {
                     identities.push((identity, file_name.clone()));
                 }
-                // The structured warnings the parser returned carry a severity;
-                // the parser's own string copy (`source.parse_warnings`) holds
-                // the same messages, so it is not folded in again.
+                // The structured warnings the parser returned carry a severity
+                // and a location; the parser's own string copy
+                // (`source.parse_warnings`) holds the same messages, so it is
+                // not folded in again. The message is the raw diagnostic text,
+                // not the Display form: Display appends the byte offset, which
+                // differs per occurrence and would defeat grouping of otherwise
+                // identical diagnostics (the offset already lives separately in
+                // `line`/`column`/`byte_offset`).
                 let mut diagnostics: Vec<DatDiagnostic> = parsed
                     .warnings
                     .iter()
                     .map(|warning| DatDiagnostic {
                         severity: warning.severity(),
                         code: warning.code(),
-                        message: warning.to_string(),
+                        message: warning.message.clone(),
                         line: warning.line,
                         column: warning.column,
                     })
                     .collect();
-                // The same message can legitimately be recorded several times
-                // (for example one per affected ROM); report it once.
+                // The same diagnostic can legitimately be recorded several times
+                // (for example one per affected ROM); report it once. The
+                // dedup key includes severity and code as well as the message,
+                // so two severities or two codes can never cancel each other
+                // out and change the verdict.
                 let mut seen = std::collections::BTreeSet::new();
-                diagnostics.retain(|diagnostic| seen.insert(diagnostic.message.clone()));
+                diagnostics.retain(|diagnostic| {
+                    seen.insert((
+                        diagnostic.severity,
+                        diagnostic.code,
+                        diagnostic.message.clone(),
+                    ))
+                });
                 for diagnostic in &diagnostics {
                     match diagnostic.severity {
                         DiagnosticSeverity::Note => {}

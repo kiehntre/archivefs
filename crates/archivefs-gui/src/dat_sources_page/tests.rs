@@ -16,6 +16,7 @@ use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant};
 
 use archivefs_core::dat::audit::{AuditReport, AuditSummary};
+use archivefs_core::dat::limits::DatLimits;
 use archivefs_core::dat::model::{DatEcosystem, DatFormat};
 use archivefs_core::dat::parser::DiagnosticSeverity;
 use archivefs_core::dat::sources::{
@@ -1476,6 +1477,60 @@ fn repeated_identical_notes_group_into_one_type_with_full_occurrence_count() {
 }
 
 #[test]
+fn thousands_of_diagnostics_stay_bounded_and_deterministic() {
+    // 100 files x 30 identical warnings = 3000 occurrences: one group, exact
+    // counts, a drill-down capped at MAX_DIAGNOSTIC_OCCURRENCES_SHOWN rows, and
+    // a deterministic message order alongside a second distinct type.
+    let per_file: Vec<Vec<DatDiagnostic>> = (0..100)
+        .map(|_| (0..30).map(|_| warn("repeated checksum dropped")).collect())
+        .collect();
+    let mut with_second_type = per_file.clone();
+    with_second_type[0].push(note("DOCTYPE declaration accepted as inert text"));
+
+    let (_fixture, page) = page_with_report(
+        with_second_type,
+        DatHealthState::ValidWithWarnings,
+        false,
+        None,
+    );
+    let row = &page.view().rows[0];
+    assert_eq!(row.diagnostic_types(DiagnosticSeverity::Warning), 1);
+    assert_eq!(
+        row.diagnostic_occurrences(DiagnosticSeverity::Warning),
+        3000
+    );
+    assert_eq!(row.diagnostic_types(DiagnosticSeverity::Note), 1);
+
+    let warning_group = &row.groups_of(DiagnosticSeverity::Warning)[0];
+    assert_eq!(warning_group.affected_file_count, 100);
+    assert_eq!(
+        warning_group.occurrences.len(),
+        MAX_DIAGNOSTIC_OCCURRENCES_SHOWN,
+        "the drill-down must stay bounded however many diagnostics exist"
+    );
+    assert!(warning_group.occurrences_truncated);
+    assert_eq!(
+        warning_group.occurrences[0].file_name, "warn-0.dat",
+        "occurrence rows keep the file they belong to"
+    );
+    // 30 per file; the 50-row cap therefore spans warn-0.dat and warn-1.dat.
+    assert_eq!(
+        warning_group.occurrences[29].file_name, "warn-0.dat",
+        "occurrences stay in file order"
+    );
+    assert_eq!(
+        warning_group.occurrences.last().unwrap().file_name,
+        "warn-1.dat",
+        "the cap cuts mid-file, never out of order"
+    );
+
+    // Deterministic: repeated view builds produce identical groups.
+    let first = page.view().rows[0].groups.clone();
+    let second = page.view().rows[0].groups.clone();
+    assert_eq!(first, second);
+}
+
+#[test]
 fn expanding_one_group_does_not_expand_the_others() {
     let (_fixture, page) = page_with_report(
         vec![vec![
@@ -1538,6 +1593,151 @@ fn diagnostics_group_by_code_not_only_by_message() {
 }
 
 #[test]
+fn diagnostics_with_the_same_message_at_different_severities_stay_separate() {
+    // A Note and a Warning with identical wording are two distinct groups and
+    // the note never drags the warning's verdict down.
+    let same_text = "identical wording, different severities";
+    let (_fixture, page) = page_with_report(
+        vec![vec![note(same_text), warn(same_text)]],
+        DatHealthState::ValidWithWarnings,
+        false,
+        None,
+    );
+    let row = &page.view().rows[0];
+    assert_eq!(row.diagnostic_types(DiagnosticSeverity::Note), 1);
+    assert_eq!(row.diagnostic_types(DiagnosticSeverity::Warning), 1);
+    assert_eq!(row.diagnostic_occurrences(DiagnosticSeverity::Warning), 1);
+}
+
+#[test]
+fn clrmamepro_truncation_warnings_group_across_files() {
+    // Regression: the ClrMamePro parser records a byte offset on its only
+    // warning, and DatDiagnostic used to carry the Display form of the message
+    // ("… (byte 12)"). Every occurrence then had a unique message and grouping
+    // silently failed for TOSEC/ClrMamePro - the exact format this PR exists
+    // for. The message is now the raw text; the offset lives in the location,
+    // so two identical truncations in two files become ONE group.
+    let fixture = Fixture::new();
+    let folder = fixture.dir("dats");
+    let description = "x".repeat(80);
+    for (name, header) in [("a", "A"), ("b", "B")] {
+        std::fs::write(
+            folder.join(format!("{name}.dat")),
+            format!(
+                "clrmamepro (\n\tname {header}\n\tdescription {description}\n)\n\
+                 game ( name G rom ( name {name}.bin size 1 crc deadbeef ) )\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    let mut page = fixture.page();
+    page.limits = DatLimits::builder().max_description_length(10).build();
+    page.apply(DatSourcesPageAction::AddFolder { path: folder });
+    page.apply(DatSourcesPageAction::Validate {
+        id: "dats".to_string(),
+    });
+    run_to_completion(&mut page);
+
+    let view = page.view();
+    let row = &view.rows[0];
+    assert_eq!(
+        row.health_state,
+        DatHealthState::ValidWithWarnings,
+        "a truncated description is a genuine warning"
+    );
+    assert_eq!(
+        row.diagnostic_types(DiagnosticSeverity::Warning),
+        1,
+        "two identical truncations must be one diagnostic type"
+    );
+    assert_eq!(row.diagnostic_occurrences(DiagnosticSeverity::Warning), 2);
+    let group = &row.groups_of(DiagnosticSeverity::Warning)[0];
+    assert_eq!(group.code, "description_truncated");
+    assert_eq!(
+        group.message, "description truncated from 80 to 10 bytes",
+        "the raw message must not carry a per-occurrence byte offset"
+    );
+    assert_eq!(group.affected_file_count, 2);
+    // Each occurrence keeps its own genuine one-based line and no invented
+    // column.
+    assert!(group.occurrences.iter().all(|o| o.line.is_some()));
+    assert!(group.occurrences.iter().all(|o| o.column.is_none()));
+}
+
+#[test]
+fn expanding_a_group_on_one_source_does_not_open_the_same_group_on_another() {
+    // Regression: the group id used to be "{code}:{message}", so expanding the
+    // DOCTYPE note on source A left source B's identical note open on load. The
+    // id is now scoped by source and severity.
+    let note_text = "DOCTYPE declaration accepted as inert text";
+    let fixture = Fixture::new();
+
+    // Build two independent sources that both carry the same note.
+    let mut pages = Vec::new();
+    for name in ["a", "b"] {
+        let folder = fixture.dir(name);
+        let mut page = fixture.page();
+        page.apply(DatSourcesPageAction::AddFolder {
+            path: folder.clone(),
+        });
+        let id = name.to_string();
+        let report = DatValidationReport {
+            source_id: id.clone(),
+            path: folder.to_string_lossy().into_owned(),
+            kind: "DAT folder",
+            state: DatHealthState::Valid,
+            files: vec![DatFileReport {
+                path: format!("{}/x.dat", folder.display()),
+                file_name: format!("{name}.dat"),
+                outcome: DatFileOutcome::Parsed {
+                    format: DatFormat::Logiqx,
+                    ecosystem: DatEcosystem::GenericLogiqx,
+                    name: Some("Test".to_string()),
+                    version: Some("1".to_string()),
+                    entry_count: 1,
+                    rom_count: 1,
+                    diagnostics: vec![note(note_text)],
+                },
+            }],
+            duplicate_identities: Vec::new(),
+            skipped: Vec::new(),
+            truncated: false,
+            total_dat_files: None,
+            summary: "1 DAT files, 1 entries, 1 ROMs".to_string(),
+            entry_count: 1,
+            rom_count: 1,
+            formats: vec!["Logiqx XML".to_string()],
+            path_refusal: None,
+        };
+        page.validations.insert(id, report);
+        pages.push(page);
+    }
+
+    let view_a = pages[0].view();
+    let view_b = pages[1].view();
+    assert_ne!(
+        view_a.rows[0].groups[0].id, view_b.rows[0].groups[0].id,
+        "same-typed groups on different sources must have distinct ids"
+    );
+
+    // Opening A's group must not leave B's group open.
+    let mut ui_state = DatSourcesPageUi {
+        open_diagnostic: Some(view_a.rows[0].groups[0].id.clone()),
+        ..Default::default()
+    };
+    let rendered_a = render(&view_a, &mut ui_state);
+    assert_eq!(rendered_text_count(&rendered_a, "Hide locations"), 1);
+    let rendered_b = render(&view_b, &mut ui_state);
+    assert_eq!(
+        rendered_text_count(&rendered_b, "Hide locations"),
+        0,
+        "source B's identical group must not be open just because A's was"
+    );
+    assert_eq!(rendered_text_count(&rendered_b, "View locations"), 1);
+}
+
+#[test]
 fn drill_down_shows_parser_location_when_available_and_unavailable_otherwise() {
     // The drill-down shows line/column only when the parser provided one;
     // otherwise it says "Location unavailable". It never re-parses to build.
@@ -1548,9 +1748,18 @@ fn drill_down_shows_parser_location_when_available_and_unavailable_otherwise() {
         line: Some(3),
         column: Some(12),
     };
+    // The ClrMamePro parser records a line but no column; that shape must read
+    // "line N", not "line N:0" and not "Location unavailable".
+    let line_only = DatDiagnostic {
+        severity: DiagnosticSeverity::Warning,
+        code: "test_warning",
+        message: "has a line only".to_string(),
+        line: Some(9),
+        column: None,
+    };
     let without = warn("no location");
     let (_fixture, page) = page_with_report(
-        vec![vec![with_location, without]],
+        vec![vec![with_location, line_only, without]],
         DatHealthState::ValidWithWarnings,
         false,
         None,
@@ -1558,7 +1767,7 @@ fn drill_down_shows_parser_location_when_available_and_unavailable_otherwise() {
     let view = page.view();
     let row = &view.rows[0];
     let groups = row.groups_of(DiagnosticSeverity::Warning);
-    assert_eq!(groups.len(), 2);
+    assert_eq!(groups.len(), 3);
     let located = groups
         .iter()
         .find(|group| group.message == "has a location")
@@ -1572,6 +1781,18 @@ fn drill_down_shows_parser_location_when_available_and_unavailable_otherwise() {
     };
     let located_output = render(&view, &mut ui_state);
     assert!(rendered_text_contains(&located_output, "line 3:12"));
+
+    let line_only_group = groups
+        .iter()
+        .find(|group| group.message == "has a line only")
+        .unwrap();
+    ui_state.open_diagnostic = Some(line_only_group.id.clone());
+    let line_only_output = render(&view, &mut ui_state);
+    assert!(rendered_text_contains(&line_only_output, "line 9"));
+    assert!(
+        !rendered_text_contains(&line_only_output, "line 9:0"),
+        "a missing column must not be rendered as zero"
+    );
 
     let unlocated = groups
         .iter()

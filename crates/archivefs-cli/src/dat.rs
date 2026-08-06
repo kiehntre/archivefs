@@ -298,15 +298,21 @@ fn run_validate(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>>
     };
 
     if json {
+        // Fold Error-severity parser diagnostics into the errors list so the
+        // JSON contract matches the text path: `valid` reflects them, and an
+        // Error is never left sitting in `warnings`.
+        let (diagnostic_errors, _, _) = partition_diagnostics(&warnings);
+        let mut all_errors = errors.clone();
+        all_errors.extend(diagnostic_errors.iter().map(ToString::to_string));
         let output = ValidateOutput {
             file_path: dat.source.file_path.clone(),
-            valid: errors.is_empty(),
+            valid: all_errors.is_empty(),
             format: dat.source.format.label(),
             ecosystem: dat.source.ecosystem.label(),
             name: dat.source.name.clone(),
             entry_count: dat.source.entry_count,
             rom_count: dat.source.rom_count,
-            errors,
+            errors: all_errors,
             warnings,
         };
         println!("{}", serde_json::to_string_pretty(&output)?);

@@ -597,8 +597,9 @@ fn authoritative_platform(entry: &DatSourceEntry) -> Option<String> {
 /// The result is sorted by severity (Error, Warning, Note) then code then
 /// message, so two runs over the same folder produce identical output. Occurrence
 /// rows are kept bounded; the message string is cloned once per distinct type,
-/// never once per occurrence.
-fn group_diagnostics(report: &DatValidationReport) -> Vec<DiagnosticGroupView> {
+/// never once per occurrence. `source_id` scopes each group's stable id so the
+/// open-group state can never bleed across sources.
+fn group_diagnostics(source_id: &str, report: &DatValidationReport) -> Vec<DiagnosticGroupView> {
     use std::collections::{BTreeMap, BTreeSet};
 
     fn severity_rank(severity: DiagnosticSeverity) -> u8 {
@@ -662,7 +663,13 @@ fn group_diagnostics(report: &DatValidationReport) -> Vec<DiagnosticGroupView> {
             affected_file_count: acc.affected_files.len(),
             occurrences: acc.occurrences,
             occurrences_truncated: acc.occurrences_truncated,
-            id: format!("{code}:{message}"),
+            // The id is scoped by source and severity so expanding a group on
+            // one source can never leave another source's same-typed group
+            // open, and a code reused at two severities cannot collide.
+            id: format!(
+                "{source_id}:{}:{code}:{message}",
+                severity_rank(acc.severity)
+            ),
         })
         .collect()
 }
@@ -856,6 +863,10 @@ pub(crate) struct DatSourcesPageState {
     action_error: Option<String>,
     /// The last validation report for each source, this session.
     validations: BTreeMap<String, DatValidationReport>,
+    /// The grouped diagnostics for each validated source, derived once when the
+    /// report lands and cached so the per-frame view rebuild does not re-group
+    /// thousands of diagnostics. Kept in lockstep with `validations`.
+    diagnostic_groups: BTreeMap<String, Vec<DiagnosticGroupView>>,
     audit: Option<Box<DatAuditOutcome>>,
     audit_error: Option<String>,
     /// How long the most recent completed audit took, read from the job's start
@@ -903,6 +914,7 @@ impl DatSourcesPageState {
             save_state: DatSaveState::Idle,
             action_error: None,
             validations: BTreeMap::new(),
+            diagnostic_groups: BTreeMap::new(),
             audit: None,
             audit_error: None,
             audit_elapsed_seconds: None,
@@ -1021,7 +1033,13 @@ impl DatSourcesPageState {
                         if let Some(entry) = self.draft.get_mut(&id) {
                             entry.health = report.to_health(&entry.path.clone(), entry.kind);
                         }
-                        self.validations.insert(id, *report);
+                        // The grouped diagnostics are derived once here, when
+                        // the report lands, and cached: the view is rebuilt
+                        // every frame, and re-grouping thousands of diagnostics
+                        // per frame would be pure churn for an unchanged report.
+                        let groups = group_diagnostics(&id, &report);
+                        self.validations.insert(id.clone(), *report);
+                        self.diagnostic_groups.insert(id, groups);
                         changed = true;
                         finished = true;
                     }
@@ -1120,6 +1138,7 @@ impl DatSourcesPageState {
                 // are untouched - see `DatSourceRegistry::remove`.
                 if self.draft.remove(&id).is_some() {
                     self.validations.remove(&id);
+                    self.diagnostic_groups.remove(&id);
                     if self
                         .audit
                         .as_ref()
@@ -1350,7 +1369,18 @@ impl DatSourcesPageState {
             Some(saved) => saved != entry,
         };
         let validation = self.validation(&entry.id);
-        let groups = validation.map(group_diagnostics).unwrap_or_default();
+        // Read the cached groups when the report landed through a validation
+        // run; fall back to deriving them on demand so test-injected reports
+        // (which bypass the poll path) still render.
+        let groups = self
+            .diagnostic_groups
+            .get(&entry.id)
+            .cloned()
+            .unwrap_or_else(|| {
+                validation
+                    .map(|report| group_diagnostics(&entry.id, report))
+                    .unwrap_or_default()
+            });
         let incomplete_load = validation.is_some_and(|report| report.truncated);
         let dat_files_read = incomplete_load.then(|| validation.unwrap().files.len() as u64);
         let dat_files_total = incomplete_load
