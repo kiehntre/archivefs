@@ -157,7 +157,17 @@ user-facing version at
   local import is explicit; the historical third-party SQLite database is
   validated, stored immutably, and queried read-only/query-only with bounded
   pagination. BSFree Stage 1 is browse-only and has no Install action.
-- Ships a desktop GUI (`archivefs-gui`) covering scanning, mounting, sources, library views, duplicates, and catalogue health over the same core logic as the CLI.
+- Supports an optional **RomM** server as an external identity source
+  (`identity source romm ...`, and Sources → RomM in the GUI): configuration,
+  bounded catalogue import, browsing, per-archive identity matching, and
+  cover artwork, all read-only towards RomM - no command writes to it,
+  triggers a scan on it, or touches a ROM. Only loopback and private LAN
+  addresses are accepted, and the access token is never printed, logged, or
+  stored in config or cache JSON.
+- Ships a desktop GUI (`archivefs-gui`) covering scanning, mounting, sources
+  (including RomM and DAT/Cheat catalogue management), library views,
+  duplicates, catalogue health, Cheats & Mods, Doctor, History & Logs, and
+  Settings over the same core logic as the CLI.
 - Provides stable, documented JSON output for several commands - see [`docs/json-api.md`](docs/json-api.md).
 
 ## Current limitations
@@ -178,7 +188,7 @@ user-facing version at
   be expected. See [`CHANGELOG.md`](CHANGELOG.md) for what has actually
   shipped.
 - ZIP-contained identity, CHD, RVZ, and generic BIN identity remain incomplete
-  for some platforms/layouts. RomM integration is not included.
+  for some platforms/layouts.
 
 ## Install from a Release
 

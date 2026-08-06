@@ -102,7 +102,6 @@ upgrade, workflow, and validation guidance.
   evidence rather than being promoted.
 - ZIP-contained identity, CHD, RVZ, and generic BIN identity remain incomplete
   for some platforms and layouts.
-- RomM integration is not included.
 - Some emulator-specific cheat formats and destinations remain unsupported;
   ambiguous, unknown, placeholder-bearing, revision-mismatched, or unsupported
   master-code entries remain non-installable.
