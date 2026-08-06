@@ -537,6 +537,49 @@ fn an_empty_folder_is_invalid_and_says_what_it_looked_for() {
 }
 
 #[test]
+fn a_safety_limit_stop_reports_an_honest_total_when_it_knows_one() {
+    let dir = temp();
+    let folder = dir.path().join("big");
+    std::fs::create_dir(&folder).unwrap();
+    // More DAT files than one folder source reads: 512 read, but the scan
+    // really saw all of them, so the total is known and must be reported.
+    let total = validation::MAX_FOLDER_DAT_FILES + 17;
+    for index in 0..total {
+        write(&folder, &format!("set-{index:04}.dat"), LOGIQX);
+    }
+
+    let report = validate_dat_source(
+        &entry_for(&folder, DatSourceKind::Folder),
+        DatLimits::default(),
+    );
+    assert!(report.truncated);
+    assert_eq!(report.files.len(), validation::MAX_FOLDER_DAT_FILES);
+    assert_eq!(report.total_dat_files, Some(total));
+    assert!(
+        report.summary.contains("only the first were read"),
+        "{}",
+        report.summary
+    );
+}
+
+#[test]
+fn a_folder_that_fits_reports_its_exact_count() {
+    let dir = temp();
+    let folder = dir.path().join("small");
+    std::fs::create_dir(&folder).unwrap();
+    write(&folder, "a.dat", LOGIQX);
+    write(&folder, "b.dat", LOGIQX);
+
+    let report = validate_dat_source(
+        &entry_for(&folder, DatSourceKind::Folder),
+        DatLimits::default(),
+    );
+    assert!(!report.truncated);
+    assert_eq!(report.files.len(), 2);
+    assert_eq!(report.total_dat_files, Some(2));
+}
+
+#[test]
 fn a_source_whose_path_disappeared_is_unreadable_not_invalid() {
     let dir = temp();
     let path = write(dir.path(), "gone.dat", LOGIQX);
