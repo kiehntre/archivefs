@@ -726,8 +726,21 @@ impl DoctorCategory {
     }
 }
 
-fn doctor_status_severity(status: DoctorStatus) -> Option<DoctorSeverity> {
-    match status {
+/// `DoctorCheck`/`DoctorStatus` predate `SetupDiagnosticStatus::NotConfigured`
+/// and cannot themselves distinguish "genuinely missing config - a brand-new
+/// install, not a fault" from any other reason a check failed. The literal
+/// detail text `complete_doctor_report` emits for a confirmed-missing config
+/// (`format!("missing {}", config_path.display())` on the "config file"
+/// check) is the only signal available here, so it is matched directly
+/// rather than re-deriving the distinction from `DoctorStatus` alone. This
+/// keeps Doctor's aggregated view consistent with the softened
+/// `SetupDiagnostics` adapter below, instead of showing the same first-run
+/// absence as an Error from one subsystem and Info from the other.
+fn doctor_check_severity(check: &DoctorCheck) -> Option<DoctorSeverity> {
+    if check.name == "config file" && check.detail.starts_with("missing ") {
+        return Some(DoctorSeverity::Info);
+    }
+    match check.status {
         DoctorStatus::Fail => Some(DoctorSeverity::Error),
         DoctorStatus::Warn => Some(DoctorSeverity::Warning),
         DoctorStatus::Pass => None,
@@ -735,7 +748,7 @@ fn doctor_status_severity(status: DoctorStatus) -> Option<DoctorSeverity> {
 }
 
 fn finding_from_doctor_check(check: &DoctorCheck) -> Option<Finding> {
-    let severity = doctor_status_severity(check.status)?;
+    let severity = doctor_check_severity(check)?;
     let category = doctor_check_category(&check.name);
     let mut finding = Finding::new(
         doctor_check_id(&check.name),
@@ -775,6 +788,8 @@ fn setup_status_severity(status: SetupDiagnosticStatus) -> Option<DoctorSeverity
     match status {
         SetupDiagnosticStatus::Error => Some(DoctorSeverity::Error),
         SetupDiagnosticStatus::Warning => Some(DoctorSeverity::Warning),
+        // Expected first-run absence, not a fault - informational only.
+        SetupDiagnosticStatus::NotConfigured => Some(DoctorSeverity::Info),
         // A pass is not a finding, and neither is a check that did not run:
         // the latter is surfaced as a coverage gap instead (see
         // `not_checked_from_setup_diagnostics`).
@@ -1116,9 +1131,15 @@ mod database_adapter {
     use crate::emulator_environment::EncodedPath;
 
     /// Conservative mapping with deliberate *escalation* for codes that mean
-    /// the user's catalogue may actually be damaged. Nothing is ever
-    /// downgraded.
+    /// the user's catalogue may actually be damaged. Nothing else is ever
+    /// downgraded: a missing database is the one deliberate exception,
+    /// because it is the ordinary state of a library that has never been
+    /// scanned - not evidence of any damage - and every install starts
+    /// there.
     pub(super) fn database_severity(diagnostic: &DatabaseDiagnostic) -> DoctorSeverity {
+        if diagnostic.code == DatabaseDiagnosticCode::MissingDatabase {
+            return DoctorSeverity::Info;
+        }
         let escalate_to_critical = matches!(
             diagnostic.code,
             DatabaseDiagnosticCode::CorruptDatabase

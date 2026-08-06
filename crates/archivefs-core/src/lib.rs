@@ -336,6 +336,16 @@ pub enum SetupDiagnosticStatus {
     /// [`run_setup_diagnostics_read_only`] for mount-root writability,
     /// which can only be established by writing.
     NotChecked,
+    /// This check cannot pass yet only because no configuration file
+    /// exists at all - a brand-new install, not a broken one. Distinct
+    /// from [`Self::Error`], which means something that *should* work is
+    /// actually broken (malformed config, a path that should exist but
+    /// does not, a missing tool). A config that is merely absent is never
+    /// downgraded to this status until the read has confirmed it is
+    /// genuinely missing (see `config_missing` in
+    /// `run_setup_diagnostics_with_checks`) rather than merely unreadable,
+    /// so a real permission problem still reports [`Self::Error`].
+    NotConfigured,
     Warning,
     Error,
 }
@@ -1170,6 +1180,24 @@ fn run_setup_diagnostics_with_checks(
         "Mount and unmount controls are unsafe or unusable until these checks pass.",
         "Resolve mount-root and tool errors above.",
     );
+    // A genuinely missing config file (first run - never one that exists
+    // but is malformed, unreadable, or references paths that do not exist)
+    // makes every downstream check fail for the same single reason: there
+    // is nothing configured yet. Presenting each of those as its own red
+    // "Error" would greet a brand-new install with a wall of failures for
+    // a state that is not a failure at all. System-tool checks are left
+    // alone: whether ratarmount or an unmount tool is installed is a fact
+    // about the machine, independent of whether a config file exists.
+    if config_missing {
+        for check in &mut checks {
+            if check.status == SetupDiagnosticStatus::Error
+                && check.name != "ratarmount is available"
+                && check.name != "fusermount3 or umount is available"
+            {
+                check.status = SetupDiagnosticStatus::NotConfigured;
+            }
+        }
+    }
     let identity = config_identity(&config_path, contents.as_deref());
     SetupDiagnostics {
         config_path: Some(config_path),
@@ -12073,6 +12101,75 @@ mod tests {
         assert!(contents.contains("ratarmount_bin"));
         assert!(create_starter_config(&path).is_err());
         assert_eq!(fs::read_to_string(path).unwrap(), contents);
+    }
+
+    #[test]
+    fn setup_diagnostics_treats_genuinely_missing_config_as_not_configured_not_error() {
+        // A brand-new install with no config file at all: nothing is
+        // broken, so nothing downstream of the missing file should read as
+        // a red "Error" - only ratarmount/unmount tool availability (a fact
+        // about the machine, not the config) may still be genuinely Error.
+        let root = test_root("setup_diagnostics_first_run");
+        let config_path = root.join("config.toml");
+
+        let report = run_setup_diagnostics_with_command_check(&config_path, |_| true);
+
+        assert!(report.config_missing);
+        assert!(!report.ready_for_scanning);
+        assert!(!report.ready_for_actions);
+        assert!(
+            report
+                .checks
+                .iter()
+                .all(|check| check.status != SetupDiagnosticStatus::Error),
+            "expected no Error-status checks for a genuinely missing config, got: {:#?}",
+            report.checks
+        );
+        assert!(report.checks.iter().any(|check| {
+            check.name == "Config file exists"
+                && check.status == SetupDiagnosticStatus::NotConfigured
+        }));
+        assert!(report.checks.iter().any(|check| {
+            check.name == "ArchiveFS is ready for scanning"
+                && check.status == SetupDiagnosticStatus::NotConfigured
+        }));
+    }
+
+    #[test]
+    fn setup_diagnostics_missing_config_still_flags_genuinely_absent_tools_as_error() {
+        // The softening for a missing config must not swallow a real,
+        // independent environment problem: if ratarmount or an unmount
+        // tool is genuinely absent, that stays Error even on first run.
+        let root = test_root("setup_diagnostics_first_run_no_tools");
+        let config_path = root.join("config.toml");
+
+        let report = run_setup_diagnostics_with_command_check(&config_path, |_| false);
+
+        assert!(report.config_missing);
+        assert!(report.checks.iter().any(|check| {
+            check.name == "ratarmount is available" && check.status == SetupDiagnosticStatus::Error
+        }));
+        assert!(report.checks.iter().any(|check| {
+            check.name == "fusermount3 or umount is available"
+                && check.status == SetupDiagnosticStatus::Error
+        }));
+    }
+
+    #[test]
+    fn setup_diagnostics_malformed_existing_config_remains_an_error() {
+        // Distinct from a missing file: an existing-but-malformed config is
+        // a real problem and must never be softened to NotConfigured.
+        let root = test_root("setup_diagnostics_malformed");
+        let config_path = root.join("config.toml");
+        fs::write(&config_path, "this is not valid toml [[[").unwrap();
+
+        let report = run_setup_diagnostics_with_command_check(&config_path, |_| true);
+
+        assert!(!report.config_missing);
+        assert!(report.checks.iter().any(|check| {
+            check.name == "Config parses successfully"
+                && check.status == SetupDiagnosticStatus::Error
+        }));
     }
 
     #[test]

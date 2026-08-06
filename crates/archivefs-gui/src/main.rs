@@ -15222,6 +15222,23 @@ fn show_setup_diagnostics(
         ui.add_enabled(false, egui::Button::new("Continue to ArchiveFS"));
         return None;
     };
+    if report.config_missing && report.config_path_error.is_none() {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.strong("Welcome to ArchiveFS");
+            ui.label(
+                "ArchiveFS is not configured yet - that is expected on a fresh install, not an \
+                 error. Select Create Starter Config below to begin, then add a source folder \
+                 on the Sources page.",
+            );
+            ui.label(
+                "DAT Sources and Cheat Sources live on their own pages and start empty; both \
+                 are optional. RomM is optional too. Audits are always read-only: ArchiveFS \
+                 will not rename, move or delete any ROM without a later, explicit, reviewed \
+                 action.",
+            );
+        });
+        ui.add_space(8.0);
+    }
     ui.horizontal_wrapped(|ui| {
         ui.strong("Config path:");
         match &report.config_path {
@@ -15305,6 +15322,8 @@ fn show_setup_diagnostics(
                     SetupDiagnosticStatus::Ready => ("Ready", egui::Color32::from_rgb(70, 170, 90)),
                     // Neither a pass nor a problem: the check did not run.
                     SetupDiagnosticStatus::NotChecked => ("Not checked", theme::muted(ui)),
+                    // Expected on a fresh install - informational, not red.
+                    SetupDiagnosticStatus::NotConfigured => ("Not configured", theme::muted(ui)),
                     SetupDiagnosticStatus::Warning => {
                         ("Warning", egui::Color32::from_rgb(220, 170, 40))
                     }

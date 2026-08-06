@@ -494,6 +494,20 @@ pub fn run_doctor_scan(inputs: &DoctorScanInputs<'_>) -> DoctorScan {
     }
 }
 
+/// Whether a gatherer's failure reason describes an input that is simply
+/// absent (a config file or catalogue database that has never been
+/// created) rather than one that exists but is broken. Every caller of
+/// this adapter formats those specific cases with the OS's own ENOENT
+/// wording or the database layer's matching "does not exist" phrase (see
+/// the gatherers in `main.rs`/`archivefs-cli`'s `gather_doctor_scan` and
+/// `database::open_database`), so matching on that text is enough to tell
+/// "nothing configured yet" apart from a genuine permission or corruption
+/// problem, which never contains this wording. This avoids threading a
+/// structured "confirmed missing" flag through every gatherer.
+fn failure_reason_is_expected_first_run_absence(reason: &str) -> bool {
+    reason.contains("No such file or directory") || reason.contains("does not exist")
+}
+
 /// One finding per failed subsystem.
 ///
 /// The id is namespaced by subsystem (`doctor.adapter_failed.archive_health`
@@ -505,11 +519,16 @@ fn adapter_failure_finding(
     subsystem: DoctorSubsystem,
     reason: String,
 ) -> Finding {
+    let severity = if failure_reason_is_expected_first_run_absence(&reason) {
+        DoctorSeverity::Info
+    } else {
+        DoctorSeverity::Error
+    };
     let mut finding = Finding::new(
         format!("doctor.adapter_failed.{}", subsystem.slug()),
         DoctorCategory::Doctor,
         DoctorSubsystem::DoctorRunner,
-        DoctorSeverity::Error,
+        severity,
         format!("The {} check could not run", subsystem.label()),
         format!(
             "This scan does not cover {} because its input could not be collected.",
