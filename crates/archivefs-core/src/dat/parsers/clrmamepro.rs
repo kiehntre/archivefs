@@ -60,6 +60,7 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
                 context: String::new(),
                 message: msg.to_string(),
                 severity: DiagnosticSeverity::Warning,
+                code: "description_truncated",
             });
         }
     };

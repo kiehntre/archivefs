@@ -129,17 +129,10 @@ pub(crate) struct DatSourceRowView {
     pub(crate) busy: bool,
     /// The last validation run's per-file breakdown, if one has been run.
     pub(crate) detail: Option<InspectView>,
-    /// Error-severity diagnostics from the last validation, flattened across
-    /// files in the deterministic order the files were read. A source with any
-    /// of these reads Invalid.
-    pub(crate) errors: Vec<String>,
-    /// Every warning the last validation found, flattened across files in the
-    /// deterministic order the files were read. Empty when there were none.
-    pub(crate) warnings: Vec<String>,
-    /// Parser notes from the last validation: expected parser behaviour that
-    /// needs no action. Flattened in the same deterministic order. These never
-    /// lower the health verdict and must not be presented as warnings.
-    pub(crate) notes: Vec<String>,
+    /// The last validation's diagnostics, grouped by (severity, code, message)
+    /// and sorted by severity then code then message. Deterministic, bounded,
+    /// and never reparsed to build.
+    pub(crate) groups: Vec<DiagnosticGroupView>,
     /// The bounded safety limit stopped the last validation part-way through a
     /// folder, so the verdict covers only part of it. Must never be presented
     /// as "everything was checked".
@@ -170,6 +163,27 @@ impl DatSourceRowView {
             _ => Some("Processing stopped at the configured safety limit".to_string()),
         }
     }
+
+    /// The groups of one severity, in deterministic order.
+    pub(crate) fn groups_of(&self, severity: DiagnosticSeverity) -> Vec<&DiagnosticGroupView> {
+        self.groups
+            .iter()
+            .filter(|group| group.severity == severity)
+            .collect()
+    }
+
+    /// How many distinct diagnostic types (groups) have this severity.
+    pub(crate) fn diagnostic_types(&self, severity: DiagnosticSeverity) -> usize {
+        self.groups_of(severity).len()
+    }
+
+    /// How many total occurrences of this severity were found.
+    pub(crate) fn diagnostic_occurrences(&self, severity: DiagnosticSeverity) -> usize {
+        self.groups_of(severity)
+            .iter()
+            .map(|group| group.occurrence_count)
+            .sum()
+    }
 }
 
 /// One DAT file inside a source, as the Inspect panel lists it.
@@ -182,6 +196,43 @@ pub(crate) struct InspectFileView {
     pub(crate) errors: Vec<String>,
     pub(crate) warnings: Vec<String>,
     pub(crate) notes: Vec<String>,
+}
+
+/// How many occurrence rows a diagnostic group will show before truncating.
+/// The drill-down is bounded so a folder of hundreds of affected files cannot
+/// produce an unbounded list.
+pub(crate) const MAX_DIAGNOSTIC_OCCURRENCES_SHOWN: usize = 50;
+
+/// One occurrence of a diagnostic, with the safe DAT filename and the location
+/// the parser recorded (when it records one).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DiagnosticOccurrenceView {
+    /// The DAT file's name only - never an absolute path.
+    pub(crate) file_name: String,
+    pub(crate) line: Option<usize>,
+    pub(crate) column: Option<usize>,
+}
+
+/// Repeated diagnostics from a validation run, grouped into one row per
+/// distinct (severity, code, message) so 512 identical DOCTYPE notes render as
+/// one group with an occurrence count instead of 512 lines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DiagnosticGroupView {
+    pub(crate) severity: DiagnosticSeverity,
+    /// The stable parser code, e.g. "doctype_ignored".
+    pub(crate) code: &'static str,
+    /// The diagnostic message, verbatim, deduplicated by the group key.
+    pub(crate) message: String,
+    /// Total occurrences across every DAT file in the source.
+    pub(crate) occurrence_count: usize,
+    /// Distinct DAT files that produced at least one occurrence.
+    pub(crate) affected_file_count: usize,
+    /// A bounded, deterministic list of occurrences (safe filename + location).
+    pub(crate) occurrences: Vec<DiagnosticOccurrenceView>,
+    /// More occurrences exist than are listed in `occurrences`.
+    pub(crate) occurrences_truncated: bool,
+    /// A stable id for the disclosure toggle.
+    pub(crate) id: String,
 }
 
 /// What the last validation run found, in detail.
@@ -517,39 +568,80 @@ fn shorten_path(path: &str) -> String {
     format!("…/{}", kept.join("/"))
 }
 
-/// A warning's text cut to a bounded length so the inline summary stays one
-/// readable line. The full text is always preserved in the expandable details.
-fn truncate_inline(text: &str) -> String {
-    const MAX_INLINE_CHARS: usize = 120;
-    let mut chars = text.chars();
-    let mut out: String = chars.by_ref().take(MAX_INLINE_CHARS).collect();
-    if chars.next().is_some() {
-        out.push('…');
-    }
-    out
-}
+/// Groups the last validation's diagnostics by (severity, code, message),
+/// accumulating per-group occurrence and affected-file counts.
+///
+/// The result is sorted by severity (Error, Warning, Note) then code then
+/// message, so two runs over the same folder produce identical output. Occurrence
+/// rows are kept bounded; the message string is cloned once per distinct type,
+/// never once per occurrence.
+fn group_diagnostics(report: &DatValidationReport) -> Vec<DiagnosticGroupView> {
+    use std::collections::{BTreeMap, BTreeSet};
 
-/// The errors, warnings, and parser notes the last validation found, flattened
-/// across files in the deterministic order the files were read (files are
-/// sorted by name; each file's diagnostics keep the parser's own order). Each
-/// severity keeps its own list: errors are never folded into warnings.
-fn flatten_diagnostics(report: &DatValidationReport) -> (Vec<String>, Vec<String>, Vec<String>) {
-    let mut errors = Vec::new();
-    let mut warnings = Vec::new();
-    let mut notes = Vec::new();
+    fn severity_rank(severity: DiagnosticSeverity) -> u8 {
+        match severity {
+            DiagnosticSeverity::Error => 0,
+            DiagnosticSeverity::Warning => 1,
+            DiagnosticSeverity::Note => 2,
+        }
+    }
+
+    struct GroupAcc {
+        severity: DiagnosticSeverity,
+        occurrence_count: usize,
+        affected_files: BTreeSet<String>,
+        occurrences: Vec<DiagnosticOccurrenceView>,
+        occurrences_truncated: bool,
+    }
+
+    // The key is ordered so the BTreeMap yields severity- then code- then
+    // message-sorted groups.
+    let mut groups: BTreeMap<(u8, &'static str, String), GroupAcc> = BTreeMap::new();
+
     for file in &report.files {
         let DatFileOutcome::Parsed { diagnostics, .. } = &file.outcome else {
             continue;
         };
         for diagnostic in diagnostics {
-            match diagnostic.severity {
-                DiagnosticSeverity::Error => errors.push(diagnostic.message.clone()),
-                DiagnosticSeverity::Warning => warnings.push(diagnostic.message.clone()),
-                DiagnosticSeverity::Note => notes.push(diagnostic.message.clone()),
+            let key = (
+                severity_rank(diagnostic.severity),
+                diagnostic.code,
+                diagnostic.message.clone(),
+            );
+            let acc = groups.entry(key).or_insert_with(|| GroupAcc {
+                severity: diagnostic.severity,
+                occurrence_count: 0,
+                affected_files: BTreeSet::new(),
+                occurrences: Vec::new(),
+                occurrences_truncated: false,
+            });
+            acc.occurrence_count += 1;
+            acc.affected_files.insert(file.file_name.clone());
+            if acc.occurrences.len() < MAX_DIAGNOSTIC_OCCURRENCES_SHOWN {
+                acc.occurrences.push(DiagnosticOccurrenceView {
+                    file_name: file.file_name.clone(),
+                    line: diagnostic.line,
+                    column: diagnostic.column,
+                });
+            } else {
+                acc.occurrences_truncated = true;
             }
         }
     }
-    (errors, warnings, notes)
+
+    groups
+        .into_iter()
+        .map(|((_, code, message), acc)| DiagnosticGroupView {
+            severity: acc.severity,
+            code,
+            message: message.clone(),
+            occurrence_count: acc.occurrence_count,
+            affected_file_count: acc.affected_files.len(),
+            occurrences: acc.occurrences,
+            occurrences_truncated: acc.occurrences_truncated,
+            id: format!("{code}:{message}"),
+        })
+        .collect()
 }
 
 /// How far a running audit has got, structurally.
@@ -1208,7 +1300,7 @@ impl DatSourcesPageState {
             Some(saved) => saved != entry,
         };
         let validation = self.validation(&entry.id);
-        let (errors, warnings, notes) = validation.map(flatten_diagnostics).unwrap_or_default();
+        let groups = validation.map(group_diagnostics).unwrap_or_default();
         let incomplete_load = validation.is_some_and(|report| report.truncated);
         let dat_files_read = incomplete_load.then(|| validation.unwrap().files.len() as u64);
         let dat_files_total = incomplete_load
@@ -1243,9 +1335,7 @@ impl DatSourcesPageState {
                 .as_ref()
                 .is_some_and(|job| job.source_id == entry.id),
             detail: self.validation(&entry.id).map(inspect_view),
-            errors,
-            warnings,
-            notes,
+            groups,
             incomplete_load,
             dat_files_read,
             dat_files_total,
@@ -1607,12 +1697,9 @@ pub(crate) struct DatSourcesPageUi {
     pub(crate) open_audit_picker: Option<String>,
     /// Which source is awaiting removal confirmation.
     pub(crate) confirm_remove: Option<String>,
-    /// Which source's error-details disclosure is open.
-    pub(crate) open_errors: Option<String>,
-    /// Which source's warning-details disclosure is open.
-    pub(crate) open_warnings: Option<String>,
-    /// Which source's parser-notes disclosure is open.
-    pub(crate) open_notes: Option<String>,
+    /// Which diagnostic group's drill-down is open, as the group's stable id.
+    /// One group expands at a time; expanding another collapses this one.
+    pub(crate) open_diagnostic: Option<String>,
 }
 
 impl DatSourcesPageUi {
@@ -1623,9 +1710,7 @@ impl DatSourcesPageUi {
         self.platform_query.clear();
         self.open_audit_picker = None;
         self.confirm_remove = None;
-        self.open_errors = None;
-        self.open_warnings = None;
-        self.open_notes = None;
+        self.open_diagnostic = None;
     }
 }
 
@@ -2081,143 +2166,139 @@ fn health_label(row: &DatSourceRowView) -> String {
 ///
 /// Warnings are worth investigating; parser notes are expected behaviour and
 /// are never presented as if something is wrong.
+/// The pluralised, type-oriented label for a severity, as used in the section
+/// badge: "error type", "warning type", "parser-note type".
+fn severity_type_label(severity: DiagnosticSeverity, types: usize) -> String {
+    let base = match severity {
+        DiagnosticSeverity::Error => "error type",
+        DiagnosticSeverity::Warning => "warning type",
+        DiagnosticSeverity::Note => "parser-note type",
+    };
+    if types == 1 {
+        base.to_string()
+    } else {
+        format!("{base}s")
+    }
+}
+
+/// "line 3:12" / "line 3" / "Location unavailable", from what the parser
+/// actually recorded. Never invents a location the parser did not provide.
+fn format_location(line: Option<usize>, column: Option<usize>) -> String {
+    match (line, column) {
+        (Some(line), Some(column)) => format!("line {line}:{column}"),
+        (Some(line), None) => format!("line {line}"),
+        _ => "Location unavailable".to_string(),
+    }
+}
+
+/// One group's drill-down: the verbatim message, the counts, and a bounded
+/// occurrence list with safe filenames and parser-provided locations.
+fn show_diagnostic_group(
+    ui: &mut egui::Ui,
+    group: &DiagnosticGroupView,
+    ui_state: &mut DatSourcesPageUi,
+) {
+    let open = ui_state.open_diagnostic.as_deref() == Some(group.id.as_str());
+    ui.horizontal_top(|ui| {
+        ui.label(egui::RichText::new("•").color(theme::muted(ui)));
+        ui.vertical(|ui| {
+            // The original diagnostic message, preserved verbatim.
+            ui.add(egui::Label::new(&group.message).wrap());
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} occurrence{} · affects {} DAT file{}",
+                    group.occurrence_count,
+                    if group.occurrence_count == 1 { "" } else { "s" },
+                    group.affected_file_count,
+                    if group.affected_file_count == 1 {
+                        ""
+                    } else {
+                        "s"
+                    },
+                ))
+                .color(theme::muted(ui))
+                .small(),
+            );
+            let toggle = if open {
+                "Hide locations"
+            } else {
+                "View locations"
+            };
+            if widgets::action_button(ui, toggle, widgets::ActionStyle::Quiet, true).clicked() {
+                ui_state.open_diagnostic = if open { None } else { Some(group.id.clone()) };
+            }
+            if open {
+                for occurrence in &group.occurrences {
+                    ui.horizontal_top(|ui| {
+                        ui.label(
+                            egui::RichText::new(format_location(
+                                occurrence.line,
+                                occurrence.column,
+                            ))
+                            .color(theme::muted(ui))
+                            .small()
+                            .monospace(),
+                        );
+                        ui.label(egui::RichText::new(&occurrence.file_name).small());
+                    });
+                }
+                if group.occurrences_truncated {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "… and {} more occurrence(s)",
+                            group.occurrence_count - group.occurrences.len()
+                        ))
+                        .color(theme::muted(ui))
+                        .small(),
+                    );
+                }
+            }
+        });
+    });
+}
+
+/// Diagnostics grouped by type, drawn directly on the source card so the health
+/// badge is never the only thing the user can see.
+///
+/// Each severity (Errors, Warnings, Parser notes) is one section showing how
+/// many distinct types and total occurrences there are, followed by one row per
+/// diagnostic type. Expanding a row reveals its locations. One row expands at a
+/// time; parser notes carry the reassurance that no action is needed.
 fn show_diagnostics_summary(
     ui: &mut egui::Ui,
     row: &DatSourceRowView,
     ui_state: &mut DatSourcesPageUi,
 ) {
-    let errors_open = ui_state.open_errors.as_deref() == Some(row.id.as_str());
-    let warnings_open = ui_state.open_warnings.as_deref() == Some(row.id.as_str());
-    let notes_open = ui_state.open_notes.as_deref() == Some(row.id.as_str());
+    for severity in [
+        DiagnosticSeverity::Error,
+        DiagnosticSeverity::Warning,
+        DiagnosticSeverity::Note,
+    ] {
+        let groups = row.groups_of(severity);
+        if groups.is_empty() {
+            continue;
+        }
+        let types = row.diagnostic_types(severity);
+        let occurrences = row.diagnostic_occurrences(severity);
+        let tone = match severity {
+            DiagnosticSeverity::Error => widgets::StatusTone::Blocked,
+            DiagnosticSeverity::Warning => widgets::StatusTone::Warning,
+            DiagnosticSeverity::Note => widgets::StatusTone::Info,
+        };
 
-    if !row.errors.is_empty() {
-        let count = row.errors.len();
         ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            widgets::status_badge(
-                ui,
-                format!("{count} {}", if count == 1 { "error" } else { "errors" }),
-                widgets::StatusTone::Blocked,
-            );
-            let label = if errors_open {
-                "Hide error details"
-            } else {
-                "View error details"
-            };
-            if widgets::action_button(ui, label, widgets::ActionStyle::Quiet, true).clicked() {
-                ui_state.open_errors = if errors_open {
-                    None
-                } else {
-                    Some(row.id.clone())
-                };
-            }
-        });
-        // Concise inline summary: the first error, kept to one line.
-        if let Some(first) = row.errors.first() {
-            ui.label(
-                egui::RichText::new(format!("Error: {}", truncate_inline(first)))
-                    .color(widgets::StatusTone::Blocked.color(ui))
-                    .small(),
-            );
-        }
-        if errors_open {
-            for error in &row.errors {
-                ui.horizontal_top(|ui| {
-                    ui.label(
-                        egui::RichText::new("•").color(widgets::StatusTone::Blocked.color(ui)),
-                    );
-                    // The original error text is preserved verbatim.
-                    ui.add(egui::Label::new(error).wrap());
-                });
-            }
-        }
-    }
+        widgets::status_badge(
+            ui,
+            format!(
+                "{types} {}, {} occurrence{}",
+                severity_type_label(severity, types),
+                occurrences,
+                if occurrences == 1 { "" } else { "s" }
+            ),
+            tone,
+        );
 
-    if !row.warnings.is_empty() {
-        let count = row.warnings.len();
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            widgets::status_badge(
-                ui,
-                format!(
-                    "{count} {}",
-                    if count == 1 { "warning" } else { "warnings" }
-                ),
-                widgets::StatusTone::Warning,
-            );
-            let label = if warnings_open {
-                "Hide warning details"
-            } else {
-                "View warning details"
-            };
-            if widgets::action_button(ui, label, widgets::ActionStyle::Quiet, true).clicked() {
-                ui_state.open_warnings = if warnings_open {
-                    None
-                } else {
-                    Some(row.id.clone())
-                };
-            }
-        });
-        // Concise inline summary: the first warning, kept to one line.
-        if let Some(first) = row.warnings.first() {
-            ui.label(
-                egui::RichText::new(format!("Summary: {}", truncate_inline(first)))
-                    .color(theme::muted(ui))
-                    .small(),
-            );
-        }
-        if warnings_open {
-            for warning in &row.warnings {
-                ui.horizontal_top(|ui| {
-                    ui.label(
-                        egui::RichText::new("•").color(widgets::StatusTone::Warning.color(ui)),
-                    );
-                    // The original warning text is preserved verbatim; only the
-                    // inline summary is ever truncated.
-                    ui.add(egui::Label::new(warning).wrap());
-                });
-            }
-        }
-    }
-
-    if !row.notes.is_empty() {
-        let count = row.notes.len();
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            widgets::status_badge(
-                ui,
-                format!(
-                    "{count} {}",
-                    if count == 1 {
-                        "parser note"
-                    } else {
-                        "parser notes"
-                    }
-                ),
-                widgets::StatusTone::Info,
-            );
-            let label = if notes_open {
-                "Hide parser notes"
-            } else {
-                "View parser notes"
-            };
-            if widgets::action_button(ui, label, widgets::ActionStyle::Quiet, true).clicked() {
-                ui_state.open_notes = if notes_open {
-                    None
-                } else {
-                    Some(row.id.clone())
-                };
-            }
-        });
-        // Concise inline summary: the first note, kept to one line.
-        if let Some(first) = row.notes.first() {
-            ui.label(
-                egui::RichText::new(format!("Note: {}", truncate_inline(first)))
-                    .color(theme::muted(ui))
-                    .small(),
-            );
-        }
-        if notes_open {
+        if severity == DiagnosticSeverity::Note {
             ui.label(
                 egui::RichText::new(
                     "Parser notes are expected parser behaviour and need no action.",
@@ -2225,13 +2306,11 @@ fn show_diagnostics_summary(
                 .color(theme::muted(ui))
                 .small(),
             );
-            for note in &row.notes {
-                ui.horizontal_top(|ui| {
-                    ui.label(egui::RichText::new("•").color(theme::muted(ui)));
-                    // The original note text is preserved verbatim.
-                    ui.add(egui::Label::new(note).wrap());
-                });
-            }
+        }
+
+        for group in groups {
+            ui.add_space(2.0);
+            show_diagnostic_group(ui, group, ui_state);
         }
     }
 

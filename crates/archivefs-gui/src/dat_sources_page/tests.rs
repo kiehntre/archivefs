@@ -1047,25 +1047,30 @@ fn the_page_states_what_it_supports_and_what_it_will_never_do() {
 
 /// A warning-severity diagnostic for a test report.
 fn warn(message: impl Into<String>) -> DatDiagnostic {
-    DatDiagnostic {
-        severity: DiagnosticSeverity::Warning,
-        message: message.into(),
-    }
+    diagnostic(DiagnosticSeverity::Warning, "test_warning", message)
 }
 
 /// A parser-note-severity diagnostic for a test report.
 fn note(message: impl Into<String>) -> DatDiagnostic {
-    DatDiagnostic {
-        severity: DiagnosticSeverity::Note,
-        message: message.into(),
-    }
+    diagnostic(DiagnosticSeverity::Note, "test_note", message)
 }
 
 /// An error-severity diagnostic for a test report.
 fn error(message: impl Into<String>) -> DatDiagnostic {
+    diagnostic(DiagnosticSeverity::Error, "test_error", message)
+}
+
+fn diagnostic(
+    severity: DiagnosticSeverity,
+    code: &'static str,
+    message: impl Into<String>,
+) -> DatDiagnostic {
     DatDiagnostic {
-        severity: DiagnosticSeverity::Error,
+        severity,
+        code,
         message: message.into(),
+        line: None,
+        column: None,
     }
 }
 
@@ -1151,6 +1156,22 @@ fn rendered_text_contains(output: &egui::FullOutput, needle: &str) -> bool {
         .any(|clipped| shape_contains(&clipped.shape, needle))
 }
 
+/// How many times `needle` appears across every rendered text shape.
+fn rendered_text_count(output: &egui::FullOutput, needle: &str) -> usize {
+    fn shape_count(shape: &egui::Shape, needle: &str) -> usize {
+        match shape {
+            egui::Shape::Text(text_shape) => text_shape.galley.text().matches(needle).count(),
+            egui::Shape::Vec(nested) => nested.iter().map(|shape| shape_count(shape, needle)).sum(),
+            _ => 0,
+        }
+    }
+    output
+        .shapes
+        .iter()
+        .map(|clipped| shape_count(&clipped.shape, needle))
+        .sum()
+}
+
 #[test]
 fn warnings_render_count_summary_and_expandable_details() {
     let warnings = vec![
@@ -1161,46 +1182,54 @@ fn warnings_render_count_summary_and_expandable_details() {
     let (_fixture, page) =
         page_with_report(diagnostics, DatHealthState::ValidWithWarnings, false, None);
     let view = page.view();
-    assert_eq!(view.rows[0].warnings.len(), 2);
-    assert_eq!(view.rows[0].health_state, DatHealthState::ValidWithWarnings);
+    let row = &view.rows[0];
+    assert_eq!(row.diagnostic_types(DiagnosticSeverity::Warning), 2);
+    assert_eq!(row.diagnostic_occurrences(DiagnosticSeverity::Warning), 2);
+    assert_eq!(row.health_state, DatHealthState::ValidWithWarnings);
 
     let mut ui_state = DatSourcesPageUi::default();
     let collapsed = render(&view, &mut ui_state);
     assert!(
-        rendered_text_contains(&collapsed, "2 warnings"),
-        "the count must sit on the card"
+        rendered_text_contains(&collapsed, "2 warning types, 2 occurrences"),
+        "the type and occurrence counts must sit on the card"
     );
     assert!(
-        rendered_text_contains(&collapsed, "View warning details"),
+        rendered_text_contains(&collapsed, "View locations"),
         "an expandable control must be offered"
     );
-    assert!(
-        !rendered_text_contains(&collapsed, &warnings[1]),
-        "the details list must stay hidden until the user expands it"
-    );
-
-    ui_state.open_warnings = Some(view.rows[0].id.clone());
-    let expanded = render(&view, &mut ui_state);
-    assert!(rendered_text_contains(&expanded, "Hide warning details"));
     for warning in &warnings {
         assert!(
-            rendered_text_contains(&expanded, warning),
-            "the full original text must appear when expanded"
+            rendered_text_contains(&collapsed, warning),
+            "each group's message is visible without expanding"
         );
     }
+    assert!(
+        !rendered_text_contains(&collapsed, "Location unavailable"),
+        "the drill-down must stay hidden until the user expands a group"
+    );
+
+    // Expanding one group reveals its locations (unavailable here, since the
+    // test diagnostics carry no parser location).
+    ui_state.open_diagnostic = Some(row.groups[0].id.clone());
+    let expanded = render(&view, &mut ui_state);
+    assert!(rendered_text_contains(&expanded, "Hide locations"));
+    assert!(rendered_text_contains(&expanded, "Location unavailable"));
 }
 
 #[test]
 fn zero_warnings_show_no_warning_details_control() {
     let (_fixture, page) = page_with_report(vec![Vec::new()], DatHealthState::Valid, false, None);
     let view = page.view();
-    assert!(view.rows[0].warnings.is_empty());
+    let row = &view.rows[0];
+    assert_eq!(row.diagnostic_types(DiagnosticSeverity::Warning), 0);
+    assert_eq!(row.diagnostic_occurrences(DiagnosticSeverity::Warning), 0);
+    assert!(row.groups.is_empty());
 
     let mut ui_state = DatSourcesPageUi::default();
     let output = render(&view, &mut ui_state);
     assert!(
-        !rendered_text_contains(&output, "View warning details"),
-        "no warnings means no details control"
+        !rendered_text_contains(&output, "View locations"),
+        "no diagnostics means no details control"
     );
 }
 #[test]
@@ -1219,23 +1248,33 @@ fn warnings_and_parser_notes_render_as_separate_sections() {
     );
     let view = page.view();
     let row = &view.rows[0];
-    assert_eq!(row.warnings, vec![warning_text]);
-    assert_eq!(row.notes, vec![note_text]);
+    assert_eq!(row.diagnostic_types(DiagnosticSeverity::Warning), 1);
+    assert_eq!(row.diagnostic_types(DiagnosticSeverity::Note), 1);
+    let warning_group = row.groups_of(DiagnosticSeverity::Warning)[0];
+    let note_group = row.groups_of(DiagnosticSeverity::Note)[0];
+    assert_eq!(warning_group.message, warning_text);
+    assert_eq!(note_group.message, note_text);
 
     let mut ui_state = DatSourcesPageUi::default();
     let output = render(&view, &mut ui_state);
-    assert!(rendered_text_contains(&output, "1 warning"));
-    assert!(rendered_text_contains(&output, "1 parser note"));
-    assert!(rendered_text_contains(&output, "View warning details"));
-    assert!(rendered_text_contains(&output, "View parser notes"));
-
-    // Expanding the notes reveals the reassurance and the full note text.
-    ui_state.open_notes = Some(view.rows[0].id.clone());
-    let expanded = render(&view, &mut ui_state);
     assert!(rendered_text_contains(
-        &expanded,
+        &output,
+        "1 warning type, 1 occurrence"
+    ));
+    assert!(rendered_text_contains(
+        &output,
+        "1 parser-note type, 1 occurrence"
+    ));
+    // The note reassurance is always on the card.
+    assert!(rendered_text_contains(
+        &output,
         "Parser notes are expected parser behaviour and need no action."
     ));
+
+    // Expanding a note group reveals its (unavailable) location.
+    ui_state.open_diagnostic = Some(note_group.id.clone());
+    let expanded = render(&view, &mut ui_state);
+    assert!(rendered_text_contains(&expanded, "Hide locations"));
     assert!(rendered_text_contains(&expanded, note_text));
 }
 
@@ -1252,18 +1291,21 @@ fn an_error_diagnostic_renders_in_its_own_section_not_as_a_warning() {
     );
     let view = page.view();
     let row = &view.rows[0];
-    assert_eq!(row.errors, vec![error_text]);
-    assert!(row.warnings.is_empty(), "an error is not a warning");
-    assert!(row.notes.is_empty());
+    assert_eq!(row.diagnostic_types(DiagnosticSeverity::Error), 1);
+    assert_eq!(row.diagnostic_types(DiagnosticSeverity::Warning), 0);
+    assert_eq!(row.diagnostic_types(DiagnosticSeverity::Note), 0);
     assert_eq!(row.health_state, DatHealthState::Invalid);
 
     let mut ui_state = DatSourcesPageUi::default();
     let output = render(&view, &mut ui_state);
-    assert!(rendered_text_contains(&output, "1 error"));
-    assert!(rendered_text_contains(&output, "View error details"));
+    assert!(rendered_text_contains(
+        &output,
+        "1 error type, 1 occurrence"
+    ));
+    assert!(rendered_text_contains(&output, error_text));
     assert!(
-        !rendered_text_contains(&output, "View warning details"),
-        "the error must not appear in a warning-details control"
+        !rendered_text_contains(&output, "warning type"),
+        "the error must not appear in a warning section"
     );
 }
 
@@ -1282,16 +1324,182 @@ fn mixed_errors_warnings_and_notes_render_as_three_sections() {
     );
     let view = page.view();
     let row = &view.rows[0];
-    assert_eq!(row.errors, vec![error_text]);
-    assert_eq!(row.warnings, vec![warning_text]);
-    assert_eq!(row.notes, vec![note_text]);
+    assert_eq!(row.diagnostic_types(DiagnosticSeverity::Error), 1);
+    assert_eq!(row.diagnostic_types(DiagnosticSeverity::Warning), 1);
+    assert_eq!(row.diagnostic_types(DiagnosticSeverity::Note), 1);
 
     let mut ui_state = DatSourcesPageUi::default();
     let output = render(&view, &mut ui_state);
     assert!(rendered_text_contains(&output, "Invalid"));
-    assert!(rendered_text_contains(&output, "1 error"));
-    assert!(rendered_text_contains(&output, "1 warning"));
-    assert!(rendered_text_contains(&output, "1 parser note"));
+    assert!(rendered_text_contains(
+        &output,
+        "1 error type, 1 occurrence"
+    ));
+    assert!(rendered_text_contains(
+        &output,
+        "1 warning type, 1 occurrence"
+    ));
+    assert!(rendered_text_contains(
+        &output,
+        "1 parser-note type, 1 occurrence"
+    ));
+}
+
+#[test]
+fn repeated_identical_notes_group_into_one_type_with_full_occurrence_count() {
+    // A folder of 512 DAT files all carrying the same DOCTYPE note must render
+    // as ONE group with an occurrence count - never 512 separate lines.
+    let fixture = Fixture::new();
+    let folder = fixture.dir("dats");
+    for index in 0..512 {
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE datafile PUBLIC "-//Logiqx//DTD ROM Management Datafile//EN" "http://www.logiqx.com/Dats/datafile.dtd">
+<datafile><header><name>Set {index}</name><version>1</version></header>
+<game name="Game {index}"><rom name="g.bin" size="16" crc="0c7e7fd8"/></game></datafile>"#
+        );
+        std::fs::write(folder.join(format!("set-{index:04}.dat")), &xml).unwrap();
+    }
+
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddFolder { path: folder });
+    page.apply(DatSourcesPageAction::Validate {
+        id: "dats".to_string(),
+    });
+    run_to_completion(&mut page);
+
+    let view = page.view();
+    let row = &view.rows[0];
+    assert_eq!(
+        row.health_state,
+        DatHealthState::Valid,
+        "parser notes do not lower the verdict"
+    );
+    assert_eq!(row.diagnostic_types(DiagnosticSeverity::Note), 1);
+    assert_eq!(row.diagnostic_occurrences(DiagnosticSeverity::Note), 512);
+    let note_group = &row.groups_of(DiagnosticSeverity::Note)[0];
+    assert_eq!(note_group.affected_file_count, 512);
+    assert_eq!(
+        note_group.occurrences.len(),
+        MAX_DIAGNOSTIC_OCCURRENCES_SHOWN,
+        "the drill-down must be bounded"
+    );
+    assert!(note_group.occurrences_truncated);
+
+    let mut ui_state = DatSourcesPageUi::default();
+    let output = render(&view, &mut ui_state);
+    assert!(rendered_text_contains(
+        &output,
+        "1 parser-note type, 512 occurrences"
+    ));
+}
+
+#[test]
+fn expanding_one_group_does_not_expand_the_others() {
+    let (_fixture, page) = page_with_report(
+        vec![vec![
+            warn("first warning text"),
+            warn("second warning text"),
+            note("first note text"),
+        ]],
+        DatHealthState::ValidWithWarnings,
+        false,
+        None,
+    );
+    let view = page.view();
+    let row = &view.rows[0];
+    let warning_groups = row.groups_of(DiagnosticSeverity::Warning);
+    assert_eq!(warning_groups.len(), 2);
+
+    let mut ui_state = DatSourcesPageUi::default();
+    let collapsed = render(&view, &mut ui_state);
+    assert_eq!(rendered_text_count(&collapsed, "View locations"), 3);
+
+    // Open only the first warning group.
+    ui_state.open_diagnostic = Some(warning_groups[0].id.clone());
+    let expanded = render(&view, &mut ui_state);
+    assert_eq!(
+        rendered_text_count(&expanded, "Hide locations"),
+        1,
+        "exactly one group expands"
+    );
+    assert_eq!(rendered_text_count(&expanded, "View locations"), 2);
+}
+
+#[test]
+fn diagnostics_group_by_code_not_only_by_message() {
+    // The same message text under two different codes is two distinct types.
+    let same_text = "identical wording, different kinds";
+    let (_fixture, page) = page_with_report(
+        vec![vec![
+            DatDiagnostic {
+                severity: DiagnosticSeverity::Warning,
+                code: "code_a",
+                message: same_text.to_string(),
+                line: None,
+                column: None,
+            },
+            DatDiagnostic {
+                severity: DiagnosticSeverity::Warning,
+                code: "code_b",
+                message: same_text.to_string(),
+                line: None,
+                column: None,
+            },
+        ]],
+        DatHealthState::ValidWithWarnings,
+        false,
+        None,
+    );
+    let row = &page.view().rows[0];
+    assert_eq!(row.diagnostic_types(DiagnosticSeverity::Warning), 2);
+    assert_eq!(row.diagnostic_occurrences(DiagnosticSeverity::Warning), 2);
+}
+
+#[test]
+fn drill_down_shows_parser_location_when_available_and_unavailable_otherwise() {
+    // The drill-down shows line/column only when the parser provided one;
+    // otherwise it says "Location unavailable". It never re-parses to build.
+    let with_location = DatDiagnostic {
+        severity: DiagnosticSeverity::Warning,
+        code: "test_warning",
+        message: "has a location".to_string(),
+        line: Some(3),
+        column: Some(12),
+    };
+    let without = warn("no location");
+    let (_fixture, page) = page_with_report(
+        vec![vec![with_location, without]],
+        DatHealthState::ValidWithWarnings,
+        false,
+        None,
+    );
+    let view = page.view();
+    let row = &view.rows[0];
+    let groups = row.groups_of(DiagnosticSeverity::Warning);
+    assert_eq!(groups.len(), 2);
+    let located = groups
+        .iter()
+        .find(|group| group.message == "has a location")
+        .unwrap();
+    assert_eq!(located.occurrences[0].line, Some(3));
+    assert_eq!(located.occurrences[0].column, Some(12));
+
+    let mut ui_state =
+        DatSourcesPageUi { open_diagnostic: Some(located.id.clone()), ..Default::default() };
+    let located_output = render(&view, &mut ui_state);
+    assert!(rendered_text_contains(&located_output, "line 3:12"));
+
+    let unlocated = groups
+        .iter()
+        .find(|group| group.message == "no location")
+        .unwrap();
+    ui_state.open_diagnostic = Some(unlocated.id.clone());
+    let unlocated_output = render(&view, &mut ui_state);
+    assert!(rendered_text_contains(
+        &unlocated_output,
+        "Location unavailable"
+    ));
 }
 
 #[test]
@@ -1376,10 +1584,15 @@ fn warning_order_is_deterministic() {
     let (_fixture, page) =
         page_with_report(per_file, DatHealthState::ValidWithWarnings, false, None);
     let row = &page.view().rows[0];
+    let messages: Vec<&str> = row
+        .groups
+        .iter()
+        .map(|group| group.message.as_str())
+        .collect();
     assert_eq!(
-        row.warnings,
-        vec!["first-a", "second-a", "first-b", "second-b"],
-        "warnings must come in file order, files in name order, never in read_dir order"
+        messages,
+        vec!["first-a", "first-b", "second-a", "second-b"],
+        "groups must come in a deterministic order (by message), never in read_dir order"
     );
 }
 
@@ -1415,8 +1628,8 @@ fn the_history_and_logs_reference_is_only_drawn_when_details_are_recorded_there(
 fn warnings_are_prominent_on_the_card_not_buried_behind_inspect() {
     // Regression: the old card showed the "Valid, with warnings" badge, but
     // the warning text was only reachable by opening Inspect and reading a
-    // nested per-file list. The count and an expandable "View warning details"
-    // control now sit on the card itself.
+    // nested per-file list. The type/occurrence counts and the expandable
+    // drill-down control now sit on the card itself.
     let diagnostics = vec![vec![
         warn("A ROM entry has no SHA-1 checksum; only CRC32 was compared"),
         warn("The header declares a version that differs from the filename"),
@@ -1424,17 +1637,19 @@ fn warnings_are_prominent_on_the_card_not_buried_behind_inspect() {
     let (_fixture, page) =
         page_with_report(diagnostics, DatHealthState::ValidWithWarnings, false, None);
     let view = page.view();
-    assert_eq!(view.rows[0].health_state, DatHealthState::ValidWithWarnings);
+    let row = &view.rows[0];
+    assert_eq!(row.health_state, DatHealthState::ValidWithWarnings);
+    assert_eq!(row.diagnostic_types(DiagnosticSeverity::Warning), 2);
 
     let mut ui_state = DatSourcesPageUi::default();
     let output = render(&view, &mut ui_state);
     assert!(rendered_text_contains(&output, "Valid, with warnings"));
     assert!(
-        rendered_text_contains(&output, "2 warnings"),
-        "the count must be visible without any disclosure click"
+        rendered_text_contains(&output, "2 warning types, 2 occurrences"),
+        "the counts must be visible without any disclosure click"
     );
     assert!(
-        rendered_text_contains(&output, "View warning details"),
+        rendered_text_contains(&output, "View locations"),
         "the expandable control must be visible without opening Inspect"
     );
 }
@@ -1505,27 +1720,36 @@ fn a_doctype_parser_note_shows_valid_with_no_warnings() {
         DatHealthState::Valid,
         "a parser note must not lower the verdict"
     );
-    assert!(
-        row.warnings.is_empty(),
-        "the DOCTYPE must not surface as a warning: {:?}",
-        row.warnings
+    assert_eq!(
+        row.diagnostic_types(DiagnosticSeverity::Warning),
+        0,
+        "the DOCTYPE must not surface as a warning"
     );
     assert_eq!(
-        row.notes.len(),
+        row.diagnostic_types(DiagnosticSeverity::Note),
         1,
-        "the DOCTYPE must be a single parser note"
+        "the DOCTYPE must be a single parser-note type"
     );
-    assert!(row.notes[0].contains("DOCTYPE"), "{}", row.notes[0]);
+    assert_eq!(row.diagnostic_occurrences(DiagnosticSeverity::Note), 1);
+    let note_group = &row.groups_of(DiagnosticSeverity::Note)[0];
+    assert!(
+        note_group.message.contains("DOCTYPE"),
+        "{}",
+        note_group.message
+    );
 
     let mut ui_state = DatSourcesPageUi::default();
     let output = render(&view, &mut ui_state);
     assert!(!rendered_text_contains(&output, "with warnings"));
     assert!(
-        !rendered_text_contains(&output, "1 warning"),
+        !rendered_text_contains(&output, "warning type"),
         "the note must not be called a warning"
     );
-    assert!(rendered_text_contains(&output, "1 parser note"));
-    assert!(rendered_text_contains(&output, "View parser notes"));
+    assert!(rendered_text_contains(
+        &output,
+        "1 parser-note type, 1 occurrence"
+    ));
+    assert!(rendered_text_contains(&output, "View locations"));
 }
 
 #[test]
@@ -1543,14 +1767,18 @@ fn a_real_warning_shows_valid_with_warnings() {
     let view = page.view();
     let row = &view.rows[0];
     assert_eq!(row.health_state, DatHealthState::ValidWithWarnings);
-    assert_eq!(row.warnings.len(), 1, "{:?}", row.warnings);
-    assert!(row.notes.is_empty());
+    assert_eq!(row.diagnostic_types(DiagnosticSeverity::Warning), 1);
+    assert_eq!(row.diagnostic_occurrences(DiagnosticSeverity::Warning), 1);
+    assert_eq!(row.diagnostic_types(DiagnosticSeverity::Note), 0);
 
     let mut ui_state = DatSourcesPageUi::default();
     let output = render(&view, &mut ui_state);
     assert!(rendered_text_contains(&output, "Valid, with warnings"));
-    assert!(rendered_text_contains(&output, "1 warning"));
-    assert!(rendered_text_contains(&output, "View warning details"));
+    assert!(rendered_text_contains(
+        &output,
+        "1 warning type, 1 occurrence"
+    ));
+    assert!(rendered_text_contains(&output, "View locations"));
 }
 
 #[test]
@@ -1568,14 +1796,14 @@ fn a_real_parser_failure_shows_invalid() {
     let view = page.view();
     let row = &view.rows[0];
     assert_eq!(row.health_state, DatHealthState::Invalid);
-    assert!(row.warnings.is_empty());
-    assert!(row.notes.is_empty());
+    assert_eq!(row.diagnostic_types(DiagnosticSeverity::Warning), 0);
+    assert_eq!(row.diagnostic_types(DiagnosticSeverity::Note), 0);
+    assert!(row.groups.is_empty());
 
     let mut ui_state = DatSourcesPageUi::default();
     let output = render(&view, &mut ui_state);
     assert!(rendered_text_contains(&output, "Invalid"));
-    assert!(!rendered_text_contains(&output, "View warning details"));
-    assert!(!rendered_text_contains(&output, "View parser notes"));
+    assert!(!rendered_text_contains(&output, "View locations"));
 }
 
 #[test]
@@ -1596,14 +1824,20 @@ fn mixed_warning_and_notes_shows_valid_with_warnings() {
         DatHealthState::ValidWithWarnings,
         "a warning overrides parser notes in the verdict"
     );
-    assert_eq!(row.warnings.len(), 1, "{:?}", row.warnings);
-    assert_eq!(row.notes.len(), 1, "{:?}", row.notes);
+    assert_eq!(row.diagnostic_types(DiagnosticSeverity::Warning), 1);
+    assert_eq!(row.diagnostic_types(DiagnosticSeverity::Note), 1);
 
     let mut ui_state = DatSourcesPageUi::default();
     let output = render(&view, &mut ui_state);
     assert!(rendered_text_contains(&output, "Valid, with warnings"));
-    assert!(rendered_text_contains(&output, "1 warning"));
-    assert!(rendered_text_contains(&output, "1 parser note"));
+    assert!(rendered_text_contains(
+        &output,
+        "1 warning type, 1 occurrence"
+    ));
+    assert!(rendered_text_contains(
+        &output,
+        "1 parser-note type, 1 occurrence"
+    ));
 }
 
 #[test]

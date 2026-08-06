@@ -24,6 +24,7 @@ use super::*;
 use crate::dat::limits::DatLimits;
 use crate::dat::model::DatFormat;
 use crate::dat::parser::DiagnosticSeverity;
+use crate::dat::parsers::parse_dat_file;
 use crate::safe_read::TrustedRoots;
 
 // ---------------------------------------------------------------------------
@@ -707,6 +708,42 @@ fn mixed_errors_warnings_and_notes_produce_invalid() {
         DatHealthState::Invalid,
         "an error in any file makes the whole source invalid"
     );
+}
+
+#[test]
+fn clrmamepro_diagnostics_carry_their_line() {
+    // The ClrMamePro parser records the line of a diagnostic, and the report
+    // keeps it, so the GUI can show a real location instead of "unavailable".
+    let dir = temp();
+    let path = write(
+        dir.path(),
+        "t.dat",
+        "clrmamepro (\n\tname Test\n\tdescription this-description-is-too-long\n)\n\
+         game ( name G rom ( name a.bin size 1 crc deadbeef ) )\n",
+    );
+    let limits = DatLimits::builder().max_description_length(10).build();
+    let outcome = parse_dat_file(&path, limits).expect("the DAT parses");
+    let warning = outcome
+        .warnings
+        .iter()
+        .find(|w| w.severity() == DiagnosticSeverity::Warning)
+        .expect("a truncation warning");
+    assert_eq!(warning.code(), "description_truncated");
+    assert!(
+        warning.line.is_some(),
+        "the ClrMamePro parser must record the offending line: {warning:?}"
+    );
+
+    let report = validate_dat_source(&entry_for(&path, DatSourceKind::File), limits);
+    let DatFileOutcome::Parsed { diagnostics, .. } = &report.files[0].outcome else {
+        panic!("the DAT must parse");
+    };
+    let diagnostic = diagnostics
+        .iter()
+        .find(|d| d.code == "description_truncated")
+        .expect("the code survives into the report");
+    assert_eq!(diagnostic.severity, DiagnosticSeverity::Warning);
+    assert!(diagnostic.line.is_some(), "{diagnostic:?}");
 }
 
 #[test]

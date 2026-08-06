@@ -367,11 +367,18 @@ pub fn sniff_dat_format(path: &Path) -> Option<DatFormat> {
 }
 
 /// One diagnostic attached to a parsed DAT file, reduced to what a report and
-/// the GUI show: the severity and the message.
+/// the GUI show: the severity, a stable code, the message, and the location the
+/// parser recorded (when it records one at all).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DatDiagnostic {
     pub severity: crate::dat::parser::DiagnosticSeverity,
+    pub code: &'static str,
     pub message: String,
+    /// The line in the DAT the parser attributed the diagnostic to, when the
+    /// parser records one. `None` when the parser does not track lines.
+    pub line: Option<usize>,
+    /// The column within the line, when the parser records one.
+    pub column: Option<usize>,
 }
 
 /// What one DAT file in a source turned out to be.
@@ -574,7 +581,10 @@ pub fn validate_dat_source(entry: &DatSourceEntry, limits: DatLimits) -> DatVali
                     .iter()
                     .map(|warning| DatDiagnostic {
                         severity: warning.severity(),
+                        code: warning.code(),
                         message: warning.to_string(),
+                        line: warning.line,
+                        column: warning.column,
                     })
                     .collect();
                 // The same message can legitimately be recorded several times

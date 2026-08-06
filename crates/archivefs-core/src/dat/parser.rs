@@ -46,10 +46,15 @@ pub struct ParseWarning {
     pub context: String,
     pub message: String,
     pub severity: DiagnosticSeverity,
+    /// A stable machine code naming the diagnostic kind (for example
+    /// "doctype_ignored" or "checksum_dropped"). Repeated diagnostics across
+    /// many DAT files share one code, which is what lets a report group them.
+    pub code: &'static str,
 }
 
 impl ParseWarning {
-    /// A warning: something unusual happened, worth investigating.
+    /// A warning: something unusual happened, worth investigating. The code is
+    /// left as "unclassified" for callers that do not name their diagnostic.
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             byte_offset: None,
@@ -58,19 +63,34 @@ impl ParseWarning {
             context: String::new(),
             message: message.into(),
             severity: DiagnosticSeverity::Warning,
+            code: "unclassified",
         }
     }
 
-    /// A parser note: expected parser behaviour, no action needed.
-    pub fn note(message: impl Into<String>) -> Self {
+    /// A warning with a stable code.
+    pub fn with_code(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            ..Self::new(message)
+        }
+    }
+
+    /// A parser note with a stable code: expected parser behaviour, no action
+    /// needed.
+    pub fn note(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             severity: DiagnosticSeverity::Note,
+            code,
             ..Self::new(message)
         }
     }
 
     pub fn severity(&self) -> DiagnosticSeverity {
         self.severity
+    }
+
+    pub fn code(&self) -> &'static str {
+        self.code
     }
 
     pub fn is_note(&self) -> bool {
