@@ -1061,6 +1061,14 @@ fn note(message: impl Into<String>) -> DatDiagnostic {
     }
 }
 
+/// An error-severity diagnostic for a test report.
+fn error(message: impl Into<String>) -> DatDiagnostic {
+    DatDiagnostic {
+        severity: DiagnosticSeverity::Error,
+        message: message.into(),
+    }
+}
+
 /// A page holding one folder source plus a stored validation report built by
 /// the test, so diagnostic presentation can be driven without depending on
 /// parser wording. The health state is supplied by the test because it now
@@ -1195,7 +1203,6 @@ fn zero_warnings_show_no_warning_details_control() {
         "no warnings means no details control"
     );
 }
-
 #[test]
 fn warnings_and_parser_notes_render_as_separate_sections() {
     // A parsed file carrying both a real warning and a parser note must show
@@ -1230,6 +1237,61 @@ fn warnings_and_parser_notes_render_as_separate_sections() {
         "Parser notes are expected parser behaviour and need no action."
     ));
     assert!(rendered_text_contains(&expanded, note_text));
+}
+
+#[test]
+fn an_error_diagnostic_renders_in_its_own_section_not_as_a_warning() {
+    // An Error-severity diagnostic must not be folded into the warnings list:
+    // it gets its own Blocked section, and the source reads Invalid.
+    let error_text = "the catalogue declares an entry the build refuses to index";
+    let (_fixture, page) = page_with_report(
+        vec![vec![error(error_text)]],
+        DatHealthState::Invalid,
+        false,
+        None,
+    );
+    let view = page.view();
+    let row = &view.rows[0];
+    assert_eq!(row.errors, vec![error_text]);
+    assert!(row.warnings.is_empty(), "an error is not a warning");
+    assert!(row.notes.is_empty());
+    assert_eq!(row.health_state, DatHealthState::Invalid);
+
+    let mut ui_state = DatSourcesPageUi::default();
+    let output = render(&view, &mut ui_state);
+    assert!(rendered_text_contains(&output, "1 error"));
+    assert!(rendered_text_contains(&output, "View error details"));
+    assert!(
+        !rendered_text_contains(&output, "View warning details"),
+        "the error must not appear in a warning-details control"
+    );
+}
+
+#[test]
+fn mixed_errors_warnings_and_notes_render_as_three_sections() {
+    // All three severities present: each gets its own labelled section, and the
+    // badge stays driven by core health (Invalid because an error is present).
+    let error_text = "one entry was refused";
+    let warning_text = "a checksum was dropped";
+    let note_text = "DOCTYPE declaration accepted as inert text";
+    let (_fixture, page) = page_with_report(
+        vec![vec![error(error_text), warn(warning_text), note(note_text)]],
+        DatHealthState::Invalid,
+        false,
+        None,
+    );
+    let view = page.view();
+    let row = &view.rows[0];
+    assert_eq!(row.errors, vec![error_text]);
+    assert_eq!(row.warnings, vec![warning_text]);
+    assert_eq!(row.notes, vec![note_text]);
+
+    let mut ui_state = DatSourcesPageUi::default();
+    let output = render(&view, &mut ui_state);
+    assert!(rendered_text_contains(&output, "Invalid"));
+    assert!(rendered_text_contains(&output, "1 error"));
+    assert!(rendered_text_contains(&output, "1 warning"));
+    assert!(rendered_text_contains(&output, "1 parser note"));
 }
 
 #[test]

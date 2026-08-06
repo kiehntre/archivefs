@@ -129,6 +129,10 @@ pub(crate) struct DatSourceRowView {
     pub(crate) busy: bool,
     /// The last validation run's per-file breakdown, if one has been run.
     pub(crate) detail: Option<InspectView>,
+    /// Error-severity diagnostics from the last validation, flattened across
+    /// files in the deterministic order the files were read. A source with any
+    /// of these reads Invalid.
+    pub(crate) errors: Vec<String>,
     /// Every warning the last validation found, flattened across files in the
     /// deterministic order the files were read. Empty when there were none.
     pub(crate) warnings: Vec<String>,
@@ -175,6 +179,7 @@ pub(crate) struct InspectFileView {
     pub(crate) status: &'static str,
     /// The format and counts, or the parser's error.
     pub(crate) detail: String,
+    pub(crate) errors: Vec<String>,
     pub(crate) warnings: Vec<String>,
     pub(crate) notes: Vec<String>,
 }
@@ -524,10 +529,12 @@ fn truncate_inline(text: &str) -> String {
     out
 }
 
-/// The warnings and parser notes the last validation found, flattened across
-/// files in the deterministic order the files were read (files are sorted by
-/// name; each file's diagnostics keep the parser's own order).
-fn flatten_diagnostics(report: &DatValidationReport) -> (Vec<String>, Vec<String>) {
+/// The errors, warnings, and parser notes the last validation found, flattened
+/// across files in the deterministic order the files were read (files are
+/// sorted by name; each file's diagnostics keep the parser's own order). Each
+/// severity keeps its own list: errors are never folded into warnings.
+fn flatten_diagnostics(report: &DatValidationReport) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let mut errors = Vec::new();
     let mut warnings = Vec::new();
     let mut notes = Vec::new();
     for file in &report.files {
@@ -536,13 +543,13 @@ fn flatten_diagnostics(report: &DatValidationReport) -> (Vec<String>, Vec<String
         };
         for diagnostic in diagnostics {
             match diagnostic.severity {
+                DiagnosticSeverity::Error => errors.push(diagnostic.message.clone()),
                 DiagnosticSeverity::Warning => warnings.push(diagnostic.message.clone()),
                 DiagnosticSeverity::Note => notes.push(diagnostic.message.clone()),
-                DiagnosticSeverity::Error => warnings.push(diagnostic.message.clone()),
             }
         }
     }
-    (warnings, notes)
+    (errors, warnings, notes)
 }
 
 /// How far a running audit has got, structurally.
@@ -1201,7 +1208,7 @@ impl DatSourcesPageState {
             Some(saved) => saved != entry,
         };
         let validation = self.validation(&entry.id);
-        let (warnings, notes) = validation.map(flatten_diagnostics).unwrap_or_default();
+        let (errors, warnings, notes) = validation.map(flatten_diagnostics).unwrap_or_default();
         let incomplete_load = validation.is_some_and(|report| report.truncated);
         let dat_files_read = incomplete_load.then(|| validation.unwrap().files.len() as u64);
         let dat_files_total = incomplete_load
@@ -1236,6 +1243,7 @@ impl DatSourcesPageState {
                 .as_ref()
                 .is_some_and(|job| job.source_id == entry.id),
             detail: self.validation(&entry.id).map(inspect_view),
+            errors,
             warnings,
             notes,
             incomplete_load,
@@ -1330,9 +1338,14 @@ fn inspect_view(report: &DatValidationReport) -> InspectView {
                     rom_count,
                     diagnostics,
                 } => {
+                    let errors: Vec<String> = diagnostics
+                        .iter()
+                        .filter(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
+                        .map(|diagnostic| diagnostic.message.clone())
+                        .collect();
                     let warnings: Vec<String> = diagnostics
                         .iter()
-                        .filter(|diagnostic| diagnostic.severity != DiagnosticSeverity::Note)
+                        .filter(|diagnostic| diagnostic.severity == DiagnosticSeverity::Warning)
                         .map(|diagnostic| diagnostic.message.clone())
                         .collect();
                     let notes: Vec<String> = diagnostics
@@ -1342,7 +1355,9 @@ fn inspect_view(report: &DatValidationReport) -> InspectView {
                         .collect();
                     InspectFileView {
                         file_name: file.file_name.clone(),
-                        status: if warnings.is_empty() {
+                        status: if !errors.is_empty() {
+                            "Failed"
+                        } else if warnings.is_empty() {
                             "OK"
                         } else {
                             "OK, with warnings"
@@ -1364,6 +1379,7 @@ fn inspect_view(report: &DatValidationReport) -> InspectView {
                             }
                             parts.join(" · ")
                         },
+                        errors,
                         warnings,
                         notes,
                     }
@@ -1372,6 +1388,7 @@ fn inspect_view(report: &DatValidationReport) -> InspectView {
                     file_name: file.file_name.clone(),
                     status: "Failed",
                     detail: error.clone(),
+                    errors: Vec::new(),
                     warnings: Vec::new(),
                     notes: Vec::new(),
                 },
@@ -1590,6 +1607,8 @@ pub(crate) struct DatSourcesPageUi {
     pub(crate) open_audit_picker: Option<String>,
     /// Which source is awaiting removal confirmation.
     pub(crate) confirm_remove: Option<String>,
+    /// Which source's error-details disclosure is open.
+    pub(crate) open_errors: Option<String>,
     /// Which source's warning-details disclosure is open.
     pub(crate) open_warnings: Option<String>,
     /// Which source's parser-notes disclosure is open.
@@ -1604,6 +1623,7 @@ impl DatSourcesPageUi {
         self.platform_query.clear();
         self.open_audit_picker = None;
         self.confirm_remove = None;
+        self.open_errors = None;
         self.open_warnings = None;
         self.open_notes = None;
     }
@@ -2066,8 +2086,52 @@ fn show_diagnostics_summary(
     row: &DatSourceRowView,
     ui_state: &mut DatSourcesPageUi,
 ) {
+    let errors_open = ui_state.open_errors.as_deref() == Some(row.id.as_str());
     let warnings_open = ui_state.open_warnings.as_deref() == Some(row.id.as_str());
     let notes_open = ui_state.open_notes.as_deref() == Some(row.id.as_str());
+
+    if !row.errors.is_empty() {
+        let count = row.errors.len();
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            widgets::status_badge(
+                ui,
+                format!("{count} {}", if count == 1 { "error" } else { "errors" }),
+                widgets::StatusTone::Blocked,
+            );
+            let label = if errors_open {
+                "Hide error details"
+            } else {
+                "View error details"
+            };
+            if widgets::action_button(ui, label, widgets::ActionStyle::Quiet, true).clicked() {
+                ui_state.open_errors = if errors_open {
+                    None
+                } else {
+                    Some(row.id.clone())
+                };
+            }
+        });
+        // Concise inline summary: the first error, kept to one line.
+        if let Some(first) = row.errors.first() {
+            ui.label(
+                egui::RichText::new(format!("Error: {}", truncate_inline(first)))
+                    .color(widgets::StatusTone::Blocked.color(ui))
+                    .small(),
+            );
+        }
+        if errors_open {
+            for error in &row.errors {
+                ui.horizontal_top(|ui| {
+                    ui.label(
+                        egui::RichText::new("•").color(widgets::StatusTone::Blocked.color(ui)),
+                    );
+                    // The original error text is preserved verbatim.
+                    ui.add(egui::Label::new(error).wrap());
+                });
+            }
+        }
+    }
 
     if !row.warnings.is_empty() {
         let count = row.warnings.len();
@@ -2472,6 +2536,13 @@ fn show_inspect(ui: &mut egui::Ui, row: &DatSourceRowView) {
                             .color(theme::muted(ui))
                             .small(),
                     );
+                    for error in file.errors.iter().take(20) {
+                        ui.label(
+                            egui::RichText::new(format!("error: {error}"))
+                                .color(widgets::StatusTone::Blocked.color(ui))
+                                .small(),
+                        );
+                    }
                     for warning in file.warnings.iter().take(20) {
                         ui.label(
                             egui::RichText::new(format!("warning: {warning}"))

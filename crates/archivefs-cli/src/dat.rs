@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use archivefs_core::dat::audit::{KnownFileEvidence, audit_files};
 use archivefs_core::dat::index::DatIndex;
 use archivefs_core::dat::limits::DatLimits;
+use archivefs_core::dat::model::ParsedDat;
 use archivefs_core::dat::parser::{ParseOutcome, ParseWarning};
 use archivefs_core::dat::parsers::parse_dat_file;
 use serde::Serialize;
@@ -39,6 +40,161 @@ struct ValidateOutput {
     rom_count: usize,
     errors: Vec<String>,
     warnings: Vec<ParseWarning>,
+}
+
+/// Splits parser diagnostics into (errors, warnings, parser notes) by severity.
+///
+/// The three lists keep the parser's own deterministic order. Nothing is
+/// re-parsed or re-derived here; the severity was attached when the diagnostic
+/// was created.
+fn partition_diagnostics(
+    warnings: &[ParseWarning],
+) -> (Vec<&ParseWarning>, Vec<&ParseWarning>, Vec<&ParseWarning>) {
+    let mut errors = Vec::new();
+    let mut real_warnings = Vec::new();
+    let mut notes = Vec::new();
+    for warning in warnings {
+        match warning.severity() {
+            archivefs_core::dat::parser::DiagnosticSeverity::Error => errors.push(warning),
+            archivefs_core::dat::parser::DiagnosticSeverity::Warning => real_warnings.push(warning),
+            archivefs_core::dat::parser::DiagnosticSeverity::Note => notes.push(warning),
+        }
+    }
+    (errors, real_warnings, notes)
+}
+
+/// Appends one labelled diagnostic section when it is non-empty.
+fn write_diagnostic_section(out: &mut String, heading: &str, diagnostics: &[&ParseWarning]) {
+    if diagnostics.is_empty() {
+        return;
+    }
+    writeln!(out, "{heading}:").unwrap();
+    for diagnostic in diagnostics {
+        writeln!(out, "  - {diagnostic}").unwrap();
+    }
+}
+
+/// The human-readable `dat inspect` output. Parser notes are shown under their
+/// own heading, never as warnings.
+fn inspect_text(dat: &ParsedDat, warnings: &[ParseWarning]) -> String {
+    let (_errors, real_warnings, notes) = partition_diagnostics(warnings);
+    let mut out = String::new();
+    writeln!(&mut out, "DAT File: {}", dat.source.file_path).unwrap();
+    writeln!(&mut out, "Format:   {}", dat.source.format.label()).unwrap();
+    writeln!(&mut out, "Ecosystem: {}", dat.source.ecosystem.label()).unwrap();
+    if let Some(ref n) = dat.source.name {
+        writeln!(&mut out, "Name:     {n}").unwrap();
+    }
+    if let Some(ref d) = dat.source.description {
+        writeln!(&mut out, "Description: {d}").unwrap();
+    }
+    if let Some(ref v) = dat.source.version {
+        writeln!(&mut out, "Version:  {v}").unwrap();
+    }
+    if let Some(ref a) = dat.source.author {
+        writeln!(&mut out, "Author:   {a}").unwrap();
+    }
+    writeln!(&mut out, "Entries:  {}", dat.source.entry_count).unwrap();
+    writeln!(&mut out, "ROMs:     {}", dat.source.rom_count).unwrap();
+    write_diagnostic_section(&mut out, "Warnings", &real_warnings);
+    write_diagnostic_section(&mut out, "Parser notes", &notes);
+    writeln!(&mut out).unwrap();
+
+    // Print game summary.
+    writeln!(&mut out, "Games:").unwrap();
+    for game in &dat.games {
+        writeln!(&mut out, "  {}", game.name).unwrap();
+        for rom in &game.roms {
+            let mut desc = String::new();
+            if let Some(s) = rom.size_bytes {
+                desc.push_str(&format!("  {s}B"));
+            }
+            let checksums = rom.checksums();
+            if !checksums.is_empty() {
+                if !desc.is_empty() {
+                    desc.push_str(", ");
+                }
+                desc.push_str(
+                    &checksums
+                        .iter()
+                        .map(|c| format!("{}: {}", c.algorithm.label(), c.value))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                );
+            }
+            writeln!(&mut out, "    {}  [{desc}]", rom.name).unwrap();
+        }
+    }
+
+    out
+}
+
+/// The human-readable `dat validate` output. Errors, warnings, and parser notes
+/// each get their own deterministic section, printed only when non-empty. A
+/// note-only valid DAT therefore never shows a "Warnings:" section.
+fn validate_text(dat: &ParsedDat, warnings: &[ParseWarning], errors: &[String]) -> String {
+    let (diagnostic_errors, real_warnings, notes) = partition_diagnostics(warnings);
+    let mut out = String::new();
+    writeln!(&mut out, "DAT File:  {}", dat.source.file_path).unwrap();
+    writeln!(&mut out, "Format:    {}", dat.source.format.label()).unwrap();
+    writeln!(&mut out, "Ecosystem:  {}", dat.source.ecosystem.label()).unwrap();
+    if let Some(ref n) = dat.source.name {
+        writeln!(&mut out, "Name:      {n}").unwrap();
+    }
+    writeln!(&mut out, "Entries:   {}", dat.source.entry_count).unwrap();
+    writeln!(&mut out, "ROMs:      {}", dat.source.rom_count).unwrap();
+
+    if errors.is_empty() && diagnostic_errors.is_empty() {
+        writeln!(&mut out, "Valid:     yes").unwrap();
+    } else {
+        writeln!(&mut out, "Valid:     no").unwrap();
+        writeln!(&mut out, "Errors:").unwrap();
+        for error in errors {
+            writeln!(&mut out, "  - {error}").unwrap();
+        }
+        for warning in diagnostic_errors {
+            writeln!(&mut out, "  - {warning}").unwrap();
+        }
+    }
+    write_diagnostic_section(&mut out, "Warnings", &real_warnings);
+    write_diagnostic_section(&mut out, "Parser notes", &notes);
+
+    // Hash coverage summary
+    if !dat.games.is_empty() {
+        writeln!(&mut out).unwrap();
+        let total_roms: usize = dat.games.iter().map(|g| g.roms.len()).sum();
+        let with_crc = dat
+            .games
+            .iter()
+            .flat_map(|g| &g.roms)
+            .filter(|r| r.crc32.is_some())
+            .count();
+        let with_md5 = dat
+            .games
+            .iter()
+            .flat_map(|g| &g.roms)
+            .filter(|r| r.md5.is_some())
+            .count();
+        let with_sha1 = dat
+            .games
+            .iter()
+            .flat_map(|g| &g.roms)
+            .filter(|r| r.sha1.is_some())
+            .count();
+        let with_sha256 = dat
+            .games
+            .iter()
+            .flat_map(|g| &g.roms)
+            .filter(|r| r.sha256.is_some())
+            .count();
+        writeln!(&mut out, "Hash coverage ({total_roms} ROMs):").unwrap();
+        writeln!(&mut out, "  CRC32:   {with_crc}").unwrap();
+        writeln!(&mut out, "  MD5:     {with_md5}").unwrap();
+        writeln!(&mut out, "  SHA-1:   {with_sha1}").unwrap();
+        writeln!(&mut out, "  SHA-256: {with_sha256}").unwrap();
+    }
+
+    out
 }
 
 pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
@@ -93,57 +249,7 @@ fn run_inspect(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         return Ok(());
     }
 
-    let mut out = String::new();
-    writeln!(&mut out, "DAT File: {}", dat.source.file_path).unwrap();
-    writeln!(&mut out, "Format:   {}", dat.source.format.label()).unwrap();
-    writeln!(&mut out, "Ecosystem: {}", dat.source.ecosystem.label()).unwrap();
-    if let Some(ref n) = dat.source.name {
-        writeln!(&mut out, "Name:     {n}").unwrap();
-    }
-    if let Some(ref d) = dat.source.description {
-        writeln!(&mut out, "Description: {d}").unwrap();
-    }
-    if let Some(ref v) = dat.source.version {
-        writeln!(&mut out, "Version:  {v}").unwrap();
-    }
-    if let Some(ref a) = dat.source.author {
-        writeln!(&mut out, "Author:   {a}").unwrap();
-    }
-    writeln!(&mut out, "Entries:  {}", dat.source.entry_count).unwrap();
-    writeln!(&mut out, "ROMs:     {}", dat.source.rom_count).unwrap();
-    writeln!(&mut out, "Warnings: {}", dat.source.parse_warnings.len()).unwrap();
-    for w in &dat.source.parse_warnings {
-        writeln!(&mut out, "  - {w}").unwrap();
-    }
-    writeln!(&mut out).unwrap();
-
-    // Print game summary.
-    writeln!(&mut out, "Games:").unwrap();
-    for game in &dat.games {
-        writeln!(&mut out, "  {}", game.name).unwrap();
-        for rom in &game.roms {
-            let mut desc = String::new();
-            if let Some(s) = rom.size_bytes {
-                desc.push_str(&format!("  {s}B"));
-            }
-            let checksums = rom.checksums();
-            if !checksums.is_empty() {
-                if !desc.is_empty() {
-                    desc.push_str(", ");
-                }
-                desc.push_str(
-                    &checksums
-                        .iter()
-                        .map(|c| format!("{}: {}", c.algorithm.label(), c.value))
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                );
-            }
-            writeln!(&mut out, "    {}  [{desc}]", rom.name).unwrap();
-        }
-    }
-
-    print!("{out}");
+    print!("{}", inspect_text(&dat, &warnings));
     Ok(())
 }
 
@@ -210,71 +316,13 @@ fn run_validate(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>>
         return Ok(());
     }
 
-    let mut out = String::new();
-    writeln!(&mut out, "DAT File:  {}", dat.source.file_path).unwrap();
-    writeln!(&mut out, "Format:    {}", dat.source.format.label()).unwrap();
-    writeln!(&mut out, "Ecosystem:  {}", dat.source.ecosystem.label()).unwrap();
-    if let Some(ref n) = dat.source.name {
-        writeln!(&mut out, "Name:      {n}").unwrap();
-    }
-    writeln!(&mut out, "Entries:   {}", dat.source.entry_count).unwrap();
-    writeln!(&mut out, "ROMs:      {}", dat.source.rom_count).unwrap();
+    let text = validate_text(&dat, &warnings, &errors);
+    print!("{text}");
 
-    if errors.is_empty() {
-        writeln!(&mut out, "Valid:     yes").unwrap();
-    } else {
-        writeln!(&mut out, "Valid:     no").unwrap();
-        writeln!(&mut out, "Errors:").unwrap();
-        for e in &errors {
-            writeln!(&mut out, "  - {e}").unwrap();
-        }
-    }
-
-    if !warnings.is_empty() {
-        writeln!(&mut out, "Warnings:").unwrap();
-        for w in &warnings {
-            writeln!(&mut out, "  - {w}").unwrap();
-        }
-    }
-
-    // Hash coverage summary
-    if !dat.games.is_empty() {
-        writeln!(&mut out).unwrap();
-        let total_roms: usize = dat.games.iter().map(|g| g.roms.len()).sum();
-        let with_crc = dat
-            .games
-            .iter()
-            .flat_map(|g| &g.roms)
-            .filter(|r| r.crc32.is_some())
-            .count();
-        let with_md5 = dat
-            .games
-            .iter()
-            .flat_map(|g| &g.roms)
-            .filter(|r| r.md5.is_some())
-            .count();
-        let with_sha1 = dat
-            .games
-            .iter()
-            .flat_map(|g| &g.roms)
-            .filter(|r| r.sha1.is_some())
-            .count();
-        let with_sha256 = dat
-            .games
-            .iter()
-            .flat_map(|g| &g.roms)
-            .filter(|r| r.sha256.is_some())
-            .count();
-        writeln!(&mut out, "Hash coverage ({total_roms} ROMs):").unwrap();
-        writeln!(&mut out, "  CRC32:   {with_crc}").unwrap();
-        writeln!(&mut out, "  MD5:     {with_md5}").unwrap();
-        writeln!(&mut out, "  SHA-1:   {with_sha1}").unwrap();
-        writeln!(&mut out, "  SHA-256: {with_sha256}").unwrap();
-    }
-
-    print!("{out}");
-
-    if !errors.is_empty() {
+    // An Error-severity parser diagnostic also makes the file invalid, matching
+    // the core verdict.
+    let (diagnostic_errors, _, _) = partition_diagnostics(&warnings);
+    if !errors.is_empty() || !diagnostic_errors.is_empty() {
         return Err("dat validate: file failed validation".into());
     }
     Ok(())
@@ -569,6 +617,74 @@ mod tests {
         let (_dir, path) = write_temp_file("doctype.dat", xml);
         let args = vec!["inspect".into(), path.to_string_lossy().into_owned()];
         assert!(run(args).is_ok());
+    }
+
+    /// A Logiqx XML DAT carrying the standard DOCTYPE plus `games` entries, the
+    /// shape of the reported TOSEC case.
+    fn logiqx_with_doctype_and_entries(games: usize) -> String {
+        let mut xml = String::from(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <!DOCTYPE datafile PUBLIC \"-//Logiqx//DTD ROM Management Datafile//EN\" \
+             \"http://www.logiqx.com/Dats/datafile.dtd\">\n\
+             <datafile>\n\
+             <header><name>Test TOSEC Set</name><version>2026-01-01</version></header>\n",
+        );
+        for index in 0..games {
+            xml.push_str(&format!(
+                "<game name=\"Game {index}\"><rom name=\"g{index}.bin\" size=\"16\" crc=\"{index:08x}\"/></game>\n"
+            ));
+        }
+        xml.push_str("</datafile>\n");
+        xml
+    }
+
+    #[test]
+    fn validate_note_only_dat_never_prints_a_warnings_section() {
+        // Regression: the CLI must not label parser notes as warnings. A
+        // note-only TOSEC DAT parses cleanly and must show no "Warnings:"
+        // section at all - only "Parser notes:".
+        let (_dir, path) = write_temp_file("tosec.dat", &logiqx_with_doctype_and_entries(1005));
+        let outcome = parse_dat_file(&path, DatLimits::default()).expect("the TOSEC DAT parses");
+        assert_eq!(outcome.dat.source.entry_count, 1005);
+
+        let text = validate_text(&outcome.dat, &outcome.warnings, &[]);
+        assert!(text.contains("Valid:     yes"), "{text}");
+        assert!(
+            !text.contains("Warnings:"),
+            "a parser note is not a warning:\n{text}"
+        );
+        assert!(text.contains("Parser notes:"), "{text}");
+        assert!(text.contains("DOCTYPE"), "{text}");
+    }
+
+    #[test]
+    fn inspect_note_only_dat_lists_parser_notes_not_warnings() {
+        let (_dir, path) = write_temp_file("tosec.dat", &logiqx_with_doctype_and_entries(1005));
+        let outcome = parse_dat_file(&path, DatLimits::default()).expect("the TOSEC DAT parses");
+
+        let text = inspect_text(&outcome.dat, &outcome.warnings);
+        assert!(
+            !text.contains("Warnings:"),
+            "inspect must not label a parser note as a warning:\n{text}"
+        );
+        assert!(text.contains("Parser notes:"), "{text}");
+        assert!(text.contains("DOCTYPE"), "{text}");
+    }
+
+    #[test]
+    fn validate_a_real_warning_still_prints_a_warnings_section() {
+        // A genuinely dropped checksum is a warning, not a parser note, and must
+        // keep its own section.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<datafile><game name="G"><rom name="a.bin" size="4" crc="not-a-checksum"/></game></datafile>"#;
+        let (_dir, path) = write_temp_file("warn.dat", xml);
+        let outcome = parse_dat_file(&path, DatLimits::default()).expect("parses with a warning");
+
+        let text = validate_text(&outcome.dat, &outcome.warnings, &[]);
+        assert!(text.contains("Valid:     yes"), "{text}");
+        assert!(text.contains("Warnings:"), "{text}");
+        assert!(text.contains("not-a-checksum"), "{text}");
+        assert!(!text.contains("Parser notes:"), "{text}");
     }
 
     #[test]
