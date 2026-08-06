@@ -741,6 +741,49 @@ fn discarding_while_a_validation_is_in_flight_stops_it_from_landing() {
 }
 
 #[test]
+fn discarding_forgets_completed_session_validation_records() {
+    // Regression: Revert used to leave `validations` (and now the diagnostic
+    // groups cache) in place, so a source that was validated, then discarded
+    // (never saved), then re-added - reusing its auto-suggested id - showed
+    // stale Inspect detail and stale diagnostic groups next to a "Not checked"
+    // badge.
+    let fixture = Fixture::new();
+    let dat = fixture.write("no-intro.dat", &logiqx_with_doctype_and_entries(1));
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddFile { path: dat.clone() });
+    page.apply(DatSourcesPageAction::Validate {
+        id: "no-intro".to_string(),
+    });
+    run_to_completion(&mut page);
+    assert!(
+        page.validation("no-intro").is_some(),
+        "a completed validation is recorded"
+    );
+    assert_eq!(
+        page.view().rows[0].diagnostic_types(DiagnosticSeverity::Note),
+        1,
+        "the DOCTYPE note is grouped so the discard below is observable"
+    );
+
+    // Discard the never-saved source, then re-add the same file.
+    page.apply(DatSourcesPageAction::Revert);
+    assert!(page.view().rows.is_empty());
+    page.apply(DatSourcesPageAction::AddFile { path: dat });
+
+    let view = page.view();
+    assert_eq!(view.rows[0].id, "no-intro");
+    assert_eq!(view.rows[0].health_state, DatHealthState::NotChecked);
+    assert!(
+        view.rows[0].detail.is_none(),
+        "a re-added source must not show stale Inspect detail from a discarded run"
+    );
+    assert!(
+        view.rows[0].groups.is_empty(),
+        "a re-added source must not show stale diagnostic groups from a discarded run"
+    );
+}
+
+#[test]
 fn a_second_job_is_refused_while_one_is_running() {
     let fixture = Fixture::new();
     let dat = fixture.write("no-intro.dat", LOGIQX);

@@ -1175,6 +1175,12 @@ impl DatSourcesPageState {
                 self.abandon_running_job();
                 self.draft = self.saved.clone();
                 self.action_error = None;
+                // Discard also forgets the session's validation records: a
+                // re-added source (which reuses its auto-suggested id) must not
+                // show yesterday's Inspect detail or diagnostic groups next to
+                // a "Not checked" badge. Both maps are discarded together.
+                self.validations.clear();
+                self.diagnostic_groups.clear();
             }
             DatSourcesPageAction::Save => self.save(),
         }

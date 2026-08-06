@@ -298,12 +298,19 @@ fn run_validate(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>>
     };
 
     if json {
-        // Fold Error-severity parser diagnostics into the errors list so the
-        // JSON contract matches the text path: `valid` reflects them, and an
-        // Error is never left sitting in `warnings`.
+        // Fold Error-severity parser diagnostics into the errors list AND drop
+        // them from `warnings`, so the JSON contract matches the text path and
+        // `valid`/exit-code agree, without an Error appearing twice.
         let (diagnostic_errors, _, _) = partition_diagnostics(&warnings);
         let mut all_errors = errors.clone();
         all_errors.extend(diagnostic_errors.iter().map(ToString::to_string));
+        let warnings = warnings
+            .iter()
+            .filter(|warning| {
+                warning.severity() != archivefs_core::dat::parser::DiagnosticSeverity::Error
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         let output = ValidateOutput {
             file_path: dat.source.file_path.clone(),
             valid: all_errors.is_empty(),
