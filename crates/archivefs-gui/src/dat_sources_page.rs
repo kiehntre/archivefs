@@ -398,9 +398,14 @@ pub(crate) struct AuditResultView {
     pub(crate) source_id: String,
     pub(crate) dat_path: String,
     pub(crate) scan_root: String,
+    /// The scan folder shortened for display, so a long private path does not
+    /// take over the summary.
+    pub(crate) scan_root_short: String,
     pub(crate) catalogue_names: Vec<String>,
     pub(crate) catalogue_entries: usize,
     pub(crate) headline: String,
+    /// How long the run took, when it completed.
+    pub(crate) elapsed_seconds: Option<u64>,
     pub(crate) categories: Vec<AuditCategoryView>,
     /// Per-file lines, capped for display.
     pub(crate) entries: Vec<AuditEntryView>,
@@ -853,6 +858,9 @@ pub(crate) struct DatSourcesPageState {
     validations: BTreeMap<String, DatValidationReport>,
     audit: Option<Box<DatAuditOutcome>>,
     audit_error: Option<String>,
+    /// How long the most recent completed audit took, read from the job's start
+    /// instant when its result arrived. `None` until an audit completes.
+    audit_elapsed_seconds: Option<u64>,
     job: Option<RunningJob>,
     /// Decides whether a symlinked ROM may be followed while hashing, exactly
     /// as it does everywhere else in the build.
@@ -897,6 +905,7 @@ impl DatSourcesPageState {
             validations: BTreeMap::new(),
             audit: None,
             audit_error: None,
+            audit_elapsed_seconds: None,
             job: None,
             trusted,
             library_folders,
@@ -1025,6 +1034,10 @@ impl DatSourcesPageState {
                         // audit.
                         finished = true;
                     } else {
+                        // The elapsed time is measured from the job's own start
+                        // instant, so the summary can say how long the run took
+                        // without the worker carrying any timestamps.
+                        self.audit_elapsed_seconds = Some(job.started_at.elapsed().as_secs());
                         self.audit = Some(outcome);
                         self.audit_error = None;
                         changed = true;
@@ -1035,6 +1048,7 @@ impl DatSourcesPageState {
                     match job.kind {
                         JobKind::Audit => {
                             self.audit = None;
+                            self.audit_elapsed_seconds = None;
                             if !job.cancel_requested {
                                 self.audit_error = Some(error);
                             }
@@ -1049,6 +1063,9 @@ impl DatSourcesPageState {
                     finished = true;
                 }
                 Ok(JobMessage::Cancelled) => {
+                    // A cancelled audit produces no summary and no elapsed time.
+                    self.audit = None;
+                    self.audit_elapsed_seconds = None;
                     changed = true;
                     finished = true;
                 }
@@ -1220,6 +1237,7 @@ impl DatSourcesPageState {
         };
         self.audit = None;
         self.audit_error = None;
+        self.audit_elapsed_seconds = None;
         let (sender, messages) = sync_channel(PROGRESS_QUEUE_DEPTH);
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = cancel.clone();
@@ -1319,7 +1337,7 @@ impl DatSourcesPageState {
             audit: self
                 .audit
                 .as_ref()
-                .map(|outcome| Box::new(audit_view(outcome))),
+                .map(|outcome| Box::new(audit_view(outcome, self.audit_elapsed_seconds))),
             audit_error: self.audit_error.clone(),
             rows,
         }
@@ -1568,8 +1586,9 @@ fn describe(progress: &DatAuditProgress) -> String {
     }
 }
 
-/// Turns a core outcome into rows, without adding or merging any category.
-fn audit_view(outcome: &DatAuditOutcome) -> AuditResultView {
+/// Turns a core outcome into rows, without adding or merging any category. The
+/// in-memory outcome is the only input; nothing is re-scanned to build this.
+fn audit_view(outcome: &DatAuditOutcome, elapsed_seconds: Option<u64>) -> AuditResultView {
     let summary = &outcome.report.summary;
     // Every category the core counts, each with the meaning the core documents
     // for it. Zero counts are kept: "0 ambiguous" is a result, and hiding it
@@ -1635,9 +1654,11 @@ fn audit_view(outcome: &DatAuditOutcome) -> AuditResultView {
         source_id: outcome.source_id.clone(),
         dat_path: outcome.dat_path.clone(),
         scan_root: outcome.scan_root.clone(),
+        scan_root_short: shorten_path(&outcome.scan_root),
         catalogue_names: outcome.catalogue_names.clone(),
         catalogue_entries: outcome.catalogue_entries,
         headline: outcome.headline(),
+        elapsed_seconds,
         categories,
         entries,
         entries_truncated,
@@ -2727,7 +2748,10 @@ fn show_audit_result(ui: &mut egui::Ui, audit: &AuditResultView) {
         ui.label(
             egui::RichText::new(format!(
                 "Source '{}' ({}) · checked {} · {} files read",
-                audit.source_display_name, audit.source_id, audit.scan_root, audit.files_scanned
+                audit.source_display_name,
+                audit.source_id,
+                audit.scan_root_short,
+                audit.files_scanned
             ))
             .color(theme::muted(ui)),
         );
@@ -2741,6 +2765,13 @@ fn show_audit_result(ui: &mut egui::Ui, audit: &AuditResultView) {
             .color(theme::muted(ui))
             .small(),
         );
+        if let Some(elapsed) = audit.elapsed_seconds {
+            ui.label(
+                egui::RichText::new(format!("Completed in {}", format_elapsed(elapsed)))
+                    .color(theme::muted(ui))
+                    .small(),
+            );
+        }
         ui.add_space(6.0);
 
         for category in &audit.categories {

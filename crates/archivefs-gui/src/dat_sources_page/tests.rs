@@ -776,6 +776,76 @@ fn audit_fixture() -> (Fixture, DatSourcesPageState, PathBuf) {
 }
 
 #[test]
+fn the_audit_summary_shows_elapsed_time_and_a_shortened_scan_folder() {
+    let (_fixture, mut page, roms) = audit_fixture();
+    page.apply(DatSourcesPageAction::Audit {
+        id: "collection".to_string(),
+        scan_root: roms.clone(),
+    });
+    run_to_completion(&mut page);
+
+    let view = page.view();
+    let audit = view.audit.as_ref().expect("an audit result");
+    // The full folder is still on the result for provenance...
+    assert_eq!(audit.scan_root, roms.to_string_lossy());
+    // ...but the display uses a shortened form that never exposes the full path.
+    assert_eq!(audit.scan_root_short, shorten_path(&roms.to_string_lossy()));
+    assert!(
+        !audit.scan_root_short.contains("/tmp"),
+        "the full private path must not be shown: {}",
+        audit.scan_root_short
+    );
+    // A completed audit knows how long it took.
+    assert!(audit.elapsed_seconds.is_some());
+
+    let mut ui_state = DatSourcesPageUi::default();
+    let output = render(&view, &mut ui_state);
+    assert!(rendered_text_contains(&output, "Completed in"));
+    assert!(
+        !rendered_text_contains(&output, &roms.to_string_lossy()),
+        "the full scan folder must not be rendered"
+    );
+}
+
+#[test]
+fn the_audit_summary_survives_navigation_and_is_replaced_by_a_new_generation() {
+    let (_fixture, mut page, roms) = audit_fixture();
+    page.apply(DatSourcesPageAction::Audit {
+        id: "collection".to_string(),
+        scan_root: roms.clone(),
+    });
+    run_to_completion(&mut page);
+
+    // Navigating away and back keeps the same summary for this generation.
+    let first = page
+        .view()
+        .audit
+        .as_ref()
+        .expect("summary")
+        .headline
+        .clone();
+    for _ in 0..3 {
+        assert_eq!(
+            page.view().audit.as_ref().map(|a| a.headline.clone()),
+            Some(first.clone()),
+            "the same generation must keep its summary across views"
+        );
+    }
+
+    // A cancelled new generation never shows a success summary.
+    page.apply(DatSourcesPageAction::Audit {
+        id: "collection".to_string(),
+        scan_root: roms,
+    });
+    page.apply(DatSourcesPageAction::CancelJob);
+    run_to_completion(&mut page);
+    assert!(
+        page.view().audit.is_none(),
+        "a cancelled audit never shows a success summary"
+    );
+}
+
+#[test]
 fn the_audit_picker_offers_the_configured_library_folders() {
     let (_fixture, page, roms) = audit_fixture();
     assert_eq!(page.view().library_folders, vec![roms]);
