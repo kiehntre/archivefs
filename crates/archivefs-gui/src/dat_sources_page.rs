@@ -379,6 +379,13 @@ impl DatSourcesPageState {
         }
     }
 
+    /// How many sources are registered on disk, right now - what Home
+    /// shows once this page has been visited this session. Reads `saved`,
+    /// not `draft`: an unsaved edit should not change what Home reports.
+    pub(crate) fn registered_source_count(&self) -> usize {
+        self.saved.len()
+    }
+
     /// Whether the draft differs from what is on disk.
     ///
     /// Compared as serialised configuration, because that is exactly what a
