@@ -534,6 +534,42 @@ fn finding_ids_are_stable_and_namespaced_by_category() {
     assert_eq!(first[0].id, second[0].id);
 }
 
+#[test]
+fn a_confirmed_missing_config_file_from_doctor_report_is_info_not_error() {
+    // The exact literal `complete_doctor_report` writes for a genuinely
+    // absent config file - a fresh install, not a fault.
+    let missing = findings_from_doctor_report(&doctor_report(vec![check(
+        "config file",
+        DoctorStatus::Fail,
+        "missing /home/tester/.config/archivefs/config.toml",
+    )]));
+    assert_eq!(missing.len(), 1);
+    assert_eq!(missing[0].severity, DoctorSeverity::Info);
+    assert!(!missing[0].severity.is_blocking());
+
+    // Any other "config file" failure - unreadable, permission denied,
+    // wrong type - must still be a real Error.
+    let broken = findings_from_doctor_report(&doctor_report(vec![check(
+        "config file",
+        DoctorStatus::Fail,
+        "cannot be read: permission denied",
+    )]));
+    assert_eq!(broken.len(), 1);
+    assert_eq!(broken[0].severity, DoctorSeverity::Error);
+
+    // A broken symlink at the config path (the exact wording
+    // `run_doctor_with_mount_root_creation` now emits for anything
+    // `PathInspection::is_confirmed_missing` does not confirm as truly
+    // absent) must never be mistaken for an ordinary first run either.
+    let ambiguous = findings_from_doctor_report(&doctor_report(vec![check(
+        "config file",
+        DoctorStatus::Fail,
+        "/home/tester/.config/archivefs/config.toml cannot be inspected safely: the path is not a readable file",
+    )]));
+    assert_eq!(ambiguous.len(), 1);
+    assert_eq!(ambiguous[0].severity, DoctorSeverity::Error);
+}
+
 // --- 9, 10, 11. Duplicate suppression ------------------------------------
 
 #[test]
@@ -684,6 +720,66 @@ fn a_failed_adapter_input_becomes_a_finding_and_never_panics() {
     );
 }
 
+#[test]
+fn a_failed_adapter_input_caused_by_a_missing_config_is_info_not_error() {
+    // On a fresh install every gatherer that depends on reading the config
+    // file fails the same way - the file genuinely does not exist yet.
+    // That must read as "not configured", not as Doctor itself being
+    // broken. `setup` must be supplied and confirm `config_missing` -
+    // that authoritative flag, not the gatherer's own OS error text, is
+    // what gates this softening (see
+    // `a_failed_adapter_input_caused_by_an_ambiguous_config_path_stays_error`).
+    let mut inputs = DoctorScanInputs::none_loaded();
+    let mut setup = setup_diagnostics(Vec::new());
+    setup.config_missing = true;
+    inputs.setup = Gathered::Ready(&setup);
+    inputs.source_health = Gathered::Failed(
+        "source folders could not be listed: /home/tester/.config/archivefs/config.toml: No such file or directory (os error 2)"
+            .to_string(),
+    );
+
+    let scan = run_doctor_scan(&inputs);
+    let failure = scan
+        .finding("doctor.adapter_failed.source_health")
+        .expect("the failure is reported as a finding");
+    assert_eq!(failure.severity, DoctorSeverity::Info);
+    assert!(!failure.severity.is_blocking());
+}
+
+#[test]
+fn a_failed_adapter_input_caused_by_an_ambiguous_config_path_stays_error() {
+    // A broken symlink (or any other ambiguous state `PathInspection`
+    // cannot confirm as truly absent) produces the exact same OS wording
+    // as a genuinely missing file - "No such file or directory" - from a
+    // plain `fs::read_to_string`. Without gating on the authoritative
+    // `config_missing` flag, this would be softened to Info even though
+    // it is a real, unresolved problem - and would contradict
+    // `SetupDiagnostics`'s own check for the same path, which stays Error
+    // for exactly this ambiguous case.
+    let mut inputs = DoctorScanInputs::none_loaded();
+    let setup = setup_diagnostics(Vec::new());
+    inputs.setup = Gathered::Ready(&setup);
+    inputs.source_health = Gathered::Failed(
+        "source folders could not be listed: /home/tester/.config/archivefs/config.toml: No such file or directory (os error 2)"
+            .to_string(),
+    );
+    inputs.mount_root_safety = Gathered::Failed(
+        "configuration could not be read: /home/tester/.config/archivefs/config.toml: No such file or directory (os error 2)"
+            .to_string(),
+    );
+
+    let scan = run_doctor_scan(&inputs);
+    for id in [
+        "doctor.adapter_failed.source_health",
+        "doctor.adapter_failed.destination_safety",
+    ] {
+        let failure = scan
+            .finding(id)
+            .unwrap_or_else(|| panic!("{id} is reported as a finding"));
+        assert_eq!(failure.severity, DoctorSeverity::Error, "{id}");
+    }
+}
+
 // --- 13-17. Adapter correctness -----------------------------------------
 
 #[test]
@@ -742,9 +838,23 @@ fn database_diagnostics_map_to_stable_ids_and_are_escalated_conservatively() {
 }
 
 #[test]
+fn missing_database_is_deliberately_downgraded_to_info() {
+    // The one deliberate exception to `no_database_error_is_ever_downgraded_
+    // below_error` below: a catalogue database that has never been created
+    // is the ordinary state of a fresh install that has never been
+    // scanned, not evidence of damage.
+    let report = database_report(vec![database_diagnostic(
+        DatabaseDiagnosticCode::MissingDatabase,
+        DatabaseDiagnosticSeverity::Error,
+    )]);
+    let findings = findings_from_database_report(&report);
+    assert_eq!(findings[0].severity, DoctorSeverity::Info);
+    assert!(!findings[0].severity.is_blocking());
+}
+
+#[test]
 fn no_database_error_is_ever_downgraded_below_error() {
     for code in [
-        DatabaseDiagnosticCode::MissingDatabase,
         DatabaseDiagnosticCode::PermissionDenied,
         DatabaseDiagnosticCode::DatabaseLocked,
         DatabaseDiagnosticCode::DatabaseBusy,
@@ -931,6 +1041,25 @@ fn a_config_path_error_from_setup_diagnostics_becomes_a_finding() {
     assert_eq!(findings.len(), 1);
     assert_eq!(findings[0].id, "config.path_unresolvable");
     assert_eq!(findings[0].severity, DoctorSeverity::Error);
+}
+
+#[test]
+fn not_configured_setup_checks_become_info_severity_findings_not_errors() {
+    // A first-run "nothing configured yet" check must reach Doctor as
+    // Info, never Error/Critical - it is expected, not a fault.
+    let mut setup = setup_diagnostics(vec![setup_check(
+        "Config file exists",
+        SetupDiagnosticStatus::NotConfigured,
+        "Configuration file is missing: ~/.config/archivefs/config.toml",
+        "ArchiveFS needs this file to locate archives and mounts.",
+        "Create a starter config or create this file manually.",
+    )]);
+    setup.config_missing = true;
+    let findings = findings_from_setup_diagnostics(&setup);
+
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].severity, DoctorSeverity::Info);
+    assert!(!findings[0].severity.is_blocking());
 }
 
 #[cfg(unix)]

@@ -336,6 +336,16 @@ pub enum SetupDiagnosticStatus {
     /// [`run_setup_diagnostics_read_only`] for mount-root writability,
     /// which can only be established by writing.
     NotChecked,
+    /// This check cannot pass yet only because no configuration file
+    /// exists at all - a brand-new install, not a broken one. Distinct
+    /// from [`Self::Error`], which means something that *should* work is
+    /// actually broken (malformed config, a path that should exist but
+    /// does not, a missing tool). A config that is merely absent is never
+    /// downgraded to this status until the read has confirmed it is
+    /// genuinely missing (see `config_missing` in
+    /// `run_setup_diagnostics_with_checks`) rather than merely unreadable,
+    /// so a real permission problem still reports [`Self::Error`].
+    NotConfigured,
     Warning,
     Error,
 }
@@ -529,7 +539,30 @@ fn run_doctor_with_mount_root_creation(
     if config_path.exists() {
         report.pass("config file", format!("found {}", config_path.display()));
     } else {
-        report.fail("config file", format!("missing {}", config_path.display()));
+        // The exact wording here matters beyond this report: Doctor's
+        // Finding adapter (`diagnostics::mod::doctor_check_severity`)
+        // recognises literal "missing {path}" text on this check as a
+        // confirmed-absent config and reports it as Info rather than
+        // Error. Reusing `inspect_path`/`is_confirmed_missing` - the same
+        // primitives `run_setup_diagnostics_with_checks` uses for its own
+        // `config_missing` - keeps that wording reserved for genuine
+        // absence, so a broken symlink or other ambiguous path state
+        // (which `.exists()` alone cannot tell apart from "not there at
+        // all") is never softened to Info here while `SetupDiagnostics`
+        // correctly still reports it as Error.
+        let state = inspect_path(&config_path);
+        let detail = if state.is_confirmed_missing() {
+            format!("missing {}", config_path.display())
+        } else {
+            format!(
+                "{} cannot be inspected safely: {}",
+                config_path.display(),
+                state
+                    .error_detail()
+                    .unwrap_or("the path is not a readable file")
+            )
+        };
+        report.fail("config file", detail);
         return report;
     }
 
@@ -1170,6 +1203,24 @@ fn run_setup_diagnostics_with_checks(
         "Mount and unmount controls are unsafe or unusable until these checks pass.",
         "Resolve mount-root and tool errors above.",
     );
+    // A genuinely missing config file (first run - never one that exists
+    // but is malformed, unreadable, or references paths that do not exist)
+    // makes every downstream check fail for the same single reason: there
+    // is nothing configured yet. Presenting each of those as its own red
+    // "Error" would greet a brand-new install with a wall of failures for
+    // a state that is not a failure at all. System-tool checks are left
+    // alone: whether ratarmount or an unmount tool is installed is a fact
+    // about the machine, independent of whether a config file exists.
+    if config_missing {
+        for check in &mut checks {
+            if check.status == SetupDiagnosticStatus::Error
+                && check.name != "ratarmount is available"
+                && check.name != "fusermount3 or umount is available"
+            {
+                check.status = SetupDiagnosticStatus::NotConfigured;
+            }
+        }
+    }
     let identity = config_identity(&config_path, contents.as_deref());
     SetupDiagnostics {
         config_path: Some(config_path),
@@ -11089,6 +11140,36 @@ mod tests {
     }
 
     #[test]
+    fn doctor_reports_a_broken_symlink_config_path_as_ambiguous_not_confirmed_missing() {
+        // A broken symlink at the config path is not "nothing here" - the
+        // wording must differ from the confirmed-missing case so Doctor's
+        // Finding adapter never mistakes it for an ordinary first run.
+        let root = test_root("doctor_broken_symlink_config");
+        let config_path = root.join("config.toml");
+        std::os::unix::fs::symlink(root.join("nonexistent-target.toml"), &config_path).unwrap();
+
+        let report = run_doctor(&config_path);
+
+        assert!(!report.is_ready());
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.name == "config file")
+            .expect("a config file check is reported");
+        assert_eq!(check.status, DoctorStatus::Fail);
+        assert!(
+            !check.detail.starts_with("missing "),
+            "a broken symlink must not be worded as confirmed-missing: {}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("cannot be inspected safely"),
+            "{}",
+            check.detail
+        );
+    }
+
+    #[test]
     fn doctor_counts_archives_platforms_and_pending_mounts() {
         let root = test_root("doctor_counts");
         let source_root = root.join("roms");
@@ -12073,6 +12154,75 @@ mod tests {
         assert!(contents.contains("ratarmount_bin"));
         assert!(create_starter_config(&path).is_err());
         assert_eq!(fs::read_to_string(path).unwrap(), contents);
+    }
+
+    #[test]
+    fn setup_diagnostics_treats_genuinely_missing_config_as_not_configured_not_error() {
+        // A brand-new install with no config file at all: nothing is
+        // broken, so nothing downstream of the missing file should read as
+        // a red "Error" - only ratarmount/unmount tool availability (a fact
+        // about the machine, not the config) may still be genuinely Error.
+        let root = test_root("setup_diagnostics_first_run");
+        let config_path = root.join("config.toml");
+
+        let report = run_setup_diagnostics_with_command_check(&config_path, |_| true);
+
+        assert!(report.config_missing);
+        assert!(!report.ready_for_scanning);
+        assert!(!report.ready_for_actions);
+        assert!(
+            report
+                .checks
+                .iter()
+                .all(|check| check.status != SetupDiagnosticStatus::Error),
+            "expected no Error-status checks for a genuinely missing config, got: {:#?}",
+            report.checks
+        );
+        assert!(report.checks.iter().any(|check| {
+            check.name == "Config file exists"
+                && check.status == SetupDiagnosticStatus::NotConfigured
+        }));
+        assert!(report.checks.iter().any(|check| {
+            check.name == "ArchiveFS is ready for scanning"
+                && check.status == SetupDiagnosticStatus::NotConfigured
+        }));
+    }
+
+    #[test]
+    fn setup_diagnostics_missing_config_still_flags_genuinely_absent_tools_as_error() {
+        // The softening for a missing config must not swallow a real,
+        // independent environment problem: if ratarmount or an unmount
+        // tool is genuinely absent, that stays Error even on first run.
+        let root = test_root("setup_diagnostics_first_run_no_tools");
+        let config_path = root.join("config.toml");
+
+        let report = run_setup_diagnostics_with_command_check(&config_path, |_| false);
+
+        assert!(report.config_missing);
+        assert!(report.checks.iter().any(|check| {
+            check.name == "ratarmount is available" && check.status == SetupDiagnosticStatus::Error
+        }));
+        assert!(report.checks.iter().any(|check| {
+            check.name == "fusermount3 or umount is available"
+                && check.status == SetupDiagnosticStatus::Error
+        }));
+    }
+
+    #[test]
+    fn setup_diagnostics_malformed_existing_config_remains_an_error() {
+        // Distinct from a missing file: an existing-but-malformed config is
+        // a real problem and must never be softened to NotConfigured.
+        let root = test_root("setup_diagnostics_malformed");
+        let config_path = root.join("config.toml");
+        fs::write(&config_path, "this is not valid toml [[[").unwrap();
+
+        let report = run_setup_diagnostics_with_command_check(&config_path, |_| true);
+
+        assert!(!report.config_missing);
+        assert!(report.checks.iter().any(|check| {
+            check.name == "Config parses successfully"
+                && check.status == SetupDiagnosticStatus::Error
+        }));
     }
 
     #[test]

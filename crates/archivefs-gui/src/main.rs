@@ -3488,6 +3488,14 @@ struct ArchiveFsApp {
     history: OperationHistory,
     cleanup_after_unmount: bool,
     diagnostics: DiagnosticsState,
+    /// Set once this session has seen a diagnostics report where the
+    /// config file was confirmed present and readable. Lets the Setup
+    /// screen tell a genuine first run apart from a config that
+    /// disappeared after previously being found - the latter may mean
+    /// something was deleted, unmounted, or is otherwise a real problem,
+    /// and must never be presented with the same reassuring "you have not
+    /// configured this yet" framing as a fresh install.
+    config_previously_confirmed: bool,
     /// Doctor Stage 1A: the current read-only diagnostic scan. Entirely
     /// separate from `self.state`/`self.refresh`, so running Doctor never
     /// reloads the application.
@@ -3852,6 +3860,7 @@ impl ArchiveFsApp {
             history,
             cleanup_after_unmount: false,
             diagnostics: start_diagnostics(context.clone(), generation),
+            config_previously_confirmed: false,
             doctor_scan: DoctorScanState::NotRun,
             doctor_scan_generation: RefreshGeneration::INITIAL,
             doctor_selected_finding: None,
@@ -4397,6 +4406,9 @@ impl ArchiveFsApp {
                         "Diagnostics completed: setup needs attention."
                     },
                 ));
+                if !report.config_missing && report.config_path_error.is_none() {
+                    self.config_previously_confirmed = true;
+                }
                 self.diagnostics = DiagnosticsState::Ready { generation, report };
             }
             Some(PollResult::Disconnected(generation)) if generation == self.refresh_generation => {
@@ -12983,6 +12995,7 @@ impl ArchiveFsApp {
                                 self.feedback.as_ref(),
                                 self.refresh_error.as_deref(),
                                 self.snapshot_stale && matches!(self.state, LoadState::Ready(_)),
+                                self.config_previously_confirmed,
                             );
                         }
                         ToolsOverlay::PlatformAliases => {
@@ -15175,6 +15188,16 @@ fn show_unmount_all_result(ui: &mut egui::Ui, result: &UnmountAllResult) {
     });
 }
 
+/// Whether a currently-missing config should be framed as an ordinary
+/// first run rather than a possible problem: only when this session has
+/// never once seen the config file present and readable. Kept as its own
+/// pure predicate (mirroring `library_table_message`/
+/// `gamer_empty_list_guidance`) so the distinction is directly testable
+/// without an `egui::Ui`.
+fn missing_config_is_first_run(config_previously_confirmed: bool) -> bool {
+    !config_previously_confirmed
+}
+
 fn show_setup_diagnostics(
     ui: &mut egui::Ui,
     state: &DiagnosticsState,
@@ -15182,6 +15205,7 @@ fn show_setup_diagnostics(
     feedback: Option<&ActionFeedback>,
     refresh_error: Option<&str>,
     has_last_snapshot: bool,
+    config_previously_confirmed: bool,
 ) -> Option<DiagnosticsUiAction> {
     let mut action = None;
     ui.heading("Setup / Diagnostics");
@@ -15222,6 +15246,40 @@ fn show_setup_diagnostics(
         ui.add_enabled(false, egui::Button::new("Continue to ArchiveFS"));
         return None;
     };
+    if report.config_missing && report.config_path_error.is_none() {
+        if missing_config_is_first_run(config_previously_confirmed) {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.strong("Welcome to ArchiveFS");
+                ui.label(
+                    "ArchiveFS is not configured yet - that is expected on a fresh install, not \
+                     an error. Select Create Starter Config below to begin, then add a source \
+                     folder on the Sources page.",
+                );
+                ui.label(
+                    "DAT Sources and Cheat Sources live on their own pages and start empty; \
+                     both are optional. RomM is optional too. Audits are always read-only: \
+                     ArchiveFS will not rename, move or delete any ROM without a later, \
+                     explicit, reviewed action.",
+                );
+            });
+        } else {
+            // Not a first run: this session already saw the config file
+            // present and readable, and it is now gone. That can be an
+            // intentional removal, but it can just as easily mean a real
+            // problem (deleted by accident, an unmounted drive, a bug) -
+            // so this is never dressed up as an ordinary welcome.
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.colored_label(theme::WARNING, "Configuration file is no longer found");
+                ui.label(
+                    "ArchiveFS found your configuration earlier in this session, and it is no \
+                     longer present. If you did not remove it intentionally, check whether it \
+                     was deleted, moved, or is on a drive that is no longer mounted, before \
+                     creating a new one below.",
+                );
+            });
+        }
+        ui.add_space(8.0);
+    }
     ui.horizontal_wrapped(|ui| {
         ui.strong("Config path:");
         match &report.config_path {
@@ -15305,6 +15363,8 @@ fn show_setup_diagnostics(
                     SetupDiagnosticStatus::Ready => ("Ready", egui::Color32::from_rgb(70, 170, 90)),
                     // Neither a pass nor a problem: the check did not run.
                     SetupDiagnosticStatus::NotChecked => ("Not checked", theme::muted(ui)),
+                    // Expected on a fresh install - informational, not red.
+                    SetupDiagnosticStatus::NotConfigured => ("Not configured", theme::muted(ui)),
                     SetupDiagnosticStatus::Warning => {
                         ("Warning", egui::Color32::from_rgb(220, 170, 40))
                     }
@@ -50744,6 +50804,7 @@ $Instant Growth [Nayr]\n";
                 generation: RefreshGeneration::INITIAL,
                 report: setup_report(true, true),
             },
+            config_previously_confirmed: true,
             setup_action: None,
             refresh_error: None,
             snapshot_stale: false,
@@ -54151,6 +54212,15 @@ $Instant Growth [Nayr]\n";
         report.config_path_error = None;
         report.config_missing = true;
         assert!(starter_config_available(&report));
+    }
+
+    #[test]
+    fn missing_config_reads_as_first_run_only_when_never_previously_confirmed() {
+        // A genuine fresh install: nothing has been seen yet this session.
+        assert!(missing_config_is_first_run(false));
+        // The config was found present and readable earlier this session,
+        // and is now gone - this must never read as an ordinary first run.
+        assert!(!missing_config_is_first_run(true));
     }
 
     #[test]

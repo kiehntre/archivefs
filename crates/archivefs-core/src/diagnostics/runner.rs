@@ -351,6 +351,22 @@ pub fn run_doctor_scan(inputs: &DoctorScanInputs<'_>) -> DoctorScan {
     let mut findings = Vec::new();
     let mut coverage = Vec::new();
 
+    // The authoritative answer to "is the config file genuinely, confirmed
+    // absent" - computed once, the same way `SetupDiagnostics.config_missing`
+    // already computes it (`PathInspection::is_confirmed_missing`), rather
+    // than re-derived per gatherer from OS error text. That text alone
+    // cannot make this distinction: a broken symlink at the config path
+    // produces the identical "No such file or directory" from a plain
+    // `fs::read_to_string` that a genuinely missing file does. Using this
+    // flag keeps `adapter_failure_finding` from softening a gatherer that
+    // failed to read an ambiguous (possibly broken) config path, while
+    // `SetupDiagnostics`'s own check for that same path correctly stays an
+    // Error - see `a_failed_adapter_input_caused_by_an_ambiguous_config_path_stays_error`.
+    let config_confirmed_missing = inputs
+        .setup
+        .as_ready()
+        .is_some_and(|report| report.config_missing);
+
     // One closure per subsystem so the "collect, or record why not" shape
     // is identical everywhere and cannot drift between subsystems.
     macro_rules! subsystem {
@@ -366,6 +382,7 @@ pub fn run_doctor_scan(inputs: &DoctorScanInputs<'_>) -> DoctorScan {
                     $category,
                     $subsystem,
                     reason.clone(),
+                    config_confirmed_missing,
                 )),
                 Gathered::NotLoaded(_) => {}
             }
@@ -494,6 +511,39 @@ pub fn run_doctor_scan(inputs: &DoctorScanInputs<'_>) -> DoctorScan {
     }
 }
 
+/// Whether a gatherer's failure reason describes an input that is simply
+/// absent (a config file or catalogue database that has never been
+/// created) rather than one that exists but is broken.
+///
+/// Two different kinds of evidence are used, deliberately not interchanged:
+///
+/// - Gatherers that fail because *the config file itself* could not be read
+///   (`"configuration could not be read"` / `"source folders could not be
+///   listed"`, from `Config::load_default`/`list_source_folder_views_default`
+///   failing) are gated on `config_confirmed_missing`, the authoritative
+///   answer `SetupDiagnostics` already computed. Their own OS error text
+///   cannot make this distinction itself: a broken symlink at the config
+///   path produces the identical "No such file or directory" that a
+///   genuinely missing file does, and softening on that text alone would
+///   contradict `SetupDiagnostics`'s own, correctly-Error verdict for the
+///   same ambiguous path.
+/// - Every other gatherer failure (a missing catalogue database, in
+///   practice) is judged on its own wording, matching the database layer's
+///   "does not exist" phrasing - `database_severity`'s deliberate exception
+///   for `DatabaseDiagnosticCode::MissingDatabase` establishes that this
+///   specific absence is always expected, independent of config state.
+fn failure_reason_is_expected_first_run_absence(
+    reason: &str,
+    config_confirmed_missing: bool,
+) -> bool {
+    let describes_a_missing_config_read = reason.starts_with("configuration could not be read")
+        || reason.starts_with("source folders could not be listed");
+    if describes_a_missing_config_read {
+        return config_confirmed_missing;
+    }
+    reason.contains("No such file or directory") || reason.contains("does not exist")
+}
+
 /// One finding per failed subsystem.
 ///
 /// The id is namespaced by subsystem (`doctor.adapter_failed.archive_health`
@@ -504,12 +554,19 @@ fn adapter_failure_finding(
     category: DoctorCategory,
     subsystem: DoctorSubsystem,
     reason: String,
+    config_confirmed_missing: bool,
 ) -> Finding {
+    let severity =
+        if failure_reason_is_expected_first_run_absence(&reason, config_confirmed_missing) {
+            DoctorSeverity::Info
+        } else {
+            DoctorSeverity::Error
+        };
     let mut finding = Finding::new(
         format!("doctor.adapter_failed.{}", subsystem.slug()),
         DoctorCategory::Doctor,
         DoctorSubsystem::DoctorRunner,
-        DoctorSeverity::Error,
+        severity,
         format!("The {} check could not run", subsystem.label()),
         format!(
             "This scan does not cover {} because its input could not be collected.",
