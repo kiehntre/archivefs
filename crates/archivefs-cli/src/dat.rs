@@ -10,11 +10,11 @@ use archivefs_core::dat::audit::{KnownFileEvidence, audit_files};
 use archivefs_core::dat::index::DatIndex;
 use archivefs_core::dat::limits::DatLimits;
 use archivefs_core::dat::model::ParsedDat;
-use archivefs_core::dat::parser::{ParseOutcome, ParseWarning};
+use archivefs_core::dat::parser::{DiagnosticSeverity, ParseOutcome, ParseWarning};
 use archivefs_core::dat::parsers::parse_dat_file;
 use serde::Serialize;
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct InspectOutput {
     file_path: String,
     format: &'static str,
@@ -25,8 +25,15 @@ struct InspectOutput {
     author: Option<String>,
     entry_count: usize,
     rom_count: usize,
+    /// Warning-severity diagnostics only. A parser note is never listed here -
+    /// see `notes`.
     warnings: Vec<ParseWarning>,
+    /// The same diagnostics as `warnings`, as their `Display` strings.
     warning_summary: Vec<String>,
+    /// Note-severity diagnostics: expected parser behaviour, kept out of
+    /// `warnings` so a JSON consumer never mistakes one for something to
+    /// investigate.
+    notes: Vec<ParseWarning>,
 }
 
 #[derive(Serialize)]
@@ -55,9 +62,9 @@ fn partition_diagnostics(
     let mut notes = Vec::new();
     for warning in warnings {
         match warning.severity() {
-            archivefs_core::dat::parser::DiagnosticSeverity::Error => errors.push(warning),
-            archivefs_core::dat::parser::DiagnosticSeverity::Warning => real_warnings.push(warning),
-            archivefs_core::dat::parser::DiagnosticSeverity::Note => notes.push(warning),
+            DiagnosticSeverity::Error => errors.push(warning),
+            DiagnosticSeverity::Warning => real_warnings.push(warning),
+            DiagnosticSeverity::Note => notes.push(warning),
         }
     }
     (errors, real_warnings, notes)
@@ -232,25 +239,36 @@ fn run_inspect(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
     };
 
     if json {
-        let output = InspectOutput {
-            file_path: dat.source.file_path.clone(),
-            format: dat.source.format.label(),
-            ecosystem: dat.source.ecosystem.label(),
-            name: dat.source.name.clone(),
-            description: dat.source.description.clone(),
-            version: dat.source.version.clone(),
-            author: dat.source.author.clone(),
-            entry_count: dat.source.entry_count,
-            rom_count: dat.source.rom_count,
-            warning_summary: dat.source.parse_warnings.clone(),
-            warnings,
-        };
+        let output = inspect_json(&dat, &warnings);
         println!("{}", serde_json::to_string_pretty(&output)?);
         return Ok(());
     }
 
     print!("{}", inspect_text(&dat, &warnings));
     Ok(())
+}
+
+/// Builds the `dat inspect --json` payload. Partitioned by severity so a
+/// parser note (e.g. the DOCTYPE acceptance note) can never land in
+/// `warnings`/`warning_summary`, matching what the text path already does
+/// and how `validate --json` keeps Error diagnostics out of its own
+/// `warnings`.
+fn inspect_json(dat: &ParsedDat, warnings: &[ParseWarning]) -> InspectOutput {
+    let (_errors, real_warnings, notes) = partition_diagnostics(warnings);
+    InspectOutput {
+        file_path: dat.source.file_path.clone(),
+        format: dat.source.format.label(),
+        ecosystem: dat.source.ecosystem.label(),
+        name: dat.source.name.clone(),
+        description: dat.source.description.clone(),
+        version: dat.source.version.clone(),
+        author: dat.source.author.clone(),
+        entry_count: dat.source.entry_count,
+        rom_count: dat.source.rom_count,
+        warning_summary: real_warnings.iter().map(|w| w.to_string()).collect(),
+        warnings: real_warnings.into_iter().cloned().collect(),
+        notes: notes.into_iter().cloned().collect(),
+    }
 }
 
 fn run_validate(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
@@ -306,9 +324,7 @@ fn run_validate(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>>
         all_errors.extend(diagnostic_errors.iter().map(ToString::to_string));
         let warnings = warnings
             .iter()
-            .filter(|warning| {
-                warning.severity() != archivefs_core::dat::parser::DiagnosticSeverity::Error
-            })
+            .filter(|warning| warning.severity() != DiagnosticSeverity::Error)
             .cloned()
             .collect::<Vec<_>>();
         let output = ValidateOutput {
@@ -698,6 +714,136 @@ mod tests {
         assert!(text.contains("Warnings:"), "{text}");
         assert!(text.contains("not-a-checksum"), "{text}");
         assert!(!text.contains("Parser notes:"), "{text}");
+    }
+
+    #[test]
+    fn inspect_json_note_only_dat_keeps_the_note_out_of_warnings() {
+        // Regression: `dat inspect --json` must not report a parser note as a
+        // warning. A note-only TOSEC/No-Intro-shaped DAT (DOCTYPE only) must
+        // produce empty `warnings`/`warning_summary` and the note must appear
+        // only in `notes`, with its severity and code intact.
+        let (_dir, path) = write_temp_file("tosec.dat", &logiqx_with_doctype_and_entries(3));
+        let outcome = parse_dat_file(&path, DatLimits::default()).expect("the TOSEC DAT parses");
+
+        let output = inspect_json(&outcome.dat, &outcome.warnings);
+        assert!(
+            output.warnings.is_empty(),
+            "a parser note must not appear in warnings: {:?}",
+            output.warnings
+        );
+        assert!(
+            output.warning_summary.is_empty(),
+            "a parser note must not appear in warning_summary: {:?}",
+            output.warning_summary
+        );
+        assert_eq!(output.notes.len(), 1, "{:?}", output.notes);
+        assert_eq!(output.notes[0].severity, DiagnosticSeverity::Note);
+        assert_eq!(output.notes[0].code, "doctype_ignored");
+        assert!(output.notes[0].message.contains("DOCTYPE"), "{output:?}");
+    }
+
+    #[test]
+    fn inspect_json_real_warning_stays_in_warnings() {
+        // A genuine warning must still show up in both `warnings` and
+        // `warning_summary`, exactly as before this fix.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<datafile><game name="G"><rom name="a.bin" size="4" crc="not-a-checksum"/></game></datafile>"#;
+        let (_dir, path) = write_temp_file("warn.dat", xml);
+        let outcome = parse_dat_file(&path, DatLimits::default()).expect("parses with a warning");
+
+        let output = inspect_json(&outcome.dat, &outcome.warnings);
+        assert_eq!(output.warnings.len(), 1, "{:?}", output.warnings);
+        assert_eq!(output.warnings[0].severity, DiagnosticSeverity::Warning);
+        assert_eq!(
+            output.warning_summary.len(),
+            1,
+            "{:?}",
+            output.warning_summary
+        );
+        assert!(
+            output.warning_summary[0].contains("not-a-checksum"),
+            "{:?}",
+            output.warning_summary
+        );
+        assert!(output.notes.is_empty(), "{:?}", output.notes);
+    }
+
+    #[test]
+    fn inspect_json_mixed_note_and_warning_stay_separated() {
+        // A DAT that produces both a DOCTYPE note and a genuine warning must
+        // keep them apart: the note never dilutes or merges with the warning
+        // list in either direction.
+        let mut xml = String::from(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <!DOCTYPE datafile PUBLIC \"-//Logiqx//DTD ROM Management Datafile//EN\" \
+             \"http://www.logiqx.com/Dats/datafile.dtd\">\n\
+             <datafile><header><name>Mixed</name></header>\n",
+        );
+        xml.push_str(
+            "<game name=\"G\"><rom name=\"a.bin\" size=\"4\" crc=\"not-a-checksum\"/></game>\n",
+        );
+        xml.push_str("</datafile>\n");
+        let (_dir, path) = write_temp_file("mixed.dat", &xml);
+        let outcome = parse_dat_file(&path, DatLimits::default()).expect("parses");
+
+        let output = inspect_json(&outcome.dat, &outcome.warnings);
+        assert_eq!(output.warnings.len(), 1, "{:?}", output.warnings);
+        assert_eq!(output.warnings[0].severity, DiagnosticSeverity::Warning);
+        assert_eq!(
+            output.warning_summary.len(),
+            1,
+            "{:?}",
+            output.warning_summary
+        );
+        assert_eq!(output.notes.len(), 1, "{:?}", output.notes);
+        assert_eq!(output.notes[0].severity, DiagnosticSeverity::Note);
+        assert_eq!(output.notes[0].code, "doctype_ignored");
+    }
+
+    #[test]
+    fn inspect_json_error_diagnostics_never_land_in_warnings_or_notes() {
+        // No current parser actually emits an Error-severity ParseWarning, but
+        // the contract must hold regardless: an Error-severity diagnostic
+        // must never be misclassified into `warnings` or `notes`.
+        let (_dir, path) = write_temp_file("tosec.dat", &logiqx_with_doctype_and_entries(1));
+        let outcome = parse_dat_file(&path, DatLimits::default()).expect("parses");
+
+        let mut warnings = outcome.warnings.clone();
+        warnings.push(ParseWarning {
+            byte_offset: None,
+            line: None,
+            column: None,
+            context: String::new(),
+            message: "synthetic error diagnostic".to_string(),
+            severity: DiagnosticSeverity::Error,
+            code: "synthetic_error",
+        });
+
+        let output = inspect_json(&outcome.dat, &warnings);
+        assert!(
+            output
+                .warnings
+                .iter()
+                .all(|w| w.severity == DiagnosticSeverity::Warning),
+            "{:?}",
+            output.warnings
+        );
+        assert!(
+            output
+                .notes
+                .iter()
+                .all(|w| w.severity == DiagnosticSeverity::Note),
+            "{:?}",
+            output.notes
+        );
+        assert!(
+            !output
+                .warning_summary
+                .iter()
+                .any(|line| line.contains("synthetic error diagnostic")),
+            "{:?}",
+            output.warning_summary
+        );
     }
 
     #[test]
