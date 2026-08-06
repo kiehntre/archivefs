@@ -556,6 +556,18 @@ fn a_confirmed_missing_config_file_from_doctor_report_is_info_not_error() {
     )]));
     assert_eq!(broken.len(), 1);
     assert_eq!(broken[0].severity, DoctorSeverity::Error);
+
+    // A broken symlink at the config path (the exact wording
+    // `run_doctor_with_mount_root_creation` now emits for anything
+    // `PathInspection::is_confirmed_missing` does not confirm as truly
+    // absent) must never be mistaken for an ordinary first run either.
+    let ambiguous = findings_from_doctor_report(&doctor_report(vec![check(
+        "config file",
+        DoctorStatus::Fail,
+        "/home/tester/.config/archivefs/config.toml cannot be inspected safely: the path is not a readable file",
+    )]));
+    assert_eq!(ambiguous.len(), 1);
+    assert_eq!(ambiguous[0].severity, DoctorSeverity::Error);
 }
 
 // --- 9, 10, 11. Duplicate suppression ------------------------------------
@@ -713,8 +725,14 @@ fn a_failed_adapter_input_caused_by_a_missing_config_is_info_not_error() {
     // On a fresh install every gatherer that depends on reading the config
     // file fails the same way - the file genuinely does not exist yet.
     // That must read as "not configured", not as Doctor itself being
-    // broken.
+    // broken. `setup` must be supplied and confirm `config_missing` -
+    // that authoritative flag, not the gatherer's own OS error text, is
+    // what gates this softening (see
+    // `a_failed_adapter_input_caused_by_an_ambiguous_config_path_stays_error`).
     let mut inputs = DoctorScanInputs::none_loaded();
+    let mut setup = setup_diagnostics(Vec::new());
+    setup.config_missing = true;
+    inputs.setup = Gathered::Ready(&setup);
     inputs.source_health = Gathered::Failed(
         "source folders could not be listed: /home/tester/.config/archivefs/config.toml: No such file or directory (os error 2)"
             .to_string(),
@@ -726,6 +744,40 @@ fn a_failed_adapter_input_caused_by_a_missing_config_is_info_not_error() {
         .expect("the failure is reported as a finding");
     assert_eq!(failure.severity, DoctorSeverity::Info);
     assert!(!failure.severity.is_blocking());
+}
+
+#[test]
+fn a_failed_adapter_input_caused_by_an_ambiguous_config_path_stays_error() {
+    // A broken symlink (or any other ambiguous state `PathInspection`
+    // cannot confirm as truly absent) produces the exact same OS wording
+    // as a genuinely missing file - "No such file or directory" - from a
+    // plain `fs::read_to_string`. Without gating on the authoritative
+    // `config_missing` flag, this would be softened to Info even though
+    // it is a real, unresolved problem - and would contradict
+    // `SetupDiagnostics`'s own check for the same path, which stays Error
+    // for exactly this ambiguous case.
+    let mut inputs = DoctorScanInputs::none_loaded();
+    let setup = setup_diagnostics(Vec::new());
+    inputs.setup = Gathered::Ready(&setup);
+    inputs.source_health = Gathered::Failed(
+        "source folders could not be listed: /home/tester/.config/archivefs/config.toml: No such file or directory (os error 2)"
+            .to_string(),
+    );
+    inputs.mount_root_safety = Gathered::Failed(
+        "configuration could not be read: /home/tester/.config/archivefs/config.toml: No such file or directory (os error 2)"
+            .to_string(),
+    );
+
+    let scan = run_doctor_scan(&inputs);
+    for id in [
+        "doctor.adapter_failed.source_health",
+        "doctor.adapter_failed.destination_safety",
+    ] {
+        let failure = scan
+            .finding(id)
+            .unwrap_or_else(|| panic!("{id} is reported as a finding"));
+        assert_eq!(failure.severity, DoctorSeverity::Error, "{id}");
+    }
 }
 
 // --- 13-17. Adapter correctness -----------------------------------------

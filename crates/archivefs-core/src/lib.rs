@@ -539,7 +539,30 @@ fn run_doctor_with_mount_root_creation(
     if config_path.exists() {
         report.pass("config file", format!("found {}", config_path.display()));
     } else {
-        report.fail("config file", format!("missing {}", config_path.display()));
+        // The exact wording here matters beyond this report: Doctor's
+        // Finding adapter (`diagnostics::mod::doctor_check_severity`)
+        // recognises literal "missing {path}" text on this check as a
+        // confirmed-absent config and reports it as Info rather than
+        // Error. Reusing `inspect_path`/`is_confirmed_missing` - the same
+        // primitives `run_setup_diagnostics_with_checks` uses for its own
+        // `config_missing` - keeps that wording reserved for genuine
+        // absence, so a broken symlink or other ambiguous path state
+        // (which `.exists()` alone cannot tell apart from "not there at
+        // all") is never softened to Info here while `SetupDiagnostics`
+        // correctly still reports it as Error.
+        let state = inspect_path(&config_path);
+        let detail = if state.is_confirmed_missing() {
+            format!("missing {}", config_path.display())
+        } else {
+            format!(
+                "{} cannot be inspected safely: {}",
+                config_path.display(),
+                state
+                    .error_detail()
+                    .unwrap_or("the path is not a readable file")
+            )
+        };
+        report.fail("config file", detail);
         return report;
     }
 
@@ -11113,6 +11136,36 @@ mod tests {
                 .checks
                 .iter()
                 .any(|check| check.name == "config file" && check.status == DoctorStatus::Fail)
+        );
+    }
+
+    #[test]
+    fn doctor_reports_a_broken_symlink_config_path_as_ambiguous_not_confirmed_missing() {
+        // A broken symlink at the config path is not "nothing here" - the
+        // wording must differ from the confirmed-missing case so Doctor's
+        // Finding adapter never mistakes it for an ordinary first run.
+        let root = test_root("doctor_broken_symlink_config");
+        let config_path = root.join("config.toml");
+        std::os::unix::fs::symlink(root.join("nonexistent-target.toml"), &config_path).unwrap();
+
+        let report = run_doctor(&config_path);
+
+        assert!(!report.is_ready());
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.name == "config file")
+            .expect("a config file check is reported");
+        assert_eq!(check.status, DoctorStatus::Fail);
+        assert!(
+            !check.detail.starts_with("missing "),
+            "a broken symlink must not be worded as confirmed-missing: {}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("cannot be inspected safely"),
+            "{}",
+            check.detail
         );
     }
 

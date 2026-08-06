@@ -85,7 +85,14 @@ one place and `Error` in another:
   literal "missing " detail text `complete_doctor_report`'s "config file"
   check emits for a confirmed-absent file, and reports `Info` for exactly
   that case — any other "config file" failure (unreadable, wrong type) stays
-  `Error`.
+  `Error`. `run_doctor_with_mount_root_creation` was tightened to only ever
+  emit that "missing " wording when `inspect_path` confirms the path is
+  genuinely absent (the same primitive `SetupDiagnostics` already used) —
+  before that fix, a broken symlink at the config path was indistinguishable
+  from true absence by `.exists()` alone, which would have let this adapter
+  soften a real, ambiguous problem to `Info` while `SetupDiagnostics`
+  correctly still reported it as `Error`, producing two contradictory
+  findings for the same fact.
 - `database_severity` treats `DatabaseDiagnosticCode::MissingDatabase` as
   `Info`: a catalogue database that has never been created is the ordinary
   state of a library that has never been scanned, not evidence of damage.
@@ -106,8 +113,8 @@ the softening never fires for a broken config, only a confirmed-absent one.
 ## 4. Welcome guidance
 
 The Setup/Diagnostics screen (`show_setup_diagnostics` in
-`crates/archivefs-gui/src/main.rs`) now shows a compact welcome panel above
-the check list whenever `config_missing` is true: ArchiveFS is unconfigured,
+`crates/archivefs-gui/src/main.rs`) now shows a compact panel above the
+check list whenever `config_missing` is true: ArchiveFS is unconfigured,
 where to begin (Create Starter Config, then a source folder on the Sources
 page), that DAT Sources and Cheat Sources live on their own pages and start
 empty, that RomM is optional, and that ArchiveFS never renames, moves, or
@@ -116,6 +123,31 @@ addition, not a new wizard: the existing gated Setup screen with its
 "Create Starter Config" / "Create Mount Root" / "Continue to ArchiveFS"
 actions already matches the "clear start page with direct navigation
 actions" shape the spec asks for.
+
+**A missing config is not always a first run.** `SetupDiagnostics` is a pure
+recomputation of current filesystem state with no memory of its own, so
+`config_missing` alone cannot tell a genuine fresh install apart from a
+config that was present and readable earlier in this session and has since
+disappeared - which can mean an intentional removal, but can just as easily
+mean a deleted file, an unmounted drive, or a bug. Showing the reassuring
+"Welcome to ArchiveFS, this is expected" copy in the latter case would
+actively mislead. `ArchiveFsApp` tracks this with one `bool`,
+`config_previously_confirmed`, set the first time `poll_diagnostics` sees a
+`Ready` report with `!config_missing`. `show_setup_diagnostics` (via the
+pure, directly-tested `missing_config_is_first_run` predicate) shows the
+welcome panel only when that flag is still false; once a config has been
+seen, a missing config instead shows a distinctly-worded, warning-toned
+panel asking the person to check whether it was deleted, moved, or is on an
+unmounted drive before creating a new one.
+
+This distinction is deliberately GUI-local, not part of core's Doctor
+severity model: `diagnostics/runner.rs` documents `run_doctor_scan` as a
+*pure* function of its gathered inputs (enforced by
+`the_same_inputs_always_produce_byte_identical_scans`), so severity itself
+must never depend on session history. Doctor's Info-severity finding for a
+missing config states a fact ("configuration file is missing") without any
+narrative claim that this is expected - the risk this section addresses is
+specific to the Setup screen's added prose, not to severity coloring.
 
 ## 5. Empty states already in place (unchanged by this branch)
 
