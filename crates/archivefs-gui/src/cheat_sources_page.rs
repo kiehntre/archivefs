@@ -276,6 +276,13 @@ impl CheatSourcesPageState {
         }
     }
 
+    /// How many sources are enabled on disk, right now - what Home shows
+    /// once this page has been visited this session. Reads `saved`, not
+    /// `draft`: an unsaved edit should not change what Home reports.
+    pub(crate) fn enabled_source_count(&self) -> usize {
+        self.saved.sorted_enabled().len()
+    }
+
     /// Whether the draft differs from what is on disk.
     ///
     /// Compared as serialised configuration rather than as registries,
