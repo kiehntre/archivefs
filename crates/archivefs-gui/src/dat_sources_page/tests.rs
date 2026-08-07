@@ -159,6 +159,16 @@ fn a_fresh_install_renders_an_empty_page_with_no_error() {
     assert!(view.audit.is_none());
     assert_eq!(view.save_state, DatSaveState::Idle);
     assert_eq!(view.config_path, fixture.config_path);
+    // The policy section is present and at safe defaults on a clean install.
+    assert_eq!(view.policy.scope, None);
+    assert_eq!(view.policy.scope_label, "All platforms");
+    assert!(view.policy.region_preferences.is_empty());
+    assert!(view.policy.language_preferences.is_empty());
+    assert_eq!(view.policy.revision_policy, RevisionPolicy::default());
+    assert_eq!(view.policy.clone_policy, ClonePolicy::default());
+    assert!(view.policy.effective.source_ordering.is_empty());
+    assert!(view.policy.problems.is_empty());
+    assert!(view.policy.editable);
 
     // And opening the page must not have created the file.
     assert!(

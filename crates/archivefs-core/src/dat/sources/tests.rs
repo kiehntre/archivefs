@@ -877,6 +877,8 @@ fn a_missing_or_empty_file_means_no_sources_yet() {
     let (registry, problems) = DatSourceRegistry::from_config(&absent);
     assert!(registry.is_empty());
     assert!(problems.is_empty());
+    // A clean install carries the safe default policy, not an invented one.
+    assert_eq!(registry.policy(), &DatPolicyConfig::default());
 }
 
 #[test]
