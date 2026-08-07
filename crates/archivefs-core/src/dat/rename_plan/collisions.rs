@@ -39,9 +39,7 @@ pub fn detect_target_collision(
             kind: CollisionKind::ExistingTarget,
             colliding_with: Some(proposed_basename.to_string()),
             colliding_is_symlink: false,
-            detail: format!(
-                "a file named '{proposed_basename}' already exists in the same folder"
-            ),
+            detail: format!("a file named '{proposed_basename}' already exists in the same folder"),
         });
     }
 
@@ -81,7 +79,9 @@ pub fn detect_proposal_collisions(proposals: &mut [RenameProposal]) {
         if proposal.state != ProposalState::Suggested {
             continue;
         }
-        let Some(proposed) = &proposal.proposed_basename else { continue };
+        let Some(proposed) = &proposal.proposed_basename else {
+            continue;
+        };
         let parent = proposal
             .source_path
             .parent()
@@ -116,7 +116,10 @@ pub fn detect_proposal_collisions(proposals: &mut [RenameProposal]) {
         let detail = match kind {
             CollisionKind::TwoProposalsSameTarget => format!(
                 "another proposal in the same folder also targets '{}'",
-                proposals[group[0]].proposed_basename.as_deref().unwrap_or_default()
+                proposals[group[0]]
+                    .proposed_basename
+                    .as_deref()
+                    .unwrap_or_default()
             ),
             _ => "another proposal in the same folder targets a name differing only by case"
                 .to_string(),
@@ -138,7 +141,7 @@ pub fn detect_proposal_collisions(proposals: &mut [RenameProposal]) {
 mod tests {
     use super::*;
     use crate::dat::rename_plan::model::SourceObjectKind;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
     fn proposal(path: &str, proposed: &str) -> RenameProposal {
         RenameProposal {
@@ -196,21 +199,14 @@ mod tests {
 
     #[test]
     fn renaming_case_only_is_not_a_self_collision() {
-        let found = detect_target_collision(
-            "game.bin",
-            "Game.bin",
-            &siblings(&["game.bin"]),
-        );
+        let found = detect_target_collision("game.bin", "Game.bin", &siblings(&["game.bin"]));
         assert!(found.is_none(), "{found:?}");
     }
 
     #[test]
     fn no_sibling_means_no_conflict() {
-        let found = detect_target_collision(
-            "game.bin",
-            "Game (Europe).bin",
-            &siblings(&["game.bin"]),
-        );
+        let found =
+            detect_target_collision("game.bin", "Game (Europe).bin", &siblings(&["game.bin"]));
         assert!(found.is_none());
     }
 
@@ -258,6 +254,10 @@ mod tests {
             proposal("/roms/b/game.bin", "Game.bin"),
         ];
         detect_proposal_collisions(&mut proposals);
-        assert!(proposals.iter().all(|p| p.state == ProposalState::Suggested));
+        assert!(
+            proposals
+                .iter()
+                .all(|p| p.state == ProposalState::Suggested)
+        );
     }
 }

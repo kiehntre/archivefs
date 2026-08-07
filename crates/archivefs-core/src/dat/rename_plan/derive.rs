@@ -112,9 +112,8 @@ fn sanitise(name: &str) -> (String, Vec<String>) {
     let mut notes: Vec<String> = Vec::new();
     for ch in name.chars() {
         if is_invalid_on_current_filesystem(ch) {
-            let note = format!(
-                "replaced {ch:?} (not allowed in a filename on this filesystem) with '_'"
-            );
+            let note =
+                format!("replaced {ch:?} (not allowed in a filename on this filesystem) with '_'");
             if !notes.contains(&note) {
                 notes.push(note);
             }
@@ -156,9 +155,17 @@ mod tests {
 
     #[test]
     fn path_separators_are_blocked_not_sanitised() {
-        for evil in ["../escape.bin", "dir/escape.bin", "dir\\escape.bin", "a\0b.bin"] {
+        for evil in [
+            "../escape.bin",
+            "dir/escape.bin",
+            "dir\\escape.bin",
+            "a\0b.bin",
+        ] {
             assert!(
-                matches!(derive_proposed_basename(evil, "x.bin"), DeriveOutcome::Blocked(_)),
+                matches!(
+                    derive_proposed_basename(evil, "x.bin"),
+                    DeriveOutcome::Blocked(_)
+                ),
                 "{evil:?} must be blocked"
             );
         }
@@ -168,7 +175,10 @@ mod tests {
     fn empty_and_reserved_names_are_blocked() {
         for bad in ["", "   ", ".", ".."] {
             assert!(
-                matches!(derive_proposed_basename(bad, "x.bin"), DeriveOutcome::Blocked(_)),
+                matches!(
+                    derive_proposed_basename(bad, "x.bin"),
+                    DeriveOutcome::Blocked(_)
+                ),
                 "{bad:?} must be blocked"
             );
         }
@@ -207,7 +217,10 @@ mod tests {
         };
         assert_eq!(derived.proposed_basename, "Game_Special.bin");
         assert!(
-            derived.sanitisation_notes.iter().any(|note| note.contains("replaced")),
+            derived
+                .sanitisation_notes
+                .iter()
+                .any(|note| note.contains("replaced")),
             "{:?}",
             derived.sanitisation_notes
         );

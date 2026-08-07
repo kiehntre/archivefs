@@ -471,8 +471,9 @@ impl DatSourcesPageView {
 // ---------------------------------------------------------------------------
 
 /// How the plan rows are filtered for display.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum RenamePlanFilter {
+    #[default]
     All,
     Suggested,
     AlreadyCanonical,
@@ -515,12 +516,6 @@ impl RenamePlanFilter {
             Self::Unsupported => row.state == ProposalState::Unsupported,
             Self::Blocked => row.state == ProposalState::Blocked,
         }
-    }
-}
-
-impl Default for RenamePlanFilter {
-    fn default() -> Self {
-        Self::All
     }
 }
 
@@ -2064,7 +2059,22 @@ impl DatSourcesPageState {
     /// session-only review decisions. Renders the core's output; nothing here
     /// re-derives or re-ranks.
     fn rename_plan_view(&self) -> Option<RenamePlanView> {
-        let plan = self.rename_plan.as_ref()?;
+        let Some(plan) = self.rename_plan.as_ref() else {
+            // A plan build that failed is still worth showing, so the user
+            // learns why rather than the section silently vanishing.
+            return self.rename_plan_error.as_ref().map(|error| RenamePlanView {
+                generation: self.audit_generation,
+                scan_root_short: String::new(),
+                platform_display: None,
+                source_display_name: String::new(),
+                counts: archivefs_core::dat::rename_plan::RenamePlanCounts::default(),
+                audited_total: 0,
+                verified_total: 0,
+                truncated: false,
+                rows: Vec::new(),
+                error: Some(error.clone()),
+            });
+        };
         let rows = plan
             .proposals
             .iter()
@@ -4386,14 +4396,13 @@ fn show_rename_plan_row(
             }
         });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-            if let Some(proposed) = &row.proposed_basename {
-                if ui
+            if let Some(proposed) = &row.proposed_basename
+                && ui
                     .add(egui::Button::new("Copy name").small())
                     .on_hover_text("Copy the proposed filename to the clipboard")
                     .clicked()
-                {
-                    ui.ctx().copy_text(proposed.clone());
-                }
+            {
+                ui.ctx().copy_text(proposed.clone());
             }
             if ui
                 .add(egui::Button::new("Needs review").small())
@@ -4425,17 +4434,16 @@ fn show_rename_plan_row(
                     decision: Some(ReviewDecision::AcceptedForReview),
                 });
             }
-            if row.decision.is_some() {
-                if ui
+            if row.decision.is_some()
+                && ui
                     .add(egui::Button::new("Clear").small())
                     .on_hover_text("Clear your decision; nothing on disk changes")
                     .clicked()
-                {
-                    *action = Some(DatSourcesPageAction::SetReviewDecision {
-                        path: row.source_path.to_string_lossy().into_owned(),
-                        decision: None,
-                    });
-                }
+            {
+                *action = Some(DatSourcesPageAction::SetReviewDecision {
+                    path: row.source_path.to_string_lossy().into_owned(),
+                    decision: None,
+                });
             }
         });
     });

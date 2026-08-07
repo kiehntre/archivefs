@@ -39,14 +39,10 @@ pub mod derive;
 pub mod model;
 pub mod plan;
 
-pub use collisions::{
-    DirSiblings, detect_proposal_collisions, detect_target_collision,
-};
+pub use collisions::{DirSiblings, detect_proposal_collisions, detect_target_collision};
 pub use derive::{DeriveOutcome, DerivedName, derive_proposed_basename};
 pub use model::{
     CollisionInfo, CollisionKind, ExtensionStatus, ProposalState, RenamePlan, RenamePlanCounts,
     RenameProposal, ReviewDecision, SourceObjectKind,
 };
-pub use plan::{
-    RenamePlanContext, RenamePlanError, build_rename_plan, plan_matches_generation,
-};
+pub use plan::{RenamePlanContext, RenamePlanError, build_rename_plan, plan_matches_generation};

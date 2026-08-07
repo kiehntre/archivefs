@@ -15,7 +15,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::dat::audit::{AuditEntry, AuditVerdict};
-use crate::dat::sources::audit_run::{DatAuditOutcome, DatPolicyNote};
 use crate::dat::rename_plan::collisions::{
     DirSiblings, detect_proposal_collisions, detect_target_collision,
 };
@@ -23,6 +22,7 @@ use crate::dat::rename_plan::derive::{DeriveOutcome, derive_proposed_basename};
 use crate::dat::rename_plan::model::{
     ProposalState, RenamePlan, RenamePlanCounts, RenameProposal, SourceObjectKind,
 };
+use crate::dat::sources::audit_run::{DatAuditOutcome, DatPolicyNote};
 
 /// The identity a plan is built for. `generation` lets a caller reject a plan
 /// built for a stale audit generation.
@@ -81,7 +81,9 @@ pub fn build_rename_plan(
     let mut siblings_by_parent: HashMap<PathBuf, DirSiblings> = HashMap::new();
     for entry in &outcome.report.entries {
         let path = Path::new(&entry.local_path);
-        let Some(parent) = path.parent() else { continue };
+        let Some(parent) = path.parent() else {
+            continue;
+        };
         let siblings = siblings_by_parent.entry(parent.to_path_buf()).or_default();
         siblings.names.insert(entry.local_filename.clone());
         siblings
@@ -157,7 +159,6 @@ pub fn build_rename_plan(
         audited_total: outcome.report.summary.total,
         verified_total,
         truncated: outcome.truncated,
-        unreadable_dirs: Vec::new(),
     })
 }
 
@@ -197,7 +198,11 @@ fn derive_proposal(
     // The verified match: a single `Exact` verdict, or the policy's winner
     // among `ExactMultipleCandidates`.
     let (game_name, rom_name, explanations, ambiguity_reason) = match &entry.verdict {
-        AuditVerdict::Exact { game_name, rom_name, .. } => (
+        AuditVerdict::Exact {
+            game_name,
+            rom_name,
+            ..
+        } => (
             Some(game_name.clone()),
             Some(rom_name.clone()),
             Vec::new(),
@@ -349,14 +354,18 @@ fn detect_target_collisions(
         if proposal.state != ProposalState::Suggested {
             continue;
         }
-        let Some(proposed) = &proposal.proposed_basename else { continue };
-        let Some(parent) = proposal.source_path.parent() else { continue };
-        let Some(siblings) = siblings_by_parent.get(parent) else { continue };
-        if let Some(collision) = detect_target_collision(
-            &proposal.current_basename,
-            proposed,
-            siblings,
-        ) {
+        let Some(proposed) = &proposal.proposed_basename else {
+            continue;
+        };
+        let Some(parent) = proposal.source_path.parent() else {
+            continue;
+        };
+        let Some(siblings) = siblings_by_parent.get(parent) else {
+            continue;
+        };
+        if let Some(collision) =
+            detect_target_collision(&proposal.current_basename, proposed, siblings)
+        {
             proposal.collision = Some(collision);
             proposal.state = ProposalState::Conflict;
             proposal.actionable = false;
@@ -373,12 +382,14 @@ mod tests {
     use super::*;
     use crate::dat::audit::{AuditEntry, AuditReport, AuditSummary, AuditVerdict};
     use crate::dat::policy::candidate::DatCandidate;
-    use crate::dat::policy::evaluate::{CandidateResolution, RankedCandidate};
-    use crate::dat::policy::model::{RegionId, RevisionPolicy, ClonePolicy, LanguagePreference, LanguageId};
     use crate::dat::policy::config::DatPolicyConfig;
-    use crate::dat::policy::evaluate::{EffectiveDatPolicy, ParticipatingSource, resolve};
-    use crate::dat::sources::audit_run::{DatAuditPolicyOutcome, DatPolicyNote};
+    use crate::dat::policy::evaluate::{CandidateResolution, RankedCandidate};
+    use crate::dat::policy::evaluate::{ParticipatingSource, resolve};
+    use crate::dat::policy::model::{
+        ClonePolicy, LanguageId, LanguagePreference, RegionId, RevisionPolicy,
+    };
     use crate::dat::rename_plan::model::{CollisionKind, ExtensionStatus, ProposalState};
+    use crate::dat::sources::audit_run::{DatAuditPolicyOutcome, DatPolicyNote};
     use std::path::Path;
 
     fn temp() -> tempfile::TempDir {
@@ -448,7 +459,9 @@ mod tests {
             decided: false,
             winner_index: None,
             ambiguous: true,
-            ambiguity_reason: Some("2 candidates are tied and the policy cannot decide between them".to_string()),
+            ambiguity_reason: Some(
+                "2 candidates are tied and the policy cannot decide between them".to_string(),
+            ),
             explanations,
             summary: "ambiguity remains".to_string(),
         }
@@ -486,7 +499,7 @@ mod tests {
         }
     }
 
-    fn entry_for(path: &std::path::PathBuf, filename: &str, verdict: AuditVerdict) -> AuditEntry {
+    fn entry_for(path: &Path, filename: &str, verdict: AuditVerdict) -> AuditEntry {
         AuditEntry {
             local_path: path.to_string_lossy().into_owned(),
             local_filename: filename.to_string(),
@@ -494,7 +507,7 @@ mod tests {
         }
     }
 
-    fn note(path: &std::path::PathBuf, resolution: CandidateResolution) -> DatPolicyNote {
+    fn note(path: &Path, resolution: CandidateResolution) -> DatPolicyNote {
         DatPolicyNote {
             local_path: path.to_string_lossy().into_owned(),
             verdict_label: "Exact (multiple)".to_string(),
@@ -506,9 +519,11 @@ mod tests {
         AtomicBool::new(false)
     }
 
-    /// A recursive `(relative path, inode, contents)` snapshot proving nothing
-    /// changed on disk during planning.
-    fn snapshot(root: &Path) -> Vec<(std::path::PathBuf, u64, Vec<u8>)> {
+    /// A recursive `(relative path, inode, size, mtime, contents)` snapshot
+    /// proving nothing changed on disk during planning. `mtime` is a system
+    /// time expressed as seconds since the epoch; a planning pass that only
+    /// reads leaves it untouched.
+    fn snapshot(root: &Path) -> Vec<(std::path::PathBuf, u64, u64, u64, Vec<u8>)> {
         let mut out = Vec::new();
         let mut queue = vec![root.to_path_buf()];
         while let Some(dir) = queue.pop() {
@@ -521,7 +536,13 @@ mod tests {
                     let relative = path.strip_prefix(root).unwrap().to_path_buf();
                     let content = std::fs::read(&path).unwrap_or_default();
                     let inode = std::os::unix::fs::MetadataExt::ino(&meta);
-                    out.push((relative, inode, content));
+                    let modified = meta
+                        .modified()
+                        .ok()
+                        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|elapsed| elapsed.as_secs())
+                        .unwrap_or(0);
+                    out.push((relative, inode, meta.len(), modified, content));
                 }
             }
         }
@@ -533,13 +554,25 @@ mod tests {
     fn an_exact_verified_match_produces_a_suggested_proposal() {
         let dir = temp();
         let file = write(dir.path(), "goldenaxe.hdf");
-        let entries = vec![entry_for(&file, "goldenaxe.hdf", exact("Golden Axe (Europe).hdf"))];
-        let plan = build_rename_plan(&outcome(dir.path(), entries, Vec::new(), None, false), &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+        let entries = vec![entry_for(
+            &file,
+            "goldenaxe.hdf",
+            exact("Golden Axe (Europe).hdf"),
+        )];
+        let plan = build_rename_plan(
+            &outcome(dir.path(), entries, Vec::new(), None, false),
+            &RenamePlanContext { generation: 1 },
+            &no_cancel(),
+        )
+        .unwrap();
         assert_eq!(plan.counts.total, 1);
         assert_eq!(plan.counts.suggested, 1);
         let p = &plan.proposals[0];
         assert_eq!(p.state, ProposalState::Suggested);
-        assert_eq!(p.proposed_basename.as_deref(), Some("Golden Axe (Europe).hdf"));
+        assert_eq!(
+            p.proposed_basename.as_deref(),
+            Some("Golden Axe (Europe).hdf")
+        );
         assert_eq!(p.extension_status, Some(ExtensionStatus::Preserved));
         assert!(p.actionable);
         assert!(p.match_confident);
@@ -549,8 +582,17 @@ mod tests {
     fn a_current_name_already_canonical_is_not_suggested() {
         let dir = temp();
         let file = write(dir.path(), "Golden Axe (Europe).hdf");
-        let entries = vec![entry_for(&file, "Golden Axe (Europe).hdf", exact("Golden Axe (Europe).hdf"))];
-        let plan = build_rename_plan(&outcome(dir.path(), entries, Vec::new(), None, false), &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+        let entries = vec![entry_for(
+            &file,
+            "Golden Axe (Europe).hdf",
+            exact("Golden Axe (Europe).hdf"),
+        )];
+        let plan = build_rename_plan(
+            &outcome(dir.path(), entries, Vec::new(), None, false),
+            &RenamePlanContext { generation: 1 },
+            &no_cancel(),
+        )
+        .unwrap();
         assert_eq!(plan.counts.already_canonical, 1);
         assert_eq!(plan.counts.suggested, 0);
         assert_eq!(plan.proposals[0].state, ProposalState::AlreadyCanonical);
@@ -561,9 +603,22 @@ mod tests {
     fn policy_ambiguity_produces_an_ambiguous_proposal() {
         let dir = temp();
         let file = write(dir.path(), "game.bin");
-        let entries = vec![entry_for(&file, "game.bin", AuditVerdict::ExactMultipleCandidates { algorithm: "SHA-1", count: 2, game_names: vec!["Game (USA)".into(), "Game (Europe)".into()] })];
+        let entries = vec![entry_for(
+            &file,
+            "game.bin",
+            AuditVerdict::ExactMultipleCandidates {
+                algorithm: "SHA-1",
+                count: 2,
+                game_names: vec!["Game (USA)".into(), "Game (Europe)".into()],
+            },
+        )];
         let notes = vec![note(&file, ambiguous_resolution(Vec::new()))];
-        let plan = build_rename_plan(&outcome(dir.path(), entries, notes, None, false), &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+        let plan = build_rename_plan(
+            &outcome(dir.path(), entries, notes, None, false),
+            &RenamePlanContext { generation: 1 },
+            &no_cancel(),
+        )
+        .unwrap();
         assert_eq!(plan.counts.ambiguous, 1);
         assert_eq!(plan.proposals[0].state, ProposalState::Ambiguous);
         assert_eq!(plan.proposals[0].proposed_basename, None);
@@ -580,10 +635,27 @@ mod tests {
             entry_for(&a, "a.bin", exact("Game.bin")),
             entry_for(&b, "b.bin", exact("Game.bin")),
         ];
-        let plan = build_rename_plan(&outcome(dir.path(), entries, Vec::new(), None, false), &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
-        assert_eq!(plan.counts.conflicts, 2, "both proposals report the conflict; nothing is resolved");
-        assert!(plan.proposals.iter().all(|p| p.state == ProposalState::Conflict));
-        assert!(plan.proposals.iter().all(|p| p.collision.as_ref().map(|c| c.kind) == Some(CollisionKind::TwoProposalsSameTarget)));
+        let plan = build_rename_plan(
+            &outcome(dir.path(), entries, Vec::new(), None, false),
+            &RenamePlanContext { generation: 1 },
+            &no_cancel(),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.counts.conflicts, 2,
+            "both proposals report the conflict; nothing is resolved"
+        );
+        assert!(
+            plan.proposals
+                .iter()
+                .all(|p| p.state == ProposalState::Conflict)
+        );
+        assert!(
+            plan.proposals
+                .iter()
+                .all(|p| p.collision.as_ref().map(|c| c.kind)
+                    == Some(CollisionKind::TwoProposalsSameTarget))
+        );
     }
 
     #[test]
@@ -596,11 +668,19 @@ mod tests {
             entry_for(&file, "game.bin", exact("Game (Europe).bin")),
             entry_for(&existing, "Game (Europe).bin", AuditVerdict::NotInDat),
         ];
-        let plan = build_rename_plan(&outcome(dir.path(), entries, Vec::new(), None, false), &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+        let plan = build_rename_plan(
+            &outcome(dir.path(), entries, Vec::new(), None, false),
+            &RenamePlanContext { generation: 1 },
+            &no_cancel(),
+        )
+        .unwrap();
         assert_eq!(plan.counts.conflicts, 1);
         let p = &plan.proposals[0];
         assert_eq!(p.state, ProposalState::Conflict);
-        assert_eq!(p.collision.as_ref().map(|c| c.kind), Some(CollisionKind::ExistingTarget));
+        assert_eq!(
+            p.collision.as_ref().map(|c| c.kind),
+            Some(CollisionKind::ExistingTarget)
+        );
     }
 
     #[test]
@@ -612,9 +692,17 @@ mod tests {
             entry_for(&file, "game.bin", exact("Game (Europe).BIN")),
             entry_for(&existing, "game (europe).bin", AuditVerdict::NotInDat),
         ];
-        let plan = build_rename_plan(&outcome(dir.path(), entries, Vec::new(), None, false), &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+        let plan = build_rename_plan(
+            &outcome(dir.path(), entries, Vec::new(), None, false),
+            &RenamePlanContext { generation: 1 },
+            &no_cancel(),
+        )
+        .unwrap();
         assert_eq!(plan.counts.conflicts, 1);
-        assert_eq!(plan.proposals[0].collision.as_ref().map(|c| c.kind), Some(CollisionKind::CaseCollision));
+        assert_eq!(
+            plan.proposals[0].collision.as_ref().map(|c| c.kind),
+            Some(CollisionKind::CaseCollision)
+        );
     }
 
     #[test]
@@ -623,11 +711,27 @@ mod tests {
         let weak = write(dir.path(), "crc.bin");
         let strong = write(dir.path(), "exact.bin");
         let entries = vec![
-            entry_for(&weak, "crc.bin", AuditVerdict::Probable { game_name: "Game".into(), rom_name: "Game.bin".into() }),
+            entry_for(
+                &weak,
+                "crc.bin",
+                AuditVerdict::Probable {
+                    game_name: "Game".into(),
+                    rom_name: "Game.bin".into(),
+                },
+            ),
             entry_for(&strong, "exact.bin", exact("Game (Europe).bin")),
         ];
-        let plan = build_rename_plan(&outcome(dir.path(), entries, Vec::new(), None, false), &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
-        assert_eq!(plan.proposals.len(), 1, "only the cryptographic match gets a proposal");
+        let plan = build_rename_plan(
+            &outcome(dir.path(), entries, Vec::new(), None, false),
+            &RenamePlanContext { generation: 1 },
+            &no_cancel(),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.proposals.len(),
+            1,
+            "only the cryptographic match gets a proposal"
+        );
         assert_eq!(plan.proposals[0].source_path, strong);
         assert_eq!(plan.verified_total, 1);
     }
@@ -637,7 +741,12 @@ mod tests {
         let dir = temp();
         let file = write(dir.path(), "game.zip");
         let entries = vec![entry_for(&file, "game.zip", exact("Game (Europe).iso"))];
-        let plan = build_rename_plan(&outcome(dir.path(), entries, Vec::new(), None, false), &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+        let plan = build_rename_plan(
+            &outcome(dir.path(), entries, Vec::new(), None, false),
+            &RenamePlanContext { generation: 1 },
+            &no_cancel(),
+        )
+        .unwrap();
         assert_eq!(plan.counts.unsupported, 1);
         let p = &plan.proposals[0];
         assert_eq!(p.state, ProposalState::Unsupported);
@@ -650,7 +759,12 @@ mod tests {
         let dir = temp();
         let file = write(dir.path(), "game.bin");
         let entries = vec![entry_for(&file, "game.bin", exact("../escape.bin"))];
-        let plan = build_rename_plan(&outcome(dir.path(), entries, Vec::new(), None, false), &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+        let plan = build_rename_plan(
+            &outcome(dir.path(), entries, Vec::new(), None, false),
+            &RenamePlanContext { generation: 1 },
+            &no_cancel(),
+        )
+        .unwrap();
         assert_eq!(plan.counts.blocked, 1);
         let p = &plan.proposals[0];
         assert_eq!(p.state, ProposalState::Blocked);
@@ -663,7 +777,12 @@ mod tests {
         let dir = temp();
         let file = write(dir.path(), "game.bin");
         let entries = vec![entry_for(&file, "game.bin", exact("  "))];
-        let plan = build_rename_plan(&outcome(dir.path(), entries, Vec::new(), None, false), &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+        let plan = build_rename_plan(
+            &outcome(dir.path(), entries, Vec::new(), None, false),
+            &RenamePlanContext { generation: 1 },
+            &no_cancel(),
+        )
+        .unwrap();
         assert_eq!(plan.counts.blocked, 1);
     }
 
@@ -674,7 +793,12 @@ mod tests {
         let link = dir.path().join("link.bin");
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let entries = vec![entry_for(&link, "link.bin", exact("Game.bin"))];
-        let plan = build_rename_plan(&outcome(dir.path(), entries, Vec::new(), None, false), &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+        let plan = build_rename_plan(
+            &outcome(dir.path(), entries, Vec::new(), None, false),
+            &RenamePlanContext { generation: 1 },
+            &no_cancel(),
+        )
+        .unwrap();
         assert_eq!(plan.counts.unsupported, 1);
         let p = &plan.proposals[0];
         assert_eq!(p.object_kind, SourceObjectKind::Symlink);
@@ -691,9 +815,17 @@ mod tests {
         let link = dir.path().join("broken.bin");
         std::os::unix::fs::symlink(dir.path().join("nowhere.bin"), &link).unwrap();
         let entries = vec![entry_for(&link, "broken.bin", exact("Game.bin"))];
-        let plan = build_rename_plan(&outcome(dir.path(), entries, Vec::new(), None, false), &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+        let plan = build_rename_plan(
+            &outcome(dir.path(), entries, Vec::new(), None, false),
+            &RenamePlanContext { generation: 1 },
+            &no_cancel(),
+        )
+        .unwrap();
         assert_eq!(plan.counts.unsupported, 1);
-        assert_eq!(plan.proposals[0].object_kind, SourceObjectKind::BrokenSymlink);
+        assert_eq!(
+            plan.proposals[0].object_kind,
+            SourceObjectKind::BrokenSymlink
+        );
     }
 
     #[test]
@@ -706,29 +838,61 @@ mod tests {
             entry_for(&other, "other.bin", AuditVerdict::NotInDat),
         ];
         let before = snapshot(dir.path());
-        build_rename_plan(&outcome(dir.path(), entries, Vec::new(), Some("NES".into()), false), &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+        build_rename_plan(
+            &outcome(dir.path(), entries, Vec::new(), Some("NES".into()), false),
+            &RenamePlanContext { generation: 1 },
+            &no_cancel(),
+        )
+        .unwrap();
         let after = snapshot(dir.path());
-        assert_eq!(before, after, "planning must leave every path, inode, size and content unchanged");
+        assert_eq!(
+            before, after,
+            "planning must leave every path, inode identity, size, mtime and content unchanged"
+        );
     }
 
     #[test]
     fn a_stale_generation_is_rejected() {
         let dir = temp();
         let file = write(dir.path(), "goldenaxe.hdf");
-        let entries = vec![entry_for(&file, "goldenaxe.hdf", exact("Golden Axe (Europe).hdf"))];
-        let plan = build_rename_plan(&outcome(dir.path(), entries, Vec::new(), None, false), &RenamePlanContext { generation: 7 }, &no_cancel()).unwrap();
+        let entries = vec![entry_for(
+            &file,
+            "goldenaxe.hdf",
+            exact("Golden Axe (Europe).hdf"),
+        )];
+        let plan = build_rename_plan(
+            &outcome(dir.path(), entries, Vec::new(), None, false),
+            &RenamePlanContext { generation: 7 },
+            &no_cancel(),
+        )
+        .unwrap();
         assert!(plan_matches_generation(&plan, 7));
-        assert!(!plan_matches_generation(&plan, 8), "a newer generation invalidates the plan");
-        assert!(!plan_matches_generation(&plan, 6), "a stale generation is never accepted");
+        assert!(
+            !plan_matches_generation(&plan, 8),
+            "a newer generation invalidates the plan"
+        );
+        assert!(
+            !plan_matches_generation(&plan, 6),
+            "a stale generation is never accepted"
+        );
     }
 
     #[test]
     fn a_cancelled_build_is_rejected() {
         let dir = temp();
         let file = write(dir.path(), "goldenaxe.hdf");
-        let entries = vec![entry_for(&file, "goldenaxe.hdf", exact("Golden Axe (Europe).hdf"))];
+        let entries = vec![entry_for(
+            &file,
+            "goldenaxe.hdf",
+            exact("Golden Axe (Europe).hdf"),
+        )];
         let cancel = AtomicBool::new(true);
-        let error = build_rename_plan(&outcome(dir.path(), entries, Vec::new(), None, false), &RenamePlanContext { generation: 1 }, &cancel).expect_err("cancelled");
+        let error = build_rename_plan(
+            &outcome(dir.path(), entries, Vec::new(), None, false),
+            &RenamePlanContext { generation: 1 },
+            &cancel,
+        )
+        .expect_err("cancelled");
         assert_eq!(error, RenamePlanError::Cancelled);
     }
 
@@ -743,18 +907,47 @@ mod tests {
         }
         let mut reversed = entries.clone();
         reversed.reverse();
-        let forward = build_rename_plan(&outcome(dir.path(), entries, Vec::new(), None, false), &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
-        let backward = build_rename_plan(&outcome(dir.path(), reversed, Vec::new(), None, false), &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+        let forward = build_rename_plan(
+            &outcome(dir.path(), entries, Vec::new(), None, false),
+            &RenamePlanContext { generation: 1 },
+            &no_cancel(),
+        )
+        .unwrap();
+        let backward = build_rename_plan(
+            &outcome(dir.path(), reversed, Vec::new(), None, false),
+            &RenamePlanContext { generation: 1 },
+            &no_cancel(),
+        )
+        .unwrap();
         assert_eq!(forward, backward, "input order must not change the plan");
-        let names: Vec<String> = forward.proposals.iter().map(|p| p.current_basename.clone()).collect();
-        assert_eq!(names, vec!["a.bin".to_string(), "b.bin".to_string(), "c.bin".to_string()]);
+        let names: Vec<String> = forward
+            .proposals
+            .iter()
+            .map(|p| p.current_basename.clone())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "a.bin".to_string(),
+                "b.bin".to_string(),
+                "c.bin".to_string()
+            ]
+        );
     }
 
     #[test]
     fn policy_explanations_are_preserved() {
         let dir = temp();
         let file = write(dir.path(), "game.bin");
-        let entries = vec![entry_for(&file, "game.bin", AuditVerdict::ExactMultipleCandidates { algorithm: "SHA-1", count: 2, game_names: vec![] })];
+        let entries = vec![entry_for(
+            &file,
+            "game.bin",
+            AuditVerdict::ExactMultipleCandidates {
+                algorithm: "SHA-1",
+                count: 2,
+                game_names: vec![],
+            },
+        )];
         let winner = DatCandidate {
             source_id: "src".to_string(),
             source_priority: 20,
@@ -766,20 +959,50 @@ mod tests {
             has_revision_marker: true,
             parent_name: None,
         };
-        let notes = vec![note(&file, resolution(winner, vec![
-            "preferred region matched (Europe)".to_string(),
-            "newer verified revision preferred (Rev 2)".to_string(),
-            "source priority 20 outranked source priority 100".to_string(),
-            "parent preferred".to_string(),
-        ]))];
-        let plan = build_rename_plan(&outcome(dir.path(), entries, notes, None, false), &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+        let notes = vec![note(
+            &file,
+            resolution(
+                winner,
+                vec![
+                    "preferred region matched (Europe)".to_string(),
+                    "newer verified revision preferred (Rev 2)".to_string(),
+                    "source priority 20 outranked source priority 100".to_string(),
+                    "parent preferred".to_string(),
+                ],
+            ),
+        )];
+        let plan = build_rename_plan(
+            &outcome(dir.path(), entries, notes, None, false),
+            &RenamePlanContext { generation: 1 },
+            &no_cancel(),
+        )
+        .unwrap();
         assert_eq!(plan.counts.suggested, 1);
         let p = &plan.proposals[0];
-        assert_eq!(p.proposed_basename.as_deref(), Some("Game (Europe) (Rev 2).bin"));
-        assert!(p.explanations.iter().any(|e| e.contains("preferred region matched")));
-        assert!(p.explanations.iter().any(|e| e.contains("newer verified revision")));
-        assert!(p.explanations.iter().any(|e| e.contains("source priority 20")));
-        assert!(p.explanations.iter().any(|e| e.contains("parent preferred")));
+        assert_eq!(
+            p.proposed_basename.as_deref(),
+            Some("Game (Europe) (Rev 2).bin")
+        );
+        assert!(
+            p.explanations
+                .iter()
+                .any(|e| e.contains("preferred region matched"))
+        );
+        assert!(
+            p.explanations
+                .iter()
+                .any(|e| e.contains("newer verified revision"))
+        );
+        assert!(
+            p.explanations
+                .iter()
+                .any(|e| e.contains("source priority 20"))
+        );
+        assert!(
+            p.explanations
+                .iter()
+                .any(|e| e.contains("parent preferred"))
+        );
         assert_eq!(p.rom_name.as_deref(), Some("Game (Europe) (Rev 2).bin"));
     }
 
@@ -787,10 +1010,28 @@ mod tests {
     fn platform_is_carried_into_the_proposal() {
         let dir = temp();
         let file = write(dir.path(), "goldenaxe.hdf");
-        let entries = vec![entry_for(&file, "goldenaxe.hdf", exact("Golden Axe (Europe).hdf"))];
-        let plan = build_rename_plan(&outcome(dir.path(), entries, Vec::new(), Some("Sega Mega Drive".into()), false), &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+        let entries = vec![entry_for(
+            &file,
+            "goldenaxe.hdf",
+            exact("Golden Axe (Europe).hdf"),
+        )];
+        let plan = build_rename_plan(
+            &outcome(
+                dir.path(),
+                entries,
+                Vec::new(),
+                Some("Sega Mega Drive".into()),
+                false,
+            ),
+            &RenamePlanContext { generation: 1 },
+            &no_cancel(),
+        )
+        .unwrap();
         assert_eq!(plan.platform.as_deref(), Some("Sega Mega Drive"));
-        assert_eq!(plan.proposals[0].platform.as_deref(), Some("Sega Mega Drive"));
+        assert_eq!(
+            plan.proposals[0].platform.as_deref(),
+            Some("Sega Mega Drive")
+        );
         assert!(plan.proposals[0].platform_display.is_some());
     }
 
@@ -801,14 +1042,21 @@ mod tests {
             region_preferences: Some(vec!["europe".to_string()]),
             ..Default::default()
         };
-        let effective = resolve(&config, None, vec![ParticipatingSource {
-            id: "src".to_string(),
-            display_name: "Source".to_string(),
-            priority: 100,
-        }]);
+        let effective = resolve(
+            &config,
+            None,
+            vec![ParticipatingSource {
+                id: "src".to_string(),
+                display_name: "Source".to_string(),
+                priority: 100,
+            }],
+        );
         assert_eq!(effective.revision_policy, RevisionPolicy::default());
         assert_eq!(effective.clone_policy, ClonePolicy::default());
         assert_eq!(effective.region_preferences, vec![RegionId::Europe]);
-        assert_eq!(effective.language_preferences, Vec::<LanguagePreference>::new());
+        assert_eq!(
+            effective.language_preferences,
+            Vec::<LanguagePreference>::new()
+        );
     }
 }

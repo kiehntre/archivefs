@@ -271,7 +271,4 @@ pub struct RenamePlan {
     pub verified_total: usize,
     /// The audit hit a ceiling, so this plan covers part of the folder.
     pub truncated: bool,
-    /// Parent directories whose sibling listing was unavailable; collision
-    /// detection was skipped for proposals in them.
-    pub unreadable_dirs: Vec<String>,
 }

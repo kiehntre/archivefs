@@ -3286,7 +3286,6 @@ fn page_with_plan(proposals: Vec<RenameProposal>) -> (Fixture, DatSourcesPageSta
         audited_total: 2,
         verified_total,
         truncated: false,
-        unreadable_dirs: Vec::new(),
     });
     (fixture, page)
 }
@@ -3367,8 +3366,10 @@ fn the_plan_filters_select_which_rows_are_drawn() {
     let view = page.view();
     assert_eq!(view.rename_plan.as_ref().unwrap().rows.len(), 3);
 
-    let mut ui_state = DatSourcesPageUi::default();
-    ui_state.plan_filter = RenamePlanFilter::Suggested;
+    let mut ui_state = DatSourcesPageUi {
+        plan_filter: RenamePlanFilter::Suggested,
+        ..Default::default()
+    };
     let output = render(&view, &mut ui_state);
     assert!(rendered_text_contains(&output, "a.bin"));
     assert!(
@@ -3410,7 +3411,6 @@ fn review_decisions_never_touch_files() {
         audited_total: 1,
         verified_total: 1,
         truncated: false,
-        unreadable_dirs: Vec::new(),
     });
 
     let before = snapshot(&roms);
@@ -3454,7 +3454,6 @@ fn clearing_review_decisions_leaves_source_files_untouched() {
         audited_total: 1,
         verified_total: 1,
         truncated: false,
-        unreadable_dirs: Vec::new(),
     });
 
     page.apply(DatSourcesPageAction::SetReviewDecision {
@@ -3535,4 +3534,62 @@ fn the_plan_controls_are_reachable_by_keyboard() {
         }
     }
     assert!(focused_anything, "Tab never focused anything on the page");
+}
+
+#[test]
+fn an_audit_builds_a_read_only_rename_plan_and_changes_nothing() {
+    // End-to-end: audit a folder whose file matches two catalogue entries
+    // with a region preference; the plan must propose the preferred name and
+    // the scanned tree must be byte-for-byte unchanged (paths, contents and
+    // file identities).
+    let fixture = Fixture::new();
+    let multi = r#"<?xml version="1.0" encoding="UTF-8"?>
+<datafile>
+    <header>
+        <name>Multi</name>
+        <version>1</version>
+        <author>Test</author>
+    </header>
+    <game name="Game (USA)">
+        <rom name="Game (USA).bin" size="4" md5="098f6bcd4621d373cade4e832627b4f6"/>
+    </game>
+    <game name="Game (Europe)">
+        <rom name="Game (Europe).bin" size="4" md5="098f6bcd4621d373cade4e832627b4f6"/>
+    </game>
+</datafile>"#;
+    let dat = fixture.write("multi.dat", multi);
+    let roms = fixture.dir("roms");
+    std::fs::write(roms.join("game.bin"), SUPER_BIN).unwrap();
+
+    let mut page = fixture.page_with_library(vec![roms.clone()]);
+    page.apply(DatSourcesPageAction::AddFile { path: dat });
+    page.apply(DatSourcesPageAction::AddRegion {
+        scope: None,
+        region: RegionId::Europe,
+    });
+
+    let before = snapshot(&fixture.root);
+    page.apply(DatSourcesPageAction::Audit {
+        id: page.view().rows[0].id.clone(),
+        scan_root: roms.clone(),
+    });
+    run_to_completion(&mut page);
+
+    let view = page.view();
+    let plan = view
+        .rename_plan
+        .as_ref()
+        .expect("an audit with a policy produces a rename plan");
+    assert_eq!(plan.counts.suggested, 1, "{:?}", plan.counts);
+    assert_eq!(
+        plan.rows[0].proposed_basename.as_deref(),
+        Some("Game (Europe).bin"),
+        "the preferred region's name is proposed"
+    );
+    assert!(plan.rows[0].explanations.iter().any(|e| e.contains("preferred region matched")));
+    assert_eq!(
+        snapshot(&fixture.root),
+        before,
+        "planning an audit must not change any path, file identity or content"
+    );
 }
