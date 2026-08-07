@@ -33,12 +33,23 @@ use serde::{Deserialize, Serialize};
 
 use super::{DatHealthState, DatSourceEntry, DatSourceHealth, DatSourceKind, MIN_DAT_PRIORITY};
 use crate::ArchiveFsError;
+use crate::dat::policy::config::DatPolicyConfig;
 
 /// The whole preferences document.
+///
+/// Alongside the registered sources it carries one optional `[policy]` table:
+/// the DAT matching preferences. The policy is deliberately part of this file
+/// rather than a second document, so there is a single answer to "what is this
+/// user's DAT matching policy" and a single durable-write path for both.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DatSourcesConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sources: Option<Vec<DatSourceConfigEntry>>,
+
+    /// The DAT matching policy, present only when the user has set at least
+    /// one preference. Absent means the safe defaults apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<DatPolicyConfig>,
 
     /// Top-level keys a newer build wrote. Never interpreted, never dropped.
     #[serde(flatten)]

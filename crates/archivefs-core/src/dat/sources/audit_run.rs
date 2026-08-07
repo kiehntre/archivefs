@@ -45,11 +45,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::Serialize;
 
 use super::{DatSourceKind, validation};
-use crate::dat::audit::{AuditReport, KnownFileEvidence, audit_files};
-use crate::dat::index::DatIndex;
+use crate::dat::audit::{AuditReport, AuditVerdict, KnownFileEvidence, audit_files};
+use crate::dat::index::{DatIndex, DatRomRef};
 use crate::dat::limits::DatLimits;
 use crate::dat::model::ParsedDat;
 use crate::dat::parsers::parse_dat_file;
+use crate::dat::policy::candidate::candidate_for_rom;
+use crate::dat::policy::evaluate::{CandidateResolution, EffectiveDatPolicy, rank_candidates};
 use crate::identity_source::hashing::{HashRefusal, hash_file_reporting};
 use crate::safe_read::TrustedRoots;
 
@@ -81,6 +83,12 @@ pub struct DatAuditRequest {
     /// The folder of local files to compare against the catalogue.
     pub scan_root: PathBuf,
     pub limits: DatLimits,
+    /// The effective DAT policy, when the caller wants multi-candidate
+    /// verdicts annotated with the user's preference order.
+    ///
+    /// `None` (the default) makes the audit behave exactly as it did before
+    /// policy existed: every verdict is reported, none is preferred.
+    pub policy: Option<EffectiveDatPolicy>,
 }
 
 /// A file that was audited without hash evidence, and why.
@@ -175,6 +183,8 @@ pub struct DatAuditOutcome {
     pub bytes_hashed: u64,
     /// The walk hit a ceiling, so this is part of the folder and not all of it.
     pub truncated: bool,
+    /// The policy annotation, present only when the request supplied a policy.
+    pub policy: Option<DatAuditPolicyOutcome>,
 }
 
 impl DatAuditOutcome {
@@ -185,6 +195,30 @@ impl DatAuditOutcome {
             self.report.summary.total, self.catalogue_entries, self.source_display_name
         )
     }
+}
+
+/// The policy annotation an audit carries when a policy was supplied.
+///
+/// This never changes a verdict. Every verdict the core produced stands as it
+/// is; the annotation only adds, for each file whose hash matched several
+/// catalogue entries, the user's *preference order* over those already-valid
+/// candidates, plus the consultation order of the sources involved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DatAuditPolicyOutcome {
+    /// The sources consulted for this platform, in order. For a single-source
+    /// audit this is just that source and its peers for the same platform.
+    pub source_ordering: Vec<String>,
+    /// One note per file with a multi-candidate verdict that was ranked.
+    pub notes: Vec<DatPolicyNote>,
+}
+
+/// One file's policy ranking.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DatPolicyNote {
+    pub local_path: String,
+    /// The verdict this note accompanies (`Exact (multiple)`, …).
+    pub verdict_label: String,
+    pub resolution: CandidateResolution,
 }
 
 /// Runs a read-only audit.
@@ -273,16 +307,24 @@ pub fn run_dat_audit(
         }
     }
 
-    let Some(catalogue) = merged else {
+    let Some(mut catalogue) = merged else {
         return Err(DatAuditError::NoCatalogue(unreadable_catalogues.join("; ")));
     };
 
     let index = DatIndex::build(&catalogue);
     let catalogue_entries = catalogue.source.entry_count;
     let catalogue_roms = catalogue.source.rom_count;
-    // The parsed games are no longer needed once indexed; the index owns what
-    // the lookups use, and a 500,000-entry catalogue is not worth holding twice.
+    // The parsed games are kept when a policy is supplied: the candidate
+    // ranking needs each candidate's region/language/revision/parent metadata,
+    // which only the game entries carry. Otherwise they are dropped so a
+    // 500,000-entry catalogue is not held twice.
+    let taken_games = std::mem::take(&mut catalogue.games);
     drop(catalogue);
+    let catalogue_games: Vec<_> = if request.policy.is_some() {
+        taken_games
+    } else {
+        Vec::new()
+    };
 
     on_progress(DatAuditProgress::CatalogueReady {
         entries: catalogue_entries,
@@ -356,6 +398,21 @@ pub fn run_dat_audit(
     on_progress(DatAuditProgress::Comparing { files: known.len() });
     let report = audit_files(&known, &index);
 
+    // ---- 5. Annotate multi-candidate verdicts with the policy -------------
+    // The policy only *ranks already valid candidates*: the audit's verdicts
+    // are untouched, and a preference note is added exactly for the files
+    // whose cryptographic hash matched several catalogue entries.
+    let policy = request.policy.as_ref().map(|policy| {
+        annotate_with_policy(
+            &report,
+            &known,
+            &index,
+            &catalogue_games,
+            policy,
+            &request.source_id,
+        )
+    });
+
     Ok(DatAuditOutcome {
         source_id: request.source_id.clone(),
         source_display_name: request.source_display_name.clone(),
@@ -370,7 +427,102 @@ pub fn run_dat_audit(
         report,
         unhashed,
         bytes_hashed,
+        policy,
     })
+}
+
+/// Builds the policy annotation for an audit.
+///
+/// For every entry whose verdict is `ExactMultipleCandidates`, the matching
+/// catalogue ROMs are turned into policy candidates and ranked. The verdict
+/// itself is never replaced - `Exact (multiple)` still says what it says - the
+/// note just shows the user's preferred order over that already-valid set.
+fn annotate_with_policy(
+    report: &AuditReport,
+    known: &[KnownFileEvidence],
+    index: &DatIndex,
+    games: &[crate::dat::model::DatGameEntry],
+    policy: &EffectiveDatPolicy,
+    audited_source_id: &str,
+) -> DatAuditPolicyOutcome {
+    let source_ordering: Vec<String> = policy
+        .source_ordering
+        .iter()
+        .map(|source| source.display_name.clone())
+        .collect();
+
+    // All candidates come from the audited source's own catalogue. Its id and
+    // priority are what the ranking attributes them to, so the candidate
+    // participates (its source must be in the ordering) and any priority
+    // explanation is honest.
+    let audited_source = policy
+        .source_ordering
+        .iter()
+        .find(|source| source.id == audited_source_id);
+
+    let mut notes = Vec::new();
+    for (entry, evidence) in report.entries.iter().zip(known.iter()) {
+        if !matches!(entry.verdict, AuditVerdict::ExactMultipleCandidates { .. }) {
+            continue;
+        }
+        let refs = verified_candidate_refs(evidence, index);
+        if refs.len() < 2 {
+            continue;
+        }
+        let candidates: Vec<crate::dat::policy::DatCandidate> = refs
+            .iter()
+            .filter_map(|rom_ref| {
+                let game = games.get(rom_ref.game_index)?;
+                let rom = game.roms.get(rom_ref.rom_index)?;
+                Some(candidate_for_rom(
+                    game,
+                    rom,
+                    audited_source_id,
+                    audited_source.map(|source| source.priority).unwrap_or(0),
+                ))
+            })
+            .collect();
+        if candidates.len() < 2 {
+            continue;
+        }
+        let resolution = rank_candidates(candidates, policy);
+        notes.push(DatPolicyNote {
+            local_path: entry.local_path.clone(),
+            verdict_label: entry.verdict.label().to_string(),
+            resolution,
+        });
+    }
+
+    DatAuditPolicyOutcome {
+        source_ordering,
+        notes,
+    }
+}
+
+/// The candidate catalogue ROMs a cryptographic hash matched, strongest hash
+/// first, mirroring [`crate::dat::audit`]'s evidence priority.
+///
+/// This is deliberately the same algorithm the verdict uses: a file whose
+/// SHA-1 matched is ranked by the same SHA-1 candidates the audit reported,
+/// so the annotation can never disagree with the verdict about what matched.
+fn verified_candidate_refs(known: &KnownFileEvidence, index: &DatIndex) -> Vec<DatRomRef> {
+    for value in [
+        known.sha256.as_deref(),
+        known.sha1.as_deref(),
+        known.md5.as_deref(),
+    ] {
+        let Some(value) = value else { continue };
+        let candidates = match value.len() {
+            64 => index.lookup_sha256(value),
+            40 => index.lookup_sha1(value),
+            32 => index.lookup_md5(value),
+            _ => continue,
+        };
+        if !candidates.is_empty() {
+            return candidates.to_vec();
+        }
+    }
+    Vec::new()
 }
 
 struct LocalScan {

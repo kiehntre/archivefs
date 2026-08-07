@@ -65,6 +65,7 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
     let mut games: Vec<DatGameEntry> = Vec::new();
     let mut current_game_name: Option<String> = None;
     let mut current_game_desc: Option<String> = None;
+    let mut current_game_clone_of: Option<String> = None;
     let mut current_roms: Vec<DatRomEntry> = Vec::new();
     let mut current_rom_name: Option<String> = None;
     let mut current_rom_size: Option<u64> = None;
@@ -128,6 +129,7 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                         drop_current_game(
                             &mut current_game_name,
                             &mut current_game_desc,
+                            &mut current_game_clone_of,
                             &mut current_roms,
                             &mut games,
                         );
@@ -144,6 +146,26 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                             &mut warnings,
                             limits.max_warnings,
                         )?;
+                        // A `cloneof` attribute names the parent entry; when a
+                        // catalogue uses the MAME-style `cloneofid` (a ROM name)
+                        // instead, that is captured as the parent reference.
+                        // Deliberately not length-checked beyond the identifier
+                        // ceiling: a parent name is a label, and overlong values
+                        // are carried as-is so nothing is dropped.
+                        current_game_clone_of = attr_str_opt(
+                            start_bytes,
+                            b"cloneof",
+                            &mut warnings,
+                            limits.max_warnings,
+                        )
+                        .or_else(|| {
+                            attr_str_opt(
+                                start_bytes,
+                                b"cloneofid",
+                                &mut warnings,
+                                limits.max_warnings,
+                            )
+                        });
                         current_game_desc = None;
                         current_roms = Vec::new();
                     }
@@ -514,6 +536,7 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
     drop_current_game(
         &mut current_game_name,
         &mut current_game_desc,
+        &mut current_game_clone_of,
         &mut current_roms,
         &mut games,
     );
@@ -600,6 +623,7 @@ fn record_note(
 fn drop_current_game(
     name: &mut Option<String>,
     desc: &mut Option<String>,
+    clone_of: &mut Option<String>,
     roms: &mut Vec<DatRomEntry>,
     games: &mut Vec<DatGameEntry>,
 ) {
@@ -608,7 +632,7 @@ fn drop_current_game(
             name: game_name,
             description: desc.take(),
             roms: std::mem::take(roms),
-            clone_of: None,
+            clone_of: clone_of.take(),
             sample_of: None,
             board: None,
             rebuild_to: None,
@@ -949,6 +973,26 @@ mod tests {
         assert_eq!(outcome.dat.games.len(), 2);
         assert_eq!(outcome.dat.games[0].name, "Parent Game");
         assert_eq!(outcome.dat.games[1].name, "Clone Game");
+        // The parent declaration is captured so the clone policy can act on
+        // it; `cloneofid` (MAME-style, a ROM name) is used when `cloneof` is
+        // absent.
+        assert_eq!(outcome.dat.games[0].clone_of, None);
+        assert_eq!(outcome.dat.games[1].clone_of.as_deref(), Some("parent.bin"));
+    }
+
+    #[test]
+    fn a_cloneof_attribute_names_the_parent_entry() {
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+    <game name="Parent">
+        <rom name="parent.bin" size="100" crc="AAAAAAAA"/>
+    </game>
+    <game name="Clone" cloneof="Parent">
+        <rom name="clone.bin" size="100" crc="BBBBBBBB"/>
+    </game>
+</datafile>"#;
+        let outcome = parse_xml(xml).unwrap();
+        assert_eq!(outcome.dat.games[1].clone_of.as_deref(), Some("Parent"));
     }
 
     // ------------------------------------------------------------------

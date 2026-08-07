@@ -45,6 +45,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::dat::policy::{DatPolicyConfig, default_dat_policy};
 pub use config::{
     DatSourceConfigEntry, DatSourcesConfig, default_dat_sources_config_path,
     load_dat_sources_config_default, load_dat_sources_config_from, save_dat_sources_config_default,
@@ -344,11 +345,14 @@ impl UnresolvedDatSetting {
     }
 }
 
-/// The registered DAT sources, and everything in the file this build kept but
-/// did not interpret.
+/// The registered DAT sources, the DAT matching policy, and everything in the
+/// file this build kept but did not interpret.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DatSourceRegistry {
     entries: Vec<DatSourceEntry>,
+    /// The DAT matching policy, carried through load/edit/save like any other
+    /// user preference. `Default` means the safe defaults apply.
+    policy: DatPolicyConfig,
     /// Top-level keys a newer build wrote, re-emitted verbatim on save.
     unknown_top_level: toml::Table,
 }
@@ -367,6 +371,7 @@ impl DatSourceRegistry {
     pub fn from_config(config: &DatSourcesConfig) -> (Self, Vec<String>) {
         let mut registry = Self {
             entries: Vec::new(),
+            policy: config.policy.clone().unwrap_or_default(),
             unknown_top_level: config.unknown_fields.clone(),
         };
         let mut problems = Vec::new();
@@ -410,8 +415,23 @@ impl DatSourceRegistry {
             } else {
                 Some(sources)
             },
+            policy: if self.policy == DatPolicyConfig::default() {
+                None
+            } else {
+                Some(self.policy.clone())
+            },
             unknown_fields: self.unknown_top_level.clone(),
         }
+    }
+
+    /// The DAT matching policy.
+    pub fn policy(&self) -> &DatPolicyConfig {
+        &self.policy
+    }
+
+    /// The DAT matching policy, for editing a draft registry.
+    pub fn policy_mut(&mut self) -> &mut DatPolicyConfig {
+        &mut self.policy
     }
 
     pub fn entries(&self) -> &[DatSourceEntry] {
@@ -435,6 +455,18 @@ impl DatSourceRegistry {
         let mut all: Vec<&DatSourceEntry> = self.entries.iter().collect();
         all.sort_by(|a, b| a.priority.cmp(&b.priority).then_with(|| a.id.cmp(&b.id)));
         all
+    }
+
+    /// Every enabled source, in consultation order.
+    ///
+    /// Used by the policy resolver for the global scope (no platform), where
+    /// "participates" simply means enabled. Ordered the same way as
+    /// [`Self::sorted_all`]: priority then ID.
+    pub fn sorted_enabled(&self) -> Vec<&DatSourceEntry> {
+        let mut enabled: Vec<&DatSourceEntry> =
+            self.entries.iter().filter(|entry| entry.enabled).collect();
+        enabled.sort_by(|a, b| a.priority.cmp(&b.priority).then_with(|| a.id.cmp(&b.id)));
+        enabled
     }
 
     /// The enabled sources relevant to `platform_id`, in consultation order.
