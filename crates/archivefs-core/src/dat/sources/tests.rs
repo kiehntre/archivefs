@@ -1422,6 +1422,7 @@ fn audit_fixture() -> (TempDir, DatAuditRequest) {
         scan_root: roms,
         limits: DatLimits::default(),
         policy: None,
+        platform: None,
     };
     (dir, request)
 }
@@ -1563,6 +1564,7 @@ fn an_audit_against_a_folder_source_merges_its_catalogues() {
         scan_root: roms,
         limits: DatLimits::default(),
         policy: None,
+        platform: None,
     };
     let cancel = no_cancel();
     let outcome =
@@ -1586,6 +1588,7 @@ fn an_audit_of_an_empty_folder_says_so_rather_than_reporting_all_clear() {
         scan_root: empty,
         limits: DatLimits::default(),
         policy: None,
+        platform: None,
     };
     let cancel = no_cancel();
     let error = run_dat_audit(&request, &TrustedRoots::none(), &cancel, &|_| {})
@@ -1616,6 +1619,7 @@ fn an_audit_against_an_unparseable_catalogue_fails_with_a_reason() {
         scan_root: roms,
         limits: DatLimits::default(),
         policy: None,
+        platform: None,
     };
     let cancel = no_cancel();
     let error = run_dat_audit(&request, &TrustedRoots::none(), &cancel, &|_| {})
@@ -1640,6 +1644,7 @@ fn an_audit_descends_into_subfolders_within_its_depth_limit() {
         scan_root: roms,
         limits: DatLimits::default(),
         policy: None,
+        platform: None,
     };
     let cancel = no_cancel();
     let outcome =
@@ -1666,6 +1671,7 @@ fn an_audit_does_not_follow_a_symlinked_rom_without_trusted_roots() {
         scan_root: roms,
         limits: DatLimits::default(),
         policy: None,
+        platform: None,
     };
     let cancel = no_cancel();
     let outcome = run_dat_audit(&request, &TrustedRoots::none(), &cancel, &|_| {})
@@ -1755,6 +1761,7 @@ fn an_audit_annotates_multi_candidate_verdicts_with_the_policy_preference() {
         scan_root: roms,
         limits: DatLimits::default(),
         policy: Some(policy),
+        platform: None,
     };
     let cancel = no_cancel();
     let outcome =
