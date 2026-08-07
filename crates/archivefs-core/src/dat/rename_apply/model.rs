@@ -262,9 +262,7 @@ impl RenameTransaction {
     pub fn is_settled(&self) -> bool {
         !matches!(
             self.state,
-            TransactionState::Planned
-                | TransactionState::Applying
-                | TransactionState::RollingBack
+            TransactionState::Planned | TransactionState::Applying | TransactionState::RollingBack
         )
     }
 }

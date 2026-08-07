@@ -79,7 +79,15 @@ fn apply(
     cancel: &AtomicBool,
 ) -> Result<ApplyOutcome, ApplyError> {
     let tx = build_transaction(plan, &approved, plan.generation)?;
-    apply_exec(tx, approved, trusted, journal_dir, mode, cancel, plan.generation)
+    apply_exec(
+        tx,
+        approved,
+        trusted,
+        journal_dir,
+        mode,
+        cancel,
+        plan.generation,
+    )
 }
 
 /// Applies an already-built transaction (used when the test mutates files
@@ -151,7 +159,12 @@ fn one_approved_safe_rename_applies() {
     let source = write(&roms, "goldenaxe.hdf");
     let journal = dir.path().join("journal");
     std::fs::create_dir_all(&journal).unwrap();
-    let proposals = vec![proposal(source.to_str().unwrap(), "goldenaxe.hdf", "Golden Axe (Europe).hdf", ProposalState::Suggested)];
+    let proposals = vec![proposal(
+        source.to_str().unwrap(),
+        "goldenaxe.hdf",
+        "Golden Axe (Europe).hdf",
+        ProposalState::Suggested,
+    )];
     let plan = plan(proposals, 1, &roms);
 
     let cancel = no_cancel();
@@ -176,7 +189,11 @@ fn one_approved_safe_rename_applies() {
         b"fixture contents"
     );
     // The journal is present and says Applied.
-    assert!(journal.join(format!("{}.json", outcome.transaction.transaction_id)).exists());
+    assert!(
+        journal
+            .join(format!("{}.json", outcome.transaction.transaction_id))
+            .exists()
+    );
 }
 
 #[test]
@@ -187,7 +204,16 @@ fn an_unapproved_proposal_cannot_apply() {
     let source = write(&roms, "a.bin");
     let journal = dir.path().join("journal");
     std::fs::create_dir_all(&journal).unwrap();
-    let plan = plan(vec![proposal(source.to_str().unwrap(), "a.bin", "b.bin", ProposalState::Suggested)], 1, &roms);
+    let plan = plan(
+        vec![proposal(
+            source.to_str().unwrap(),
+            "a.bin",
+            "b.bin",
+            ProposalState::Suggested,
+        )],
+        1,
+        &roms,
+    );
     let cancel = no_cancel();
     let error = apply(
         &plan,
@@ -210,7 +236,12 @@ fn an_ambiguous_proposal_cannot_apply() {
     let source = write(&roms, "a.bin");
     let journal = dir.path().join("journal");
     std::fs::create_dir_all(&journal).unwrap();
-    let mut p = proposal(source.to_str().unwrap(), "a.bin", "b.bin", ProposalState::Ambiguous);
+    let mut p = proposal(
+        source.to_str().unwrap(),
+        "a.bin",
+        "b.bin",
+        ProposalState::Ambiguous,
+    );
     p.actionable = false;
     let plan = plan(vec![p], 1, &roms);
     let cancel = no_cancel();
@@ -223,7 +254,11 @@ fn an_ambiguous_proposal_cannot_apply() {
         &cancel,
     )
     .unwrap_err();
-    assert_eq!(error, ApplyError::NothingApproved, "ambiguous proposals are not applicable");
+    assert_eq!(
+        error,
+        ApplyError::NothingApproved,
+        "ambiguous proposals are not applicable"
+    );
     assert!(source.exists());
 }
 
@@ -235,7 +270,12 @@ fn a_conflict_proposal_cannot_apply() {
     let source = write(&roms, "a.bin");
     let journal = dir.path().join("journal");
     std::fs::create_dir_all(&journal).unwrap();
-    let mut p = proposal(source.to_str().unwrap(), "a.bin", "b.bin", ProposalState::Conflict);
+    let mut p = proposal(
+        source.to_str().unwrap(),
+        "a.bin",
+        "b.bin",
+        ProposalState::Conflict,
+    );
     p.actionable = false;
     let plan = plan(vec![p], 1, &roms);
     let cancel = no_cancel();
@@ -248,7 +288,11 @@ fn a_conflict_proposal_cannot_apply() {
         &cancel,
     )
     .unwrap_err();
-    assert_eq!(error, ApplyError::NothingApproved, "conflict proposals are not applicable");
+    assert_eq!(
+        error,
+        ApplyError::NothingApproved,
+        "conflict proposals are not applicable"
+    );
     assert!(source.exists());
 }
 
@@ -260,7 +304,16 @@ fn a_stale_generation_is_rejected() {
     let source = write(&roms, "a.bin");
     let journal = dir.path().join("journal");
     std::fs::create_dir_all(&journal).unwrap();
-    let plan = plan(vec![proposal(source.to_str().unwrap(), "a.bin", "b.bin", ProposalState::Suggested)], 5, &roms);
+    let plan = plan(
+        vec![proposal(
+            source.to_str().unwrap(),
+            "a.bin",
+            "b.bin",
+            ProposalState::Suggested,
+        )],
+        5,
+        &roms,
+    );
     let error = build_transaction(&plan, &approved_of(&[&source]), 6).unwrap_err();
     assert!(matches!(error, ApplyError::StalePlan { .. }));
     assert!(source.exists());
@@ -275,7 +328,16 @@ fn an_existing_destination_is_never_overwritten() {
     write(&roms, "b.bin"); // destination exists
     let journal = dir.path().join("journal");
     std::fs::create_dir_all(&journal).unwrap();
-    let plan = plan(vec![proposal(source.to_str().unwrap(), "a.bin", "b.bin", ProposalState::Suggested)], 1, &roms);
+    let plan = plan(
+        vec![proposal(
+            source.to_str().unwrap(),
+            "a.bin",
+            "b.bin",
+            ProposalState::Suggested,
+        )],
+        1,
+        &roms,
+    );
     let cancel = no_cancel();
     let error = apply(
         &plan,
@@ -290,7 +352,10 @@ fn an_existing_destination_is_never_overwritten() {
     // AbortAll: a hard conflict prevents the batch from starting at all.
     assert!(matches!(error, ApplyError::HardConflicts(_)));
     assert!(source.exists(), "the source must not move");
-    assert_eq!(std::fs::read(roms.join("b.bin")).unwrap(), b"fixture contents");
+    assert_eq!(
+        std::fs::read(roms.join("b.bin")).unwrap(),
+        b"fixture contents"
+    );
 }
 
 #[test]
@@ -302,7 +367,16 @@ fn an_existing_destination_in_skip_mode_is_skipped() {
     write(&roms, "b.bin");
     let journal = dir.path().join("journal");
     std::fs::create_dir_all(&journal).unwrap();
-    let plan = plan(vec![proposal(source.to_str().unwrap(), "a.bin", "b.bin", ProposalState::Suggested)], 1, &roms);
+    let plan = plan(
+        vec![proposal(
+            source.to_str().unwrap(),
+            "a.bin",
+            "b.bin",
+            ProposalState::Suggested,
+        )],
+        1,
+        &roms,
+    );
     let cancel = no_cancel();
     let outcome = apply(
         &plan,
@@ -328,7 +402,12 @@ fn a_symlink_source_is_rejected() {
     std::os::unix::fs::symlink(&target, &link).unwrap();
     let journal = dir.path().join("journal");
     std::fs::create_dir_all(&journal).unwrap();
-    let mut p = proposal(link.to_str().unwrap(), "link.bin", "renamed.bin", ProposalState::Suggested);
+    let mut p = proposal(
+        link.to_str().unwrap(),
+        "link.bin",
+        "renamed.bin",
+        ProposalState::Suggested,
+    );
     p.object_kind = SourceObjectKind::Symlink;
     let plan = plan(vec![p], 1, &roms);
     let cancel = no_cancel();
@@ -341,7 +420,11 @@ fn a_symlink_source_is_rejected() {
         &cancel,
     )
     .unwrap_err();
-    assert_eq!(error, ApplyError::NothingApproved, "symlink sources are never applicable");
+    assert_eq!(
+        error,
+        ApplyError::NothingApproved,
+        "symlink sources are never applicable"
+    );
     // The link still points at its target; neither was touched.
     assert_eq!(std::fs::read_link(&link).unwrap(), target);
     assert!(target.exists());
@@ -357,7 +440,16 @@ fn outside_trusted_roots_is_rejected() {
     std::fs::create_dir_all(&other).unwrap();
     let journal = dir.path().join("journal");
     std::fs::create_dir_all(&journal).unwrap();
-    let plan = plan(vec![proposal(source.to_str().unwrap(), "a.bin", "b.bin", ProposalState::Suggested)], 1, &roms);
+    let plan = plan(
+        vec![proposal(
+            source.to_str().unwrap(),
+            "a.bin",
+            "b.bin",
+            ProposalState::Suggested,
+        )],
+        1,
+        &roms,
+    );
     let cancel = no_cancel();
     // Trusted root is a DIFFERENT directory than the source's parent.
     let error = apply(
@@ -382,7 +474,16 @@ fn cancellation_before_first_rename_leaves_everything_untouched() {
     let journal = dir.path().join("journal");
     std::fs::create_dir_all(&journal).unwrap();
     let before = snapshot(&roms);
-    let plan = plan(vec![proposal(source.to_str().unwrap(), "a.bin", "b.bin", ProposalState::Suggested)], 1, &roms);
+    let plan = plan(
+        vec![proposal(
+            source.to_str().unwrap(),
+            "a.bin",
+            "b.bin",
+            ProposalState::Suggested,
+        )],
+        1,
+        &roms,
+    );
     let cancel = cancelled();
     let error = apply(
         &plan,
@@ -409,8 +510,18 @@ fn an_apply_failure_stops_subsequent_operations() {
     // b.bin's destination already exists, so it fails preflight; a is fine.
     write(&roms, "B.bin");
     let proposals = vec![
-        proposal(a.to_str().unwrap(), "a.bin", "A.bin", ProposalState::Suggested),
-        proposal(b.to_str().unwrap(), "b.bin", "B.bin", ProposalState::Suggested),
+        proposal(
+            a.to_str().unwrap(),
+            "a.bin",
+            "A.bin",
+            ProposalState::Suggested,
+        ),
+        proposal(
+            b.to_str().unwrap(),
+            "b.bin",
+            "B.bin",
+            ProposalState::Suggested,
+        ),
     ];
     let plan = plan(proposals, 1, &roms);
     let cancel = no_cancel();
@@ -442,7 +553,16 @@ fn source_replaced_with_a_symlink_after_approval_is_rejected() {
     let source = write(&roms, "a.bin");
     let journal = dir.path().join("journal");
     std::fs::create_dir_all(&journal).unwrap();
-    let plan = plan(vec![proposal(source.to_str().unwrap(), "a.bin", "b.bin", ProposalState::Suggested)], 1, &roms);
+    let plan = plan(
+        vec![proposal(
+            source.to_str().unwrap(),
+            "a.bin",
+            "b.bin",
+            ProposalState::Suggested,
+        )],
+        1,
+        &roms,
+    );
     // Hostile change: replace the source with a symlink after approval.
     std::fs::remove_file(&source).unwrap();
     std::os::unix::fs::symlink(dir.path().join("elsewhere.bin"), &source).unwrap();
@@ -457,7 +577,10 @@ fn source_replaced_with_a_symlink_after_approval_is_rejected() {
     )
     .unwrap();
     assert_eq!(outcome.summary.applied, 0);
-    assert_eq!(outcome.summary.skipped, 1, "the symlink substitution is a hard conflict");
+    assert_eq!(
+        outcome.summary.skipped, 1,
+        "the symlink substitution is a hard conflict"
+    );
     let entry = &outcome.transaction.entries[0];
     assert!(
         entry
@@ -468,7 +591,12 @@ fn source_replaced_with_a_symlink_after_approval_is_rejected() {
         entry.preflight_failures
     );
     // The symlink is still there; the target was never touched.
-    assert!(std::fs::symlink_metadata(&source).unwrap().file_type().is_symlink());
+    assert!(
+        std::fs::symlink_metadata(&source)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
 }
 
 #[test]
@@ -479,7 +607,16 @@ fn source_replaced_with_a_different_inode_is_rejected() {
     let source = write(&roms, "a.bin");
     let journal = dir.path().join("journal");
     std::fs::create_dir_all(&journal).unwrap();
-    let plan = plan(vec![proposal(source.to_str().unwrap(), "a.bin", "b.bin", ProposalState::Suggested)], 1, &roms);
+    let plan = plan(
+        vec![proposal(
+            source.to_str().unwrap(),
+            "a.bin",
+            "b.bin",
+            ProposalState::Suggested,
+        )],
+        1,
+        &roms,
+    );
     let approved = approved_of(&[&source]);
     let tx = build_transaction(&plan, &approved, 1).unwrap();
     // Hostile change: delete and recreate the file (different inode) after review.
@@ -496,7 +633,10 @@ fn source_replaced_with_a_different_inode_is_rejected() {
         1,
     )
     .unwrap();
-    assert_eq!(outcome.summary.applied, 0, "a different object must not be renamed");
+    assert_eq!(
+        outcome.summary.applied, 0,
+        "a different object must not be renamed"
+    );
     assert_eq!(outcome.summary.skipped, 1);
 }
 
@@ -508,7 +648,16 @@ fn destination_created_after_approval_is_rejected() {
     let source = write(&roms, "a.bin");
     let journal = dir.path().join("journal");
     std::fs::create_dir_all(&journal).unwrap();
-    let plan = plan(vec![proposal(source.to_str().unwrap(), "a.bin", "b.bin", ProposalState::Suggested)], 1, &roms);
+    let plan = plan(
+        vec![proposal(
+            source.to_str().unwrap(),
+            "a.bin",
+            "b.bin",
+            ProposalState::Suggested,
+        )],
+        1,
+        &roms,
+    );
     // Hostile change: destination appears after approval.
     write(&roms, "b.bin");
     let cancel = no_cancel();
@@ -521,8 +670,14 @@ fn destination_created_after_approval_is_rejected() {
         &cancel,
     )
     .unwrap();
-    assert_eq!(outcome.summary.applied, 0, "an appearing destination must never be overwritten");
-    assert_eq!(std::fs::read(roms.join("b.bin")).unwrap(), b"fixture contents");
+    assert_eq!(
+        outcome.summary.applied, 0,
+        "an appearing destination must never be overwritten"
+    );
+    assert_eq!(
+        std::fs::read(roms.join("b.bin")).unwrap(),
+        b"fixture contents"
+    );
 }
 
 #[test]
@@ -533,7 +688,16 @@ fn source_renamed_externally_is_rejected() {
     let source = write(&roms, "a.bin");
     let journal = dir.path().join("journal");
     std::fs::create_dir_all(&journal).unwrap();
-    let plan = plan(vec![proposal(source.to_str().unwrap(), "a.bin", "b.bin", ProposalState::Suggested)], 1, &roms);
+    let plan = plan(
+        vec![proposal(
+            source.to_str().unwrap(),
+            "a.bin",
+            "b.bin",
+            ProposalState::Suggested,
+        )],
+        1,
+        &roms,
+    );
     let approved = approved_of(&[&source]);
     let tx = build_transaction(&plan, &approved, 1).unwrap();
     // Hostile change: rename the source externally after review.
@@ -550,7 +714,10 @@ fn source_renamed_externally_is_rejected() {
         1,
     )
     .unwrap();
-    assert_eq!(outcome.summary.applied, 0, "an externally renamed source must not be touched");
+    assert_eq!(
+        outcome.summary.applied, 0,
+        "an externally renamed source must not be touched"
+    );
     assert_eq!(outcome.summary.skipped, 1);
     assert!(renamed.exists());
 }
@@ -563,7 +730,16 @@ fn size_changed_after_approval_is_rejected() {
     let source = write(&roms, "a.bin");
     let journal = dir.path().join("journal");
     std::fs::create_dir_all(&journal).unwrap();
-    let plan = plan(vec![proposal(source.to_str().unwrap(), "a.bin", "b.bin", ProposalState::Suggested)], 1, &roms);
+    let plan = plan(
+        vec![proposal(
+            source.to_str().unwrap(),
+            "a.bin",
+            "b.bin",
+            ProposalState::Suggested,
+        )],
+        1,
+        &roms,
+    );
     let approved = approved_of(&[&source]);
     let tx = build_transaction(&plan, &approved, 1).unwrap();
     // Hostile change: change the size after review.
@@ -579,7 +755,10 @@ fn size_changed_after_approval_is_rejected() {
         1,
     )
     .unwrap();
-    assert_eq!(outcome.summary.applied, 0, "a resized file must not be renamed");
+    assert_eq!(
+        outcome.summary.applied, 0,
+        "a resized file must not be renamed"
+    );
     assert_eq!(outcome.summary.skipped, 1);
 }
 
@@ -591,7 +770,16 @@ fn destination_parent_changed_is_rejected() {
     let source = write(&roms, "a.bin");
     let journal = dir.path().join("journal");
     std::fs::create_dir_all(&journal).unwrap();
-    let plan = plan(vec![proposal(source.to_str().unwrap(), "a.bin", "b.bin", ProposalState::Suggested)], 1, &roms);
+    let plan = plan(
+        vec![proposal(
+            source.to_str().unwrap(),
+            "a.bin",
+            "b.bin",
+            ProposalState::Suggested,
+        )],
+        1,
+        &roms,
+    );
     let approved = approved_of(&[&source]);
     let tx = build_transaction(&plan, &approved, 1).unwrap();
     // Hostile change: the source is moved into a different directory after review.
@@ -610,7 +798,10 @@ fn destination_parent_changed_is_rejected() {
         1,
     )
     .unwrap();
-    assert_eq!(outcome.summary.applied, 0, "a source moved elsewhere must not be renamed");
+    assert_eq!(
+        outcome.summary.applied, 0,
+        "a source moved elsewhere must not be renamed"
+    );
     assert_eq!(outcome.summary.skipped, 1);
     assert!(moved.exists());
 }
@@ -624,7 +815,16 @@ fn a_case_fold_sibling_appearing_after_approval_is_rejected() {
     let journal = dir.path().join("journal");
     std::fs::create_dir_all(&journal).unwrap();
     // Proposal: game.bin -> Game.bin
-    let plan = plan(vec![proposal(source.to_str().unwrap(), "game.bin", "Game.bin", ProposalState::Suggested)], 1, &roms);
+    let plan = plan(
+        vec![proposal(
+            source.to_str().unwrap(),
+            "game.bin",
+            "Game.bin",
+            ProposalState::Suggested,
+        )],
+        1,
+        &roms,
+    );
     let approved = approved_of(&[&source]);
     let tx = build_transaction(&plan, &approved, 1).unwrap();
     // Hostile change: a second file appears with the same case-fold after review.
@@ -640,7 +840,10 @@ fn a_case_fold_sibling_appearing_after_approval_is_rejected() {
         1,
     )
     .unwrap();
-    assert_eq!(outcome.summary.applied, 0, "the case-fold collision must be detected at apply time");
+    assert_eq!(
+        outcome.summary.applied, 0,
+        "the case-fold collision must be detected at apply time"
+    );
     assert_eq!(outcome.summary.skipped, 1);
 }
 
@@ -655,8 +858,18 @@ fn duplicate_batch_destinations_are_rejected() {
     std::fs::create_dir_all(&journal).unwrap();
     // Two proposals targeting the same destination.
     let proposals = vec![
-        proposal(a.to_str().unwrap(), "a.bin", "Same.bin", ProposalState::Suggested),
-        proposal(b.to_str().unwrap(), "b.bin", "Same.bin", ProposalState::Suggested),
+        proposal(
+            a.to_str().unwrap(),
+            "a.bin",
+            "Same.bin",
+            ProposalState::Suggested,
+        ),
+        proposal(
+            b.to_str().unwrap(),
+            "b.bin",
+            "Same.bin",
+            ProposalState::Suggested,
+        ),
     ];
     let plan = plan(proposals, 1, &roms);
     let cancel = no_cancel();
@@ -669,7 +882,10 @@ fn duplicate_batch_destinations_are_rejected() {
         &cancel,
     )
     .unwrap();
-    assert_eq!(outcome.summary.applied, 0, "duplicate targets must not apply");
+    assert_eq!(
+        outcome.summary.applied, 0,
+        "duplicate targets must not apply"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -684,7 +900,16 @@ fn the_journal_is_written_before_any_mutation() {
     let source = write(&roms, "a.bin");
     let journal = dir.path().join("journal");
     std::fs::create_dir_all(&journal).unwrap();
-    let plan = plan(vec![proposal(source.to_str().unwrap(), "a.bin", "b.bin", ProposalState::Suggested)], 1, &roms);
+    let plan = plan(
+        vec![proposal(
+            source.to_str().unwrap(),
+            "a.bin",
+            "b.bin",
+            ProposalState::Suggested,
+        )],
+        1,
+        &roms,
+    );
     let cancel = no_cancel();
     let outcome = apply(
         &plan,
@@ -714,30 +939,28 @@ fn crash_after_journal_write_before_first_rename_is_recoverable() {
         created_at_unix: 1,
         source_scan_root: "/tmp/roms".to_string(),
         state: TransactionState::Planned,
-        entries: vec![
-            TransactionEntry {
-                source_path: PathBuf::from("/tmp/roms/a.bin"),
-                destination_path: PathBuf::from("/tmp/roms/b.bin"),
-                original_basename: "a.bin".to_string(),
-                proposed_basename: "b.bin".to_string(),
-                identity: ObjectIdentity {
-                    size_bytes: 1,
-                    modified_unix: 1,
-                    kind: ObjectKind::RegularFile,
-                    #[cfg(unix)]
-                    ino: 1,
-                    #[cfg(unix)]
-                    dev: 1,
-                },
-                preflight_passed: false,
-                preflight_failures: Vec::new(),
-                state: EntryState::Planned,
-                failure_reason: None,
-                applied_at_unix: None,
-                rolled_back_at_unix: None,
-                unknown: Default::default(),
+        entries: vec![TransactionEntry {
+            source_path: PathBuf::from("/tmp/roms/a.bin"),
+            destination_path: PathBuf::from("/tmp/roms/b.bin"),
+            original_basename: "a.bin".to_string(),
+            proposed_basename: "b.bin".to_string(),
+            identity: ObjectIdentity {
+                size_bytes: 1,
+                modified_unix: 1,
+                kind: ObjectKind::RegularFile,
+                #[cfg(unix)]
+                ino: 1,
+                #[cfg(unix)]
+                dev: 1,
             },
-        ],
+            preflight_passed: false,
+            preflight_failures: Vec::new(),
+            state: EntryState::Planned,
+            failure_reason: None,
+            applied_at_unix: None,
+            rolled_back_at_unix: None,
+            unknown: Default::default(),
+        }],
         unknown: Default::default(),
     };
     write_journal(&journal, &tx).unwrap();
@@ -745,7 +968,11 @@ fn crash_after_journal_write_before_first_rename_is_recoverable() {
     let (recovery, problems) = find_recovery_transactions(&journal);
     assert!(problems.is_empty());
     assert_eq!(recovery.len(), 1);
-    assert_eq!(recovery[0].applied_count(), 0, "nothing was renamed before the crash");
+    assert_eq!(
+        recovery[0].applied_count(),
+        0,
+        "nothing was renamed before the crash"
+    );
 }
 
 #[test]
@@ -790,7 +1017,11 @@ fn crash_after_first_of_n_renames_is_recoverable() {
 
     let (recovery, _) = find_recovery_transactions(&journal);
     assert_eq!(recovery.len(), 1);
-    assert_eq!(recovery[0].applied_count(), 1, "one rename happened before the crash");
+    assert_eq!(
+        recovery[0].applied_count(),
+        1,
+        "one rename happened before the crash"
+    );
     assert_eq!(recovery[0].state, TransactionState::Applying);
 }
 
@@ -828,7 +1059,16 @@ fn apply_one(dir: &Path) -> (RenamePlan, RenameTransaction, BTreeSet<String>) {
     let source = write(&roms, "a.bin");
     let journal = dir.join("journal");
     std::fs::create_dir_all(&journal).unwrap();
-    let plan = plan(vec![proposal(source.to_str().unwrap(), "a.bin", "b.bin", ProposalState::Suggested)], 1, &roms);
+    let plan = plan(
+        vec![proposal(
+            source.to_str().unwrap(),
+            "a.bin",
+            "b.bin",
+            ProposalState::Suggested,
+        )],
+        1,
+        &roms,
+    );
     let cancel = no_cancel();
     let outcome = apply(
         &plan,
@@ -854,7 +1094,10 @@ fn a_successful_rollback_restores_the_original_path_and_bytes() {
     let roms = dir.path().join("roms");
     assert!(roms.join("a.bin").exists(), "the original path is restored");
     assert!(!roms.join("b.bin").exists());
-    assert_eq!(std::fs::read(roms.join("a.bin")).unwrap(), b"fixture contents");
+    assert_eq!(
+        std::fs::read(roms.join("a.bin")).unwrap(),
+        b"fixture contents"
+    );
 }
 
 #[test]
@@ -867,8 +1110,18 @@ fn rollback_reverses_in_reverse_order() {
     let journal = dir.path().join("journal");
     std::fs::create_dir_all(&journal).unwrap();
     let proposals = vec![
-        proposal(a.to_str().unwrap(), "a.bin", "A.bin", ProposalState::Suggested),
-        proposal(b.to_str().unwrap(), "b.bin", "B.bin", ProposalState::Suggested),
+        proposal(
+            a.to_str().unwrap(),
+            "a.bin",
+            "A.bin",
+            ProposalState::Suggested,
+        ),
+        proposal(
+            b.to_str().unwrap(),
+            "b.bin",
+            "B.bin",
+            ProposalState::Suggested,
+        ),
     ];
     let plan = plan(proposals, 1, &roms);
     let cancel = no_cancel();
@@ -896,9 +1149,15 @@ fn rollback_reverses_in_reverse_order() {
         "second rolls back, first cannot: {:?}",
         rollback.result
     );
-    assert!(roms.join("b.bin").exists(), "the second entry was rolled back");
+    assert!(
+        roms.join("b.bin").exists(),
+        "the second entry was rolled back"
+    );
     assert!(!roms.join("B.bin").exists());
-    assert!(!roms.join("a.bin").exists(), "the first could not roll back (destination gone)");
+    assert!(
+        !roms.join("a.bin").exists(),
+        "the first could not roll back (destination gone)"
+    );
 }
 
 #[test]
@@ -911,7 +1170,10 @@ fn rollback_refuses_when_the_destination_was_changed_externally() {
     std::fs::write(roms.join("b.bin"), b"replaced by an attacker").unwrap();
     let cancel = no_cancel();
     let outcome = rollback_transaction(&mut tx, &journal, &cancel).unwrap();
-    assert!(matches!(outcome.result, RollbackResult::RollbackFailed { .. }));
+    assert!(matches!(
+        outcome.result,
+        RollbackResult::RollbackFailed { .. }
+    ));
     assert_eq!(outcome.transaction.state, TransactionState::RollbackFailed);
     assert!(!roms.join("a.bin").exists(), "nothing was moved back");
 }
@@ -926,10 +1188,19 @@ fn rollback_refuses_when_the_original_name_is_occupied() {
     write(&roms, "a.bin");
     let cancel = no_cancel();
     let outcome = rollback_transaction(&mut tx, &journal, &cancel).unwrap();
-    assert!(matches!(outcome.result, RollbackResult::RollbackFailed { .. }));
+    assert!(matches!(
+        outcome.result,
+        RollbackResult::RollbackFailed { .. }
+    ));
     // The occupied original is untouched; the destination still has the data.
-    assert_eq!(std::fs::read(roms.join("a.bin")).unwrap(), b"fixture contents");
-    assert_eq!(std::fs::read(roms.join("b.bin")).unwrap(), b"fixture contents");
+    assert_eq!(
+        std::fs::read(roms.join("a.bin")).unwrap(),
+        b"fixture contents"
+    );
+    assert_eq!(
+        std::fs::read(roms.join("b.bin")).unwrap(),
+        b"fixture contents"
+    );
 }
 
 #[test]
@@ -941,7 +1212,11 @@ fn repeated_rollback_is_idempotent_and_safe() {
     let first = rollback_transaction(&mut tx, &journal, &cancel).unwrap();
     assert_eq!(first.result, RollbackResult::FullyRolledBack);
     let second = rollback_transaction(&mut tx, &journal, &cancel).unwrap();
-    assert_eq!(second.result, RollbackResult::FullyRolledBack, "second rollback is a safe no-op");
+    assert_eq!(
+        second.result,
+        RollbackResult::FullyRolledBack,
+        "second rollback is a safe no-op"
+    );
     let roms = dir.path().join("roms");
     assert!(roms.join("a.bin").exists());
     assert!(!roms.join("b.bin").exists());
@@ -955,7 +1230,16 @@ fn a_completed_transaction_cannot_be_applied_twice() {
     let source = write(&roms, "a.bin");
     let journal = dir.path().join("journal");
     std::fs::create_dir_all(&journal).unwrap();
-    let plan = plan(vec![proposal(source.to_str().unwrap(), "a.bin", "b.bin", ProposalState::Suggested)], 1, &roms);
+    let plan = plan(
+        vec![proposal(
+            source.to_str().unwrap(),
+            "a.bin",
+            "b.bin",
+            ProposalState::Suggested,
+        )],
+        1,
+        &roms,
+    );
     let cancel = no_cancel();
     apply(
         &plan,
@@ -992,7 +1276,16 @@ fn content_is_identical_through_apply_and_rollback() {
     let journal = dir.path().join("journal");
     std::fs::create_dir_all(&journal).unwrap();
     let before = std::fs::read(&source).unwrap();
-    let plan = plan(vec![proposal(source.to_str().unwrap(), "a.bin", "b.bin", ProposalState::Suggested)], 1, &roms);
+    let plan = plan(
+        vec![proposal(
+            source.to_str().unwrap(),
+            "a.bin",
+            "b.bin",
+            ProposalState::Suggested,
+        )],
+        1,
+        &roms,
+    );
     let cancel = no_cancel();
     let outcome = apply(
         &plan,
@@ -1022,7 +1315,16 @@ fn a_failed_preflight_leaves_all_files_untouched() {
     std::fs::create_dir_all(&journal).unwrap();
     write(&roms, "b.bin"); // destination exists -> hard conflict
     let before = snapshot(&roms);
-    let plan = plan(vec![proposal(source.to_str().unwrap(), "a.bin", "b.bin", ProposalState::Suggested)], 1, &roms);
+    let plan = plan(
+        vec![proposal(
+            source.to_str().unwrap(),
+            "a.bin",
+            "b.bin",
+            ProposalState::Suggested,
+        )],
+        1,
+        &roms,
+    );
     let cancel = no_cancel();
     let error = apply(
         &plan,
@@ -1034,7 +1336,11 @@ fn a_failed_preflight_leaves_all_files_untouched() {
     )
     .unwrap_err();
     assert!(matches!(error, ApplyError::HardConflicts(_)));
-    assert_eq!(snapshot(&roms), before, "a failed preflight changes nothing");
+    assert_eq!(
+        snapshot(&roms),
+        before,
+        "a failed preflight changes nothing"
+    );
 }
 
 #[test]
@@ -1049,7 +1355,12 @@ fn rename_cannot_escape_the_source_directory() {
     let journal = dir.path().join("journal");
     std::fs::create_dir_all(&journal).unwrap();
     // A hostile proposed name with a path separator.
-    let p = proposal(source.to_str().unwrap(), "a.bin", "../escape.bin", ProposalState::Suggested);
+    let p = proposal(
+        source.to_str().unwrap(),
+        "a.bin",
+        "../escape.bin",
+        ProposalState::Suggested,
+    );
     // destination_path would be parent.join("../escape.bin") - but preflight
     // rejects the unsafe basename before anything happens.
     let plan = plan(vec![p], 1, &roms);
@@ -1076,7 +1387,16 @@ fn broken_symlink_substitution_is_rejected() {
     let source = write(&roms, "a.bin");
     let journal = dir.path().join("journal");
     std::fs::create_dir_all(&journal).unwrap();
-    let plan = plan(vec![proposal(source.to_str().unwrap(), "a.bin", "b.bin", ProposalState::Suggested)], 1, &roms);
+    let plan = plan(
+        vec![proposal(
+            source.to_str().unwrap(),
+            "a.bin",
+            "b.bin",
+            ProposalState::Suggested,
+        )],
+        1,
+        &roms,
+    );
     // Hostile change: replace the source with a broken symlink.
     std::fs::remove_file(&source).unwrap();
     std::os::unix::fs::symlink(dir.path().join("nowhere.bin"), &source).unwrap();
@@ -1105,7 +1425,12 @@ fn a_symlink_loop_is_not_followed() {
     std::os::unix::fs::symlink(&a, &b).unwrap();
     let journal = dir.path().join("journal");
     std::fs::create_dir_all(&journal).unwrap();
-    let mut p = proposal(a.to_str().unwrap(), "a.bin", "renamed.bin", ProposalState::Suggested);
+    let mut p = proposal(
+        a.to_str().unwrap(),
+        "a.bin",
+        "renamed.bin",
+        ProposalState::Suggested,
+    );
     p.object_kind = SourceObjectKind::Symlink;
     let plan = plan(vec![p], 1, &roms);
     let cancel = no_cancel();
@@ -1118,7 +1443,11 @@ fn a_symlink_loop_is_not_followed() {
         &cancel,
     )
     .unwrap_err();
-    assert_eq!(error, ApplyError::NothingApproved, "symlink loops are never applicable");
+    assert_eq!(
+        error,
+        ApplyError::NothingApproved,
+        "symlink loops are never applicable"
+    );
 }
 
 #[test]

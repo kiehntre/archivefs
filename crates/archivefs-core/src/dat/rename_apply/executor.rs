@@ -250,7 +250,11 @@ pub fn apply_transaction(execution: &mut ApplyExecution<'_>) -> Result<ApplyOutc
     write_journal(&execution.journal_dir, transaction)
         .map_err(|error| ApplyError::Journal(error.to_string()))?;
 
-    if transaction.entries.iter().all(|e| e.state == EntryState::Skipped) {
+    if transaction
+        .entries
+        .iter()
+        .all(|e| e.state == EntryState::Skipped)
+    {
         transaction.state = TransactionState::ApplyFailed;
         write_journal(&execution.journal_dir, transaction)
             .map_err(|error| ApplyError::Journal(error.to_string()))?;
@@ -323,7 +327,10 @@ enum ApplyOne {
 /// no-clobber rename itself, and a filesystem confirmation before the entry is
 /// marked Applied. On any failure the entry is marked ApplyFailed with an
 /// exact reason and the batch is told to stop.
-fn apply_one_entry(entry: &mut TransactionEntry, preflight_options: &PreflightOptions<'_>) -> ApplyOne {
+fn apply_one_entry(
+    entry: &mut TransactionEntry,
+    preflight_options: &PreflightOptions<'_>,
+) -> ApplyOne {
     if let Err(failures) = run_preflight(entry, preflight_options) {
         entry.state = EntryState::ApplyFailed;
         entry.failure_reason = Some(

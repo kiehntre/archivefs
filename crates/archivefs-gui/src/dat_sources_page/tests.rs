@@ -3598,3 +3598,308 @@ fn an_audit_builds_a_read_only_rename_plan_and_changes_nothing() {
         "planning an audit must not change any path, file identity or content"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Rename apply flow
+// ---------------------------------------------------------------------------
+
+/// Builds a page whose plan references real files in a trusted folder, with a
+/// temporary journal directory - so an apply actually renames on a real worker
+/// and writes its journal into the temp dir, never the real home.
+fn page_with_apply_plan(count: usize) -> (Fixture, PathBuf, DatSourcesPageState) {
+    let fixture = Fixture::new();
+    let roms = fixture.dir("roms");
+    let mut proposals = Vec::new();
+    for index in 0..count {
+        let name = format!("game{index}.bin");
+        let path = roms.join(&name);
+        std::fs::write(&path, b"fixture contents").unwrap();
+        proposals.push(plan_proposal(
+            path.to_str().unwrap(),
+            &name,
+            Some(&format!("Game {index} (Europe).bin")),
+            ProposalState::Suggested,
+        ));
+    }
+    let journal = fixture.dir("journal");
+    let counts = RenamePlanCounts::from_proposals(&proposals);
+    let mut page = DatSourcesPageState::load_with_transaction_dir(
+        fixture.config_path.clone(),
+        Vec::new(),
+        TrustedRoots::from_paths([&roms]),
+        journal.clone(),
+    );
+    page.rename_plan = Some(RenamePlan {
+        generation: 1,
+        source_id: "src".to_string(),
+        source_display_name: "Source".to_string(),
+        scan_root: roms.to_string_lossy().into_owned(),
+        platform: None,
+        platform_display: None,
+        proposals,
+        counts,
+        audited_total: counts.total,
+        verified_total: counts.total,
+        truncated: false,
+    });
+    (fixture, roms, page)
+}
+
+fn approve_all(page: &mut DatSourcesPageState) {
+    let plan = page.rename_plan.clone().unwrap();
+    for proposal in &plan.proposals {
+        page.apply(DatSourcesPageAction::SetReviewDecision {
+            path: proposal.source_path.to_string_lossy().into_owned(),
+            decision: Some(ReviewDecision::AcceptedForReview),
+        });
+    }
+}
+
+#[test]
+fn apply_is_hidden_without_approved_suggested_proposals() {
+    let (_fixture, _roms, page) = page_with_apply_plan(1);
+    let view = page.view();
+    let mut ui_state = DatSourcesPageUi::default();
+    let output = render(&view, &mut ui_state);
+    assert!(
+        !rendered_text_contains(&output, "Apply approved renames"),
+        "with nothing approved there is nothing to apply"
+    );
+}
+
+#[test]
+fn apply_is_hidden_for_unsafe_proposals() {
+    let (_fixture, _roms, mut page) = page_with_apply_plan(1);
+    // Turn the only proposal into an ambiguous one (not applicable).
+    let plan = page.rename_plan.as_mut().unwrap();
+    plan.proposals[0].state = ProposalState::Ambiguous;
+    plan.proposals[0].actionable = false;
+    approve_all(&mut page);
+    let view = page.view();
+    let mut ui_state = DatSourcesPageUi::default();
+    let output = render(&view, &mut ui_state);
+    assert!(
+        !rendered_text_contains(&output, "Apply approved renames"),
+        "ambiguous proposals must never be offered for apply"
+    );
+}
+
+#[test]
+fn begin_review_shows_the_read_only_old_to_new_pairs() {
+    let (_fixture, roms, mut page) = page_with_apply_plan(2);
+    approve_all(&mut page);
+    page.apply(DatSourcesPageAction::BeginApplyReview);
+    let view = page.view();
+    let review = view
+        .rename_apply
+        .review
+        .as_ref()
+        .expect("a review is shown");
+    assert_eq!(review.rows.len(), 2);
+    assert_eq!(review.rows[0].current_basename, "game0.bin");
+    assert_eq!(review.rows[0].proposed_basename, "Game 0 (Europe).bin");
+    assert_eq!(review.trusted_root.as_deref(), Some(roms.to_str().unwrap()));
+    // Nothing has been renamed yet.
+    assert!(roms.join("game0.bin").exists());
+    assert!(!roms.join("Game 0 (Europe).bin").exists());
+}
+
+#[test]
+fn a_large_batch_requires_the_typed_confirmation() {
+    let (_fixture, roms, mut page) = page_with_apply_plan(9);
+    approve_all(&mut page);
+    page.apply(DatSourcesPageAction::BeginApplyReview);
+    let view = page.view();
+    let review = view.rename_apply.review.as_ref().expect("review");
+    assert_eq!(
+        review.required_phrase.as_deref(),
+        Some("RENAME 9 FILES"),
+        "a batch larger than the threshold needs a typed phrase"
+    );
+
+    // A wrong phrase is refused and nothing happens.
+    page.apply(DatSourcesPageAction::ConfirmApply {
+        typed: "RENAME 8 FILES".to_string(),
+    });
+    assert!(page.view().rename_apply.apply_error.is_some());
+    assert!(roms.join("game0.bin").exists());
+
+    // The correct phrase applies.
+    page.apply(DatSourcesPageAction::ConfirmApply {
+        typed: "RENAME 9 FILES".to_string(),
+    });
+    run_to_completion(&mut page);
+    let view = page.view();
+    let outcome = view.rename_apply.outcome.as_ref().expect("an outcome");
+    assert_eq!(outcome.applied, 9);
+    assert!(roms.join("Game 0 (Europe).bin").exists());
+}
+
+#[test]
+fn an_approved_apply_renames_and_the_outcome_is_visible() {
+    let (_fixture, roms, mut page) = page_with_apply_plan(2);
+    approve_all(&mut page);
+    page.apply(DatSourcesPageAction::BeginApplyReview);
+    page.apply(DatSourcesPageAction::ConfirmApply {
+        typed: String::new(),
+    });
+    run_to_completion(&mut page);
+
+    let view = page.view();
+    let apply = &view.rename_apply;
+    let outcome = apply.outcome.as_ref().expect("an apply outcome");
+    assert_eq!(outcome.applied, 2);
+    assert_eq!(outcome.failed, 0);
+    assert!(!roms.join("game0.bin").exists());
+    assert!(roms.join("Game 0 (Europe).bin").exists());
+    assert_eq!(
+        std::fs::read(roms.join("Game 1 (Europe).bin")).unwrap(),
+        b"fixture contents"
+    );
+    // The journal records the applied state.
+    assert!(apply.journal_dir.contains("journal"));
+}
+
+#[test]
+fn rollback_from_the_page_restores_original_files() {
+    let (_fixture, roms, mut page) = page_with_apply_plan(1);
+    approve_all(&mut page);
+    page.apply(DatSourcesPageAction::BeginApplyReview);
+    page.apply(DatSourcesPageAction::ConfirmApply {
+        typed: String::new(),
+    });
+    run_to_completion(&mut page);
+    assert!(roms.join("Game 0 (Europe).bin").exists());
+
+    let id = page
+        .view()
+        .rename_apply
+        .outcome
+        .as_ref()
+        .unwrap()
+        .transaction_id
+        .clone();
+    page.apply(DatSourcesPageAction::RollbackTransaction { id });
+    run_to_completion(&mut page);
+    let view = page.view();
+    assert_eq!(
+        view.rename_apply.rollback_result.as_ref().map(|r| r.label),
+        Some("Fully rolled back")
+    );
+    assert!(roms.join("game0.bin").exists());
+    assert!(!roms.join("Game 0 (Europe).bin").exists());
+    assert_eq!(
+        std::fs::read(roms.join("game0.bin")).unwrap(),
+        b"fixture contents"
+    );
+}
+
+#[test]
+fn an_interrupted_transaction_is_offered_for_recovery_and_never_auto_resumes() {
+    let (_fixture, _roms, mut page) = page_with_apply_plan(0);
+    // Write an interrupted journal directly into the page's temp journal dir.
+    let tx = archivefs_core::dat::rename_apply::RenameTransaction {
+        transaction_id: "interrupted-test".to_string(),
+        plan_generation: 1,
+        created_at_unix: 1,
+        source_scan_root: "/tmp/roms".to_string(),
+        state: archivefs_core::dat::rename_apply::TransactionState::Applying,
+        entries: vec![archivefs_core::dat::rename_apply::TransactionEntry {
+            source_path: PathBuf::from("/tmp/roms/a.bin"),
+            destination_path: PathBuf::from("/tmp/roms/b.bin"),
+            original_basename: "a.bin".to_string(),
+            proposed_basename: "b.bin".to_string(),
+            identity: archivefs_core::dat::rename_apply::ObjectIdentity {
+                size_bytes: 1,
+                modified_unix: 1,
+                kind: archivefs_core::dat::rename_apply::ObjectKind::RegularFile,
+                #[cfg(unix)]
+                ino: 1,
+                #[cfg(unix)]
+                dev: 1,
+            },
+            preflight_passed: false,
+            preflight_failures: Vec::new(),
+            state: archivefs_core::dat::rename_apply::EntryState::Planned,
+            failure_reason: None,
+            applied_at_unix: None,
+            rolled_back_at_unix: None,
+            unknown: Default::default(),
+        }],
+        unknown: Default::default(),
+    };
+    archivefs_core::dat::rename_apply::write_journal(
+        Path::new(&page.view().rename_apply.journal_dir),
+        &tx,
+    )
+    .unwrap();
+    page.refresh_recovery();
+
+    let view = page.view();
+    assert_eq!(view.rename_apply.recovery.len(), 1);
+    assert!(
+        view.rename_apply.recovery[0]
+            .transaction_id
+            .contains("interrupted")
+    );
+    let mut ui_state = DatSourcesPageUi::default();
+    let output = render(&view, &mut ui_state);
+    assert!(rendered_text_contains(
+        &output,
+        "An interrupted rename transaction was found"
+    ));
+    assert!(rendered_text_contains(&output, "Leave untouched"));
+    // There is no auto-resume anywhere in the UI.
+    assert!(!rendered_text_contains(&output, "Resume renames"));
+}
+
+#[test]
+fn the_apply_section_renders_at_a_narrow_compact_width() {
+    let (_fixture, _roms, mut page) = page_with_apply_plan(2);
+    approve_all(&mut page);
+    page.apply(DatSourcesPageAction::BeginApplyReview);
+    let view = page.view();
+    let mut ui_state = DatSourcesPageUi::default();
+    let output = render_at_width(&view, &mut ui_state, 700.0);
+    assert!(rendered_text_contains(&output, "Review approved renames"));
+    assert!(rendered_text_contains(&output, "Apply approved renames"));
+    assert!(rendered_text_contains(&output, "game0.bin"));
+}
+
+#[test]
+fn the_apply_controls_are_reachable_by_keyboard() {
+    let (_fixture, _roms, mut page) = page_with_apply_plan(1);
+    approve_all(&mut page);
+    page.apply(DatSourcesPageAction::BeginApplyReview);
+    let view = page.view();
+    let ctx = egui::Context::default();
+    let mut focused_anything = false;
+    for _ in 0..40 {
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1100.0, 4000.0),
+                )),
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Tab,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let mut ui_state = DatSourcesPageUi::default();
+                    let _ = show_dat_sources_page(ui, &view, &mut ui_state);
+                });
+            },
+        );
+        if ctx.memory(|memory| memory.focused()).is_some() {
+            focused_anything = true;
+        }
+    }
+    assert!(focused_anything, "Tab never focused anything on the page");
+}

@@ -42,8 +42,8 @@ pub mod preflight;
 pub mod rollback;
 
 pub use executor::{
-    ApplyError, ApplyExecution, ApplyOutcome, HardConflictMode, apply_transaction, build_transaction,
-    build_transaction_entries, is_approved,
+    ApplyError, ApplyExecution, ApplyOutcome, HardConflictMode, apply_transaction,
+    build_transaction, build_transaction_entries, is_approved,
 };
 pub use identity::{capture_identity, classify_at, identity_matches};
 pub use journal::{

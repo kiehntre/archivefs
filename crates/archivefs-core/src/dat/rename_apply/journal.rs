@@ -20,9 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::ArchiveFsError;
-use crate::dat::rename_apply::model::{
-    EntryState, RenameTransaction, TransactionState,
-};
+use crate::dat::rename_apply::model::{EntryState, RenameTransaction, TransactionState};
 
 /// The journal directory's name under the ArchiveFS data directory.
 pub const RENAME_TRANSACTIONS_DIRECTORY: &str = "rename-transactions";
@@ -85,7 +83,9 @@ pub fn write_journal(dir: &Path, transaction: &RenameTransaction) -> Result<(), 
     })?;
     let path = dir.join(name);
     let body = serde_json::to_string_pretty(transaction).map_err(|error| {
-        ArchiveFsError::Config(format!("failed to serialize rename transaction journal: {error}"))
+        ArchiveFsError::Config(format!(
+            "failed to serialize rename transaction journal: {error}"
+        ))
     })?;
     crate::atomic_write_text(&path, &format!("{body}\n"))
 }
@@ -142,8 +142,7 @@ pub fn find_recovery_transactions(dir: &Path) -> (Vec<RenameTransaction>, Vec<St
 
 /// Whether a transaction's journal still exists on disk.
 pub fn journal_exists(dir: &Path, transaction_id: &str) -> bool {
-    journal_path(dir, transaction_id)
-        .is_some_and(|path| std::fs::symlink_metadata(&path).is_ok())
+    journal_path(dir, transaction_id).is_some_and(|path| std::fs::symlink_metadata(&path).is_ok())
 }
 
 /// Removes a transaction's journal. Used only after a transaction is fully
@@ -180,9 +179,7 @@ pub fn terminal_state_after_apply(transaction: &RenameTransaction) -> Transactio
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dat::rename_apply::model::{
-        ObjectIdentity, ObjectKind, TransactionEntry,
-    };
+    use crate::dat::rename_apply::model::{ObjectIdentity, ObjectKind, TransactionEntry};
     use std::path::PathBuf;
 
     fn entry(source: &str, destination: &str) -> TransactionEntry {
@@ -263,11 +260,12 @@ mod tests {
         .unwrap();
         let loaded = read_journal(&path).unwrap();
         assert_eq!(loaded.state, TransactionState::Planned);
-        assert_eq!(loaded.unknown.get("future_transaction_field"), Some(&serde_json::json!(42)));
         assert_eq!(
-            loaded.entries[0]
-                .unknown
-                .get("future_entry_field"),
+            loaded.unknown.get("future_transaction_field"),
+            Some(&serde_json::json!(42))
+        );
+        assert_eq!(
+            loaded.entries[0].unknown.get("future_entry_field"),
             Some(&serde_json::json!("kept"))
         );
     }
@@ -297,7 +295,10 @@ mod tests {
         }
         let (recovery, problems) = find_recovery_transactions(dir.path());
         assert!(problems.is_empty(), "{problems:?}");
-        let ids: Vec<&str> = recovery.iter().map(|tx| tx.transaction_id.as_str()).collect();
+        let ids: Vec<&str> = recovery
+            .iter()
+            .map(|tx| tx.transaction_id.as_str())
+            .collect();
         assert_eq!(ids, vec!["failed", "interrupted"]);
     }
 

@@ -50,6 +50,10 @@ use archivefs_core::dat::policy::{
     ClonePolicy, DatPolicyConfig, EffectiveDatPolicy, LanguageId, LanguagePreference, PolicyField,
     RegionId, RevisionPolicy, participating_sources, resolve, validate_policy_config,
 };
+use archivefs_core::dat::rename_apply::{
+    ApplyError, ApplyExecution, ApplyOutcome, EntryState, HardConflictMode, RollbackOutcome,
+    RollbackResult, TransactionState, apply_transaction, rollback_transaction,
+};
 use archivefs_core::dat::rename_plan::{
     ProposalState, RenamePlan, RenamePlanContext, ReviewDecision, build_rename_plan,
 };
@@ -70,11 +74,19 @@ use crate::ui::{components as widgets, theme};
 /// reasonably expect a "fix it" button and there is deliberately not one.
 pub(crate) const READ_ONLY_PROMISE: &str = "ArchiveFS never renames, moves, deletes or rewrites your ROMs. An audit reads files and \
      reports what it found; nothing is changed, and nothing is written beside them.";
-
 /// The prominent, repeated statement the rename-planning section must show.
 pub(crate) const PLAN_ONLY_PROMISE: &str = "Planning only — ArchiveFS will not rename any files. This section derives suggested names \
      from verified DAT matches and explains them; nothing here changes, moves, deletes or rewrites \
      a file.";
+
+/// Batches larger than this require a typed confirmation phrase such as
+/// "RENAME 42 FILES" before any rename happens.
+pub(crate) const TYPED_CONFIRMATION_THRESHOLD: usize = 8;
+
+/// The exact phrase a user must type to confirm a large batch.
+pub(crate) fn typed_confirmation_phrase(count: usize) -> String {
+    format!("RENAME {count} FILES")
+}
 
 /// What Stage 1 supports, stated rather than implied by what happens to work.
 pub(crate) const SUPPORTED_FORMATS: &str = "Logiqx XML (No-Intro, Redump) and ClrMamePro text (TOSEC, generic). Other formats are not \
@@ -457,6 +469,8 @@ pub(crate) struct DatSourcesPageView {
     /// The read-only rename-planning section, present when the latest audit
     /// produced a plan.
     pub(crate) rename_plan: Option<RenamePlanView>,
+    /// The gated apply flow: review, confirmation, results and crash recovery.
+    pub(crate) rename_apply: RenameApplyView,
 }
 
 impl DatSourcesPageView {
@@ -558,6 +572,92 @@ pub(crate) struct RenamePlanRowView {
     pub(crate) extension_preserved: bool,
     pub(crate) sanitisation_notes: Vec<String>,
     pub(crate) decision: Option<ReviewDecision>,
+}
+
+// ---------------------------------------------------------------------------
+// Rename apply view model
+// ---------------------------------------------------------------------------
+
+/// The apply/recovery section of the rename-planning flow.
+///
+/// Everything the user sees here is derived by the core executor; the GUI only
+/// renders the built transaction, records confirmations, and runs the core
+/// apply/rollback functions on a worker thread. It never calls `fs::rename`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RenameApplyView {
+    /// The read-only review of the transaction the user is about to confirm.
+    pub(crate) review: Option<ApplyReviewView>,
+    /// The last apply outcome, with per-file results.
+    pub(crate) outcome: Option<ApplyOutcomeView>,
+    pub(crate) apply_error: Option<String>,
+    /// Whether the safe-subset option is offered after an AbortAll conflict.
+    pub(crate) subset_available: bool,
+    pub(crate) rollback_result: Option<RollbackResultView>,
+    pub(crate) rollback_error: Option<String>,
+    pub(crate) apply_running: bool,
+    pub(crate) rollback_running: bool,
+    /// Interrupted transactions found on disk, offered for review.
+    pub(crate) recovery: Vec<RecoveryTransactionView>,
+    /// The journal directory, shown for transparency.
+    pub(crate) journal_dir: String,
+}
+
+/// The review a user must confirm before any rename.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ApplyReviewView {
+    /// The transaction built at review time (identity snapshots included).
+    pub(crate) transaction: archivefs_core::dat::rename_apply::RenameTransaction,
+    /// The exact old → new pairs, in plan order.
+    pub(crate) rows: Vec<ApplyReviewRow>,
+    /// The trusted root the renames must stay inside, when configured.
+    pub(crate) trusted_root: Option<String>,
+    /// The exact phrase that must be typed to confirm, when required
+    /// (`None` for small batches where a single confirm click suffices).
+    pub(crate) required_phrase: Option<String>,
+}
+
+/// One old → new pair in the review.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ApplyReviewRow {
+    pub(crate) current_basename: String,
+    pub(crate) proposed_basename: String,
+}
+
+/// The per-file result of an apply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ApplyOutcomeView {
+    pub(crate) transaction_id: String,
+    pub(crate) state: TransactionState,
+    pub(crate) requested: usize,
+    pub(crate) applied: usize,
+    pub(crate) skipped: usize,
+    pub(crate) failed: usize,
+    pub(crate) rows: Vec<ApplyRowView>,
+}
+
+/// One per-file apply result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ApplyRowView {
+    pub(crate) current_basename: String,
+    pub(crate) proposed_basename: String,
+    pub(crate) state: EntryState,
+    pub(crate) failure_reason: Option<String>,
+}
+
+/// The outcome of a rollback pass, rendered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RollbackResultView {
+    pub(crate) label: &'static str,
+    pub(crate) detail: String,
+}
+
+/// One interrupted transaction offered for crash recovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecoveryTransactionView {
+    pub(crate) transaction_id: String,
+    pub(crate) state: TransactionState,
+    pub(crate) applied_count: usize,
+    pub(crate) total_count: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -804,6 +904,38 @@ pub(crate) enum DatSourcesPageAction {
     },
     /// Clears every review decision for the current plan.
     ClearReviewDecisions,
+    /// Build the transaction for the approved, applicable proposals and show
+    /// the read-only review. No mutation.
+    BeginApplyReview,
+    /// Confirm the review and run the apply in AbortAll mode. `typed` is the
+    /// user's typed confirmation phrase, validated before any mutation.
+    ConfirmApply {
+        typed: String,
+    },
+    /// Re-run the apply applying only the independently safe subset, after an
+    /// AbortAll conflict was shown and the user explicitly chose it.
+    ConfirmApplySafeSubset {
+        typed: String,
+    },
+    CancelApplyReview,
+    /// Roll back the last applied (or recovered) transaction.
+    RollbackTransaction {
+        id: String,
+    },
+    /// A crash-recovery choice for an interrupted transaction.
+    RecoveryChoice {
+        id: String,
+        choice: RecoveryChoice,
+    },
+    /// Forget the apply outcome display.
+    ClearApplyOutcome,
+}
+
+/// A crash-recovery choice, mirroring the journal recovery options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecoveryChoice {
+    RollBack,
+    LeaveUntouched,
 }
 
 // ---------------------------------------------------------------------------
@@ -834,6 +966,40 @@ enum JobMessage {
 enum JobKind {
     Validate,
     Audit,
+}
+
+/// A rename apply or rollback worker result.
+enum ApplyJobMessage {
+    Applied(Box<ApplyOutcome>),
+    RolledBack(Box<RollbackOutcome>),
+    Failed(String),
+    /// An AbortAll apply found hard conflicts; nothing was mutated and the
+    /// safe-subset option is now offered.
+    HardConflicts(String),
+    Cancelled,
+}
+
+/// The dedicated worker for apply and rollback mutations. The GUI never calls
+/// `std::fs::rename`; it sends the core executor's request here and renders the
+/// result.
+struct ApplyJob {
+    cancel: Arc<AtomicBool>,
+    messages: Receiver<ApplyJobMessage>,
+}
+
+/// A History & Logs record produced by an apply or rollback outcome. It carries
+/// counts and the transaction id but never private paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RenameHistoryRecord {
+    pub(crate) action: RenameHistoryAction,
+    pub(crate) transaction_id: String,
+    pub(crate) message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RenameHistoryAction {
+    Apply,
+    Rollback,
 }
 
 struct RunningJob {
@@ -1344,6 +1510,28 @@ pub(crate) struct DatSourcesPageState {
     /// Session-only review decisions, keyed by source path. Recording one
     /// never touches a file; nothing here persists them (deferral documented).
     review_decisions: BTreeMap<String, ReviewDecision>,
+    /// The durable transaction journal directory.
+    transaction_dir: PathBuf,
+    /// The transaction built at review time, awaiting confirmation.
+    apply_review: Option<archivefs_core::dat::rename_apply::RenameTransaction>,
+    /// The approved source paths the review was built from.
+    apply_approved: std::collections::BTreeSet<String>,
+    /// The last apply outcome (worker result).
+    apply_outcome: Option<ApplyOutcome>,
+    apply_error: Option<String>,
+    /// Whether the safe-subset option is offered after an AbortAll conflict.
+    subset_available: bool,
+    apply_running: bool,
+    rollback_running: bool,
+    rollback_result: Option<RollbackResult>,
+    rollback_error: Option<String>,
+    /// The apply/rollback worker.
+    apply_job: Option<ApplyJob>,
+    /// Interrupted transactions found on disk, offered for crash recovery.
+    recovery_transactions: Vec<archivefs_core::dat::rename_apply::RenameTransaction>,
+    /// History & Logs records produced by apply/rollback outcomes, drained by
+    /// the shell. No private paths are included.
+    history_records: Vec<RenameHistoryRecord>,
 }
 
 impl DatSourcesPageState {
@@ -1356,6 +1544,19 @@ impl DatSourcesPageState {
         config_path: PathBuf,
         library_folders: Vec<PathBuf>,
         trusted: TrustedRoots,
+    ) -> Self {
+        let transaction_dir = archivefs_core::dat::rename_apply::default_rename_transaction_dir()
+            .unwrap_or_else(|_| std::env::temp_dir().join("archivefs-rename-transactions"));
+        Self::load_with_transaction_dir(config_path, library_folders, trusted, transaction_dir)
+    }
+
+    /// [`Self::load`] with the rename-transaction journal directory injected,
+    /// so tests never read or write the real home directory.
+    pub(crate) fn load_with_transaction_dir(
+        config_path: PathBuf,
+        library_folders: Vec<PathBuf>,
+        trusted: TrustedRoots,
+        transaction_dir: PathBuf,
     ) -> Self {
         let mut load_error = None;
         let mut load_problems = Vec::new();
@@ -1371,6 +1572,10 @@ impl DatSourcesPageState {
             }
         };
         let draft = saved.clone();
+        // The durable journal directory and any interrupted transactions found
+        // in it, offered for explicit crash recovery.
+        let (recovery_transactions, _recovery_problems) =
+            archivefs_core::dat::rename_apply::find_recovery_transactions(&transaction_dir);
         Self {
             config_path,
             saved,
@@ -1393,6 +1598,19 @@ impl DatSourcesPageState {
             rename_plan_error: None,
             audit_generation: 0,
             review_decisions: BTreeMap::new(),
+            transaction_dir,
+            apply_review: None,
+            apply_approved: std::collections::BTreeSet::new(),
+            apply_outcome: None,
+            apply_error: None,
+            subset_available: false,
+            apply_running: false,
+            rollback_running: false,
+            rollback_result: None,
+            rollback_error: None,
+            apply_job: None,
+            recovery_transactions,
+            history_records: Vec::new(),
         }
     }
 
@@ -1414,7 +1632,7 @@ impl DatSourcesPageState {
 
     /// Whether a background job is running.
     pub(crate) fn is_busy(&self) -> bool {
-        self.job.is_some()
+        self.job.is_some() || self.apply_job.is_some()
     }
 
     /// Signals cancellation and immediately forgets the running job, whatever
@@ -1448,11 +1666,111 @@ impl DatSourcesPageState {
     /// Called before [`Self::view`] so the view stays a pure function of state.
     /// Returns true when something arrived, so the caller can request a repaint
     /// only when there is a reason to.
-    pub(crate) fn poll(&mut self) -> bool {
-        let Some(job) = self.job.as_mut() else {
+    /// Drains the rename apply/rollback worker, if one is running.
+    fn poll_apply(&mut self) -> bool {
+        let Some(job) = self.apply_job.as_mut() else {
             return false;
         };
         let mut changed = false;
+        let mut finished = false;
+        loop {
+            match job.messages.try_recv() {
+                Ok(ApplyJobMessage::Applied(outcome)) => {
+                    let summary = outcome.summary.clone();
+                    let transaction_id = outcome.transaction.transaction_id.clone();
+                    self.history_records.push(RenameHistoryRecord {
+                        action: RenameHistoryAction::Apply,
+                        transaction_id,
+                        message: format!(
+                            "requested {}, applied {}, skipped {}, failed {}",
+                            summary.requested, summary.applied, summary.skipped, summary.failed
+                        ),
+                    });
+                    self.apply_outcome = Some(*outcome);
+                    self.apply_error = None;
+                    self.apply_running = false;
+                    self.apply_review = None;
+                    changed = true;
+                    finished = true;
+                }
+                Ok(ApplyJobMessage::RolledBack(outcome)) => {
+                    let transaction_id = outcome.transaction.transaction_id.clone();
+                    let label = match &outcome.result {
+                        RollbackResult::FullyRolledBack => "fully rolled back",
+                        RollbackResult::PartiallyRolledBack { .. } => "partially rolled back",
+                        RollbackResult::RollbackFailed { .. } => "rollback failed",
+                    };
+                    self.history_records.push(RenameHistoryRecord {
+                        action: RenameHistoryAction::Rollback,
+                        transaction_id,
+                        message: label.to_string(),
+                    });
+                    self.rollback_result = Some(outcome.result.clone());
+                    self.rollback_error = None;
+                    self.rollback_running = false;
+                    self.apply_outcome = Some(ApplyOutcome {
+                        transaction: outcome.transaction.clone(),
+                        summary:
+                            archivefs_core::dat::rename_apply::TransactionSummary::from_transaction(
+                                &outcome.transaction,
+                            ),
+                    });
+                    changed = true;
+                    finished = true;
+                }
+                Ok(ApplyJobMessage::HardConflicts(detail)) => {
+                    self.apply_error = Some(detail);
+                    self.subset_available = true;
+                    self.apply_running = false;
+                    changed = true;
+                    finished = true;
+                }
+                Ok(ApplyJobMessage::Failed(error)) => {
+                    if self.apply_running {
+                        self.apply_error = Some(error);
+                        self.apply_running = false;
+                    } else if self.rollback_running {
+                        self.rollback_error = Some(error);
+                        self.rollback_running = false;
+                    }
+                    changed = true;
+                    finished = true;
+                }
+                Ok(ApplyJobMessage::Cancelled) => {
+                    self.apply_running = false;
+                    self.rollback_running = false;
+                    changed = true;
+                    finished = true;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.apply_running = false;
+                    self.rollback_running = false;
+                    finished = true;
+                    break;
+                }
+            }
+        }
+        if finished {
+            self.apply_job = None;
+        }
+        // Recovery list may have changed as a result.
+        self.refresh_recovery();
+        changed
+    }
+
+    /// Re-reads interrupted transactions from the journal directory.
+    fn refresh_recovery(&mut self) {
+        let (recovery, _) =
+            archivefs_core::dat::rename_apply::find_recovery_transactions(&self.transaction_dir);
+        self.recovery_transactions = recovery;
+    }
+
+    pub(crate) fn poll(&mut self) -> bool {
+        let mut changed = self.poll_apply();
+        let Some(job) = self.job.as_mut() else {
+            return changed;
+        };
         let mut finished = false;
         // Read the clock once per drain pass. Every queued message was produced
         // between this pass and the last one, so they all share one elapsed
@@ -1644,6 +1962,7 @@ impl DatSourcesPageState {
                         self.rename_plan = None;
                         self.rename_plan_error = None;
                         self.review_decisions.clear();
+                        self.abandon_apply_work();
                     }
                 }
             }
@@ -1689,6 +2008,7 @@ impl DatSourcesPageState {
                 self.rename_plan = None;
                 self.rename_plan_error = None;
                 self.review_decisions.clear();
+                self.abandon_apply_work();
             }
             DatSourcesPageAction::Save => self.save(),
             DatSourcesPageAction::SelectPolicyScope { scope } => {
@@ -1765,7 +2085,209 @@ impl DatSourcesPageState {
             DatSourcesPageAction::ClearReviewDecisions => {
                 self.review_decisions.clear();
             }
+            DatSourcesPageAction::BeginApplyReview => self.begin_apply_review(),
+            DatSourcesPageAction::ConfirmApply { typed } => {
+                self.confirm_apply(HardConflictMode::AbortAll, typed)
+            }
+            DatSourcesPageAction::ConfirmApplySafeSubset { typed } => {
+                self.confirm_apply(HardConflictMode::SkipUnsafeSubset, typed)
+            }
+            DatSourcesPageAction::CancelApplyReview => {
+                self.apply_review = None;
+                self.apply_error = None;
+                self.subset_available = false;
+            }
+            DatSourcesPageAction::RollbackTransaction { id } => self.start_rollback(id),
+            DatSourcesPageAction::RecoveryChoice { id, choice } => {
+                self.handle_recovery_choice(id, choice)
+            }
+            DatSourcesPageAction::ClearApplyOutcome => {
+                self.apply_outcome = None;
+                self.rollback_result = None;
+                self.apply_error = None;
+                self.rollback_error = None;
+            }
         }
+    }
+
+    /// Builds the transaction for the approved, applicable proposals and shows
+    /// the read-only review. No mutation.
+    fn begin_apply_review(&mut self) {
+        let Some(plan) = self.rename_plan.as_ref() else {
+            self.apply_error = Some("no rename plan is available".to_string());
+            return;
+        };
+        let approved: std::collections::BTreeSet<String> = self
+            .review_decisions
+            .iter()
+            .filter(|(_, decision)| archivefs_core::dat::rename_apply::is_approved(decision))
+            .map(|(path, _)| path.clone())
+            .collect();
+        if approved.is_empty() {
+            self.apply_error = Some(
+                "no proposals are accepted for review; accept at least one Suggested proposal"
+                    .to_string(),
+            );
+            return;
+        }
+        match archivefs_core::dat::rename_apply::build_transaction(plan, &approved, plan.generation)
+        {
+            Ok(transaction) => {
+                self.apply_approved = approved;
+                self.apply_review = Some(transaction);
+                self.apply_error = None;
+                self.subset_available = false;
+            }
+            Err(error) => {
+                self.apply_error = Some(error.to_string());
+            }
+        }
+    }
+
+    /// Confirms the review and runs the apply on a worker thread. The typed
+    /// confirmation is validated here (the drawing layer collects it), so a
+    /// large batch cannot be confirmed without the exact phrase.
+    fn confirm_apply(&mut self, mode: HardConflictMode, typed: String) {
+        let Some(review) = self.apply_review.as_ref() else {
+            return;
+        };
+        let count = review.entries.len();
+        let required = typed_confirmation_phrase(count);
+        if count > TYPED_CONFIRMATION_THRESHOLD && typed.trim() != required {
+            self.apply_error = Some(format!("type {required} to confirm this batch"));
+            return;
+        }
+        self.spawn_apply(mode);
+    }
+
+    /// Spawns the apply worker for the current review transaction.
+    fn spawn_apply(&mut self, mode: HardConflictMode) {
+        if self.apply_job.is_some() {
+            return;
+        }
+        let Some(review) = self.apply_review.as_ref() else {
+            return;
+        };
+        let mut transaction = review.clone();
+        let approved = self.apply_approved.clone();
+        let current_generation = self.rename_plan.as_ref().map(|p| p.generation).unwrap_or(0);
+        let trusted = self.trusted.clone();
+        let journal_dir = self.transaction_dir.clone();
+        let (sender, messages) = std::sync::mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        let apply_sender = sender.clone();
+
+        std::thread::spawn(move || {
+            let result = apply_transaction(&mut ApplyExecution {
+                transaction: &mut transaction,
+                approved_paths: approved,
+                current_generation,
+                trusted,
+                journal_dir,
+                hard_conflict_mode: mode,
+                cancel: &worker_cancel,
+            });
+            let _ = match result {
+                Ok(outcome) => apply_sender.send(ApplyJobMessage::Applied(Box::new(outcome))),
+                Err(ApplyError::Cancelled) => apply_sender.send(ApplyJobMessage::Cancelled),
+                Err(ApplyError::HardConflicts(conflicts)) => {
+                    let detail = conflicts
+                        .iter()
+                        .map(|(path, reasons)| {
+                            format!(
+                                "{}: {}",
+                                path.file_name()
+                                    .map(|name| name.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| path.display().to_string()),
+                                reasons.join("; ")
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    apply_sender.send(ApplyJobMessage::HardConflicts(format!(
+                        "preflight found {} hard conflict(s); nothing was renamed.\n{detail}",
+                        conflicts.len()
+                    )))
+                }
+                Err(error) => apply_sender.send(ApplyJobMessage::Failed(error.to_string())),
+            };
+        });
+
+        self.apply_job = Some(ApplyJob { cancel, messages });
+        self.apply_running = true;
+        self.apply_error = None;
+        self.subset_available = false;
+    }
+
+    /// Rolls back a transaction (the last applied one, or a recovered one).
+    fn start_rollback(&mut self, transaction_id: String) {
+        if self.apply_job.is_some() {
+            return;
+        }
+        // Load the journal for this transaction id.
+        let Some(path) =
+            archivefs_core::dat::rename_apply::journal_path(&self.transaction_dir, &transaction_id)
+        else {
+            self.rollback_error = Some("transaction id cannot name a journal".to_string());
+            return;
+        };
+        let mut transaction = match archivefs_core::dat::rename_apply::read_journal(&path) {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                self.rollback_error = Some(format!("journal unreadable: {error}"));
+                return;
+            }
+        };
+        let journal_dir = self.transaction_dir.clone();
+        let (sender, messages) = std::sync::mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        let rollback_sender = sender.clone();
+        std::thread::spawn(move || {
+            let result = rollback_transaction(&mut transaction, &journal_dir, &worker_cancel);
+            let _ = match result {
+                Ok(outcome) => rollback_sender.send(ApplyJobMessage::RolledBack(Box::new(outcome))),
+                Err(error) => rollback_sender.send(ApplyJobMessage::Failed(error)),
+            };
+        });
+        self.apply_job = Some(ApplyJob { cancel, messages });
+        self.rollback_running = true;
+        self.rollback_error = None;
+    }
+
+    /// Handles a crash-recovery choice for an interrupted transaction.
+    fn handle_recovery_choice(&mut self, id: String, choice: RecoveryChoice) {
+        match choice {
+            RecoveryChoice::RollBack => self.start_rollback(id),
+            RecoveryChoice::LeaveUntouched => {
+                // The journal stays on disk; the user chose not to act now.
+                self.recovery_transactions
+                    .retain(|transaction| transaction.transaction_id != id);
+            }
+        }
+    }
+
+    /// History & Logs records produced by apply/rollback outcomes, drained by
+    /// the shell. No private paths are included.
+    pub(crate) fn drain_history_records(&mut self) -> Vec<RenameHistoryRecord> {
+        std::mem::take(&mut self.history_records)
+    }
+
+    /// Abandons in-memory apply/review state (the journals and files are
+    /// untouched; an in-flight worker simply stops delivering to this page).
+    fn abandon_apply_work(&mut self) {
+        if let Some(job) = self.apply_job.take() {
+            job.cancel.store(true, Ordering::Relaxed);
+        }
+        self.apply_review = None;
+        self.apply_outcome = None;
+        self.apply_error = None;
+        self.subset_available = false;
+        self.apply_running = false;
+        self.rollback_running = false;
+        self.rollback_result = None;
+        self.rollback_error = None;
     }
 
     /// Applies `edit` to the four policy fields at `scope` (global or one
@@ -1909,6 +2431,7 @@ impl DatSourcesPageState {
         self.rename_plan = None;
         self.rename_plan_error = None;
         self.review_decisions.clear();
+        self.abandon_apply_work();
         // Each audit is a generation. A result from an older generation is a
         // stale plan and is dropped, so an old plan can never replace a new one.
         self.audit_generation = self.audit_generation.wrapping_add(1);
@@ -2051,7 +2574,105 @@ impl DatSourcesPageState {
             audit_error: self.audit_error.clone(),
             policy: self.policy_view(),
             rename_plan: self.rename_plan_view(),
+            rename_apply: self.rename_apply_view(),
             rows,
+        }
+    }
+
+    /// Builds the apply/recovery view. Pure: it renders the core's built
+    /// transaction, the worker's outcome, and the recovered journals.
+    fn rename_apply_view(&self) -> RenameApplyView {
+        let review = self.apply_review.as_ref().map(|transaction| {
+            let count = transaction.entries.len();
+            ApplyReviewView {
+                transaction: transaction.clone(),
+                rows: transaction
+                    .entries
+                    .iter()
+                    .map(|entry| ApplyReviewRow {
+                        current_basename: entry.original_basename.clone(),
+                        proposed_basename: entry.proposed_basename.clone(),
+                    })
+                    .collect(),
+                trusted_root: self
+                    .trusted
+                    .roots()
+                    .first()
+                    .map(|root| root.to_string_lossy().into_owned()),
+                required_phrase: (count > TYPED_CONFIRMATION_THRESHOLD)
+                    .then(|| typed_confirmation_phrase(count)),
+            }
+        });
+        let outcome = self.apply_outcome.as_ref().map(|outcome| ApplyOutcomeView {
+            transaction_id: outcome.transaction.transaction_id.clone(),
+            state: outcome.transaction.state,
+            requested: outcome.summary.requested,
+            applied: outcome.summary.applied,
+            skipped: outcome.summary.skipped,
+            failed: outcome.summary.failed,
+            rows: outcome
+                .transaction
+                .entries
+                .iter()
+                .map(|entry| ApplyRowView {
+                    current_basename: entry.original_basename.clone(),
+                    proposed_basename: entry.proposed_basename.clone(),
+                    state: entry.state,
+                    failure_reason: entry.failure_reason.clone(),
+                })
+                .collect(),
+        });
+        let rollback_result = self.rollback_result.as_ref().map(|result| match result {
+            RollbackResult::FullyRolledBack => RollbackResultView {
+                label: "Fully rolled back",
+                detail: "every applied rename was reversed and confirmed.".to_string(),
+            },
+            RollbackResult::PartiallyRolledBack {
+                rolled_back,
+                failed,
+            } => RollbackResultView {
+                label: "Partially rolled back",
+                detail: format!(
+                    "{} rename(s) reversed; {} could not be: {}",
+                    rolled_back.len(),
+                    failed.len(),
+                    failed
+                        .iter()
+                        .map(|(path, reason)| format!("{} ({reason})", path.display()))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ),
+            },
+            RollbackResult::RollbackFailed { failed } => RollbackResultView {
+                label: "Rollback failed",
+                detail: failed
+                    .iter()
+                    .map(|(path, reason)| format!("{} ({reason})", path.display()))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            },
+        });
+        let recovery = self
+            .recovery_transactions
+            .iter()
+            .map(|transaction| RecoveryTransactionView {
+                transaction_id: transaction.transaction_id.clone(),
+                state: transaction.state,
+                applied_count: transaction.applied_count(),
+                total_count: transaction.entries.len(),
+            })
+            .collect();
+        RenameApplyView {
+            review,
+            outcome,
+            apply_error: self.apply_error.clone(),
+            subset_available: self.subset_available,
+            rollback_result,
+            rollback_error: self.rollback_error.clone(),
+            apply_running: self.apply_running,
+            rollback_running: self.rollback_running,
+            recovery,
+            journal_dir: self.transaction_dir.to_string_lossy().into_owned(),
         }
     }
 
@@ -2699,6 +3320,8 @@ pub(crate) struct DatSourcesPageUi {
     pub(crate) plan_review_open: Option<String>,
     /// Which rename-plan filter is active.
     pub(crate) plan_filter: RenamePlanFilter,
+    /// The typed confirmation phrase for a large apply batch.
+    pub(crate) plan_typed_confirmation: String,
 }
 
 impl DatSourcesPageUi {
@@ -2711,6 +3334,7 @@ impl DatSourcesPageUi {
         self.confirm_remove = None;
         self.open_diagnostic = None;
         self.plan_review_open = None;
+        self.plan_typed_confirmation.clear();
     }
 }
 
@@ -2827,6 +3451,14 @@ pub(crate) fn show_dat_sources_page(
         && let Some(plan_action) = show_rename_plan_section(ui, plan, ui_state)
     {
         action = Some(plan_action);
+    }
+
+    // The gated apply/recovery section. The user reviews the built transaction
+    // and confirms; the core executor performs any rename on a worker thread.
+    if action.is_none()
+        && let Some(apply_action) = show_rename_apply_section(ui, &view.rename_apply, ui_state)
+    {
+        action = Some(apply_action);
     }
 
     if !view.load_problems.is_empty() || !view.unresolved.is_empty() {
@@ -4151,6 +4783,267 @@ fn plan_state_tone(state: ProposalState) -> widgets::StatusTone {
     }
 }
 
+/// The gated apply and crash-recovery section.
+///
+/// This is the only place the page offers a rename: an explicitly approved,
+/// actionable batch is built by the core, shown read-only, confirmed (with a
+/// typed phrase for large batches), and executed by the core executor on a
+/// worker thread. The GUI never calls `std::fs::rename`.
+fn show_rename_apply_section(
+    ui: &mut egui::Ui,
+    apply: &RenameApplyView,
+    ui_state: &mut DatSourcesPageUi,
+) -> Option<DatSourcesPageAction> {
+    let mut action = None;
+
+    // Crash recovery first: an interrupted transaction is always surfaced
+    // before anything else in this section, and never auto-resumes.
+    if !apply.recovery.is_empty() {
+        ui.add_space(10.0);
+        widgets::section_header(ui, "Interrupted rename transaction", None);
+        widgets::card(ui, |ui| {
+            for recovery in &apply.recovery {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} · {} applied of {}",
+                            recovery.transaction_id, recovery.applied_count, recovery.total_count
+                        ))
+                        .strong(),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!("({})", recovery.state.label()))
+                            .color(theme::muted(ui)),
+                    );
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "An interrupted rename transaction was found. ArchiveFS will never \
+                         resume it automatically.",
+                    )
+                    .color(theme::muted(ui))
+                    .small(),
+                );
+                ui.horizontal(|ui| {
+                    if widgets::action_button(
+                        ui,
+                        "Roll back completed steps",
+                        widgets::ActionStyle::Destructive,
+                        !apply.rollback_running,
+                    )
+                    .clicked()
+                    {
+                        action = Some(DatSourcesPageAction::RecoveryChoice {
+                            id: recovery.transaction_id.clone(),
+                            choice: RecoveryChoice::RollBack,
+                        });
+                    }
+                    if widgets::action_button(
+                        ui,
+                        "Leave untouched",
+                        widgets::ActionStyle::Quiet,
+                        !apply.rollback_running,
+                    )
+                    .clicked()
+                    {
+                        action = Some(DatSourcesPageAction::RecoveryChoice {
+                            id: recovery.transaction_id.clone(),
+                            choice: RecoveryChoice::LeaveUntouched,
+                        });
+                    }
+                });
+                ui.add_space(6.0);
+            }
+        });
+    }
+
+    if let Some(review) = &apply.review {
+        ui.add_space(10.0);
+        widgets::section_header(
+            ui,
+            "Review approved renames",
+            Some("Nothing is renamed until you confirm. The renames stay inside the trusted root."),
+        );
+        widgets::card(ui, |ui| {
+            if let Some(root) = &review.trusted_root {
+                ui.label(
+                    egui::RichText::new(format!("Trusted root: {root}"))
+                        .color(theme::muted(ui))
+                        .small(),
+                );
+            }
+            ui.label(
+                egui::RichText::new(format!("{} rename(s) to apply", review.rows.len())).strong(),
+            );
+            ui.add_space(4.0);
+            egui::ScrollArea::vertical()
+                .max_height(220.0)
+                .id_salt("dat-apply-review-rows")
+                .show(ui, |ui| {
+                    for row in &review.rows {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(&row.current_basename).monospace());
+                            ui.label(egui::RichText::new("→").color(theme::muted(ui)));
+                            ui.label(egui::RichText::new(&row.proposed_basename).monospace());
+                        });
+                    }
+                });
+            ui.add_space(6.0);
+            if let Some(phrase) = &review.required_phrase {
+                ui.label(
+                    egui::RichText::new(format!("Type {phrase} to confirm:"))
+                        .color(theme::WARNING)
+                        .small(),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut ui_state.plan_typed_confirmation)
+                        .hint_text(phrase)
+                        .id_salt("dat-apply-typed-confirmation"),
+                );
+                ui.add_space(4.0);
+            }
+            if apply.apply_running {
+                ui.label(egui::RichText::new("Applying…").color(theme::muted(ui)));
+            } else {
+                let typed = ui_state.plan_typed_confirmation.clone();
+                let can_confirm = match &review.required_phrase {
+                    Some(phrase) => typed.trim() == *phrase,
+                    None => true,
+                };
+                ui.horizontal(|ui| {
+                    if widgets::action_button(
+                        ui,
+                        "Apply approved renames",
+                        widgets::ActionStyle::Destructive,
+                        can_confirm,
+                    )
+                    .clicked()
+                    {
+                        action = Some(DatSourcesPageAction::ConfirmApply {
+                            typed: typed.clone(),
+                        });
+                    }
+                    if apply.subset_available
+                        && widgets::action_button(
+                            ui,
+                            "Apply only the independently safe subset",
+                            widgets::ActionStyle::Secondary,
+                            can_confirm,
+                        )
+                        .clicked()
+                    {
+                        action = Some(DatSourcesPageAction::ConfirmApplySafeSubset { typed });
+                    }
+                    if widgets::action_button(ui, "Cancel", widgets::ActionStyle::Quiet, true)
+                        .clicked()
+                    {
+                        action = Some(DatSourcesPageAction::CancelApplyReview);
+                    }
+                });
+            }
+        });
+    }
+
+    if let Some(error) = &apply.apply_error {
+        ui.add_space(8.0);
+        widgets::banner(ui, "Apply did not run", error, widgets::StatusTone::Blocked);
+    }
+
+    if let Some(outcome) = &apply.outcome {
+        ui.add_space(10.0);
+        widgets::section_header(
+            ui,
+            "Rename transaction",
+            Some(&format!(
+                "requested {} · applied {} · skipped {} · failed {} · {}",
+                outcome.requested,
+                outcome.applied,
+                outcome.skipped,
+                outcome.failed,
+                outcome.state.label()
+            )),
+        );
+        widgets::card(ui, |ui| {
+            ui.label(
+                egui::RichText::new(format!("Transaction: {}", outcome.transaction_id))
+                    .color(theme::muted(ui))
+                    .small(),
+            );
+            ui.add_space(4.0);
+            egui::ScrollArea::vertical()
+                .max_height(220.0)
+                .id_salt("dat-apply-outcome-rows")
+                .show(ui, |ui| {
+                    for row in &outcome.rows {
+                        ui.horizontal(|ui| {
+                            widgets::status_badge(ui, row.state.label(), apply_row_tone(row.state));
+                            ui.label(egui::RichText::new(&row.current_basename).monospace());
+                            ui.label(egui::RichText::new("→").color(theme::muted(ui)));
+                            ui.label(egui::RichText::new(&row.proposed_basename).monospace());
+                        });
+                        if let Some(reason) = &row.failure_reason {
+                            ui.label(egui::RichText::new(reason).color(theme::WARNING).small());
+                        }
+                    }
+                });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if widgets::action_button(
+                    ui,
+                    "Roll back transaction",
+                    widgets::ActionStyle::Destructive,
+                    !apply.rollback_running && outcome.applied > 0,
+                )
+                .clicked()
+                {
+                    action = Some(DatSourcesPageAction::RollbackTransaction {
+                        id: outcome.transaction_id.clone(),
+                    });
+                }
+                if widgets::action_button(ui, "Dismiss", widgets::ActionStyle::Quiet, true)
+                    .clicked()
+                {
+                    action = Some(DatSourcesPageAction::ClearApplyOutcome);
+                }
+            });
+        });
+    }
+
+    if let Some(result) = &apply.rollback_result {
+        ui.add_space(8.0);
+        widgets::banner(
+            ui,
+            result.label,
+            &result.detail,
+            match result.label {
+                "Fully rolled back" => widgets::StatusTone::Success,
+                _ => widgets::StatusTone::Warning,
+            },
+        );
+    }
+
+    if let Some(error) = &apply.rollback_error {
+        ui.add_space(8.0);
+        widgets::banner(
+            ui,
+            "Rollback could not run",
+            error,
+            widgets::StatusTone::Blocked,
+        );
+    }
+
+    action
+}
+
+fn apply_row_tone(state: EntryState) -> widgets::StatusTone {
+    match state {
+        EntryState::Applied | EntryState::RolledBack => widgets::StatusTone::Success,
+        EntryState::Skipped => widgets::StatusTone::Info,
+        EntryState::ApplyFailed | EntryState::RollbackFailed => widgets::StatusTone::Blocked,
+        _ => widgets::StatusTone::Info,
+    }
+}
+
 /// The read-only rename-planning section.
 ///
 /// Everything here displays the core plan; the only user actions are review
@@ -4263,6 +5156,28 @@ fn show_rename_plan_section(
     if !plan.rows.is_empty() {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
+            let approved_count = plan
+                .rows
+                .iter()
+                .filter(|row| {
+                    row.state == ProposalState::Suggested
+                        && row.decision == Some(ReviewDecision::AcceptedForReview)
+                })
+                .count();
+            if approved_count > 0 {
+                if widgets::action_button(
+                    ui,
+                    &format!("Apply approved renames ({approved_count})"),
+                    widgets::ActionStyle::Destructive,
+                    true,
+                )
+                .on_hover_text("Review and confirm before anything is renamed")
+                .clicked()
+                {
+                    action = Some(DatSourcesPageAction::BeginApplyReview);
+                }
+                ui.add_space(8.0);
+            }
             if widgets::action_button(
                 ui,
                 "Reset all review decisions",

@@ -394,12 +394,17 @@ enum ActivityAction {
     /// whatever the outcome, so a refused or cancelled import is as visible
     /// as a successful one.
     RommSource,
+    /// A gated DAT rename apply: the user-reviewed, confirmed application of
+    /// approved rename proposals. Distinct from every read-only preview.
+    DatRenameApply,
+    /// A rollback of a DAT rename transaction.
+    DatRenameRollback,
 }
 
 /// Every `ActivityAction`, for the History & Logs "Operation" filter.
 /// Must list each variant exactly once (checked by
 /// `activity_filter_lists_cover_every_variant`).
-const ALL_ACTIVITY_ACTIONS: [ActivityAction; 42] = [
+const ALL_ACTIVITY_ACTIONS: [ActivityAction; 44] = [
     ActivityAction::Refresh,
     ActivityAction::Mount,
     ActivityAction::MountAll,
@@ -442,6 +447,8 @@ const ALL_ACTIVITY_ACTIONS: [ActivityAction; 42] = [
     ActivityAction::CheatInstall,
     ActivityAction::DolphinCatalogueRetrieval,
     ActivityAction::RommSource,
+    ActivityAction::DatRenameApply,
+    ActivityAction::DatRenameRollback,
 ];
 
 /// Every `ActivityOutcome`, for the History & Logs "Result" filter.
@@ -538,6 +545,8 @@ impl std::fmt::Display for ActivityAction {
             Self::CheatInstall => "Cheats & Mods install",
             Self::DolphinCatalogueRetrieval => "Dolphin cheat catalogue retrieval",
             Self::RommSource => "RomM identity source",
+            Self::DatRenameApply => "DAT rename apply",
+            Self::DatRenameRollback => "DAT rename rollback",
         })
     }
 }
@@ -4879,6 +4888,25 @@ impl ArchiveFsApp {
                 self.dat_sources_ui.clear();
             }
             page.apply(action);
+        }
+        // Surface apply/rollback outcomes into History & Logs, without private
+        // paths (the journal keeps those, never the general log).
+        for record in page.drain_history_records() {
+            let entry = match record.action {
+                dat_sources_page::RenameHistoryAction::Apply => HistoryEntry::new(
+                    ActivityAction::DatRenameApply,
+                    None,
+                    ActivityOutcome::Completed,
+                    format!("{}: {}", record.transaction_id, record.message),
+                ),
+                dat_sources_page::RenameHistoryAction::Rollback => HistoryEntry::new(
+                    ActivityAction::DatRenameRollback,
+                    None,
+                    ActivityOutcome::Completed,
+                    format!("{}: {}", record.transaction_id, record.message),
+                ),
+            };
+            self.history.record(entry);
         }
     }
 

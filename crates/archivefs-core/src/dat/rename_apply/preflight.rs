@@ -29,10 +29,7 @@ pub enum PreflightFailure {
     DestinationParentChanged,
     OutsideTrustedRoot,
     CrossFilesystemUnsupported,
-    GenerationMismatch {
-        current: u64,
-        expected: u64,
-    },
+    GenerationMismatch { current: u64, expected: u64 },
     NotApproved,
     NotActionable,
     ConflictingBatchTarget,
@@ -49,7 +46,9 @@ impl PreflightFailure {
             Self::SourceIdentityChanged => {
                 "the source file is no longer the same object that was reviewed".to_string()
             }
-            Self::SourceBasenameChanged => "the source file has been renamed since review".to_string(),
+            Self::SourceBasenameChanged => {
+                "the source file has been renamed since review".to_string()
+            }
             Self::DestinationExists => {
                 "the destination name now exists; it is never overwritten".to_string()
             }
@@ -57,7 +56,9 @@ impl PreflightFailure {
                 "a sibling whose name differs from the destination only by case now exists"
                     .to_string()
             }
-            Self::DestinationUnsafe => "the destination name is no longer a safe filename".to_string(),
+            Self::DestinationUnsafe => {
+                "the destination name is no longer a safe filename".to_string()
+            }
             Self::DestinationParentChanged => {
                 "the destination parent directory is no longer the same directory".to_string()
             }

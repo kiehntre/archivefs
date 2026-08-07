@@ -14,9 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::identity::{capture_identity, identity_matches};
 use super::journal::write_journal;
-use super::model::{
-    EntryState, RenameTransaction, RollbackResult, TransactionState,
-};
+use super::model::{EntryState, RenameTransaction, RollbackResult, TransactionState};
 use super::noclobber::{NoClobberError, rename_noreplace};
 
 /// The outcome of a rollback pass (fully / partially / failed).
@@ -118,9 +116,7 @@ fn rollback_one_entry(entry: &mut super::model::TransactionEntry) -> Result<(), 
 
     // Original source path must be free.
     if std::fs::symlink_metadata(&entry.source_path).is_ok() {
-        return Err(
-            "rollback refused: the original source path is now occupied".to_string(),
-        );
+        return Err("rollback refused: the original source path is now occupied".to_string());
     }
 
     entry.state = EntryState::RollingBack;
@@ -137,14 +133,14 @@ fn rollback_one_entry(entry: &mut super::model::TransactionEntry) -> Result<(), 
                 Ok(_) => Err(
                     "rollback renamed but the restored source identity does not match".to_string(),
                 ),
-                Err(_) => Err(
-                    "rollback renamed but the restored source path is not readable".to_string(),
-                ),
+                Err(_) => {
+                    Err("rollback renamed but the restored source path is not readable".to_string())
+                }
             }
         }
-        Err(NoClobberError::DestinationExists) => Err(
-            "rollback refused: the original source path is occupied (no-overwrite)".to_string(),
-        ),
+        Err(NoClobberError::DestinationExists) => {
+            Err("rollback refused: the original source path is occupied (no-overwrite)".to_string())
+        }
         Err(error) => Err(format!("rollback rename failed: {error}")),
     }
 }
