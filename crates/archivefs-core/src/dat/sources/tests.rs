@@ -1065,7 +1065,10 @@ fn a_policy_the_user_sets_round_trips_through_the_registry() {
         reloaded.policy().region_preferences,
         Some(vec!["europe".to_string(), "usa".to_string()])
     );
-    assert_eq!(reloaded.policy().revision_policy.as_deref(), Some("latest_verified"));
+    assert_eq!(
+        reloaded.policy().revision_policy.as_deref(),
+        Some("latest_verified")
+    );
 }
 
 #[test]
@@ -1107,7 +1110,12 @@ clone_policy = "prefer_parent"
     // Edit something unrelated, the way a user would: add a source.
     let (id, display_name) = (registry.suggest_id(&path), suggest_display_name(&path));
     registry
-        .add(DatSourceEntry::new(id, display_name, path.clone(), DatSourceKind::File))
+        .add(DatSourceEntry::new(
+            id,
+            display_name,
+            path.clone(),
+            DatSourceKind::File,
+        ))
         .unwrap();
     save_dat_sources_config_to(&config_path, &registry.to_config()).unwrap();
 
@@ -1128,7 +1136,10 @@ clone_policy = "prefer_parent"
         reloaded_registry.policy().revision_policy.as_deref(),
         Some("newest_future_policy")
     );
-    assert!(reloaded_registry.get("a").is_some(), "the unrelated edit was saved");
+    assert!(
+        reloaded_registry.get("a").is_some(),
+        "the unrelated edit was saved"
+    );
 }
 
 #[test]
@@ -1689,7 +1700,10 @@ fn an_audit_without_a_policy_annotates_nothing() {
     let cancel = no_cancel();
     let outcome =
         run_dat_audit(&request, &TrustedRoots::none(), &cancel, &|_| {}).expect("the audit runs");
-    assert!(outcome.policy.is_none(), "no policy supplied, no annotation");
+    assert!(
+        outcome.policy.is_none(),
+        "no policy supplied, no annotation"
+    );
 }
 
 #[test]
@@ -1752,8 +1766,7 @@ fn an_audit_annotates_multi_candidate_verdicts_with_the_policy_preference() {
     assert_eq!(note.verdict_label, "Exact (multiple)");
     assert!(note.resolution.decided);
     assert_eq!(
-        note.resolution.entries[0].candidate.game_name,
-        "Game (Europe)",
+        note.resolution.entries[0].candidate.game_name, "Game (Europe)",
         "the preferred region wins"
     );
     assert!(

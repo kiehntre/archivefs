@@ -51,9 +51,7 @@ use crate::dat::limits::DatLimits;
 use crate::dat::model::ParsedDat;
 use crate::dat::parsers::parse_dat_file;
 use crate::dat::policy::candidate::candidate_for_rom;
-use crate::dat::policy::evaluate::{
-    CandidateResolution, EffectiveDatPolicy, rank_candidates,
-};
+use crate::dat::policy::evaluate::{CandidateResolution, EffectiveDatPolicy, rank_candidates};
 use crate::identity_source::hashing::{HashRefusal, hash_file_reporting};
 use crate::safe_read::TrustedRoots;
 
@@ -404,19 +402,16 @@ pub fn run_dat_audit(
     // The policy only *ranks already valid candidates*: the audit's verdicts
     // are untouched, and a preference note is added exactly for the files
     // whose cryptographic hash matched several catalogue entries.
-    let policy = request
-        .policy
-        .as_ref()
-        .map(|policy| {
-            annotate_with_policy(
-                &report,
-                &known,
-                &index,
-                &catalogue_games,
-                policy,
-                &request.source_id,
-            )
-        });
+    let policy = request.policy.as_ref().map(|policy| {
+        annotate_with_policy(
+            &report,
+            &known,
+            &index,
+            &catalogue_games,
+            policy,
+            &request.source_id,
+        )
+    });
 
     Ok(DatAuditOutcome {
         source_id: request.source_id.clone(),

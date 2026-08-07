@@ -149,7 +149,10 @@ mod tests {
         let game = game("Sonic (Europe) (En,Fr,De) (Rev 1)", None);
         let candidate = candidate_for_rom(&game, &game.roms[0], "src", 100);
         assert_eq!(candidate.regions, vec![RegionId::Europe]);
-        assert_eq!(candidate.languages, vec![LanguageId::En, LanguageId::Fr, LanguageId::De]);
+        assert_eq!(
+            candidate.languages,
+            vec![LanguageId::En, LanguageId::Fr, LanguageId::De]
+        );
         assert_eq!(candidate.revision, 1);
         assert!(candidate.has_revision_marker);
         assert!(!candidate.is_clone());

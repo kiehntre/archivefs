@@ -159,7 +159,12 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                             limits.max_warnings,
                         )
                         .or_else(|| {
-                            attr_str_opt(start_bytes, b"cloneofid", &mut warnings, limits.max_warnings)
+                            attr_str_opt(
+                                start_bytes,
+                                b"cloneofid",
+                                &mut warnings,
+                                limits.max_warnings,
+                            )
                         });
                         current_game_desc = None;
                         current_roms = Vec::new();

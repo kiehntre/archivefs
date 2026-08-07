@@ -29,8 +29,8 @@ use std::collections::{BTreeMap, HashSet};
 
 use serde::Serialize;
 
-use super::config::{DatPlatformPolicyConfig, DatPolicyConfig};
 use super::candidate::DatCandidate;
+use super::config::{DatPlatformPolicyConfig, DatPolicyConfig};
 use super::model::{
     ClonePolicy, LanguageId, LanguagePreference, MAX_POLICY_PREFERENCE_LEN, PolicyField,
     PolicyScope, RegionId, RevisionPolicy,
@@ -81,7 +81,8 @@ pub fn resolve(
     platform: Option<&str>,
     participating: Vec<ParticipatingSource>,
 ) -> EffectiveDatPolicy {
-    let canonical_platform = platform.filter(|id| crate::canonical_platform_for_alias(id) == Some(id));
+    let canonical_platform =
+        platform.filter(|id| crate::canonical_platform_for_alias(id) == Some(id));
     let platform_override: Option<&DatPlatformPolicyConfig> = canonical_platform.and_then(|id| {
         config
             .platforms
@@ -93,11 +94,11 @@ pub fn resolve(
         Some(list) => parse_regions(list),
         None => parse_regions(config.region_preferences.as_deref().unwrap_or_default()),
     };
-    let language_preferences =
-        match platform_override.and_then(|o| o.language_preferences.as_ref()) {
-            Some(list) => parse_languages(list),
-            None => parse_languages(config.language_preferences.as_deref().unwrap_or_default()),
-        };
+    let language_preferences = match platform_override.and_then(|o| o.language_preferences.as_ref())
+    {
+        Some(list) => parse_languages(list),
+        None => parse_languages(config.language_preferences.as_deref().unwrap_or_default()),
+    };
     let revision_policy = match platform_override.and_then(|o| o.revision_policy.as_ref()) {
         Some(value) => RevisionPolicy::parse(value).unwrap_or_default(),
         None => config
@@ -250,7 +251,9 @@ pub fn validate_policy_config(config: &DatPolicyConfig) -> Vec<PolicyProblem> {
     {
         problems.push(PolicyProblem {
             field: PolicyField::Revision,
-            message: format!("unknown revision policy '{value}'; kept as written, safe default applies"),
+            message: format!(
+                "unknown revision policy '{value}'; kept as written, safe default applies"
+            ),
         });
     }
     if let Some(value) = config.clone_policy.as_deref()
@@ -258,7 +261,9 @@ pub fn validate_policy_config(config: &DatPolicyConfig) -> Vec<PolicyProblem> {
     {
         problems.push(PolicyProblem {
             field: PolicyField::Clone,
-            message: format!("unknown clone policy '{value}'; kept as written, safe default applies"),
+            message: format!(
+                "unknown clone policy '{value}'; kept as written, safe default applies"
+            ),
         });
     }
 
@@ -331,7 +336,9 @@ fn validate_preference_list(
         if !known(value) {
             problems.push(PolicyProblem {
                 field,
-                message: format!("unknown {kind} '{value}' in preferences; kept as written, ignored for matching"),
+                message: format!(
+                    "unknown {kind} '{value}' in preferences; kept as written, ignored for matching"
+                ),
             });
         }
         if !seen.insert(value.as_str()) {
@@ -429,7 +436,8 @@ pub fn rank_candidates(
 
     let mut explanations: Vec<String> = Vec::new();
     for pair in entries.windows(2) {
-        let (ordering, reason) = compare_with_reason(&pair[0].candidate, &pair[1].candidate, policy);
+        let (ordering, reason) =
+            compare_with_reason(&pair[0].candidate, &pair[1].candidate, policy);
         if ordering != std::cmp::Ordering::Equal
             && let Some(reason) = reason
             && !explanations.contains(&reason)
@@ -453,15 +461,15 @@ pub fn rank_candidates(
     let ambiguity_reason = if !ambiguous {
         None
     } else if policy.clone_policy == ClonePolicy::RequireExplicitChoice
-        && entries
-            .iter()
-            .skip(1)
-            .any(|other| {
-                entries[0].candidate.is_parent_of(&other.candidate)
-                    || other.candidate.is_parent_of(&entries[0].candidate)
-            })
+        && entries.iter().skip(1).any(|other| {
+            entries[0].candidate.is_parent_of(&other.candidate)
+                || other.candidate.is_parent_of(&entries[0].candidate)
+        })
     {
-        Some("a clone and its parent are tied and the policy requires an explicit choice".to_string())
+        Some(
+            "a clone and its parent are tied and the policy requires an explicit choice"
+                .to_string(),
+        )
     } else {
         Some(format!(
             "{} candidates are tied and the policy cannot decide between them",
@@ -476,7 +484,9 @@ pub fn rank_candidates(
     } else if entries.is_empty() {
         "no candidates to rank".to_string()
     } else {
-        ambiguity_reason.clone().unwrap_or_else(|| "ambiguity remains".to_string())
+        ambiguity_reason
+            .clone()
+            .unwrap_or_else(|| "ambiguity remains".to_string())
     };
 
     CandidateResolution {
@@ -566,15 +576,24 @@ fn compare_region(
         (Some(pa), Some(pb)) if pa == pb => None,
         (Some(pa), Some(pb)) => {
             let region = policy.region_preferences[pa.min(pb)];
-            Some((pa.cmp(&pb), format!("preferred region matched ({})", region.label())))
+            Some((
+                pa.cmp(&pb),
+                format!("preferred region matched ({})", region.label()),
+            ))
         }
         (Some(pa), None) => {
             let region = policy.region_preferences[pa];
-            Some((std::cmp::Ordering::Less, format!("preferred region matched ({})", region.label())))
+            Some((
+                std::cmp::Ordering::Less,
+                format!("preferred region matched ({})", region.label()),
+            ))
         }
         (None, Some(pb)) => {
             let region = policy.region_preferences[pb];
-            Some((std::cmp::Ordering::Greater, format!("preferred region matched ({})", region.label())))
+            Some((
+                std::cmp::Ordering::Greater,
+                format!("preferred region matched ({})", region.label()),
+            ))
         }
         (None, None) => None,
     }
@@ -600,15 +619,24 @@ fn compare_language(
         (Some(pa), Some(pb)) if pa == pb => None,
         (Some(pa), Some(pb)) => {
             let preference = policy.language_preferences[pa.min(pb)];
-            Some((pa.cmp(&pb), format!("preferred language matched ({})", preference.label())))
+            Some((
+                pa.cmp(&pb),
+                format!("preferred language matched ({})", preference.label()),
+            ))
         }
         (Some(pa), None) => {
             let preference = policy.language_preferences[pa];
-            Some((std::cmp::Ordering::Less, format!("preferred language matched ({})", preference.label())))
+            Some((
+                std::cmp::Ordering::Less,
+                format!("preferred language matched ({})", preference.label()),
+            ))
         }
         (None, Some(pb)) => {
             let preference = policy.language_preferences[pb];
-            Some((std::cmp::Ordering::Greater, format!("preferred language matched ({})", preference.label())))
+            Some((
+                std::cmp::Ordering::Greater,
+                format!("preferred language matched ({})", preference.label()),
+            ))
         }
         (None, None) => None,
     }
@@ -737,10 +765,16 @@ mod tests {
         resolve(&config, None, participating)
     }
 
-    fn config(region: Option<Vec<&str>>, language: Option<Vec<&str>>, revision: Option<&str>, clone: Option<&str>) -> DatPolicyConfig {
+    fn config(
+        region: Option<Vec<&str>>,
+        language: Option<Vec<&str>>,
+        revision: Option<&str>,
+        clone: Option<&str>,
+    ) -> DatPolicyConfig {
         DatPolicyConfig {
             region_preferences: region.map(|list| list.into_iter().map(str::to_string).collect()),
-            language_preferences: language.map(|list| list.into_iter().map(str::to_string).collect()),
+            language_preferences: language
+                .map(|list| list.into_iter().map(str::to_string).collect()),
             revision_policy: revision.map(str::to_string),
             clone_policy: clone.map(str::to_string),
             platforms: None,
@@ -767,7 +801,10 @@ mod tests {
         assert_eq!(resolution.winner_index, Some(0));
         assert_eq!(resolution.entries[0].candidate.game_name, "Game (Europe)");
         assert!(
-            resolution.explanations.iter().any(|line| line == "preferred region matched (Europe)"),
+            resolution
+                .explanations
+                .iter()
+                .any(|line| line == "preferred region matched (Europe)"),
             "{:?}",
             resolution.explanations
         );
@@ -809,7 +846,10 @@ mod tests {
         assert!(resolution.decided);
         assert_eq!(resolution.entries[0].candidate.game_name, "Game (Ja)");
         assert!(
-            resolution.explanations.iter().any(|line| line == "preferred language matched (Japanese)"),
+            resolution
+                .explanations
+                .iter()
+                .any(|line| line == "preferred language matched (Japanese)"),
             "{:?}",
             resolution.explanations
         );
@@ -846,14 +886,20 @@ mod tests {
             &policy,
         );
         assert!(resolution.decided);
-        assert_eq!(resolution.entries[0].candidate.game_name, "Game (Japan) (Ja)");
+        assert_eq!(
+            resolution.entries[0].candidate.game_name,
+            "Game (Japan) (Ja)"
+        );
     }
 
     // ---- revision policy --------------------------------------------------
 
     #[test]
     fn latest_revision_is_preferred() {
-        let policy = context(config(None, None, Some("latest_verified"), None), &[("src", 100)]);
+        let policy = context(
+            config(None, None, Some("latest_verified"), None),
+            &[("src", 100)],
+        );
         let resolution = rank_candidates(
             vec![
                 candidate_named("src", 100, "Game (Rev 1)"),
@@ -864,7 +910,10 @@ mod tests {
         assert!(resolution.decided);
         assert_eq!(resolution.entries[0].candidate.game_name, "Game (Rev 2)");
         assert!(
-            resolution.explanations.iter().any(|line| line == "newer verified revision preferred (Rev 2)"),
+            resolution
+                .explanations
+                .iter()
+                .any(|line| line == "newer verified revision preferred (Rev 2)"),
             "{:?}",
             resolution.explanations
         );
@@ -872,7 +921,10 @@ mod tests {
 
     #[test]
     fn a_marked_entry_outranks_an_unmarked_one_under_latest() {
-        let policy = context(config(None, None, Some("latest_verified"), None), &[("src", 100)]);
+        let policy = context(
+            config(None, None, Some("latest_verified"), None),
+            &[("src", 100)],
+        );
         let resolution = rank_candidates(
             vec![
                 candidate_named("src", 100, "Game (USA)"),
@@ -881,12 +933,18 @@ mod tests {
             &policy,
         );
         assert!(resolution.decided);
-        assert_eq!(resolution.entries[0].candidate.game_name, "Game (USA) (Rev 1)");
+        assert_eq!(
+            resolution.entries[0].candidate.game_name,
+            "Game (USA) (Rev 1)"
+        );
     }
 
     #[test]
     fn earliest_revision_is_preferred() {
-        let policy = context(config(None, None, Some("earliest_verified"), None), &[("src", 100)]);
+        let policy = context(
+            config(None, None, Some("earliest_verified"), None),
+            &[("src", 100)],
+        );
         let resolution = rank_candidates(
             vec![
                 candidate_named("src", 100, "Game (Rev 2)"),
@@ -900,7 +958,10 @@ mod tests {
 
     #[test]
     fn prefer_original_ranks_an_unrevised_entry_first() {
-        let policy = context(config(None, None, Some("prefer_original"), None), &[("src", 100)]);
+        let policy = context(
+            config(None, None, Some("prefer_original"), None),
+            &[("src", 100)],
+        );
         let resolution = rank_candidates(
             vec![
                 candidate_named("src", 100, "Game (USA)"),
@@ -911,7 +972,10 @@ mod tests {
         assert!(resolution.decided);
         assert_eq!(resolution.entries[0].candidate.game_name, "Game (USA)");
         assert!(
-            resolution.explanations.iter().any(|line| line == "original (unrevised) revision preferred"),
+            resolution
+                .explanations
+                .iter()
+                .any(|line| line == "original (unrevised) revision preferred"),
             "{:?}",
             resolution.explanations
         );
@@ -919,7 +983,10 @@ mod tests {
 
     #[test]
     fn ask_when_ambiguous_never_lets_revision_decide() {
-        let policy = context(config(None, None, Some("ask_when_ambiguous"), None), &[("src", 100)]);
+        let policy = context(
+            config(None, None, Some("ask_when_ambiguous"), None),
+            &[("src", 100)],
+        );
         let resolution = rank_candidates(
             vec![
                 candidate_named("src", 100, "Game (Rev 1)"),
@@ -935,14 +1002,23 @@ mod tests {
 
     #[test]
     fn prefer_parent_outranks_a_clone_of_it() {
-        let policy = context(config(None, None, None, Some("prefer_parent")), &[("src", 100)]);
+        let policy = context(
+            config(None, None, None, Some("prefer_parent")),
+            &[("src", 100)],
+        );
         let parent = candidate_named("src", 100, "Game (USA)");
-        let clone = as_clone_of(candidate_named("src", 100, "Game (USA) (Rev 1)"), "Game (USA)");
+        let clone = as_clone_of(
+            candidate_named("src", 100, "Game (USA) (Rev 1)"),
+            "Game (USA)",
+        );
         let resolution = rank_candidates(vec![clone, parent], &policy);
         assert!(resolution.decided);
         assert_eq!(resolution.entries[0].candidate.game_name, "Game (USA)");
         assert!(
-            resolution.explanations.iter().any(|line| line == "parent preferred"),
+            resolution
+                .explanations
+                .iter()
+                .any(|line| line == "parent preferred"),
             "{:?}",
             resolution.explanations
         );
@@ -981,7 +1057,10 @@ mod tests {
             &[("src", 100)],
         );
         let parent = candidate_named("src", 100, "Game (USA)");
-        let clone = as_clone_of(candidate_named("src", 100, "Game (USA) (Rev 1)"), "Game (USA)");
+        let clone = as_clone_of(
+            candidate_named("src", 100, "Game (USA) (Rev 1)"),
+            "Game (USA)",
+        );
         let resolution = rank_candidates(vec![clone, parent], &policy);
         assert!(resolution.decided);
         assert_eq!(resolution.entries[0].candidate.game_name, "Game (USA)");
@@ -989,9 +1068,15 @@ mod tests {
 
     #[test]
     fn keep_all_variants_ignores_parent_relationships() {
-        let policy = context(config(None, None, None, Some("keep_all_variants")), &[("src", 100)]);
+        let policy = context(
+            config(None, None, None, Some("keep_all_variants")),
+            &[("src", 100)],
+        );
         let parent = candidate_named("src", 100, "Game (USA)");
-        let clone = as_clone_of(candidate_named("src", 100, "Game (USA) (Rev 1)"), "Game (USA)");
+        let clone = as_clone_of(
+            candidate_named("src", 100, "Game (USA) (Rev 1)"),
+            "Game (USA)",
+        );
         let resolution = rank_candidates(vec![clone, parent], &policy);
         assert!(!resolution.decided);
         assert!(resolution.ambiguous);
@@ -1000,9 +1085,15 @@ mod tests {
 
     #[test]
     fn require_explicit_choice_marks_a_parent_clone_tie_ambiguous() {
-        let policy = context(config(None, None, None, Some("require_explicit_choice")), &[("src", 100)]);
+        let policy = context(
+            config(None, None, None, Some("require_explicit_choice")),
+            &[("src", 100)],
+        );
         let parent = candidate_named("src", 100, "Game (USA)");
-        let clone = as_clone_of(candidate_named("src", 100, "Game (USA) (Rev 1)"), "Game (USA)");
+        let clone = as_clone_of(
+            candidate_named("src", 100, "Game (USA) (Rev 1)"),
+            "Game (USA)",
+        );
         let resolution = rank_candidates(vec![clone, parent], &policy);
         assert!(!resolution.decided);
         assert!(resolution.ambiguous);
@@ -1040,7 +1131,10 @@ mod tests {
 
     #[test]
     fn source_priority_lower_number_wins() {
-        let policy = context(config(None, None, None, None), &[("primary", 20), ("backup", 100)]);
+        let policy = context(
+            config(None, None, None, None),
+            &[("primary", 20), ("backup", 100)],
+        );
         let resolution = rank_candidates(
             vec![
                 candidate_named("backup", 100, "Game"),
@@ -1088,11 +1182,7 @@ mod tests {
             display_name: "NES source".to_string(),
             priority: 100,
         }];
-        let policy = resolve(
-            &config(None, None, None, None),
-            Some("NES"),
-            participating,
-        );
+        let policy = resolve(&config(None, None, None, None), Some("NES"), participating);
         let resolution = rank_candidates(
             vec![
                 candidate_named("nes-source", 100, "Game"),
@@ -1107,7 +1197,9 @@ mod tests {
         assert_eq!(resolution.excluded.len(), 1);
         assert_eq!(resolution.excluded[0].candidate.source_id, "snes-source");
         assert!(
-            resolution.excluded[0].reason.contains("does not participate"),
+            resolution.excluded[0]
+                .reason
+                .contains("does not participate"),
             "{:?}",
             resolution.excluded[0].reason
         );
@@ -1116,8 +1208,16 @@ mod tests {
     #[test]
     fn a_source_that_participates_in_the_platform_is_not_excluded() {
         let participating = vec![
-            ParticipatingSource { id: "nes-source".to_string(), display_name: "NES".to_string(), priority: 100 },
-            ParticipatingSource { id: "shared-source".to_string(), display_name: "Shared".to_string(), priority: 50 },
+            ParticipatingSource {
+                id: "nes-source".to_string(),
+                display_name: "NES".to_string(),
+                priority: 100,
+            },
+            ParticipatingSource {
+                id: "shared-source".to_string(),
+                display_name: "Shared".to_string(),
+                priority: 50,
+            },
         ];
         let policy = resolve(&config(None, None, None, None), Some("NES"), participating);
         let resolution = rank_candidates(
@@ -1154,10 +1254,19 @@ mod tests {
 
     #[test]
     fn empty_preference_lists_are_the_same_as_absent() {
-        let with_empty_lists = context(config(Some(vec![]), Some(vec![]), None, None), &[("src", 100)]);
+        let with_empty_lists = context(
+            config(Some(vec![]), Some(vec![]), None, None),
+            &[("src", 100)],
+        );
         let with_absent = context(DatPolicyConfig::default(), &[("src", 100)]);
-        let a = rank_candidates(vec![candidate_named("src", 100, "Game (USA)")], &with_empty_lists);
-        let b = rank_candidates(vec![candidate_named("src", 100, "Game (USA)")], &with_absent);
+        let a = rank_candidates(
+            vec![candidate_named("src", 100, "Game (USA)")],
+            &with_empty_lists,
+        );
+        let b = rank_candidates(
+            vec![candidate_named("src", 100, "Game (USA)")],
+            &with_absent,
+        );
         assert_eq!(a, b);
     }
 
@@ -1181,17 +1290,24 @@ mod tests {
         };
         let problems = validate_policy_config(&config);
         assert!(
-            problems.iter().any(|p| p.field == PolicyField::Region && p.message.contains("moon")),
+            problems
+                .iter()
+                .any(|p| p.field == PolicyField::Region && p.message.contains("moon")),
             "{problems:?}"
         );
         assert!(
-            problems.iter().any(|p| p.field == PolicyField::Language && p.message.contains("xx")),
+            problems
+                .iter()
+                .any(|p| p.field == PolicyField::Language && p.message.contains("xx")),
             "{problems:?}"
         );
         // The values still resolve to what they can.
         let policy = resolve(&config, None, vec![]);
         assert_eq!(policy.region_preferences, vec![RegionId::Europe]);
-        assert_eq!(policy.language_preferences, vec![LanguagePreference::Language(LanguageId::En)]);
+        assert_eq!(
+            policy.language_preferences,
+            vec![LanguagePreference::Language(LanguageId::En)]
+        );
     }
 
     #[test]
@@ -1249,7 +1365,9 @@ mod tests {
         };
         let problems = validate_policy_config(&config);
         assert!(
-            problems.iter().any(|p| p.message.contains("not a canonical platform id")),
+            problems
+                .iter()
+                .any(|p| p.message.contains("not a canonical platform id")),
             "{problems:?}"
         );
         // The canonical spelling is accepted.
@@ -1285,7 +1403,10 @@ mod tests {
             policy.language_preferences,
             vec![LanguagePreference::Language(LanguageId::En)]
         );
-        assert_eq!(policy.scope_of[&PolicyField::Region], PolicyScope::PlatformOverride);
+        assert_eq!(
+            policy.scope_of[&PolicyField::Region],
+            PolicyScope::PlatformOverride
+        );
         assert_eq!(policy.scope_of[&PolicyField::Language], PolicyScope::Global);
         // A different platform is unaffected.
         let other = resolve(&config, Some("SNES"), vec![]);
@@ -1296,7 +1417,12 @@ mod tests {
     #[test]
     fn resolution_is_deterministic_across_input_orders() {
         let policy = context(
-            config(Some(vec!["europe", "usa"]), Some(vec!["en"]), Some("latest_verified"), None),
+            config(
+                Some(vec!["europe", "usa"]),
+                Some(vec!["en"]),
+                Some("latest_verified"),
+                None,
+            ),
             &[("src", 100)],
         );
         let candidates = vec![
@@ -1311,6 +1437,9 @@ mod tests {
             rank_candidates(reversed, &policy)
         };
         assert_eq!(forward, reversed_input);
-        assert_eq!(forward.entries[0].candidate.game_name, "Game (Europe) (Rev 2)");
+        assert_eq!(
+            forward.entries[0].candidate.game_name,
+            "Game (Europe) (Rev 2)"
+        );
     }
 }

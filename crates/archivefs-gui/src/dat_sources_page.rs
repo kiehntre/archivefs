@@ -895,11 +895,15 @@ fn effective_summary_view(
         ),
         (
             "Language preference".to_string(),
-            effective.scope_of[&PolicyField::Language].label().to_string(),
+            effective.scope_of[&PolicyField::Language]
+                .label()
+                .to_string(),
         ),
         (
             "Revision policy".to_string(),
-            effective.scope_of[&PolicyField::Revision].label().to_string(),
+            effective.scope_of[&PolicyField::Revision]
+                .label()
+                .to_string(),
         ),
         (
             "Clone policy".to_string(),
@@ -1521,7 +1525,11 @@ impl DatSourcesPageState {
             DatSourcesPageAction::SelectPolicyScope { scope } => {
                 self.policy_scope = scope;
             }
-            DatSourcesPageAction::MoveRegion { scope, index, delta } => {
+            DatSourcesPageAction::MoveRegion {
+                scope,
+                index,
+                delta,
+            } => {
                 self.with_policy_targets(&scope, |targets| {
                     move_index(targets.region_list(), index, delta);
                 });
@@ -1542,7 +1550,11 @@ impl DatSourcesPageState {
                     }
                 });
             }
-            DatSourcesPageAction::MoveLanguage { scope, index, delta } => {
+            DatSourcesPageAction::MoveLanguage {
+                scope,
+                index,
+                delta,
+            } => {
                 self.with_policy_targets(&scope, |targets| {
                     move_index(targets.language_list(), index, delta);
                 });
@@ -1582,7 +1594,11 @@ impl DatSourcesPageState {
     /// Editing a platform scope creates the override entry on demand; when
     /// the edit leaves it empty it is pruned again, so saving never writes an
     /// empty `[policy.platforms.X]` table the user did not ask for.
-    fn with_policy_targets(&mut self, scope: &Option<String>, edit: impl FnOnce(&mut PolicyTargets<'_>)) {
+    fn with_policy_targets(
+        &mut self,
+        scope: &Option<String>,
+        edit: impl FnOnce(&mut PolicyTargets<'_>),
+    ) {
         match scope {
             None => {
                 let policy = self.draft.policy_mut();
@@ -1721,12 +1737,17 @@ impl DatSourcesPageState {
         // worker thread only reads the resolution.
         let policy = resolve(
             self.draft.policy(),
-            entry.platform.as_deref().and_then(|platform| {
-                archivefs_core::canonical_platform_for_alias(platform)
-            }),
-            participating_sources(&self.draft, entry.platform.as_deref().and_then(|platform| {
-                archivefs_core::canonical_platform_for_alias(platform)
-            })),
+            entry
+                .platform
+                .as_deref()
+                .and_then(|platform| archivefs_core::canonical_platform_for_alias(platform)),
+            participating_sources(
+                &self.draft,
+                entry
+                    .platform
+                    .as_deref()
+                    .and_then(|platform| archivefs_core::canonical_platform_for_alias(platform)),
+            ),
         );
         let request = DatAuditRequest {
             source_id: entry.id.clone(),
@@ -1842,7 +1863,11 @@ impl DatSourcesPageState {
             _ => None,
         };
         let config = self.draft.policy();
-        let effective = resolve(config, scope.as_deref(), participating_sources(&self.draft, scope.as_deref()));
+        let effective = resolve(
+            config,
+            scope.as_deref(),
+            participating_sources(&self.draft, scope.as_deref()),
+        );
 
         let scopes_available = self.policy_scopes_available();
         let scope_label = match &scope {
@@ -2284,7 +2309,9 @@ fn audit_view(outcome: &DatAuditOutcome, elapsed_seconds: Option<u64>) -> AuditR
 
 /// Turns the core policy annotation into rows, without re-ranking anything:
 /// the resolution the core produced is rendered as-is.
-fn audit_policy_view(policy: &archivefs_core::dat::sources::audit_run::DatAuditPolicyOutcome) -> AuditPolicyView {
+fn audit_policy_view(
+    policy: &archivefs_core::dat::sources::audit_run::DatAuditPolicyOutcome,
+) -> AuditPolicyView {
     let mut notes = Vec::new();
     for note in policy.notes.iter() {
         notes.push(AuditPolicyNoteView {
@@ -3672,9 +3699,7 @@ fn show_region_preference_editor(
                 .region_preferences
                 .iter()
                 .any(|row| row.value == region.as_str());
-            if !present
-                && ui.add(egui::Button::new(region.label()).small()).clicked()
-            {
+            if !present && ui.add(egui::Button::new(region.label()).small()).clicked() {
                 action = Some(DatSourcesPageAction::AddRegion {
                     scope: view.scope.clone(),
                     region,
@@ -3757,11 +3782,7 @@ fn show_language_preference_editor(
                 }
                 for language in LanguageId::ALL {
                     let present = present.contains(&language.as_str());
-                    if !present
-                        && ui
-                            .selectable_label(false, language.label())
-                            .clicked()
-                    {
+                    if !present && ui.selectable_label(false, language.label()).clicked() {
                         action = Some(DatSourcesPageAction::AddLanguage {
                             scope: view.scope.clone(),
                             preference: LanguagePreference::Language(language),
@@ -3785,9 +3806,7 @@ fn show_effective_policy_summary(ui: &mut egui::Ui, view: &DatPolicyView) {
         ),
     );
     widgets::card(ui, |ui| {
-        ui.label(
-            egui::RichText::new(format!("Platform: {}", view.effective.platform)).strong(),
-        );
+        ui.label(egui::RichText::new(format!("Platform: {}", view.effective.platform)).strong());
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Sources consulted:").strong());
@@ -3822,11 +3841,7 @@ fn show_effective_policy_summary(ui: &mut egui::Ui, view: &DatPolicyView) {
         for (field, scope) in &view.effective.source_of {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(field).small());
-                ui.label(
-                    egui::RichText::new(scope)
-                        .color(theme::muted(ui))
-                        .small(),
-                );
+                ui.label(egui::RichText::new(scope).color(theme::muted(ui)).small());
             });
         }
     });

@@ -2739,7 +2739,11 @@ fn an_unresolved_platform_is_never_presented_on_the_running_card() {
 // ---------------------------------------------------------------------------
 
 /// Renders the whole page at a given window width.
-fn render_at_width(view: &DatSourcesPageView, ui_state: &mut DatSourcesPageUi, width: f32) -> egui::FullOutput {
+fn render_at_width(
+    view: &DatSourcesPageView,
+    ui_state: &mut DatSourcesPageUi,
+    width: f32,
+) -> egui::FullOutput {
     let context = egui::Context::default();
     context.run(
         egui::RawInput {
@@ -2797,10 +2801,7 @@ fn policy_edits_are_unsaved_changes_and_never_touch_the_rom_folder() {
 
     // A fresh page reloads the preference.
     let reloaded = fixture.page();
-    assert_eq!(
-        reloaded.view().policy.region_preferences[0].label,
-        "Europe"
-    );
+    assert_eq!(reloaded.view().policy.region_preferences[0].label, "Europe");
     assert_eq!(
         reloaded.view().policy.revision_policy,
         RevisionPolicy::LatestVerified
@@ -2876,7 +2877,10 @@ fn language_editor_adds_a_specific_language_multi_and_original() {
         .iter()
         .map(|row| row.label.as_str())
         .collect();
-    assert_eq!(labels, vec!["English", "Multi-language", "Original language"]);
+    assert_eq!(
+        labels,
+        vec!["English", "Multi-language", "Original language"]
+    );
 
     // Adding the same language again is refused (no duplicates).
     page.apply(DatSourcesPageAction::AddLanguage {
@@ -2897,7 +2901,10 @@ fn language_editor_adds_a_specific_language_multi_and_original() {
         .iter()
         .map(|row| row.label.as_str())
         .collect();
-    assert_eq!(labels, vec!["Original language", "English", "Multi-language"]);
+    assert_eq!(
+        labels,
+        vec!["Original language", "English", "Multi-language"]
+    );
 }
 
 #[test]
@@ -2957,7 +2964,12 @@ fn the_effective_policy_summary_shows_the_resolved_values_for_the_scope() {
     // Source ordering lists the enabled source as consulted 1st.
     assert_eq!(summary.source_ordering.len(), 1);
     assert_eq!(summary.source_ordering[0].consulted_position, 1);
-    assert!(summary.source_of.iter().any(|(field, scope)| field == "Region preference" && scope == "Global"));
+    assert!(
+        summary
+            .source_of
+            .iter()
+            .any(|(field, scope)| field == "Region preference" && scope == "Global")
+    );
 }
 
 #[test]
@@ -3001,11 +3013,13 @@ fn a_platform_override_is_reflected_in_the_summary_with_its_source_of_value() {
     let policy = page.view().policy;
     // The summary resolves Japan for NES, and says where it came from.
     assert_eq!(policy.effective.region, "Japan");
-    assert!(policy
-        .effective
-        .source_of
-        .iter()
-        .any(|(field, scope)| field == "Region preference" && scope == "Platform override"));
+    assert!(
+        policy
+            .effective
+            .source_of
+            .iter()
+            .any(|(field, scope)| field == "Region preference" && scope == "Platform override")
+    );
     assert_eq!(policy.effective.platform, "Nintendo Entertainment System");
 }
 
@@ -3086,7 +3100,10 @@ fn the_policy_section_and_summary_render_at_a_narrow_compact_width() {
     assert!(rendered_text_contains(&output, "Europe"));
     assert!(rendered_text_contains(&output, "Effective policy"));
     assert!(rendered_text_contains(&output, "Platform: All platforms"));
-    assert!(rendered_text_contains(&output, "ArchiveFS never renames your files."));
+    assert!(rendered_text_contains(
+        &output,
+        "ArchiveFS never renames your files."
+    ));
 }
 
 #[test]
@@ -3182,12 +3199,19 @@ fn an_audit_result_shows_the_policy_preferred_candidate_for_multi_candidate_file
     let note = &policy.notes[0];
     assert!(note.decided);
     assert_eq!(note.winner.as_deref(), Some("Game (Europe) (game.bin)"));
-    assert!(note.explanations.iter().any(|line| line.contains("preferred region matched")));
+    assert!(
+        note.explanations
+            .iter()
+            .any(|line| line.contains("preferred region matched"))
+    );
     assert!(!note.ambiguous);
 
     let mut ui_state = DatSourcesPageUi::default();
     let output = render(&view, &mut ui_state);
     assert!(rendered_text_contains(&output, "Policy preference"));
     assert!(rendered_text_contains(&output, "Game (Europe)"));
-    assert!(rendered_text_contains(&output, "Preferred: Game (Europe) (game.bin)"));
+    assert!(rendered_text_contains(
+        &output,
+        "Preferred: Game (Europe) (game.bin)"
+    ));
 }

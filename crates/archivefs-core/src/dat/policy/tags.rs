@@ -86,7 +86,9 @@ const OTHER_REGION_WORDS: &[&str] = &[
 /// Maps one normalised name token to a region, or `None` when the token is
 /// not region-shaped.
 fn region_from_word(word: &str) -> Option<RegionId> {
-    if let Some((_, region)) = CANONICAL_REGION_WORDS.iter().find(|(candidate, _)| *candidate == word)
+    if let Some((_, region)) = CANONICAL_REGION_WORDS
+        .iter()
+        .find(|(candidate, _)| *candidate == word)
     {
         return Some(*region);
     }
@@ -264,10 +266,7 @@ mod tests {
 
     #[test]
     fn language_tags_deduplicate() {
-        assert_eq!(
-            languages_of_name("Game (En,En)"),
-            vec![LanguageId::En]
-        );
+        assert_eq!(languages_of_name("Game (En,En)"), vec![LanguageId::En]);
     }
 
     #[test]
@@ -304,7 +303,13 @@ mod tests {
 
     #[test]
     fn punctuation_and_case_do_not_change_extraction() {
-        assert_eq!(regions_of_name("Game (USA,Europe)"), regions_of_name("Game (USA, Europe)"));
-        assert_eq!(regions_of_name("Game (USA,Europe)"), regions_of_name("game (usa, europe)"));
+        assert_eq!(
+            regions_of_name("Game (USA,Europe)"),
+            regions_of_name("Game (USA, Europe)")
+        );
+        assert_eq!(
+            regions_of_name("Game (USA,Europe)"),
+            regions_of_name("game (usa, europe)")
+        );
     }
 }

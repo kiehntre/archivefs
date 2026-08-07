@@ -285,7 +285,9 @@ impl LanguagePreference {
 /// safe default is [`RevisionPolicy::AskWhenAmbiguous`]: the policy never
 /// uses revision to pick a winner, which is exactly what today's audit does
 /// when it reports every candidate without choosing one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum RevisionPolicy {
     /// Prefer the newest verified revision (highest marker); a marked entry
@@ -343,7 +345,9 @@ impl RevisionPolicy {
 /// Safe default is [`ClonePolicy::KeepAllVariants`]: parent relationships are
 /// ignored and every candidate is retained, which is exactly what today's DAT
 /// audit does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ClonePolicy {
     /// A parent always outranks a clone of it, whatever region or language

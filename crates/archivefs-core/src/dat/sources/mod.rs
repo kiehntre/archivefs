@@ -45,12 +45,12 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::dat::policy::{DatPolicyConfig, default_dat_policy};
 pub use config::{
     DatSourceConfigEntry, DatSourcesConfig, default_dat_sources_config_path,
     load_dat_sources_config_default, load_dat_sources_config_from, save_dat_sources_config_default,
     save_dat_sources_config_to,
 };
-pub use crate::dat::policy::{DatPolicyConfig, default_dat_policy};
 pub use validation::{
     DatDiagnostic, DatFileOutcome, DatFileReport, DatPathRefusal, DatValidationReport,
     DuplicateDatIdentity, MAX_FOLDER_DAT_FILES, SkippedFolderEntry, discover_dat_files,

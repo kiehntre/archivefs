@@ -55,9 +55,9 @@ pub mod tags;
 pub use candidate::{DatCandidate, candidate_for_rom};
 pub use config::{DatPlatformPolicyConfig, DatPolicyConfig, default_dat_policy};
 pub use evaluate::{
-    CandidateResolution, EffectiveDatPolicy, ExcludedCandidate, ParticipatingSource,
-    PolicyProblem, RankedCandidate, original_language_of, participating_sources, rank_candidates,
-    resolve, validate_policy_config,
+    CandidateResolution, EffectiveDatPolicy, ExcludedCandidate, ParticipatingSource, PolicyProblem,
+    RankedCandidate, original_language_of, participating_sources, rank_candidates, resolve,
+    validate_policy_config,
 };
 pub use model::{
     ClonePolicy, LanguageId, LanguagePreference, MAX_POLICY_PREFERENCE_LEN, PolicyField,
