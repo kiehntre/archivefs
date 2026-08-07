@@ -43,18 +43,19 @@ pub fn detect_target_collision(
         });
     }
 
+    // A case-only collision is any sibling that folds to the proposed name
+    // but is *not* the current file itself. Comparing the case-folded current
+    // name would wrongly skip the check when the current and proposed names
+    // are themselves case variants (e.g. "game.bin" -> "Game.bin") while a
+    // distinct sibling ("GAME.BIN") still collides. Only the exact current
+    // entry is excluded.
     let proposed_lower = proposed_basename.to_ascii_lowercase();
-    if siblings.names_lower.contains(&proposed_lower)
-        && current_basename.to_ascii_lowercase() != proposed_lower
-    {
-        let colliding = siblings
-            .names
-            .iter()
-            .find(|name| name.to_ascii_lowercase() == proposed_lower)
-            .cloned();
+    if let Some(colliding) = siblings.names.iter().find(|name| {
+        name.to_ascii_lowercase() == proposed_lower && name.as_str() != current_basename
+    }) {
         return Some(CollisionInfo {
             kind: CollisionKind::CaseCollision,
-            colliding_with: colliding,
+            colliding_with: Some(colliding.clone()),
             colliding_is_symlink: false,
             detail: format!(
                 "a file whose name differs from '{proposed_basename}' only by case already \
@@ -201,6 +202,27 @@ mod tests {
     fn renaming_case_only_is_not_a_self_collision() {
         let found = detect_target_collision("game.bin", "Game.bin", &siblings(&["game.bin"]));
         assert!(found.is_none(), "{found:?}");
+    }
+
+    #[test]
+    fn a_distinct_sibling_case_collision_is_not_hidden_by_a_self_case_change() {
+        // current and proposed are themselves case variants of each other, but
+        // a *distinct* sibling still case-folds to the proposed name - that
+        // sibling must make the proposal a conflict.
+        let found =
+            detect_target_collision("game.bin", "Game.bin", &siblings(&["game.bin", "GAME.BIN"]));
+        let collision = found.expect("the distinct sibling must collide");
+        assert_eq!(collision.kind, CollisionKind::CaseCollision);
+        assert_eq!(collision.colliding_with.as_deref(), Some("GAME.BIN"));
+    }
+
+    #[test]
+    fn a_distinct_sibling_case_collision_is_detected_for_any_input_casing() {
+        let found =
+            detect_target_collision("Game.bin", "GAME.bin", &siblings(&["Game.bin", "gAmE.BIN"]));
+        let collision = found.expect("the distinct sibling must collide");
+        assert_eq!(collision.kind, CollisionKind::CaseCollision);
+        assert_eq!(collision.colliding_with.as_deref(), Some("gAmE.BIN"));
     }
 
     #[test]
