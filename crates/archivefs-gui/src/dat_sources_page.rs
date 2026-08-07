@@ -46,6 +46,10 @@ use std::time::Instant;
 
 use archivefs_core::dat::limits::DatLimits;
 use archivefs_core::dat::parser::DiagnosticSeverity;
+use archivefs_core::dat::policy::{
+    ClonePolicy, DatPolicyConfig, EffectiveDatPolicy, LanguageId, LanguagePreference, PolicyField,
+    RegionId, RevisionPolicy, participating_sources, resolve, validate_policy_config,
+};
 use archivefs_core::dat::sources::audit_run::{
     DatAuditOutcome, DatAuditProgress, DatAuditRequest, run_dat_audit,
 };
@@ -184,6 +188,75 @@ impl DatSourceRowView {
             .map(|group| group.occurrence_count)
             .sum()
     }
+}
+
+/// The four policy fields of one scope, borrowed for editing.
+///
+/// This is what lets a policy edit act on "global or this platform's
+/// override" through one code path; the field shapes of
+/// [`DatPolicyConfig`] and its per-platform override differ, but the four
+/// editable fields are the same.
+struct PolicyTargets<'a> {
+    region: &'a mut Option<Vec<String>>,
+    language: &'a mut Option<Vec<String>>,
+    revision: &'a mut Option<String>,
+    clone: &'a mut Option<String>,
+}
+
+impl<'a> PolicyTargets<'a> {
+    fn new(
+        region: &'a mut Option<Vec<String>>,
+        language: &'a mut Option<Vec<String>>,
+        revision: &'a mut Option<String>,
+        clone: &'a mut Option<String>,
+    ) -> Self {
+        Self {
+            region,
+            language,
+            revision,
+            clone,
+        }
+    }
+
+    /// The region list, creating it when absent.
+    fn region_list(&mut self) -> &mut Vec<String> {
+        self.region.get_or_insert_with(Vec::new)
+    }
+
+    /// The language list, creating it when absent.
+    fn language_list(&mut self) -> &mut Vec<String> {
+        self.language.get_or_insert_with(Vec::new)
+    }
+
+    /// Turns a list that has become empty back into "absent".
+    ///
+    /// Removing the last preference should mean "no preference, inherit the
+    /// parent scope" - the `None` state - not "this scope explicitly prefers
+    /// nothing", which is a distinction only a hand-edited file needs.
+    fn normalise_empty_lists(&mut self) {
+        if self.region.as_ref().is_some_and(Vec::is_empty) {
+            *self.region = None;
+        }
+        if self.language.as_ref().is_some_and(Vec::is_empty) {
+            *self.language = None;
+        }
+    }
+}
+
+/// Moves `list[index]` to `index + delta` (`-1` up, `+1` down), refusing to
+/// move out of range. This is a *move*, not a swap: an entry moved up two
+/// places passes over both neighbours rather than exchanging places with the
+/// first one.
+fn move_index(list: &mut Vec<String>, index: usize, delta: i32) {
+    let target = match index.checked_add_signed(delta as isize) {
+        Some(target) if target < list.len() => target,
+        _ => return,
+    };
+    if target == index {
+        return;
+    }
+    let value = list.remove(index);
+    list.insert(target, value);
 }
 
 /// One DAT file inside a source, as the Inspect panel lists it.
@@ -370,6 +443,9 @@ pub(crate) struct DatSourcesPageView {
     pub(crate) library_folders: Vec<PathBuf>,
     pub(crate) audit: Option<Box<AuditResultView>>,
     pub(crate) audit_error: Option<String>,
+    /// The DAT Matching Policy section, including the Effective Policy
+    /// Summary resolved for the scope the user is inspecting.
+    pub(crate) policy: DatPolicyView,
 }
 
 impl DatSourcesPageView {
@@ -377,6 +453,82 @@ impl DatSourcesPageView {
     pub(crate) fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }
+}
+
+// ---------------------------------------------------------------------------
+// DAT matching policy view model
+// ---------------------------------------------------------------------------
+
+/// The DAT Matching Policy section: what the user has set, at the scope they
+/// are editing, plus the resolved Effective Policy Summary for that scope.
+///
+/// The GUI never implements policy logic: every resolved value in here is the
+/// output of the core resolver, and every edit action maps onto the persisted
+/// [`DatPolicyConfig`] through the registry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DatPolicyView {
+    /// The scope being edited: `None` = global, otherwise a canonical
+    /// platform id.
+    pub(crate) scope: Option<String>,
+    /// The scope's display label ("All platforms" or the platform's name).
+    pub(crate) scope_label: String,
+    /// The platforms a user can choose as a scope, derived from the platforms
+    /// the registered sources cover.
+    pub(crate) scopes_available: Vec<PolicyScopeOption>,
+    pub(crate) region_preferences: Vec<PolicyPreferenceRowView>,
+    pub(crate) language_preferences: Vec<PolicyPreferenceRowView>,
+    pub(crate) revision_policy: RevisionPolicy,
+    pub(crate) clone_policy: ClonePolicy,
+    pub(crate) effective: EffectivePolicySummaryView,
+    /// Validation problems in the persisted policy (unknown values, bad
+    /// platform keys). Never blocks a save; the values are preserved.
+    pub(crate) problems: Vec<String>,
+    /// False when the registry could not be read, so nothing can be edited.
+    pub(crate) editable: bool,
+}
+
+/// One entry in an ordered preference list, ready to draw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PolicyPreferenceRowView {
+    /// The stable value (`europe`, `en`, `multi`, `original`, …).
+    pub(crate) value: String,
+    /// What a person sees.
+    pub(crate) label: String,
+    /// 1-based position in the list.
+    pub(crate) position: usize,
+}
+
+/// One selectable scope for the policy section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PolicyScopeOption {
+    /// `None` = "All platforms" (the global scope).
+    pub(crate) id: Option<String>,
+    pub(crate) label: String,
+}
+
+/// The Effective Policy Summary: the resolved policy for the current scope,
+/// and where each value came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EffectivePolicySummaryView {
+    /// The resolved platform ("All platforms" or the platform's display name).
+    pub(crate) platform: String,
+    /// The sources consulted for this scope, in order.
+    pub(crate) source_ordering: Vec<SourceOrderRow>,
+    pub(crate) region: String,
+    pub(crate) language: String,
+    pub(crate) revision: String,
+    pub(crate) clone: String,
+    /// "field — where it came from" rows.
+    pub(crate) source_of: Vec<(String, String)>,
+}
+
+/// One source in the summary's consultation order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SourceOrderRow {
+    pub(crate) display_name: String,
+    pub(crate) priority: u32,
+    /// 1-based: "consulted 1st, 2nd, …".
+    pub(crate) consulted_position: usize,
 }
 
 /// One verdict category, as a countable row.
@@ -414,6 +566,38 @@ pub(crate) struct AuditResultView {
     pub(crate) unreadable_catalogues: Vec<String>,
     pub(crate) truncated: bool,
     pub(crate) files_scanned: usize,
+    /// The Effective Policy Summary annotation, when the audit carried a
+    /// policy. Never changes a verdict; it shows the preferred candidate
+    /// order for the files whose hash matched several catalogue entries.
+    pub(crate) policy: Option<AuditPolicyView>,
+}
+
+/// The policy annotation of one audit result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AuditPolicyView {
+    /// The sources consulted for this platform, in order.
+    pub(crate) source_ordering: Vec<String>,
+    /// One row per multi-candidate file that was ranked.
+    pub(crate) notes: Vec<AuditPolicyNoteView>,
+    /// `None` when no file needed a ranking.
+    pub(crate) notes_truncated: Option<usize>,
+}
+
+/// One ranked multi-candidate file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AuditPolicyNoteView {
+    pub(crate) file_name: String,
+    pub(crate) verdict_label: String,
+    /// The ranked candidates, in the deterministic display order.
+    pub(crate) ranked: Vec<String>,
+    /// The explanations, most decisive first.
+    pub(crate) explanations: Vec<String>,
+    /// Whether the policy picked a single winner, and its label.
+    pub(crate) decided: bool,
+    pub(crate) winner: Option<String>,
+    /// Whether the policy could not decide, and why.
+    pub(crate) ambiguous: bool,
+    pub(crate) ambiguity_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -436,6 +620,11 @@ pub(crate) const MAX_AUDIT_ENTRIES_SHOWN: usize = 500;
 
 /// One thing the page can ask for. Only `Save` writes the registry; only
 /// `Validate` and `Audit` read anything else.
+///
+/// The policy actions all carry the scope they apply to (`None` = global,
+/// otherwise a canonical platform id), so an edit made while inspecting one
+/// platform's effective policy lands on that platform's override, never on
+/// the global preferences by accident.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DatSourcesPageAction {
     AddFile {
@@ -465,6 +654,43 @@ pub(crate) enum DatSourcesPageAction {
     CancelJob,
     Save,
     Revert,
+    SelectPolicyScope {
+        scope: Option<String>,
+    },
+    MoveRegion {
+        scope: Option<String>,
+        index: usize,
+        delta: i32,
+    },
+    AddRegion {
+        scope: Option<String>,
+        region: RegionId,
+    },
+    RemoveRegion {
+        scope: Option<String>,
+        index: usize,
+    },
+    MoveLanguage {
+        scope: Option<String>,
+        index: usize,
+        delta: i32,
+    },
+    AddLanguage {
+        scope: Option<String>,
+        preference: LanguagePreference,
+    },
+    RemoveLanguage {
+        scope: Option<String>,
+        index: usize,
+    },
+    SetRevisionPolicy {
+        scope: Option<String>,
+        policy: RevisionPolicy,
+    },
+    SetClonePolicy {
+        scope: Option<String>,
+        policy: ClonePolicy,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -589,6 +815,106 @@ fn authoritative_platform(entry: &DatSourceEntry) -> Option<String> {
         .as_ref()
         .filter(|_| entry.platform_is_resolved())
         .and_then(|_| entry.platform_display())
+}
+
+/// The region preference list as *authored* at `scope`: the global list, or a
+/// platform override's own list (empty when that platform has no override).
+fn authored_region_list(config: &DatPolicyConfig, scope: &Option<String>) -> Vec<String> {
+    match scope {
+        None => config.region_preferences.clone().unwrap_or_default(),
+        Some(platform) => config
+            .platforms
+            .as_ref()
+            .and_then(|overrides| overrides.get(platform))
+            .and_then(|entry| entry.region_preferences.clone())
+            .unwrap_or_default(),
+    }
+}
+
+/// The language preference list as *authored* at `scope`.
+fn authored_language_list(config: &DatPolicyConfig, scope: &Option<String>) -> Vec<String> {
+    match scope {
+        None => config.language_preferences.clone().unwrap_or_default(),
+        Some(platform) => config
+            .platforms
+            .as_ref()
+            .and_then(|overrides| overrides.get(platform))
+            .and_then(|entry| entry.language_preferences.clone())
+            .unwrap_or_default(),
+    }
+}
+
+/// A preference list rendered as one line for the summary, or the honest
+/// "no preference" wording when it is empty.
+fn render_preference_list(values: Vec<String>) -> String {
+    if values.is_empty() {
+        "None (all equal)".to_string()
+    } else {
+        values.join(", ")
+    }
+}
+
+/// The Effective Policy Summary for one scope, derived entirely from the core
+/// resolver's output - the GUI renders, it never re-resolves.
+fn effective_summary_view(
+    effective: &EffectiveDatPolicy,
+    scope: &Option<String>,
+) -> EffectivePolicySummaryView {
+    let platform = match scope {
+        None => "All platforms".to_string(),
+        Some(id) => archivefs_core::platform::display_name_for(id).to_string(),
+    };
+    let source_ordering = effective
+        .source_ordering
+        .iter()
+        .enumerate()
+        .map(|(index, source)| SourceOrderRow {
+            display_name: source.display_name.clone(),
+            priority: source.priority,
+            consulted_position: index + 1,
+        })
+        .collect();
+    let region = render_preference_list(
+        effective
+            .region_preferences
+            .iter()
+            .map(|region| region.label().to_string())
+            .collect(),
+    );
+    let language = render_preference_list(
+        effective
+            .language_preferences
+            .iter()
+            .map(|preference| preference.label().to_string())
+            .collect(),
+    );
+    let source_of = vec![
+        (
+            "Region preference".to_string(),
+            effective.scope_of[&PolicyField::Region].label().to_string(),
+        ),
+        (
+            "Language preference".to_string(),
+            effective.scope_of[&PolicyField::Language].label().to_string(),
+        ),
+        (
+            "Revision policy".to_string(),
+            effective.scope_of[&PolicyField::Revision].label().to_string(),
+        ),
+        (
+            "Clone policy".to_string(),
+            effective.scope_of[&PolicyField::Clone].label().to_string(),
+        ),
+    ];
+    EffectivePolicySummaryView {
+        platform,
+        source_ordering,
+        region,
+        language,
+        revision: effective.revision_policy.label().to_string(),
+        clone: effective.clone_policy.label().to_string(),
+        source_of,
+    }
 }
 
 /// Groups the last validation's diagnostics by (severity, code, message),
@@ -878,6 +1204,10 @@ pub(crate) struct DatSourcesPageState {
     trusted: TrustedRoots,
     library_folders: Vec<PathBuf>,
     limits: DatLimits,
+    /// The DAT matching policy scope being edited and inspected. `None` is the
+    /// global scope; a value is a canonical platform id. Persisted nowhere - it
+    /// only decides which preferences the policy section reads and writes.
+    policy_scope: Option<String>,
 }
 
 impl DatSourcesPageState {
@@ -922,6 +1252,7 @@ impl DatSourcesPageState {
             trusted,
             library_folders,
             limits: DatLimits::default(),
+            policy_scope: None,
         }
     }
 
@@ -1181,8 +1512,124 @@ impl DatSourcesPageState {
                 // a "Not checked" badge. Both maps are discarded together.
                 self.validations.clear();
                 self.diagnostic_groups.clear();
+                // The policy scope is not persisted, so discarding returns it
+                // to the global scope rather than leaving a platform selected
+                // whose override the user just discarded.
+                self.policy_scope = None;
             }
             DatSourcesPageAction::Save => self.save(),
+            DatSourcesPageAction::SelectPolicyScope { scope } => {
+                self.policy_scope = scope;
+            }
+            DatSourcesPageAction::MoveRegion { scope, index, delta } => {
+                self.with_policy_targets(&scope, |targets| {
+                    move_index(targets.region_list(), index, delta);
+                });
+            }
+            DatSourcesPageAction::AddRegion { scope, region } => {
+                self.with_policy_targets(&scope, |targets| {
+                    let list = targets.region_list();
+                    if !list.iter().any(|value| value == region.as_str()) {
+                        list.push(region.as_str().to_string());
+                    }
+                });
+            }
+            DatSourcesPageAction::RemoveRegion { scope, index } => {
+                self.with_policy_targets(&scope, |targets| {
+                    let list = targets.region_list();
+                    if index < list.len() {
+                        list.remove(index);
+                    }
+                });
+            }
+            DatSourcesPageAction::MoveLanguage { scope, index, delta } => {
+                self.with_policy_targets(&scope, |targets| {
+                    move_index(targets.language_list(), index, delta);
+                });
+            }
+            DatSourcesPageAction::AddLanguage { scope, preference } => {
+                self.with_policy_targets(&scope, |targets| {
+                    let list = targets.language_list();
+                    if !list.iter().any(|value| value == preference.as_str()) {
+                        list.push(preference.as_str().to_string());
+                    }
+                });
+            }
+            DatSourcesPageAction::RemoveLanguage { scope, index } => {
+                self.with_policy_targets(&scope, |targets| {
+                    let list = targets.language_list();
+                    if index < list.len() {
+                        list.remove(index);
+                    }
+                });
+            }
+            DatSourcesPageAction::SetRevisionPolicy { scope, policy } => {
+                self.with_policy_targets(&scope, |targets| {
+                    *targets.revision = Some(policy.as_str().to_string());
+                });
+            }
+            DatSourcesPageAction::SetClonePolicy { scope, policy } => {
+                self.with_policy_targets(&scope, |targets| {
+                    *targets.clone = Some(policy.as_str().to_string());
+                });
+            }
+        }
+    }
+
+    /// Applies `edit` to the four policy fields at `scope` (global or one
+    /// platform's override).
+    ///
+    /// Editing a platform scope creates the override entry on demand; when
+    /// the edit leaves it empty it is pruned again, so saving never writes an
+    /// empty `[policy.platforms.X]` table the user did not ask for.
+    fn with_policy_targets(&mut self, scope: &Option<String>, edit: impl FnOnce(&mut PolicyTargets<'_>)) {
+        match scope {
+            None => {
+                let policy = self.draft.policy_mut();
+                let mut targets = PolicyTargets::new(
+                    &mut policy.region_preferences,
+                    &mut policy.language_preferences,
+                    &mut policy.revision_policy,
+                    &mut policy.clone_policy,
+                );
+                edit(&mut targets);
+                targets.normalise_empty_lists();
+            }
+            Some(platform) => {
+                let overrides = self
+                    .draft
+                    .policy_mut()
+                    .platforms
+                    .get_or_insert_with(BTreeMap::new);
+                let entry = overrides.entry(platform.clone()).or_default();
+                let mut targets = PolicyTargets::new(
+                    &mut entry.region_preferences,
+                    &mut entry.language_preferences,
+                    &mut entry.revision_policy,
+                    &mut entry.clone_policy,
+                );
+                edit(&mut targets);
+                targets.normalise_empty_lists();
+                self.prune_empty_overrides();
+            }
+        }
+    }
+
+    /// Removes platform override entries that no longer set anything, and the
+    /// whole `platforms` map when it is empty.
+    fn prune_empty_overrides(&mut self) {
+        let policy = self.draft.policy_mut();
+        let Some(overrides) = policy.platforms.as_mut() else {
+            return;
+        };
+        overrides.retain(|_, entry| {
+            entry.region_preferences.is_some()
+                || entry.language_preferences.is_some()
+                || entry.revision_policy.is_some()
+                || entry.clone_policy.is_some()
+        });
+        if overrides.is_empty() {
+            policy.platforms = None;
         }
     }
 
@@ -1268,6 +1715,19 @@ impl DatSourcesPageState {
         let worker_cancel = cancel.clone();
         let trusted = self.trusted.clone();
         let platform_display = authoritative_platform(&entry);
+        // The audit is annotated with the effective DAT policy so multi-
+        // candidate verdicts can be shown in the user's preferred order. The
+        // policy is resolved now, from the draft, by the core resolver; the
+        // worker thread only reads the resolution.
+        let policy = resolve(
+            self.draft.policy(),
+            entry.platform.as_deref().and_then(|platform| {
+                archivefs_core::canonical_platform_for_alias(platform)
+            }),
+            participating_sources(&self.draft, entry.platform.as_deref().and_then(|platform| {
+                archivefs_core::canonical_platform_for_alias(platform)
+            })),
+        );
         let request = DatAuditRequest {
             source_id: entry.id.clone(),
             source_display_name: entry.display_name.clone(),
@@ -1275,6 +1735,7 @@ impl DatSourcesPageState {
             dat_kind: entry.kind,
             scan_root,
             limits: self.limits,
+            policy: Some(policy),
         };
 
         std::thread::spawn(move || {
@@ -1364,8 +1825,119 @@ impl DatSourcesPageState {
                 .as_ref()
                 .map(|outcome| Box::new(audit_view(outcome, self.audit_elapsed_seconds))),
             audit_error: self.audit_error.clone(),
+            policy: self.policy_view(),
             rows,
         }
+    }
+
+    /// Builds the DAT Matching Policy section view, resolving the effective
+    /// policy for the scope being edited through the core resolver.
+    fn policy_view(&self) -> DatPolicyView {
+        // The scope the user selected can outlive the source whose platform
+        // offered it: if that platform is no longer available (every source
+        // for it removed), fall back to the global scope rather than showing
+        // a scope with nothing to inspect.
+        let scope = match &self.policy_scope {
+            Some(platform) if self.scope_is_available(platform) => Some(platform.clone()),
+            _ => None,
+        };
+        let config = self.draft.policy();
+        let effective = resolve(config, scope.as_deref(), participating_sources(&self.draft, scope.as_deref()));
+
+        let scopes_available = self.policy_scopes_available();
+        let scope_label = match &scope {
+            None => "All platforms".to_string(),
+            Some(platform) => archivefs_core::platform::display_name_for(platform).to_string(),
+        };
+
+        // The lists shown for editing are the scope's *authored* lists - what
+        // is actually persisted there - not the resolved ones. The Effective
+        // Policy Summary below is where the resolved (possibly inherited)
+        // values appear, so editing a platform scope starts from an empty
+        // override and never silently copies the whole global list into it.
+        let region_preferences = authored_region_list(config, &scope)
+            .into_iter()
+            .filter_map(|value| {
+                RegionId::parse(&value).map(|region| PolicyPreferenceRowView {
+                    value: region.as_str().to_string(),
+                    label: region.label().to_string(),
+                    position: 0,
+                })
+            })
+            .enumerate()
+            .map(|(index, mut row)| {
+                row.position = index + 1;
+                row
+            })
+            .collect();
+        let language_preferences = authored_language_list(config, &scope)
+            .into_iter()
+            .filter_map(|value| {
+                LanguagePreference::parse(&value).map(|preference| PolicyPreferenceRowView {
+                    value: preference.as_str().to_string(),
+                    label: preference.label().to_string(),
+                    position: 0,
+                })
+            })
+            .enumerate()
+            .map(|(index, mut row)| {
+                row.position = index + 1;
+                row
+            })
+            .collect();
+
+        let problems = validate_policy_config(config)
+            .into_iter()
+            .map(|problem| problem.message)
+            .collect();
+
+        let summary = effective_summary_view(&effective, &scope);
+        DatPolicyView {
+            scope,
+            scope_label,
+            scopes_available,
+            region_preferences,
+            language_preferences,
+            revision_policy: effective.revision_policy,
+            clone_policy: effective.clone_policy,
+            effective: summary,
+            problems,
+            editable: self.load_error.is_none(),
+        }
+    }
+
+    /// Whether `platform` is still offered as a policy scope: some source is
+    /// assigned to it.
+    fn scope_is_available(&self, platform: &str) -> bool {
+        self.draft.entries().iter().any(|entry| {
+            entry
+                .platform
+                .as_deref()
+                .and_then(archivefs_core::canonical_platform_for_alias)
+                == Some(platform)
+        })
+    }
+
+    /// The platforms a policy scope can target: every platform some source is
+    /// assigned to, canonicalised, deduplicated, sorted by display name.
+    fn policy_scopes_available(&self) -> Vec<PolicyScopeOption> {
+        let mut seen: BTreeMap<String, String> = BTreeMap::new();
+        for entry in self.draft.entries() {
+            if let Some(platform) = &entry.platform
+                && let Some(canonical) = archivefs_core::canonical_platform_for_alias(platform)
+            {
+                seen.insert(canonical.to_string(), canonical.to_string());
+            }
+        }
+        let mut options: Vec<PolicyScopeOption> = seen
+            .into_values()
+            .map(|platform| PolicyScopeOption {
+                id: Some(platform.clone()),
+                label: archivefs_core::platform::display_name_for(&platform).to_string(),
+            })
+            .collect();
+        options.sort_by(|a, b| a.label.cmp(&b.label));
+        options
     }
 
     fn row_view(&self, entry: &DatSourceEntry) -> DatSourceRowView {
@@ -1706,6 +2278,42 @@ fn audit_view(outcome: &DatAuditOutcome, elapsed_seconds: Option<u64>) -> AuditR
         unreadable_catalogues: outcome.unreadable_catalogues.clone(),
         truncated: outcome.truncated,
         files_scanned: outcome.files_scanned,
+        policy: outcome.policy.as_ref().map(audit_policy_view),
+    }
+}
+
+/// Turns the core policy annotation into rows, without re-ranking anything:
+/// the resolution the core produced is rendered as-is.
+fn audit_policy_view(policy: &archivefs_core::dat::sources::audit_run::DatAuditPolicyOutcome) -> AuditPolicyView {
+    let mut notes = Vec::new();
+    for note in policy.notes.iter() {
+        notes.push(AuditPolicyNoteView {
+            file_name: std::path::Path::new(&note.local_path)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| note.local_path.clone()),
+            verdict_label: note.verdict_label.clone(),
+            ranked: note
+                .resolution
+                .entries
+                .iter()
+                .map(|entry| format!("{}. {}", entry.position, entry.candidate.label()))
+                .collect(),
+            explanations: note.resolution.explanations.clone(),
+            decided: note.resolution.decided,
+            winner: note
+                .resolution
+                .winner_index
+                .and_then(|index| note.resolution.entries.get(index))
+                .map(|entry| entry.candidate.label()),
+            ambiguous: note.resolution.ambiguous,
+            ambiguity_reason: note.resolution.ambiguity_reason.clone(),
+        });
+    }
+    AuditPolicyView {
+        source_ordering: policy.source_ordering.clone(),
+        notes,
+        notes_truncated: None,
     }
 }
 
@@ -1885,6 +2493,14 @@ pub(crate) fn show_dat_sources_page(
             }
             ui.add_space(8.0);
         }
+    }
+
+    // The policy section is always shown: its preferences and the Effective
+    // Policy Summary are meaningful even before any source is registered.
+    if action.is_none()
+        && let Some(policy_action) = show_dat_policy_section(ui, &view.policy)
+    {
+        action = Some(policy_action);
     }
 
     if let Some(error) = &view.audit_error {
@@ -2778,6 +3394,451 @@ fn show_inspect(ui: &mut egui::Ui, row: &DatSourceRowView) {
     });
 }
 
+/// The policy annotation of an audit: which candidates the user's preferences
+/// prefer for each multi-candidate file, and what the policy could not decide.
+///
+/// This is display of the core's resolution - nothing here ranks, and the
+/// verdicts themselves are never touched.
+fn show_audit_policy_notes(ui: &mut egui::Ui, policy: &AuditPolicyView) {
+    if policy.notes.is_empty() {
+        return;
+    }
+    widgets::section_header(
+        ui,
+        "Policy preference",
+        Some(
+            "Your DAT matching preferences, applied to the files whose hash matched several \
+             catalogue entries. Nothing is renamed or changed; this is the preferred order only.",
+        ),
+    );
+    ui.label(
+        egui::RichText::new(format!(
+            "Sources consulted: {}",
+            if policy.source_ordering.is_empty() {
+                "none".to_string()
+            } else {
+                policy.source_ordering.join(" → ")
+            }
+        ))
+        .color(theme::muted(ui))
+        .small(),
+    );
+    for note in &policy.notes {
+        ui.add_space(4.0);
+        ui.horizontal_top(|ui| {
+            ui.label(egui::RichText::new(note.file_name.clone()).strong());
+            ui.label(
+                egui::RichText::new(note.verdict_label.clone())
+                    .color(theme::muted(ui))
+                    .small(),
+            );
+        });
+        for line in &note.ranked {
+            ui.label(egui::RichText::new(line.clone()).small().monospace());
+        }
+        for line in &note.explanations {
+            ui.label(
+                egui::RichText::new(format!("• {line}"))
+                    .color(theme::muted(ui))
+                    .small(),
+            );
+        }
+        if let Some(winner) = &note.winner {
+            ui.label(
+                egui::RichText::new(format!("Preferred: {winner}"))
+                    .color(theme::SUCCESS)
+                    .small(),
+            );
+        }
+        if note.ambiguous {
+            ui.label(
+                egui::RichText::new(format!(
+                    "Ambiguous: {}",
+                    note.ambiguity_reason
+                        .as_deref()
+                        .unwrap_or("the policy cannot decide")
+                ))
+                .color(theme::WARNING)
+                .small(),
+            );
+        }
+    }
+}
+
+/// The DAT Matching Policy section: preference editors plus the Effective
+/// Policy Summary. Every value drawn here comes from the core resolver; the
+/// drawing code only turns actions into edits.
+fn show_dat_policy_section(
+    ui: &mut egui::Ui,
+    view: &DatPolicyView,
+) -> Option<DatSourcesPageAction> {
+    let mut action = None;
+    ui.add_space(10.0);
+    widgets::section_header(
+        ui,
+        "DAT matching policy",
+        Some(
+            "How ArchiveFS prefers one verified candidate over another. Nothing here renames, \
+             moves, deletes or rewrites a file.",
+        ),
+    );
+
+    widgets::card(ui, |ui| {
+        if !view.editable {
+            ui.label(
+                egui::RichText::new(
+                    "The registry could not be read, so the policy cannot be edited until that \
+                     is fixed.",
+                )
+                .color(theme::muted(ui)),
+            );
+            return;
+        }
+
+        // Scope selector: which platform the preferences and summary apply to.
+        ui.horizontal(|ui| {
+            ui.label("Applies to:");
+            egui::ComboBox::from_id_salt("dat-policy-scope")
+                .selected_text(&view.scope_label)
+                .show_ui(ui, |ui| {
+                    for option in &view.scopes_available {
+                        if ui
+                            .selectable_label(option.id == view.scope, &option.label)
+                            .clicked()
+                        {
+                            action = Some(DatSourcesPageAction::SelectPolicyScope {
+                                scope: option.id.clone(),
+                            });
+                        }
+                    }
+                });
+        });
+        ui.add_space(10.0);
+
+        if let Some(policy_action) = show_region_preference_editor(ui, view) {
+            action = Some(policy_action);
+        }
+        ui.add_space(10.0);
+        if let Some(policy_action) = show_language_preference_editor(ui, view) {
+            action = Some(policy_action);
+        }
+        ui.add_space(10.0);
+
+        ui.horizontal(|ui| {
+            ui.label("Revision policy:");
+            egui::ComboBox::from_id_salt("dat-policy-revision")
+                .selected_text(view.revision_policy.label())
+                .show_ui(ui, |ui| {
+                    for policy in RevisionPolicy::ALL {
+                        if ui
+                            .selectable_label(view.revision_policy == policy, policy.label())
+                            .clicked()
+                        {
+                            action = Some(DatSourcesPageAction::SetRevisionPolicy {
+                                scope: view.scope.clone(),
+                                policy,
+                            });
+                        }
+                    }
+                });
+        });
+        ui.horizontal(|ui| {
+            ui.label("Parent/clone handling:");
+            egui::ComboBox::from_id_salt("dat-policy-clone")
+                .selected_text(view.clone_policy.label())
+                .show_ui(ui, |ui| {
+                    for policy in ClonePolicy::ALL {
+                        if ui
+                            .selectable_label(view.clone_policy == policy, policy.label())
+                            .clicked()
+                        {
+                            action = Some(DatSourcesPageAction::SetClonePolicy {
+                                scope: view.scope.clone(),
+                                policy,
+                            });
+                        }
+                    }
+                });
+        });
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new("ArchiveFS never renames your files.")
+                .color(theme::muted(ui))
+                .small(),
+        );
+
+        if !view.problems.is_empty() {
+            ui.add_space(8.0);
+            widgets::banner(
+                ui,
+                "Policy file kept as written",
+                &format!(
+                    "{} These values are preserved but not applied until fixed by hand or by a \
+                     newer build.",
+                    view.problems.join(" ")
+                ),
+                widgets::StatusTone::Warning,
+            );
+        }
+    });
+
+    ui.add_space(10.0);
+    show_effective_policy_summary(ui, view);
+
+    action
+}
+
+/// One ordered preference list with move/remove, plus an "Add" affordance.
+fn show_preference_rows(
+    ui: &mut egui::Ui,
+    rows: &[PolicyPreferenceRowView],
+    move_action: impl Fn(usize, i32) -> DatSourcesPageAction,
+    remove_action: impl Fn(usize) -> DatSourcesPageAction,
+) -> Option<DatSourcesPageAction> {
+    let mut action = None;
+    for row in rows {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(format!("{}.", row.position)).monospace());
+            ui.label(&row.label);
+            if row.position > 1
+                && ui
+                    .add_enabled(true, egui::Button::new("↑").small())
+                    .on_hover_text("Move up")
+                    .clicked()
+            {
+                action = Some(move_action(row.position - 1, -1));
+            }
+            if row.position < rows.len()
+                && ui
+                    .add_enabled(true, egui::Button::new("↓").small())
+                    .on_hover_text("Move down")
+                    .clicked()
+            {
+                action = Some(move_action(row.position - 1, 1));
+            }
+            if ui
+                .add_enabled(true, egui::Button::new("Remove").small())
+                .on_hover_text("Remove from the preference list")
+                .clicked()
+            {
+                action = Some(remove_action(row.position - 1));
+            }
+        });
+    }
+    action
+}
+
+fn show_region_preference_editor(
+    ui: &mut egui::Ui,
+    view: &DatPolicyView,
+) -> Option<DatSourcesPageAction> {
+    let mut action = None;
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Preferred regions").strong());
+        if view.region_preferences.is_empty() {
+            ui.label(
+                egui::RichText::new("none - all regions equal")
+                    .color(theme::muted(ui))
+                    .small(),
+            );
+        }
+    });
+    ui.label(
+        egui::RichText::new(
+            "When several regions of a game are verified, prefer them in this order.",
+        )
+        .color(theme::muted(ui))
+        .small(),
+    );
+    if let Some(policy_action) = show_preference_rows(
+        ui,
+        &view.region_preferences,
+        |index, delta| DatSourcesPageAction::MoveRegion {
+            scope: view.scope.clone(),
+            index,
+            delta,
+        },
+        |index| DatSourcesPageAction::RemoveRegion {
+            scope: view.scope.clone(),
+            index,
+        },
+    ) {
+        action = Some(policy_action);
+    }
+    ui.horizontal_wrapped(|ui| {
+        ui.label(egui::RichText::new("Add:").color(theme::muted(ui)));
+        for region in RegionId::ALL {
+            let present = view
+                .region_preferences
+                .iter()
+                .any(|row| row.value == region.as_str());
+            if !present
+                && ui.add(egui::Button::new(region.label()).small()).clicked()
+            {
+                action = Some(DatSourcesPageAction::AddRegion {
+                    scope: view.scope.clone(),
+                    region,
+                });
+            }
+        }
+    });
+    action
+}
+
+fn show_language_preference_editor(
+    ui: &mut egui::Ui,
+    view: &DatPolicyView,
+) -> Option<DatSourcesPageAction> {
+    let mut action = None;
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Preferred languages").strong());
+        if view.language_preferences.is_empty() {
+            ui.label(
+                egui::RichText::new("none - all languages equal")
+                    .color(theme::muted(ui))
+                    .small(),
+            );
+        }
+    });
+    ui.label(
+        egui::RichText::new(
+            "When several languages of a game are verified, prefer them in this order. \
+             Multi-language matches any entry with more than one language tag; Original matches \
+             the release region's own language.",
+        )
+        .color(theme::muted(ui))
+        .small(),
+    );
+    if let Some(policy_action) = show_preference_rows(
+        ui,
+        &view.language_preferences,
+        |index, delta| DatSourcesPageAction::MoveLanguage {
+            scope: view.scope.clone(),
+            index,
+            delta,
+        },
+        |index| DatSourcesPageAction::RemoveLanguage {
+            scope: view.scope.clone(),
+            index,
+        },
+    ) {
+        action = Some(policy_action);
+    }
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Add:").color(theme::muted(ui)));
+        let present: Vec<&str> = view
+            .language_preferences
+            .iter()
+            .map(|row| row.value.as_str())
+            .collect();
+        egui::ComboBox::from_id_salt("dat-policy-add-language")
+            .selected_text("Choose a language…")
+            .width(220.0)
+            .show_ui(ui, |ui| {
+                if !present.contains(&"multi")
+                    && ui
+                        .selectable_label(false, LanguagePreference::MultiLanguage.label())
+                        .clicked()
+                {
+                    action = Some(DatSourcesPageAction::AddLanguage {
+                        scope: view.scope.clone(),
+                        preference: LanguagePreference::MultiLanguage,
+                    });
+                }
+                if !present.contains(&"original")
+                    && ui
+                        .selectable_label(false, LanguagePreference::OriginalLanguage.label())
+                        .clicked()
+                {
+                    action = Some(DatSourcesPageAction::AddLanguage {
+                        scope: view.scope.clone(),
+                        preference: LanguagePreference::OriginalLanguage,
+                    });
+                }
+                for language in LanguageId::ALL {
+                    let present = present.contains(&language.as_str());
+                    if !present
+                        && ui
+                            .selectable_label(false, language.label())
+                            .clicked()
+                    {
+                        action = Some(DatSourcesPageAction::AddLanguage {
+                            scope: view.scope.clone(),
+                            preference: LanguagePreference::Language(language),
+                        });
+                    }
+                }
+            });
+    });
+    action
+}
+
+/// The Effective Policy Summary: the resolved policy for the current scope,
+/// where each value came from, and the source consultation order.
+fn show_effective_policy_summary(ui: &mut egui::Ui, view: &DatPolicyView) {
+    widgets::section_header(
+        ui,
+        "Effective policy",
+        Some(
+            "What will actually be applied, after any platform overrides. Resolved by the same \
+             core the CLI uses.",
+        ),
+    );
+    widgets::card(ui, |ui| {
+        ui.label(
+            egui::RichText::new(format!("Platform: {}", view.effective.platform)).strong(),
+        );
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Sources consulted:").strong());
+            if view.effective.source_ordering.is_empty() {
+                ui.label(
+                    egui::RichText::new("none enabled for this scope")
+                        .color(theme::muted(ui))
+                        .small(),
+                );
+            } else {
+                ui.vertical(|ui| {
+                    for source in &view.effective.source_ordering {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{}. {} (priority {})",
+                                source.consulted_position, source.display_name, source.priority
+                            ))
+                            .small(),
+                        );
+                    }
+                });
+            }
+        });
+        ui.add_space(4.0);
+        summary_row(ui, "Region preference", &view.effective.region);
+        summary_row(ui, "Language preference", &view.effective.language);
+        summary_row(ui, "Revision rule", &view.effective.revision);
+        summary_row(ui, "Clone rule", &view.effective.clone);
+        ui.add_space(6.0);
+        ui.separator();
+        ui.label(egui::RichText::new("Where each value comes from").strong());
+        for (field, scope) in &view.effective.source_of {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(field).small());
+                ui.label(
+                    egui::RichText::new(scope)
+                        .color(theme::muted(ui))
+                        .small(),
+                );
+            });
+        }
+    });
+}
+
+fn summary_row(ui: &mut egui::Ui, label: &str, value: &str) {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(format!("{label}:")).strong());
+        ui.label(value);
+    });
+}
+
 fn show_audit_result(ui: &mut egui::Ui, audit: &AuditResultView) {
     widgets::section_header(ui, "Audit result", Some(&audit.headline));
     widgets::card(ui, |ui| {
@@ -2860,6 +3921,11 @@ fn show_audit_result(ui: &mut egui::Ui, audit: &AuditResultView) {
             for line in audit.unhashed.iter().take(50) {
                 ui.label(egui::RichText::new(line).small());
             }
+        }
+
+        if let Some(policy) = &audit.policy {
+            ui.add_space(6.0);
+            show_audit_policy_notes(ui, policy);
         }
     });
 

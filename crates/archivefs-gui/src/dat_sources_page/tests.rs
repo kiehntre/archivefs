@@ -2544,6 +2544,7 @@ fn minimal_outcome() -> DatAuditOutcome {
         files_scanned: 2,
         bytes_hashed: 4,
         truncated: false,
+        policy: None,
     }
 }
 
@@ -2731,4 +2732,462 @@ fn an_unresolved_platform_is_never_presented_on_the_running_card() {
     ));
     page.apply(DatSourcesPageAction::CancelJob);
     run_to_completion(&mut page);
+}
+
+// ---------------------------------------------------------------------------
+// DAT matching policy: controls, summary, safety
+// ---------------------------------------------------------------------------
+
+/// Renders the whole page at a given window width.
+fn render_at_width(view: &DatSourcesPageView, ui_state: &mut DatSourcesPageUi, width: f32) -> egui::FullOutput {
+    let context = egui::Context::default();
+    context.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width, 3000.0),
+            )),
+            ..Default::default()
+        },
+        |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                let _ = show_dat_sources_page(ui, view, ui_state);
+            });
+        },
+    )
+}
+
+#[test]
+fn policy_edits_are_unsaved_changes_and_never_touch_the_rom_folder() {
+    let fixture = Fixture::new();
+    let dat = fixture.write("collection.dat", LOGIQX);
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddFile { path: dat });
+
+    // Set a preference.
+    page.apply(DatSourcesPageAction::AddRegion {
+        scope: None,
+        region: RegionId::Europe,
+    });
+    page.apply(DatSourcesPageAction::SetRevisionPolicy {
+        scope: None,
+        policy: RevisionPolicy::LatestVerified,
+    });
+
+    let view = page.view();
+    assert!(
+        view.dirty,
+        "a policy edit is an unsaved change exactly like a source edit"
+    );
+    assert_eq!(view.policy.region_preferences.len(), 1);
+    assert_eq!(view.policy.region_preferences[0].label, "Europe");
+    assert_eq!(view.policy.revision_policy, RevisionPolicy::LatestVerified);
+    assert!(
+        !fixture.config_path.exists(),
+        "nothing is written before Save"
+    );
+
+    // Save writes only the registry file; the ROM folder is never touched.
+    let roms = fixture.dir("roms");
+    let before = snapshot(&roms);
+    page.apply(DatSourcesPageAction::Save);
+    let after = snapshot(&roms);
+    assert_eq!(before, after, "no file beside the registry was touched");
+    assert!(fixture.config_path.exists(), "Save wrote the registry");
+
+    // A fresh page reloads the preference.
+    let reloaded = fixture.page();
+    assert_eq!(
+        reloaded.view().policy.region_preferences[0].label,
+        "Europe"
+    );
+    assert_eq!(
+        reloaded.view().policy.revision_policy,
+        RevisionPolicy::LatestVerified
+    );
+}
+
+#[test]
+fn region_reorder_controls_move_and_remove() {
+    let fixture = Fixture::new();
+    let mut page = fixture.page();
+    for region in [RegionId::Europe, RegionId::Usa, RegionId::Japan] {
+        page.apply(DatSourcesPageAction::AddRegion {
+            scope: None,
+            region,
+        });
+    }
+    let order = |page: &DatSourcesPageState| {
+        page.view()
+            .policy
+            .region_preferences
+            .iter()
+            .map(|row| row.label.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(order(&page), vec!["Europe", "USA", "Japan"]);
+
+    // Move Europe down one.
+    page.apply(DatSourcesPageAction::MoveRegion {
+        scope: None,
+        index: 0,
+        delta: 1,
+    });
+    assert_eq!(order(&page), vec!["USA", "Europe", "Japan"]);
+    assert_eq!(page.view().policy.region_preferences[0].position, 1);
+
+    // Move Japan up to the front.
+    page.apply(DatSourcesPageAction::MoveRegion {
+        scope: None,
+        index: 2,
+        delta: -2,
+    });
+    assert_eq!(order(&page), vec!["Japan", "USA", "Europe"]);
+
+    // Remove USA.
+    page.apply(DatSourcesPageAction::RemoveRegion {
+        scope: None,
+        index: 1,
+    });
+    assert_eq!(order(&page), vec!["Japan", "Europe"]);
+    assert!(page.view().dirty);
+}
+
+#[test]
+fn language_editor_adds_a_specific_language_multi_and_original() {
+    let fixture = Fixture::new();
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddLanguage {
+        scope: None,
+        preference: LanguagePreference::Language(LanguageId::En),
+    });
+    page.apply(DatSourcesPageAction::AddLanguage {
+        scope: None,
+        preference: LanguagePreference::MultiLanguage,
+    });
+    page.apply(DatSourcesPageAction::AddLanguage {
+        scope: None,
+        preference: LanguagePreference::OriginalLanguage,
+    });
+    let view = page.view();
+    let labels: Vec<&str> = view
+        .policy
+        .language_preferences
+        .iter()
+        .map(|row| row.label.as_str())
+        .collect();
+    assert_eq!(labels, vec!["English", "Multi-language", "Original language"]);
+
+    // Adding the same language again is refused (no duplicates).
+    page.apply(DatSourcesPageAction::AddLanguage {
+        scope: None,
+        preference: LanguagePreference::Language(LanguageId::En),
+    });
+    assert_eq!(page.view().policy.language_preferences.len(), 3);
+
+    page.apply(DatSourcesPageAction::MoveLanguage {
+        scope: None,
+        index: 2,
+        delta: -2,
+    });
+    let view = page.view();
+    let labels: Vec<&str> = view
+        .policy
+        .language_preferences
+        .iter()
+        .map(|row| row.label.as_str())
+        .collect();
+    assert_eq!(labels, vec!["Original language", "English", "Multi-language"]);
+}
+
+#[test]
+fn revision_and_clone_policies_can_be_chosen() {
+    let fixture = Fixture::new();
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::SetRevisionPolicy {
+        scope: None,
+        policy: RevisionPolicy::PreferOriginal,
+    });
+    page.apply(DatSourcesPageAction::SetClonePolicy {
+        scope: None,
+        policy: ClonePolicy::PreferParent,
+    });
+    let view = page.view();
+    assert_eq!(view.policy.revision_policy, RevisionPolicy::PreferOriginal);
+    assert_eq!(view.policy.clone_policy, ClonePolicy::PreferParent);
+    assert_eq!(view.policy.effective.revision, "Prefer original");
+    assert_eq!(view.policy.effective.clone, "Prefer parent");
+}
+
+#[test]
+fn the_effective_policy_summary_shows_the_resolved_values_for_the_scope() {
+    let fixture = Fixture::new();
+    let dat = fixture.write("collection.dat", LOGIQX);
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddFile { path: dat });
+    page.apply(DatSourcesPageAction::SetPlatform {
+        id: page.view().rows[0].id.clone(),
+        platform: Some("NES".to_string()),
+    });
+    for region in [RegionId::Europe, RegionId::Usa] {
+        page.apply(DatSourcesPageAction::AddRegion {
+            scope: None,
+            region,
+        });
+    }
+    page.apply(DatSourcesPageAction::AddLanguage {
+        scope: None,
+        preference: LanguagePreference::Language(LanguageId::En),
+    });
+    page.apply(DatSourcesPageAction::SetRevisionPolicy {
+        scope: None,
+        policy: RevisionPolicy::LatestVerified,
+    });
+    page.apply(DatSourcesPageAction::SetClonePolicy {
+        scope: None,
+        policy: ClonePolicy::KeepAllVariants,
+    });
+
+    let summary = &page.view().policy.effective;
+    assert_eq!(summary.platform, "All platforms");
+    assert_eq!(summary.region, "Europe, USA");
+    assert_eq!(summary.language, "English");
+    assert_eq!(summary.revision, "Latest verified revision");
+    assert_eq!(summary.clone, "Keep all variants");
+    // Source ordering lists the enabled source as consulted 1st.
+    assert_eq!(summary.source_ordering.len(), 1);
+    assert_eq!(summary.source_ordering[0].consulted_position, 1);
+    assert!(summary.source_of.iter().any(|(field, scope)| field == "Region preference" && scope == "Global"));
+}
+
+#[test]
+fn a_platform_override_is_reflected_in_the_summary_with_its_source_of_value() {
+    let fixture = Fixture::new();
+    let dat = fixture.write("collection.dat", LOGIQX);
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddFile { path: dat });
+    page.apply(DatSourcesPageAction::SetPlatform {
+        id: page.view().rows[0].id.clone(),
+        platform: Some("NES".to_string()),
+    });
+    page.apply(DatSourcesPageAction::AddRegion {
+        scope: None,
+        region: RegionId::Europe,
+    });
+
+    // Select the NES scope and set a Japan override.
+    page.apply(DatSourcesPageAction::SelectPolicyScope {
+        scope: Some("NES".to_string()),
+    });
+    page.apply(DatSourcesPageAction::AddRegion {
+        scope: Some("NES".to_string()),
+        region: RegionId::Japan,
+    });
+
+    let policy = page.view().policy;
+    assert_eq!(policy.scope_label, "Nintendo Entertainment System");
+    // The authored list for the NES override is Japan alone; the global list
+    // is untouched.
+    assert_eq!(policy.region_preferences.len(), 1);
+    assert_eq!(policy.region_preferences[0].label, "Japan");
+    page.apply(DatSourcesPageAction::SelectPolicyScope { scope: None });
+    let global = page.view().policy;
+    assert_eq!(global.scope_label, "All platforms");
+    assert_eq!(global.region_preferences[0].label, "Europe");
+    // Switch back to NES for the summary assertions.
+    page.apply(DatSourcesPageAction::SelectPolicyScope {
+        scope: Some("NES".to_string()),
+    });
+    let policy = page.view().policy;
+    // The summary resolves Japan for NES, and says where it came from.
+    assert_eq!(policy.effective.region, "Japan");
+    assert!(policy
+        .effective
+        .source_of
+        .iter()
+        .any(|(field, scope)| field == "Region preference" && scope == "Platform override"));
+    assert_eq!(policy.effective.platform, "Nintendo Entertainment System");
+}
+
+#[test]
+fn the_global_scope_is_used_by_default_and_the_scope_selector_is_offered() {
+    let fixture = Fixture::new();
+    let dat = fixture.write("collection.dat", LOGIQX);
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddFile { path: dat });
+    page.apply(DatSourcesPageAction::SetPlatform {
+        id: page.view().rows[0].id.clone(),
+        platform: Some("NES".to_string()),
+    });
+    let view = page.view();
+    assert_eq!(view.policy.scope, None);
+    assert_eq!(view.policy.scope_label, "All platforms");
+    assert!(
+        view.policy
+            .scopes_available
+            .iter()
+            .any(|option| option.id.as_deref() == Some("NES")),
+        "the platform a source covers is offered as a scope"
+    );
+}
+
+#[test]
+fn unknown_policy_values_are_surfaced_but_preserved_through_save() {
+    let fixture = Fixture::new();
+    let dat = fixture.write("collection.dat", LOGIQX);
+    std::fs::create_dir_all(fixture.config_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &fixture.config_path,
+        "[policy]\nregion_preferences = [\"europe\", \"moon\"]\nrevision_policy = \"newest_future_policy\"\n",
+    )
+    .unwrap();
+
+    let mut page = fixture.page();
+    let view = page.view();
+    assert!(
+        view.policy
+            .problems
+            .iter()
+            .any(|problem| problem.contains("moon")),
+        "{:?}",
+        view.policy.problems
+    );
+    assert!(
+        view.policy
+            .problems
+            .iter()
+            .any(|problem| problem.contains("newest_future_policy")),
+        "{:?}",
+        view.policy.problems
+    );
+    // The unknown values are not applied but are preserved on a later save.
+    page.apply(DatSourcesPageAction::AddFile { path: dat });
+    page.apply(DatSourcesPageAction::Save);
+    let text = std::fs::read_to_string(&fixture.config_path).unwrap();
+    assert!(text.contains("moon"), "{text}");
+    assert!(text.contains("newest_future_policy"), "{text}");
+}
+
+#[test]
+fn the_policy_section_and_summary_render_at_a_narrow_compact_width() {
+    let fixture = Fixture::new();
+    let dat = fixture.write("collection.dat", LOGIQX);
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddFile { path: dat });
+    page.apply(DatSourcesPageAction::AddRegion {
+        scope: None,
+        region: RegionId::Europe,
+    });
+    let view = page.view();
+    let mut ui_state = DatSourcesPageUi::default();
+    let output = render_at_width(&view, &mut ui_state, 700.0);
+    assert!(rendered_text_contains(&output, "DAT matching policy"));
+    assert!(rendered_text_contains(&output, "Preferred regions"));
+    assert!(rendered_text_contains(&output, "Europe"));
+    assert!(rendered_text_contains(&output, "Effective policy"));
+    assert!(rendered_text_contains(&output, "Platform: All platforms"));
+    assert!(rendered_text_contains(&output, "ArchiveFS never renames your files."));
+}
+
+#[test]
+fn the_policy_controls_are_reachable_by_keyboard() {
+    let fixture = Fixture::new();
+    let dat = fixture.write("collection.dat", LOGIQX);
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddFile { path: dat });
+    page.apply(DatSourcesPageAction::AddRegion {
+        scope: None,
+        region: RegionId::Europe,
+    });
+    let view = page.view();
+    let ctx = egui::Context::default();
+    let mut focused_anything = false;
+    // Focus-traverse far enough to reach the policy section's controls; the
+    // page must render and keep focus moving at every step without panicking.
+    for _ in 0..40 {
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1100.0, 4000.0),
+                )),
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Tab,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let mut ui_state = DatSourcesPageUi::default();
+                    let _ = show_dat_sources_page(ui, &view, &mut ui_state);
+                });
+            },
+        );
+        if ctx.memory(|memory| memory.focused()).is_some() {
+            focused_anything = true;
+        }
+    }
+    assert!(focused_anything, "Tab never focused anything on the page");
+}
+
+#[test]
+fn an_audit_result_shows_the_policy_preferred_candidate_for_multi_candidate_files() {
+    let fixture = Fixture::new();
+    let multi = r#"<?xml version="1.0" encoding="UTF-8"?>
+<datafile>
+    <header>
+        <name>Multi</name>
+        <version>1</version>
+        <author>Test</author>
+    </header>
+    <game name="Game (USA)">
+        <rom name="game.bin" size="4" md5="098f6bcd4621d373cade4e832627b4f6"/>
+    </game>
+    <game name="Game (Europe)">
+        <rom name="game.bin" size="4" md5="098f6bcd4621d373cade4e832627b4f6"/>
+    </game>
+</datafile>"#;
+    let dat = fixture.write("multi.dat", multi);
+    let roms = fixture.dir("roms");
+    std::fs::write(roms.join("game.bin"), SUPER_BIN).unwrap();
+
+    let mut page = fixture.page_with_library(vec![roms]);
+    page.apply(DatSourcesPageAction::AddFile { path: dat });
+    page.apply(DatSourcesPageAction::AddRegion {
+        scope: None,
+        region: RegionId::Europe,
+    });
+    page.apply(DatSourcesPageAction::Audit {
+        id: page.view().rows[0].id.clone(),
+        scan_root: fixture.root.join("roms"),
+    });
+    run_to_completion(&mut page);
+
+    let view = page.view();
+    let audit = view.audit.as_ref().expect("an audit result");
+    assert_eq!(
+        audit
+            .categories
+            .iter()
+            .find(|category| category.label == "Exact (multiple)")
+            .map(|category| category.count),
+        Some(1)
+    );
+    let policy = audit.policy.as_ref().expect("the audit carried a policy");
+    assert_eq!(policy.notes.len(), 1);
+    let note = &policy.notes[0];
+    assert!(note.decided);
+    assert_eq!(note.winner.as_deref(), Some("Game (Europe) (game.bin)"));
+    assert!(note.explanations.iter().any(|line| line.contains("preferred region matched")));
+    assert!(!note.ambiguous);
+
+    let mut ui_state = DatSourcesPageUi::default();
+    let output = render(&view, &mut ui_state);
+    assert!(rendered_text_contains(&output, "Policy preference"));
+    assert!(rendered_text_contains(&output, "Game (Europe)"));
+    assert!(rendered_text_contains(&output, "Preferred: Game (Europe) (game.bin)"));
 }
