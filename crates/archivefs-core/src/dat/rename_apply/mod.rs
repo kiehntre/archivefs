@@ -33,12 +33,18 @@
 //! no-clobber primitive (everything but Linux in this build) the executor
 //! refuses to mutate rather than risk a TOCTOU-prone exists+rename sequence.
 
+pub mod executor;
 pub mod identity;
 pub mod journal;
 pub mod model;
 pub mod noclobber;
 pub mod preflight;
+pub mod rollback;
 
+pub use executor::{
+    ApplyError, ApplyExecution, ApplyOutcome, HardConflictMode, apply_transaction, build_transaction,
+    build_transaction_entries, is_approved,
+};
 pub use identity::{capture_identity, classify_at, identity_matches};
 pub use journal::{
     RENAME_TRANSACTIONS_DIRECTORY, default_rename_transaction_dir, find_recovery_transactions,
@@ -51,3 +57,7 @@ pub use model::{
 };
 pub use noclobber::{NoClobberError, rename_noreplace};
 pub use preflight::{PreflightFailure, PreflightOptions, batch_destinations, run_preflight};
+pub use rollback::{RollbackOutcome, rollback_transaction};
+
+#[cfg(test)]
+mod tests;
