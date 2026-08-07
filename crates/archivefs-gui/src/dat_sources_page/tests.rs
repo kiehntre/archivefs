@@ -2555,6 +2555,7 @@ fn minimal_outcome() -> DatAuditOutcome {
         bytes_hashed: 4,
         truncated: false,
         policy: None,
+        platform: None,
     }
 }
 
@@ -2655,7 +2656,11 @@ fn a_cancelled_audit_never_appears_complete() {
     // Even if the worker finished the whole audit before it noticed the flag,
     // the page must not present that as a completed audit.
     sender
-        .send(JobMessage::Audited(Box::new(minimal_outcome())))
+        .send(JobMessage::Audited {
+            generation: 0,
+            outcome: Box::new(minimal_outcome()),
+            plan: None,
+        })
         .unwrap();
     page.poll();
 
@@ -3224,4 +3229,372 @@ fn an_audit_result_shows_the_policy_preferred_candidate_for_multi_candidate_file
         &output,
         "Preferred: Game (Europe) (game.bin)"
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Rename planning section
+// ---------------------------------------------------------------------------
+
+use archivefs_core::dat::rename_plan::{
+    ProposalState, RenamePlan, RenamePlanCounts, RenameProposal, ReviewDecision, SourceObjectKind,
+};
+
+fn plan_proposal(
+    source: &str,
+    current: &str,
+    proposed: Option<&str>,
+    state: ProposalState,
+) -> RenameProposal {
+    RenameProposal {
+        source_path: PathBuf::from(source),
+        current_basename: current.to_string(),
+        proposed_basename: proposed.map(str::to_string),
+        platform: None,
+        platform_display: None,
+        source_id: "src".to_string(),
+        source_display_name: "Source".to_string(),
+        game_name: Some("Game".to_string()),
+        rom_name: proposed.map(str::to_string),
+        verdict_label: "Exact".to_string(),
+        match_confident: true,
+        explanations: vec!["preferred region matched (Europe)".to_string()],
+        state,
+        object_kind: SourceObjectKind::RegularFile,
+        ambiguity_reason: None,
+        collision: None,
+        blockers: Vec::new(),
+        extension_status: None,
+        sanitisation_notes: Vec::new(),
+        actionable: state == ProposalState::Suggested,
+    }
+}
+
+fn page_with_plan(proposals: Vec<RenameProposal>) -> (Fixture, DatSourcesPageState) {
+    let fixture = Fixture::new();
+    let mut page = fixture.page();
+    let counts = RenamePlanCounts::from_proposals(&proposals);
+    let verified_total = proposals.len();
+    page.rename_plan = Some(RenamePlan {
+        generation: 1,
+        source_id: "src".to_string(),
+        source_display_name: "Source".to_string(),
+        scan_root: "/tmp/roms".to_string(),
+        platform: None,
+        platform_display: None,
+        proposals,
+        counts,
+        audited_total: 2,
+        verified_total,
+        truncated: false,
+    });
+    (fixture, page)
+}
+
+#[test]
+fn the_planning_only_warning_is_prominent() {
+    let proposals = vec![plan_proposal(
+        "/tmp/roms/game.bin",
+        "game.bin",
+        Some("Game (Europe).bin"),
+        ProposalState::Suggested,
+    )];
+    let (_fixture, page) = page_with_plan(proposals);
+    let view = page.view();
+    let mut ui_state = DatSourcesPageUi::default();
+    let output = render(&view, &mut ui_state);
+    assert!(rendered_text_contains(&output, "Planning only"));
+    assert!(
+        rendered_text_contains(&output, "ArchiveFS will not rename any files"),
+        "the read-only promise must be stated plainly"
+    );
+}
+
+#[test]
+fn no_apply_rename_or_commit_control_exists() {
+    let proposals = vec![plan_proposal(
+        "/tmp/roms/game.bin",
+        "game.bin",
+        Some("Game (Europe).bin"),
+        ProposalState::Suggested,
+    )];
+    let (_fixture, page) = page_with_plan(proposals);
+    let view = page.view();
+    let mut ui_state = DatSourcesPageUi::default();
+    let output = render(&view, &mut ui_state);
+    for forbidden in [
+        "Apply",
+        "Execute",
+        "Commit",
+        "Move",
+        "Delete",
+        "Fix automatically",
+    ] {
+        assert!(
+            !rendered_text_contains(&output, forbidden),
+            "the plan section must not offer a {forbidden} control"
+        );
+    }
+    // The only controls present are review decisions and copy.
+    assert!(rendered_text_contains(&output, "Accept"));
+    assert!(rendered_text_contains(&output, "Ignore"));
+    assert!(rendered_text_contains(&output, "Copy name"));
+}
+
+#[test]
+fn the_plan_filters_select_which_rows_are_drawn() {
+    let proposals = vec![
+        plan_proposal(
+            "/tmp/roms/a.bin",
+            "a.bin",
+            Some("Game (Europe).bin"),
+            ProposalState::Suggested,
+        ),
+        plan_proposal(
+            "/tmp/roms/b.bin",
+            "b.bin",
+            Some("Other.bin"),
+            ProposalState::Conflict,
+        ),
+        plan_proposal(
+            "/tmp/roms/c.bin",
+            "Game.bin",
+            Some("Game.bin"),
+            ProposalState::AlreadyCanonical,
+        ),
+    ];
+    let (_fixture, page) = page_with_plan(proposals);
+    let view = page.view();
+    assert_eq!(view.rename_plan.as_ref().unwrap().rows.len(), 3);
+
+    let mut ui_state = DatSourcesPageUi {
+        plan_filter: RenamePlanFilter::Suggested,
+        ..Default::default()
+    };
+    let output = render(&view, &mut ui_state);
+    assert!(rendered_text_contains(&output, "a.bin"));
+    assert!(
+        !rendered_text_contains(&output, "b.bin"),
+        "conflicted row must be filtered out"
+    );
+    assert!(
+        !rendered_text_contains(&output, "Game.bin"),
+        "already-canonical row must be filtered out"
+    );
+
+    ui_state.plan_filter = RenamePlanFilter::Conflicts;
+    let output = render(&view, &mut ui_state);
+    assert!(rendered_text_contains(&output, "b.bin"));
+    assert!(!rendered_text_contains(&output, "a.bin"));
+}
+
+#[test]
+fn review_decisions_never_touch_files() {
+    let fixture = Fixture::new();
+    let roms = fixture.dir("roms");
+    let file = roms.join("game.bin");
+    std::fs::write(&file, b"content").unwrap();
+    let mut page = fixture.page();
+    page.rename_plan = Some(RenamePlan {
+        generation: 1,
+        source_id: "src".to_string(),
+        source_display_name: "Source".to_string(),
+        scan_root: roms.to_string_lossy().into_owned(),
+        platform: None,
+        platform_display: None,
+        proposals: vec![plan_proposal(
+            file.to_string_lossy().as_ref(),
+            "game.bin",
+            Some("Game.bin"),
+            ProposalState::Suggested,
+        )],
+        counts: RenamePlanCounts::default(),
+        audited_total: 1,
+        verified_total: 1,
+        truncated: false,
+    });
+
+    let before = snapshot(&roms);
+    page.apply(DatSourcesPageAction::SetReviewDecision {
+        path: file.to_string_lossy().into_owned(),
+        decision: Some(ReviewDecision::AcceptedForReview),
+    });
+    page.apply(DatSourcesPageAction::SetReviewDecision {
+        path: file.to_string_lossy().into_owned(),
+        decision: Some(ReviewDecision::Ignored),
+    });
+    let after = snapshot(&roms);
+    assert_eq!(before, after, "a review decision must not change any file");
+    assert_eq!(
+        page.view().rename_plan.as_ref().unwrap().rows[0].decision,
+        Some(ReviewDecision::Ignored)
+    );
+}
+
+#[test]
+fn clearing_review_decisions_leaves_source_files_untouched() {
+    let fixture = Fixture::new();
+    let roms = fixture.dir("roms");
+    let file = roms.join("game.bin");
+    std::fs::write(&file, b"content").unwrap();
+    let mut page = fixture.page();
+    page.rename_plan = Some(RenamePlan {
+        generation: 1,
+        source_id: "src".to_string(),
+        source_display_name: "Source".to_string(),
+        scan_root: roms.to_string_lossy().into_owned(),
+        platform: None,
+        platform_display: None,
+        proposals: vec![plan_proposal(
+            file.to_string_lossy().as_ref(),
+            "game.bin",
+            Some("Game.bin"),
+            ProposalState::Suggested,
+        )],
+        counts: RenamePlanCounts::default(),
+        audited_total: 1,
+        verified_total: 1,
+        truncated: false,
+    });
+
+    page.apply(DatSourcesPageAction::SetReviewDecision {
+        path: file.to_string_lossy().into_owned(),
+        decision: Some(ReviewDecision::AcceptedForReview),
+    });
+    assert_eq!(
+        page.view().rename_plan.as_ref().unwrap().rows[0].decision,
+        Some(ReviewDecision::AcceptedForReview)
+    );
+
+    let before = snapshot(&roms);
+    page.apply(DatSourcesPageAction::ClearReviewDecisions);
+    let after = snapshot(&roms);
+    assert_eq!(before, after, "clearing decisions must not change any file");
+    assert_eq!(
+        page.view().rename_plan.as_ref().unwrap().rows[0].decision,
+        None,
+        "the decision is cleared"
+    );
+}
+
+#[test]
+fn the_plan_section_renders_at_a_narrow_compact_width() {
+    let proposals = vec![plan_proposal(
+        "/tmp/roms/game.bin",
+        "game.bin",
+        Some("Game (Europe).bin"),
+        ProposalState::Suggested,
+    )];
+    let (_fixture, page) = page_with_plan(proposals);
+    let view = page.view();
+    let mut ui_state = DatSourcesPageUi::default();
+    let output = render_at_width(&view, &mut ui_state, 700.0);
+    assert!(rendered_text_contains(&output, "Rename planning"));
+    assert!(rendered_text_contains(&output, "Planning only"));
+    assert!(rendered_text_contains(&output, "game.bin"));
+    assert!(rendered_text_contains(&output, "Game (Europe).bin"));
+}
+
+#[test]
+fn the_plan_controls_are_reachable_by_keyboard() {
+    let proposals = vec![plan_proposal(
+        "/tmp/roms/game.bin",
+        "game.bin",
+        Some("Game (Europe).bin"),
+        ProposalState::Suggested,
+    )];
+    let (_fixture, page) = page_with_plan(proposals);
+    let view = page.view();
+    let ctx = egui::Context::default();
+    let mut focused_anything = false;
+    for _ in 0..40 {
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1100.0, 4000.0),
+                )),
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Tab,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let mut ui_state = DatSourcesPageUi::default();
+                    let _ = show_dat_sources_page(ui, &view, &mut ui_state);
+                });
+            },
+        );
+        if ctx.memory(|memory| memory.focused()).is_some() {
+            focused_anything = true;
+        }
+    }
+    assert!(focused_anything, "Tab never focused anything on the page");
+}
+
+#[test]
+fn an_audit_builds_a_read_only_rename_plan_and_changes_nothing() {
+    // End-to-end: audit a folder whose file matches two catalogue entries
+    // with a region preference; the plan must propose the preferred name and
+    // the scanned tree must be byte-for-byte unchanged (paths, contents and
+    // file identities).
+    let fixture = Fixture::new();
+    let multi = r#"<?xml version="1.0" encoding="UTF-8"?>
+<datafile>
+    <header>
+        <name>Multi</name>
+        <version>1</version>
+        <author>Test</author>
+    </header>
+    <game name="Game (USA)">
+        <rom name="Game (USA).bin" size="4" md5="098f6bcd4621d373cade4e832627b4f6"/>
+    </game>
+    <game name="Game (Europe)">
+        <rom name="Game (Europe).bin" size="4" md5="098f6bcd4621d373cade4e832627b4f6"/>
+    </game>
+</datafile>"#;
+    let dat = fixture.write("multi.dat", multi);
+    let roms = fixture.dir("roms");
+    std::fs::write(roms.join("game.bin"), SUPER_BIN).unwrap();
+
+    let mut page = fixture.page_with_library(vec![roms.clone()]);
+    page.apply(DatSourcesPageAction::AddFile { path: dat });
+    page.apply(DatSourcesPageAction::AddRegion {
+        scope: None,
+        region: RegionId::Europe,
+    });
+
+    let before = snapshot(&fixture.root);
+    page.apply(DatSourcesPageAction::Audit {
+        id: page.view().rows[0].id.clone(),
+        scan_root: roms.clone(),
+    });
+    run_to_completion(&mut page);
+
+    let view = page.view();
+    let plan = view
+        .rename_plan
+        .as_ref()
+        .expect("an audit with a policy produces a rename plan");
+    assert_eq!(plan.counts.suggested, 1, "{:?}", plan.counts);
+    assert_eq!(
+        plan.rows[0].proposed_basename.as_deref(),
+        Some("Game (Europe).bin"),
+        "the preferred region's name is proposed"
+    );
+    assert!(
+        plan.rows[0]
+            .explanations
+            .iter()
+            .any(|e| e.contains("preferred region matched"))
+    );
+    assert_eq!(
+        snapshot(&fixture.root),
+        before,
+        "planning an audit must not change any path, file identity or content"
+    );
 }

@@ -50,6 +50,9 @@ use archivefs_core::dat::policy::{
     ClonePolicy, DatPolicyConfig, EffectiveDatPolicy, LanguageId, LanguagePreference, PolicyField,
     RegionId, RevisionPolicy, participating_sources, resolve, validate_policy_config,
 };
+use archivefs_core::dat::rename_plan::{
+    ProposalState, RenamePlan, RenamePlanContext, ReviewDecision, build_rename_plan,
+};
 use archivefs_core::dat::sources::audit_run::{
     DatAuditOutcome, DatAuditProgress, DatAuditRequest, run_dat_audit,
 };
@@ -67,6 +70,11 @@ use crate::ui::{components as widgets, theme};
 /// reasonably expect a "fix it" button and there is deliberately not one.
 pub(crate) const READ_ONLY_PROMISE: &str = "ArchiveFS never renames, moves, deletes or rewrites your ROMs. An audit reads files and \
      reports what it found; nothing is changed, and nothing is written beside them.";
+
+/// The prominent, repeated statement the rename-planning section must show.
+pub(crate) const PLAN_ONLY_PROMISE: &str = "Planning only — ArchiveFS will not rename any files. This section derives suggested names \
+     from verified DAT matches and explains them; nothing here changes, moves, deletes or rewrites \
+     a file.";
 
 /// What Stage 1 supports, stated rather than implied by what happens to work.
 pub(crate) const SUPPORTED_FORMATS: &str = "Logiqx XML (No-Intro, Redump) and ClrMamePro text (TOSEC, generic). Other formats are not \
@@ -446,6 +454,9 @@ pub(crate) struct DatSourcesPageView {
     /// The DAT Matching Policy section, including the Effective Policy
     /// Summary resolved for the scope the user is inspecting.
     pub(crate) policy: DatPolicyView,
+    /// The read-only rename-planning section, present when the latest audit
+    /// produced a plan.
+    pub(crate) rename_plan: Option<RenamePlanView>,
 }
 
 impl DatSourcesPageView {
@@ -453,6 +464,100 @@ impl DatSourcesPageView {
     pub(crate) fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Rename planning view model
+// ---------------------------------------------------------------------------
+
+/// How the plan rows are filtered for display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum RenamePlanFilter {
+    #[default]
+    All,
+    Suggested,
+    AlreadyCanonical,
+    Ambiguous,
+    Conflicts,
+    Unsupported,
+    Blocked,
+}
+
+impl RenamePlanFilter {
+    pub(crate) const ALL: [RenamePlanFilter; 7] = [
+        RenamePlanFilter::All,
+        RenamePlanFilter::Suggested,
+        RenamePlanFilter::AlreadyCanonical,
+        RenamePlanFilter::Ambiguous,
+        RenamePlanFilter::Conflicts,
+        RenamePlanFilter::Unsupported,
+        RenamePlanFilter::Blocked,
+    ];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Suggested => "Suggested",
+            Self::AlreadyCanonical => "Already canonical",
+            Self::Ambiguous => "Ambiguous",
+            Self::Conflicts => "Conflicts",
+            Self::Unsupported => "Unsupported",
+            Self::Blocked => "Blocked",
+        }
+    }
+
+    fn matches(self, row: &RenamePlanRowView) -> bool {
+        match self {
+            Self::All => true,
+            Self::Suggested => row.state == ProposalState::Suggested,
+            Self::AlreadyCanonical => row.state == ProposalState::AlreadyCanonical,
+            Self::Ambiguous => row.state == ProposalState::Ambiguous,
+            Self::Conflicts => row.state == ProposalState::Conflict,
+            Self::Unsupported => row.state == ProposalState::Unsupported,
+            Self::Blocked => row.state == ProposalState::Blocked,
+        }
+    }
+}
+
+/// The rename-planning section: the read-only plan derived from the latest
+/// audit, with its counts and every row (the active filter lives in
+/// [`DatSourcesPageUi`] and selects which rows are drawn).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RenamePlanView {
+    pub(crate) generation: u64,
+    pub(crate) scan_root_short: String,
+    pub(crate) platform_display: Option<String>,
+    pub(crate) source_display_name: String,
+    pub(crate) counts: archivefs_core::dat::rename_plan::RenamePlanCounts,
+    pub(crate) audited_total: usize,
+    pub(crate) verified_total: usize,
+    pub(crate) truncated: bool,
+    pub(crate) rows: Vec<RenamePlanRowView>,
+    pub(crate) error: Option<String>,
+}
+
+/// One plan row, ready to draw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RenamePlanRowView {
+    /// The source file's path. The row renders the basename and a shortened
+    /// parent; the full path is kept only for identity and future apply work.
+    pub(crate) source_path: PathBuf,
+    pub(crate) current_basename: String,
+    pub(crate) proposed_basename: Option<String>,
+    pub(crate) platform_display: Option<String>,
+    pub(crate) source_display_name: String,
+    pub(crate) game_name: Option<String>,
+    pub(crate) rom_name: Option<String>,
+    pub(crate) verdict_label: String,
+    pub(crate) state: ProposalState,
+    pub(crate) object_kind_label: &'static str,
+    pub(crate) explanations: Vec<String>,
+    pub(crate) ambiguity_reason: Option<String>,
+    pub(crate) collision_detail: Option<String>,
+    pub(crate) blockers: Vec<String>,
+    pub(crate) extension_preserved: bool,
+    pub(crate) sanitisation_notes: Vec<String>,
+    pub(crate) decision: Option<ReviewDecision>,
 }
 
 // ---------------------------------------------------------------------------
@@ -691,6 +796,14 @@ pub(crate) enum DatSourcesPageAction {
         scope: Option<String>,
         policy: ClonePolicy,
     },
+    /// Records or clears a review decision on one proposal. Decisions are
+    /// session-only and never touch a file.
+    SetReviewDecision {
+        path: String,
+        decision: Option<ReviewDecision>,
+    },
+    /// Clears every review decision for the current plan.
+    ClearReviewDecisions,
 }
 
 // ---------------------------------------------------------------------------
@@ -703,7 +816,16 @@ enum JobMessage {
     /// percentages and an ETA instead of only echoing text.
     AuditProgress(DatAuditProgress),
     Validated(Box<DatValidationReport>),
-    Audited(Box<DatAuditOutcome>),
+    Audited {
+        /// The audit generation this result belongs to. A result from a stale
+        /// generation is discarded so an older plan can never replace a newer
+        /// one.
+        generation: u64,
+        outcome: Box<DatAuditOutcome>,
+        /// The read-only rename plan derived from the audit, when one could be
+        /// built (and was not cancelled).
+        plan: Option<Box<RenamePlan>>,
+    },
     Failed(String),
     Cancelled,
 }
@@ -1212,6 +1334,16 @@ pub(crate) struct DatSourcesPageState {
     /// global scope; a value is a canonical platform id. Persisted nowhere - it
     /// only decides which preferences the policy section reads and writes.
     policy_scope: Option<String>,
+    /// The read-only rename plan derived from the latest audit.
+    rename_plan: Option<RenamePlan>,
+    /// Why the plan could not be produced, when it could not.
+    rename_plan_error: Option<String>,
+    /// Monotonically increasing audit generation. Each audit start bumps it;
+    /// a result carrying an older generation is a stale plan and is dropped.
+    audit_generation: u64,
+    /// Session-only review decisions, keyed by source path. Recording one
+    /// never touches a file; nothing here persists them (deferral documented).
+    review_decisions: BTreeMap<String, ReviewDecision>,
 }
 
 impl DatSourcesPageState {
@@ -1257,6 +1389,10 @@ impl DatSourcesPageState {
             library_folders,
             limits: DatLimits::default(),
             policy_scope: None,
+            rename_plan: None,
+            rename_plan_error: None,
+            audit_generation: 0,
+            review_decisions: BTreeMap::new(),
         }
     }
 
@@ -1379,12 +1515,21 @@ impl DatSourcesPageState {
                         finished = true;
                     }
                 }
-                Ok(JobMessage::Audited(outcome)) => {
+                Ok(JobMessage::Audited {
+                    generation,
+                    outcome,
+                    plan,
+                }) => {
                     if job.cancel_requested {
                         // A cancelled audit never appears complete - even when
                         // the worker finished before it observed the flag, the
                         // page must not present the late result as a completed
                         // audit.
+                        finished = true;
+                    } else if generation != self.audit_generation {
+                        // A stale generation (an older worker's result landing
+                        // after a newer audit started) can never replace the
+                        // current audit or plan.
                         finished = true;
                     } else {
                         // The elapsed time is measured from the job's own start
@@ -1393,6 +1538,20 @@ impl DatSourcesPageState {
                         self.audit_elapsed_seconds = Some(job.started_at.elapsed().as_secs());
                         self.audit = Some(outcome);
                         self.audit_error = None;
+                        match plan {
+                            Some(plan) => {
+                                self.rename_plan = Some(*plan);
+                                self.rename_plan_error = None;
+                            }
+                            None => {
+                                self.rename_plan = None;
+                                self.rename_plan_error = Some(
+                                    "the rename plan could not be produced (cancelled or the \
+                                     source files could not be inspected)"
+                                        .to_string(),
+                                );
+                            }
+                        }
                         changed = true;
                         finished = true;
                     }
@@ -1482,6 +1641,9 @@ impl DatSourcesPageState {
                         // A result attributed to a source that is no longer
                         // registered would have nothing to point at.
                         self.audit = None;
+                        self.rename_plan = None;
+                        self.rename_plan_error = None;
+                        self.review_decisions.clear();
                     }
                 }
             }
@@ -1520,6 +1682,13 @@ impl DatSourcesPageState {
                 // to the global scope rather than leaving a platform selected
                 // whose override the user just discarded.
                 self.policy_scope = None;
+                // The audit result, its plan and the session-only review
+                // decisions describe a discarded state, so they go with it.
+                self.audit = None;
+                self.audit_elapsed_seconds = None;
+                self.rename_plan = None;
+                self.rename_plan_error = None;
+                self.review_decisions.clear();
             }
             DatSourcesPageAction::Save => self.save(),
             DatSourcesPageAction::SelectPolicyScope { scope } => {
@@ -1584,6 +1753,17 @@ impl DatSourcesPageState {
                 self.with_policy_targets(&scope, |targets| {
                     *targets.clone = Some(policy.as_str().to_string());
                 });
+            }
+            DatSourcesPageAction::SetReviewDecision { path, decision } => match decision {
+                Some(decision) => {
+                    self.review_decisions.insert(path, decision);
+                }
+                None => {
+                    self.review_decisions.remove(&path);
+                }
+            },
+            DatSourcesPageAction::ClearReviewDecisions => {
+                self.review_decisions.clear();
             }
         }
     }
@@ -1726,28 +1906,30 @@ impl DatSourcesPageState {
         self.audit = None;
         self.audit_error = None;
         self.audit_elapsed_seconds = None;
+        self.rename_plan = None;
+        self.rename_plan_error = None;
+        self.review_decisions.clear();
+        // Each audit is a generation. A result from an older generation is a
+        // stale plan and is dropped, so an old plan can never replace a new one.
+        self.audit_generation = self.audit_generation.wrapping_add(1);
+        let generation = self.audit_generation;
         let (sender, messages) = sync_channel(PROGRESS_QUEUE_DEPTH);
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = cancel.clone();
         let trusted = self.trusted.clone();
         let platform_display = authoritative_platform(&entry);
+        let canonical_platform = entry
+            .platform
+            .as_deref()
+            .and_then(|platform| archivefs_core::canonical_platform_for_alias(platform));
         // The audit is annotated with the effective DAT policy so multi-
         // candidate verdicts can be shown in the user's preferred order. The
         // policy is resolved now, from the draft, by the core resolver; the
         // worker thread only reads the resolution.
         let policy = resolve(
             self.draft.policy(),
-            entry
-                .platform
-                .as_deref()
-                .and_then(|platform| archivefs_core::canonical_platform_for_alias(platform)),
-            participating_sources(
-                &self.draft,
-                entry
-                    .platform
-                    .as_deref()
-                    .and_then(|platform| archivefs_core::canonical_platform_for_alias(platform)),
-            ),
+            canonical_platform,
+            participating_sources(&self.draft, canonical_platform),
         );
         let request = DatAuditRequest {
             source_id: entry.id.clone(),
@@ -1757,6 +1939,7 @@ impl DatSourcesPageState {
             scan_root,
             limits: self.limits,
             policy: Some(policy),
+            platform: canonical_platform.map(str::to_string),
         };
 
         std::thread::spawn(move || {
@@ -1765,7 +1948,27 @@ impl DatSourcesPageState {
                 send_progress(&report_sender, JobMessage::AuditProgress(progress));
             });
             let _ = match outcome {
-                Ok(outcome) => sender.send(JobMessage::Audited(Box::new(outcome))),
+                Ok(outcome) => {
+                    // Build the read-only rename plan from the finished audit.
+                    // This is cheap (no re-scan, no hashing) but cancellable and
+                    // runs on the worker, never on the UI thread.
+                    send_progress(
+                        &sender,
+                        JobMessage::Progress("Building rename plan…".to_string()),
+                    );
+                    let plan = build_rename_plan(
+                        &outcome,
+                        &RenamePlanContext { generation },
+                        &worker_cancel,
+                    )
+                    .ok()
+                    .map(Box::new);
+                    sender.send(JobMessage::Audited {
+                        generation,
+                        outcome: Box::new(outcome),
+                        plan,
+                    })
+                }
                 Err(archivefs_core::dat::sources::audit_run::DatAuditError::Cancelled) => {
                     sender.send(JobMessage::Cancelled)
                 }
@@ -1847,8 +2050,76 @@ impl DatSourcesPageState {
                 .map(|outcome| Box::new(audit_view(outcome, self.audit_elapsed_seconds))),
             audit_error: self.audit_error.clone(),
             policy: self.policy_view(),
+            rename_plan: self.rename_plan_view(),
             rows,
         }
+    }
+
+    /// Builds the rename-planning section view from the stored plan and the
+    /// session-only review decisions. Renders the core's output; nothing here
+    /// re-derives or re-ranks.
+    fn rename_plan_view(&self) -> Option<RenamePlanView> {
+        let Some(plan) = self.rename_plan.as_ref() else {
+            // A plan build that failed is still worth showing, so the user
+            // learns why rather than the section silently vanishing.
+            return self.rename_plan_error.as_ref().map(|error| RenamePlanView {
+                generation: self.audit_generation,
+                scan_root_short: String::new(),
+                platform_display: None,
+                source_display_name: String::new(),
+                counts: archivefs_core::dat::rename_plan::RenamePlanCounts::default(),
+                audited_total: 0,
+                verified_total: 0,
+                truncated: false,
+                rows: Vec::new(),
+                error: Some(error.clone()),
+            });
+        };
+        let rows = plan
+            .proposals
+            .iter()
+            .map(|proposal| RenamePlanRowView {
+                source_path: proposal.source_path.clone(),
+                current_basename: proposal.current_basename.clone(),
+                proposed_basename: proposal.proposed_basename.clone(),
+                platform_display: proposal.platform_display.clone(),
+                source_display_name: proposal.source_display_name.clone(),
+                game_name: proposal.game_name.clone(),
+                rom_name: proposal.rom_name.clone(),
+                verdict_label: proposal.verdict_label.clone(),
+                state: proposal.state,
+                object_kind_label: proposal.object_kind.label(),
+                explanations: proposal.explanations.clone(),
+                ambiguity_reason: proposal.ambiguity_reason.clone(),
+                collision_detail: proposal.collision.as_ref().map(|collision| {
+                    if collision.colliding_is_symlink {
+                        format!("{} (the colliding path is a symlink)", collision.detail)
+                    } else {
+                        collision.detail.clone()
+                    }
+                }),
+                blockers: proposal.blockers.clone(),
+                extension_preserved: proposal.extension_status
+                    == Some(archivefs_core::dat::rename_plan::ExtensionStatus::Preserved),
+                sanitisation_notes: proposal.sanitisation_notes.clone(),
+                decision: self
+                    .review_decisions
+                    .get(&proposal.source_path.to_string_lossy().into_owned())
+                    .copied(),
+            })
+            .collect();
+        Some(RenamePlanView {
+            generation: plan.generation,
+            scan_root_short: shorten_path(&plan.scan_root),
+            platform_display: plan.platform_display.clone(),
+            source_display_name: plan.source_display_name.clone(),
+            counts: plan.counts,
+            audited_total: plan.audited_total,
+            verified_total: plan.verified_total,
+            truncated: plan.truncated,
+            rows,
+            error: self.rename_plan_error.clone(),
+        })
     }
 
     /// Builds the DAT Matching Policy section view, resolving the effective
@@ -2424,6 +2695,10 @@ pub(crate) struct DatSourcesPageUi {
     /// Which diagnostic group's drill-down is open, as the group's stable id.
     /// One group expands at a time; expanding another collapses this one.
     pub(crate) open_diagnostic: Option<String>,
+    /// Which rename-plan rows' review choices are open (source path).
+    pub(crate) plan_review_open: Option<String>,
+    /// Which rename-plan filter is active.
+    pub(crate) plan_filter: RenamePlanFilter,
 }
 
 impl DatSourcesPageUi {
@@ -2435,6 +2710,7 @@ impl DatSourcesPageUi {
         self.open_audit_picker = None;
         self.confirm_remove = None;
         self.open_diagnostic = None;
+        self.plan_review_open = None;
     }
 }
 
@@ -2542,6 +2818,15 @@ pub(crate) fn show_dat_sources_page(
     if let Some(audit) = &view.audit {
         ui.add_space(10.0);
         show_audit_result(ui, audit);
+    }
+
+    // The read-only rename-planning section, shown when the latest audit
+    // produced a plan. It only ever displays and records review decisions.
+    if let Some(plan) = &view.rename_plan
+        && action.is_none()
+        && let Some(plan_action) = show_rename_plan_section(ui, plan, ui_state)
+    {
+        action = Some(plan_action);
     }
 
     if !view.load_problems.is_empty() || !view.unresolved.is_empty() {
@@ -3851,6 +4136,316 @@ fn summary_row(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(format!("{label}:")).strong());
         ui.label(value);
+    });
+}
+
+/// The tone of a proposal-state badge.
+fn plan_state_tone(state: ProposalState) -> widgets::StatusTone {
+    match state {
+        ProposalState::Suggested => widgets::StatusTone::Success,
+        ProposalState::AlreadyCanonical => widgets::StatusTone::Info,
+        ProposalState::Ambiguous => widgets::StatusTone::Warning,
+        ProposalState::Conflict => widgets::StatusTone::Warning,
+        ProposalState::Unsupported => widgets::StatusTone::Info,
+        ProposalState::Blocked => widgets::StatusTone::Blocked,
+    }
+}
+
+/// The read-only rename-planning section.
+///
+/// Everything here displays the core plan; the only user actions are review
+/// decisions (session-only, never touching a file) and copying a proposed
+/// name. There is no Rename/Apply/Execute/Move/Delete control of any kind.
+fn show_rename_plan_section(
+    ui: &mut egui::Ui,
+    plan: &RenamePlanView,
+    ui_state: &mut DatSourcesPageUi,
+) -> Option<DatSourcesPageAction> {
+    let mut action = None;
+    ui.add_space(10.0);
+    widgets::section_header(ui, "Rename planning", None);
+
+    widgets::banner(
+        ui,
+        "Planning only",
+        PLAN_ONLY_PROMISE,
+        widgets::StatusTone::Info,
+    );
+
+    widgets::card(ui, |ui| {
+        ui.label(
+            egui::RichText::new(format!(
+                "Source '{}' · {} · {} of {} audited files verified",
+                plan.source_display_name,
+                plan.scan_root_short,
+                plan.verified_total,
+                plan.audited_total
+            ))
+            .color(theme::muted(ui))
+            .small(),
+        );
+        if let Some(platform) = &plan.platform_display {
+            ui.label(
+                egui::RichText::new(format!("Platform: {platform}"))
+                    .color(theme::muted(ui))
+                    .small(),
+            );
+        }
+        if plan.truncated {
+            ui.add_space(4.0);
+            widgets::banner(
+                ui,
+                "Partial plan",
+                "The audit hit a ceiling, so this plan covers part of the folder.",
+                widgets::StatusTone::Warning,
+            );
+        }
+        if let Some(error) = &plan.error {
+            ui.add_space(4.0);
+            widgets::banner(ui, "Plan not produced", error, widgets::StatusTone::Warning);
+        }
+
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} suggested · {} already canonical · {} ambiguous · {} conflicts · {} \
+                     unsupported · {} blocked",
+                    plan.counts.suggested,
+                    plan.counts.already_canonical,
+                    plan.counts.ambiguous,
+                    plan.counts.conflicts,
+                    plan.counts.unsupported,
+                    plan.counts.blocked
+                ))
+                .small(),
+            );
+        });
+
+        // Filter row: which states are shown. Filters only change what is
+        // drawn; they never decide anything about the plan.
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("Show:").color(theme::muted(ui)));
+            for filter in RenamePlanFilter::ALL {
+                let selected = ui_state.plan_filter == filter;
+                if ui.selectable_label(selected, filter.label()).clicked() {
+                    ui_state.plan_filter = filter;
+                }
+            }
+        });
+    });
+
+    ui.add_space(8.0);
+    widgets::card(ui, |ui| {
+        let visible: Vec<&RenamePlanRowView> = plan
+            .rows
+            .iter()
+            .filter(|row| ui_state.plan_filter.matches(row))
+            .collect();
+        if visible.is_empty() {
+            ui.label(
+                egui::RichText::new("No proposals match this filter.").color(theme::muted(ui)),
+            );
+            return;
+        }
+        egui::ScrollArea::vertical()
+            .max_height(360.0)
+            .id_salt("dat-rename-plan-rows")
+            .show(ui, |ui| {
+                for row in visible {
+                    show_rename_plan_row(ui, row, &mut action);
+                    ui.add_space(4.0);
+                }
+            });
+    });
+
+    if !plan.rows.is_empty() {
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if widgets::action_button(
+                ui,
+                "Reset all review decisions",
+                widgets::ActionStyle::Quiet,
+                !plan.rows.is_empty(),
+            )
+            .clicked()
+            {
+                action = Some(DatSourcesPageAction::ClearReviewDecisions);
+            }
+        });
+    }
+
+    action
+}
+
+fn show_rename_plan_row(
+    ui: &mut egui::Ui,
+    row: &RenamePlanRowView,
+    action: &mut Option<DatSourcesPageAction>,
+) {
+    ui.horizontal_top(|ui| {
+        ui.vertical(|ui| {
+            ui.horizontal(|ui| {
+                widgets::status_badge(ui, row.state.label(), plan_state_tone(row.state));
+                if row.state == ProposalState::Suggested {
+                    ui.label(
+                        egui::RichText::new(row.current_basename.clone())
+                            .monospace()
+                            .strong(),
+                    );
+                } else {
+                    ui.label(egui::RichText::new(row.current_basename.clone()).monospace());
+                }
+            });
+            match &row.proposed_basename {
+                Some(proposed) => {
+                    ui.label(
+                        egui::RichText::new(format!("→ {proposed}"))
+                            .monospace()
+                            .color(theme::muted(ui)),
+                    );
+                    if row.extension_preserved {
+                        ui.label(
+                            egui::RichText::new("extension preserved")
+                                .color(theme::muted(ui))
+                                .small(),
+                        );
+                    }
+                }
+                None => {
+                    ui.label(
+                        egui::RichText::new("no proposed name")
+                            .color(theme::muted(ui))
+                            .small(),
+                    );
+                }
+            }
+            if let Some(platform) = &row.platform_display {
+                ui.label(
+                    egui::RichText::new(format!("{platform} · {}", row.source_display_name))
+                        .color(theme::muted(ui))
+                        .small(),
+                );
+            } else {
+                ui.label(
+                    egui::RichText::new(row.source_display_name.clone())
+                        .color(theme::muted(ui))
+                        .small(),
+                );
+            }
+            if let Some(game) = &row.game_name {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Matched: {game}{} · {}",
+                        row.rom_name
+                            .as_deref()
+                            .filter(|rom| *rom != game)
+                            .map(|rom| format!(" ({rom})"))
+                            .unwrap_or_default(),
+                        row.verdict_label
+                    ))
+                    .color(theme::muted(ui))
+                    .small(),
+                );
+            }
+            if !row.explanations.is_empty() {
+                ui.add_space(2.0);
+                for line in &row.explanations {
+                    ui.label(
+                        egui::RichText::new(format!("• {line}"))
+                            .color(theme::muted(ui))
+                            .small(),
+                    );
+                }
+            }
+            if let Some(reason) = &row.ambiguity_reason {
+                ui.label(
+                    egui::RichText::new(format!("Ambiguous: {reason}"))
+                        .color(theme::WARNING)
+                        .small(),
+                );
+            }
+            if let Some(detail) = &row.collision_detail {
+                ui.label(
+                    egui::RichText::new(format!("Conflict: {detail}"))
+                        .color(theme::WARNING)
+                        .small(),
+                );
+            }
+            for blocker in &row.blockers {
+                ui.label(
+                    egui::RichText::new(format!("Blocked: {blocker}"))
+                        .color(theme::DANGER)
+                        .small(),
+                );
+            }
+            for note in &row.sanitisation_notes {
+                ui.label(
+                    egui::RichText::new(note.clone())
+                        .color(theme::muted(ui))
+                        .small(),
+                );
+            }
+            if let Some(decision) = row.decision {
+                ui.label(
+                    egui::RichText::new(format!("Your decision: {}", decision.label()))
+                        .color(theme::SUCCESS)
+                        .small(),
+                );
+            }
+        });
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+            if let Some(proposed) = &row.proposed_basename
+                && ui
+                    .add(egui::Button::new("Copy name").small())
+                    .on_hover_text("Copy the proposed filename to the clipboard")
+                    .clicked()
+            {
+                ui.ctx().copy_text(proposed.clone());
+            }
+            if ui
+                .add(egui::Button::new("Needs review").small())
+                .on_hover_text("Mark this proposal as needing manual review")
+                .clicked()
+            {
+                *action = Some(DatSourcesPageAction::SetReviewDecision {
+                    path: row.source_path.to_string_lossy().into_owned(),
+                    decision: Some(ReviewDecision::NeedsManualReview),
+                });
+            }
+            if ui
+                .add(egui::Button::new("Ignore").small())
+                .on_hover_text("Ignore this proposal for now")
+                .clicked()
+            {
+                *action = Some(DatSourcesPageAction::SetReviewDecision {
+                    path: row.source_path.to_string_lossy().into_owned(),
+                    decision: Some(ReviewDecision::Ignored),
+                });
+            }
+            if ui
+                .add(egui::Button::new("Accept").small())
+                .on_hover_text("Keep this proposal for a future review/apply stage")
+                .clicked()
+            {
+                *action = Some(DatSourcesPageAction::SetReviewDecision {
+                    path: row.source_path.to_string_lossy().into_owned(),
+                    decision: Some(ReviewDecision::AcceptedForReview),
+                });
+            }
+            if row.decision.is_some()
+                && ui
+                    .add(egui::Button::new("Clear").small())
+                    .on_hover_text("Clear your decision; nothing on disk changes")
+                    .clicked()
+            {
+                *action = Some(DatSourcesPageAction::SetReviewDecision {
+                    path: row.source_path.to_string_lossy().into_owned(),
+                    decision: None,
+                });
+            }
+        });
     });
 }
 

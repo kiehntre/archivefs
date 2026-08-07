@@ -89,6 +89,10 @@ pub struct DatAuditRequest {
     /// `None` (the default) makes the audit behave exactly as it did before
     /// policy existed: every verdict is reported, none is preferred.
     pub policy: Option<EffectiveDatPolicy>,
+    /// The audited source's canonical platform id, when assigned and
+    /// recognised. Carried for provenance so a rename plan derived from the
+    /// outcome can report the platform without re-reading the registry.
+    pub platform: Option<String>,
 }
 
 /// A file that was audited without hash evidence, and why.
@@ -185,6 +189,9 @@ pub struct DatAuditOutcome {
     pub truncated: bool,
     /// The policy annotation, present only when the request supplied a policy.
     pub policy: Option<DatAuditPolicyOutcome>,
+    /// The audited source's canonical platform id, when assigned and
+    /// recognised. Provenance for consumers like the rename plan.
+    pub platform: Option<String>,
 }
 
 impl DatAuditOutcome {
@@ -428,6 +435,7 @@ pub fn run_dat_audit(
         unhashed,
         bytes_hashed,
         policy,
+        platform: request.platform.clone(),
     })
 }
 

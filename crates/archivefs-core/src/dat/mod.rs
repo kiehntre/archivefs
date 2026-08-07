@@ -42,4 +42,5 @@ pub mod parsers;
 pub mod policy;
 #[cfg(test)]
 mod regression;
+pub mod rename_plan;
 pub mod sources;
