@@ -693,8 +693,13 @@ fn compare_revision(
                     format!("newer verified revision preferred (Rev {newer})"),
                 ))
             } else if a.has_revision_marker != b.has_revision_marker {
+                // A marked entry outranks an unmarked one even when their
+                // numeric revisions are equal: "(Rev 0)" is still an explicit
+                // declaration of a chosen revision. `Less` means `a` wins, so
+                // `b.marker.cmp(a.marker)` (true > false) prefers the marked
+                // side.
                 Some((
-                    a.has_revision_marker.cmp(&b.has_revision_marker),
+                    b.has_revision_marker.cmp(&a.has_revision_marker),
                     "newer verified revision preferred".to_string(),
                 ))
             } else {
@@ -936,6 +941,91 @@ mod tests {
         assert_eq!(
             resolution.entries[0].candidate.game_name,
             "Game (USA) (Rev 1)"
+        );
+    }
+
+    #[test]
+    fn an_explicit_rev_0_outranks_an_unmarked_original_under_latest() {
+        // A "(Rev 0)" marker is explicit: it declares revision 0 deliberately.
+        // Under LatestVerified the marked entry must still outrank an unmarked
+        // one, because the marker says a revision was chosen even when that
+        // revision happens to be 0.
+        let policy = context(
+            config(None, None, Some("latest_verified"), None),
+            &[("src", 100)],
+        );
+        let resolution = rank_candidates(
+            vec![
+                candidate_named("src", 100, "Game (USA)"),
+                candidate_named("src", 100, "Game (USA) (Rev 0)"),
+            ],
+            &policy,
+        );
+        assert!(resolution.decided);
+        assert_eq!(
+            resolution.entries[0].candidate.game_name, "Game (USA) (Rev 0)",
+            "the explicitly marked Rev 0 entry must be preferred"
+        );
+        assert!(
+            resolution
+                .explanations
+                .iter()
+                .any(|line| line == "newer verified revision preferred"),
+            "{:?}",
+            resolution.explanations
+        );
+    }
+
+    #[test]
+    fn explicit_rev_0_wins_regardless_of_input_order_under_latest() {
+        let policy = context(
+            config(None, None, Some("latest_verified"), None),
+            &[("src", 100)],
+        );
+        let unmarked = candidate_named("src", 100, "Game (USA)");
+        let marked = candidate_named("src", 100, "Game (USA) (Rev 0)");
+
+        let forward = rank_candidates(vec![unmarked.clone(), marked.clone()], &policy);
+        let reversed = rank_candidates(vec![marked.clone(), unmarked.clone()], &policy);
+        assert_eq!(
+            forward, reversed,
+            "the ranking must not depend on input order"
+        );
+        assert!(forward.decided);
+        assert_eq!(forward.entries[0].candidate.game_name, "Game (USA) (Rev 0)");
+        assert_eq!(
+            reversed.entries[0].candidate.game_name,
+            "Game (USA) (Rev 0)"
+        );
+    }
+
+    #[test]
+    fn an_unmarked_original_still_outranks_explicit_rev_0_under_prefer_original() {
+        // PreferOriginal is the opposite contract: the unmarked original wins,
+        // and an explicit "(Rev 0)" marker is still a marker, so it loses.
+        let policy = context(
+            config(None, None, Some("prefer_original"), None),
+            &[("src", 100)],
+        );
+        let resolution = rank_candidates(
+            vec![
+                candidate_named("src", 100, "Game (USA)"),
+                candidate_named("src", 100, "Game (USA) (Rev 0)"),
+            ],
+            &policy,
+        );
+        assert!(resolution.decided);
+        assert_eq!(
+            resolution.entries[0].candidate.game_name, "Game (USA)",
+            "the unmarked original must win under PreferOriginal"
+        );
+        assert!(
+            resolution
+                .explanations
+                .iter()
+                .any(|line| line == "original (unrevised) revision preferred"),
+            "{:?}",
+            resolution.explanations
         );
     }
 
