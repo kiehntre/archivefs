@@ -5,9 +5,38 @@
 
 use std::path::PathBuf;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::model::ParsedDat;
+
+/// How severe one parser diagnostic is.
+///
+/// Decides both the overall health verdict of a validation run and how the GUI
+/// presents the diagnostic. The verdict is taken from the highest severity
+/// present, exactly as documented on [`crate::dat::sources::DatHealthState`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticSeverity {
+    /// Expected parser behaviour; nothing is wrong and no action is needed.
+    /// Never lowers the health verdict.
+    Note,
+    /// Something unusual happened and the DAT may not be exactly as claimed,
+    /// but it is still usable; worth investigating.
+    Warning,
+    /// Validation failed; user action required.
+    Error,
+}
+
+impl DiagnosticSeverity {
+    /// A short, human-readable name for the severity.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Note => "parser note",
+            Self::Warning => "warning",
+            Self::Error => "error",
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ParseWarning {
@@ -16,9 +45,16 @@ pub struct ParseWarning {
     pub column: Option<usize>,
     pub context: String,
     pub message: String,
+    pub severity: DiagnosticSeverity,
+    /// A stable machine code naming the diagnostic kind (for example
+    /// "doctype_ignored" or "checksum_dropped"). Repeated diagnostics across
+    /// many DAT files share one code, which is what lets a report group them.
+    pub code: &'static str,
 }
 
 impl ParseWarning {
+    /// A warning: something unusual happened, worth investigating. The code is
+    /// left as "unclassified" for callers that do not name their diagnostic.
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             byte_offset: None,
@@ -26,7 +62,43 @@ impl ParseWarning {
             column: None,
             context: String::new(),
             message: message.into(),
+            severity: DiagnosticSeverity::Warning,
+            code: "unclassified",
         }
+    }
+
+    /// A warning with a stable code.
+    pub fn with_code(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            ..Self::new(message)
+        }
+    }
+
+    /// A parser note with a stable code: expected parser behaviour, no action
+    /// needed.
+    pub fn note(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            severity: DiagnosticSeverity::Note,
+            code,
+            ..Self::new(message)
+        }
+    }
+
+    pub fn severity(&self) -> DiagnosticSeverity {
+        self.severity
+    }
+
+    pub fn code(&self) -> &'static str {
+        self.code
+    }
+
+    pub fn is_note(&self) -> bool {
+        self.severity == DiagnosticSeverity::Note
+    }
+
+    pub fn is_warning(&self) -> bool {
+        self.severity == DiagnosticSeverity::Warning
     }
 
     pub fn with_offset(mut self, offset: usize) -> Self {

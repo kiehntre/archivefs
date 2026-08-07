@@ -9,11 +9,12 @@ use std::path::PathBuf;
 use archivefs_core::dat::audit::{KnownFileEvidence, audit_files};
 use archivefs_core::dat::index::DatIndex;
 use archivefs_core::dat::limits::DatLimits;
-use archivefs_core::dat::parser::{ParseOutcome, ParseWarning};
+use archivefs_core::dat::model::ParsedDat;
+use archivefs_core::dat::parser::{DiagnosticSeverity, ParseOutcome, ParseWarning};
 use archivefs_core::dat::parsers::parse_dat_file;
 use serde::Serialize;
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct InspectOutput {
     file_path: String,
     format: &'static str,
@@ -24,11 +25,18 @@ struct InspectOutput {
     author: Option<String>,
     entry_count: usize,
     rom_count: usize,
+    /// Warning-severity diagnostics only. A parser note is never listed here -
+    /// see `notes`.
     warnings: Vec<ParseWarning>,
+    /// The same diagnostics as `warnings`, as their `Display` strings.
     warning_summary: Vec<String>,
+    /// Note-severity diagnostics: expected parser behaviour, kept out of
+    /// `warnings` so a JSON consumer never mistakes one for something to
+    /// investigate.
+    notes: Vec<ParseWarning>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct ValidateOutput {
     file_path: String,
     valid: bool,
@@ -38,7 +46,168 @@ struct ValidateOutput {
     entry_count: usize,
     rom_count: usize,
     errors: Vec<String>,
+    /// Warning-severity diagnostics only. A parser note is never listed here -
+    /// see `notes`.
     warnings: Vec<ParseWarning>,
+    /// Note-severity diagnostics: expected parser behaviour, kept out of
+    /// `warnings` so a JSON consumer never mistakes one for something to
+    /// investigate.
+    notes: Vec<ParseWarning>,
+}
+
+/// Splits parser diagnostics into (errors, warnings, parser notes) by severity.
+///
+/// The three lists keep the parser's own deterministic order. Nothing is
+/// re-parsed or re-derived here; the severity was attached when the diagnostic
+/// was created.
+fn partition_diagnostics(
+    warnings: &[ParseWarning],
+) -> (Vec<&ParseWarning>, Vec<&ParseWarning>, Vec<&ParseWarning>) {
+    let mut errors = Vec::new();
+    let mut real_warnings = Vec::new();
+    let mut notes = Vec::new();
+    for warning in warnings {
+        match warning.severity() {
+            DiagnosticSeverity::Error => errors.push(warning),
+            DiagnosticSeverity::Warning => real_warnings.push(warning),
+            DiagnosticSeverity::Note => notes.push(warning),
+        }
+    }
+    (errors, real_warnings, notes)
+}
+
+/// Appends one labelled diagnostic section when it is non-empty.
+fn write_diagnostic_section(out: &mut String, heading: &str, diagnostics: &[&ParseWarning]) {
+    if diagnostics.is_empty() {
+        return;
+    }
+    writeln!(out, "{heading}:").unwrap();
+    for diagnostic in diagnostics {
+        writeln!(out, "  - {diagnostic}").unwrap();
+    }
+}
+
+/// The human-readable `dat inspect` output. Parser notes are shown under their
+/// own heading, never as warnings.
+fn inspect_text(dat: &ParsedDat, warnings: &[ParseWarning]) -> String {
+    let (_errors, real_warnings, notes) = partition_diagnostics(warnings);
+    let mut out = String::new();
+    writeln!(&mut out, "DAT File: {}", dat.source.file_path).unwrap();
+    writeln!(&mut out, "Format:   {}", dat.source.format.label()).unwrap();
+    writeln!(&mut out, "Ecosystem: {}", dat.source.ecosystem.label()).unwrap();
+    if let Some(ref n) = dat.source.name {
+        writeln!(&mut out, "Name:     {n}").unwrap();
+    }
+    if let Some(ref d) = dat.source.description {
+        writeln!(&mut out, "Description: {d}").unwrap();
+    }
+    if let Some(ref v) = dat.source.version {
+        writeln!(&mut out, "Version:  {v}").unwrap();
+    }
+    if let Some(ref a) = dat.source.author {
+        writeln!(&mut out, "Author:   {a}").unwrap();
+    }
+    writeln!(&mut out, "Entries:  {}", dat.source.entry_count).unwrap();
+    writeln!(&mut out, "ROMs:     {}", dat.source.rom_count).unwrap();
+    write_diagnostic_section(&mut out, "Warnings", &real_warnings);
+    write_diagnostic_section(&mut out, "Parser notes", &notes);
+    writeln!(&mut out).unwrap();
+
+    // Print game summary.
+    writeln!(&mut out, "Games:").unwrap();
+    for game in &dat.games {
+        writeln!(&mut out, "  {}", game.name).unwrap();
+        for rom in &game.roms {
+            let mut desc = String::new();
+            if let Some(s) = rom.size_bytes {
+                desc.push_str(&format!("  {s}B"));
+            }
+            let checksums = rom.checksums();
+            if !checksums.is_empty() {
+                if !desc.is_empty() {
+                    desc.push_str(", ");
+                }
+                desc.push_str(
+                    &checksums
+                        .iter()
+                        .map(|c| format!("{}: {}", c.algorithm.label(), c.value))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                );
+            }
+            writeln!(&mut out, "    {}  [{desc}]", rom.name).unwrap();
+        }
+    }
+
+    out
+}
+
+/// The human-readable `dat validate` output. Errors, warnings, and parser notes
+/// each get their own deterministic section, printed only when non-empty. A
+/// note-only valid DAT therefore never shows a "Warnings:" section.
+fn validate_text(dat: &ParsedDat, warnings: &[ParseWarning], errors: &[String]) -> String {
+    let (diagnostic_errors, real_warnings, notes) = partition_diagnostics(warnings);
+    let mut out = String::new();
+    writeln!(&mut out, "DAT File:  {}", dat.source.file_path).unwrap();
+    writeln!(&mut out, "Format:    {}", dat.source.format.label()).unwrap();
+    writeln!(&mut out, "Ecosystem:  {}", dat.source.ecosystem.label()).unwrap();
+    if let Some(ref n) = dat.source.name {
+        writeln!(&mut out, "Name:      {n}").unwrap();
+    }
+    writeln!(&mut out, "Entries:   {}", dat.source.entry_count).unwrap();
+    writeln!(&mut out, "ROMs:      {}", dat.source.rom_count).unwrap();
+
+    if errors.is_empty() && diagnostic_errors.is_empty() {
+        writeln!(&mut out, "Valid:     yes").unwrap();
+    } else {
+        writeln!(&mut out, "Valid:     no").unwrap();
+        writeln!(&mut out, "Errors:").unwrap();
+        for error in errors {
+            writeln!(&mut out, "  - {error}").unwrap();
+        }
+        for warning in diagnostic_errors {
+            writeln!(&mut out, "  - {warning}").unwrap();
+        }
+    }
+    write_diagnostic_section(&mut out, "Warnings", &real_warnings);
+    write_diagnostic_section(&mut out, "Parser notes", &notes);
+
+    // Hash coverage summary
+    if !dat.games.is_empty() {
+        writeln!(&mut out).unwrap();
+        let total_roms: usize = dat.games.iter().map(|g| g.roms.len()).sum();
+        let with_crc = dat
+            .games
+            .iter()
+            .flat_map(|g| &g.roms)
+            .filter(|r| r.crc32.is_some())
+            .count();
+        let with_md5 = dat
+            .games
+            .iter()
+            .flat_map(|g| &g.roms)
+            .filter(|r| r.md5.is_some())
+            .count();
+        let with_sha1 = dat
+            .games
+            .iter()
+            .flat_map(|g| &g.roms)
+            .filter(|r| r.sha1.is_some())
+            .count();
+        let with_sha256 = dat
+            .games
+            .iter()
+            .flat_map(|g| &g.roms)
+            .filter(|r| r.sha256.is_some())
+            .count();
+        writeln!(&mut out, "Hash coverage ({total_roms} ROMs):").unwrap();
+        writeln!(&mut out, "  CRC32:   {with_crc}").unwrap();
+        writeln!(&mut out, "  MD5:     {with_md5}").unwrap();
+        writeln!(&mut out, "  SHA-1:   {with_sha1}").unwrap();
+        writeln!(&mut out, "  SHA-256: {with_sha256}").unwrap();
+    }
+
+    out
 }
 
 pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
@@ -76,75 +245,61 @@ fn run_inspect(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
     };
 
     if json {
-        let output = InspectOutput {
-            file_path: dat.source.file_path.clone(),
-            format: dat.source.format.label(),
-            ecosystem: dat.source.ecosystem.label(),
-            name: dat.source.name.clone(),
-            description: dat.source.description.clone(),
-            version: dat.source.version.clone(),
-            author: dat.source.author.clone(),
-            entry_count: dat.source.entry_count,
-            rom_count: dat.source.rom_count,
-            warning_summary: dat.source.parse_warnings.clone(),
-            warnings,
-        };
+        let output = inspect_json(&dat, &warnings);
         println!("{}", serde_json::to_string_pretty(&output)?);
         return Ok(());
     }
 
-    let mut out = String::new();
-    writeln!(&mut out, "DAT File: {}", dat.source.file_path).unwrap();
-    writeln!(&mut out, "Format:   {}", dat.source.format.label()).unwrap();
-    writeln!(&mut out, "Ecosystem: {}", dat.source.ecosystem.label()).unwrap();
-    if let Some(ref n) = dat.source.name {
-        writeln!(&mut out, "Name:     {n}").unwrap();
-    }
-    if let Some(ref d) = dat.source.description {
-        writeln!(&mut out, "Description: {d}").unwrap();
-    }
-    if let Some(ref v) = dat.source.version {
-        writeln!(&mut out, "Version:  {v}").unwrap();
-    }
-    if let Some(ref a) = dat.source.author {
-        writeln!(&mut out, "Author:   {a}").unwrap();
-    }
-    writeln!(&mut out, "Entries:  {}", dat.source.entry_count).unwrap();
-    writeln!(&mut out, "ROMs:     {}", dat.source.rom_count).unwrap();
-    writeln!(&mut out, "Warnings: {}", dat.source.parse_warnings.len()).unwrap();
-    for w in &dat.source.parse_warnings {
-        writeln!(&mut out, "  - {w}").unwrap();
-    }
-    writeln!(&mut out).unwrap();
-
-    // Print game summary.
-    writeln!(&mut out, "Games:").unwrap();
-    for game in &dat.games {
-        writeln!(&mut out, "  {}", game.name).unwrap();
-        for rom in &game.roms {
-            let mut desc = String::new();
-            if let Some(s) = rom.size_bytes {
-                desc.push_str(&format!("  {s}B"));
-            }
-            let checksums = rom.checksums();
-            if !checksums.is_empty() {
-                if !desc.is_empty() {
-                    desc.push_str(", ");
-                }
-                desc.push_str(
-                    &checksums
-                        .iter()
-                        .map(|c| format!("{}: {}", c.algorithm.label(), c.value))
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                );
-            }
-            writeln!(&mut out, "    {}  [{desc}]", rom.name).unwrap();
-        }
-    }
-
-    print!("{out}");
+    print!("{}", inspect_text(&dat, &warnings));
     Ok(())
+}
+
+/// Builds the `dat inspect --json` payload. Partitioned by severity so a
+/// parser note (e.g. the DOCTYPE acceptance note) can never land in
+/// `warnings`/`warning_summary`, matching what the text path already does
+/// and how `validate --json` keeps Error diagnostics out of its own
+/// `warnings`.
+fn inspect_json(dat: &ParsedDat, warnings: &[ParseWarning]) -> InspectOutput {
+    let (_errors, real_warnings, notes) = partition_diagnostics(warnings);
+    InspectOutput {
+        file_path: dat.source.file_path.clone(),
+        format: dat.source.format.label(),
+        ecosystem: dat.source.ecosystem.label(),
+        name: dat.source.name.clone(),
+        description: dat.source.description.clone(),
+        version: dat.source.version.clone(),
+        author: dat.source.author.clone(),
+        entry_count: dat.source.entry_count,
+        rom_count: dat.source.rom_count,
+        warning_summary: real_warnings.iter().map(|w| w.to_string()).collect(),
+        warnings: real_warnings.into_iter().cloned().collect(),
+        notes: notes.into_iter().cloned().collect(),
+    }
+}
+
+/// Builds the `dat validate --json` payload. Partitioned once by severity so
+/// each bucket holds exactly one kind: `errors` carries the file-level
+/// validation errors plus any Error-severity diagnostic (an Error also makes
+/// `valid` false), `warnings` carries Warning-severity diagnostics only, and
+/// `notes` carries Note-severity diagnostics only. Nothing appears in two
+/// buckets, and a parser note is never represented as a warning, matching the
+/// text path and `inspect --json`.
+fn validate_json(dat: &ParsedDat, warnings: &[ParseWarning], errors: &[String]) -> ValidateOutput {
+    let (diagnostic_errors, real_warnings, notes) = partition_diagnostics(warnings);
+    let mut all_errors = errors.to_vec();
+    all_errors.extend(diagnostic_errors.iter().map(ToString::to_string));
+    ValidateOutput {
+        file_path: dat.source.file_path.clone(),
+        valid: all_errors.is_empty(),
+        format: dat.source.format.label(),
+        ecosystem: dat.source.ecosystem.label(),
+        name: dat.source.name.clone(),
+        entry_count: dat.source.entry_count,
+        rom_count: dat.source.rom_count,
+        errors: all_errors,
+        warnings: real_warnings.into_iter().cloned().collect(),
+        notes: notes.into_iter().cloned().collect(),
+    }
 }
 
 fn run_validate(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
@@ -192,17 +347,7 @@ fn run_validate(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>>
     };
 
     if json {
-        let output = ValidateOutput {
-            file_path: dat.source.file_path.clone(),
-            valid: errors.is_empty(),
-            format: dat.source.format.label(),
-            ecosystem: dat.source.ecosystem.label(),
-            name: dat.source.name.clone(),
-            entry_count: dat.source.entry_count,
-            rom_count: dat.source.rom_count,
-            errors,
-            warnings,
-        };
+        let output = validate_json(&dat, &warnings, &errors);
         println!("{}", serde_json::to_string_pretty(&output)?);
         if !output.valid {
             return Err("dat validate: file failed validation".into());
@@ -210,71 +355,13 @@ fn run_validate(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>>
         return Ok(());
     }
 
-    let mut out = String::new();
-    writeln!(&mut out, "DAT File:  {}", dat.source.file_path).unwrap();
-    writeln!(&mut out, "Format:    {}", dat.source.format.label()).unwrap();
-    writeln!(&mut out, "Ecosystem:  {}", dat.source.ecosystem.label()).unwrap();
-    if let Some(ref n) = dat.source.name {
-        writeln!(&mut out, "Name:      {n}").unwrap();
-    }
-    writeln!(&mut out, "Entries:   {}", dat.source.entry_count).unwrap();
-    writeln!(&mut out, "ROMs:      {}", dat.source.rom_count).unwrap();
+    let text = validate_text(&dat, &warnings, &errors);
+    print!("{text}");
 
-    if errors.is_empty() {
-        writeln!(&mut out, "Valid:     yes").unwrap();
-    } else {
-        writeln!(&mut out, "Valid:     no").unwrap();
-        writeln!(&mut out, "Errors:").unwrap();
-        for e in &errors {
-            writeln!(&mut out, "  - {e}").unwrap();
-        }
-    }
-
-    if !warnings.is_empty() {
-        writeln!(&mut out, "Warnings:").unwrap();
-        for w in &warnings {
-            writeln!(&mut out, "  - {w}").unwrap();
-        }
-    }
-
-    // Hash coverage summary
-    if !dat.games.is_empty() {
-        writeln!(&mut out).unwrap();
-        let total_roms: usize = dat.games.iter().map(|g| g.roms.len()).sum();
-        let with_crc = dat
-            .games
-            .iter()
-            .flat_map(|g| &g.roms)
-            .filter(|r| r.crc32.is_some())
-            .count();
-        let with_md5 = dat
-            .games
-            .iter()
-            .flat_map(|g| &g.roms)
-            .filter(|r| r.md5.is_some())
-            .count();
-        let with_sha1 = dat
-            .games
-            .iter()
-            .flat_map(|g| &g.roms)
-            .filter(|r| r.sha1.is_some())
-            .count();
-        let with_sha256 = dat
-            .games
-            .iter()
-            .flat_map(|g| &g.roms)
-            .filter(|r| r.sha256.is_some())
-            .count();
-        writeln!(&mut out, "Hash coverage ({total_roms} ROMs):").unwrap();
-        writeln!(&mut out, "  CRC32:   {with_crc}").unwrap();
-        writeln!(&mut out, "  MD5:     {with_md5}").unwrap();
-        writeln!(&mut out, "  SHA-1:   {with_sha1}").unwrap();
-        writeln!(&mut out, "  SHA-256: {with_sha256}").unwrap();
-    }
-
-    print!("{out}");
-
-    if !errors.is_empty() {
+    // An Error-severity parser diagnostic also makes the file invalid, matching
+    // the core verdict.
+    let (diagnostic_errors, _, _) = partition_diagnostics(&warnings);
+    if !errors.is_empty() || !diagnostic_errors.is_empty() {
         return Err("dat validate: file failed validation".into());
     }
     Ok(())
@@ -569,6 +656,344 @@ mod tests {
         let (_dir, path) = write_temp_file("doctype.dat", xml);
         let args = vec!["inspect".into(), path.to_string_lossy().into_owned()];
         assert!(run(args).is_ok());
+    }
+
+    /// A Logiqx XML DAT carrying the standard DOCTYPE plus `games` entries, the
+    /// shape of the reported TOSEC case.
+    fn logiqx_with_doctype_and_entries(games: usize) -> String {
+        let mut xml = String::from(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <!DOCTYPE datafile PUBLIC \"-//Logiqx//DTD ROM Management Datafile//EN\" \
+             \"http://www.logiqx.com/Dats/datafile.dtd\">\n\
+             <datafile>\n\
+             <header><name>Test TOSEC Set</name><version>2026-01-01</version></header>\n",
+        );
+        for index in 0..games {
+            xml.push_str(&format!(
+                "<game name=\"Game {index}\"><rom name=\"g{index}.bin\" size=\"16\" crc=\"{index:08x}\"/></game>\n"
+            ));
+        }
+        xml.push_str("</datafile>\n");
+        xml
+    }
+
+    #[test]
+    fn validate_note_only_dat_never_prints_a_warnings_section() {
+        // Regression: the CLI must not label parser notes as warnings. A
+        // note-only TOSEC DAT parses cleanly and must show no "Warnings:"
+        // section at all - only "Parser notes:".
+        let (_dir, path) = write_temp_file("tosec.dat", &logiqx_with_doctype_and_entries(1005));
+        let outcome = parse_dat_file(&path, DatLimits::default()).expect("the TOSEC DAT parses");
+        assert_eq!(outcome.dat.source.entry_count, 1005);
+
+        let text = validate_text(&outcome.dat, &outcome.warnings, &[]);
+        assert!(text.contains("Valid:     yes"), "{text}");
+        assert!(
+            !text.contains("Warnings:"),
+            "a parser note is not a warning:\n{text}"
+        );
+        assert!(text.contains("Parser notes:"), "{text}");
+        assert!(text.contains("DOCTYPE"), "{text}");
+    }
+
+    #[test]
+    fn inspect_note_only_dat_lists_parser_notes_not_warnings() {
+        let (_dir, path) = write_temp_file("tosec.dat", &logiqx_with_doctype_and_entries(1005));
+        let outcome = parse_dat_file(&path, DatLimits::default()).expect("the TOSEC DAT parses");
+
+        let text = inspect_text(&outcome.dat, &outcome.warnings);
+        assert!(
+            !text.contains("Warnings:"),
+            "inspect must not label a parser note as a warning:\n{text}"
+        );
+        assert!(text.contains("Parser notes:"), "{text}");
+        assert!(text.contains("DOCTYPE"), "{text}");
+    }
+
+    #[test]
+    fn validate_a_real_warning_still_prints_a_warnings_section() {
+        // A genuinely dropped checksum is a warning, not a parser note, and must
+        // keep its own section.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<datafile><game name="G"><rom name="a.bin" size="4" crc="not-a-checksum"/></game></datafile>"#;
+        let (_dir, path) = write_temp_file("warn.dat", xml);
+        let outcome = parse_dat_file(&path, DatLimits::default()).expect("parses with a warning");
+
+        let text = validate_text(&outcome.dat, &outcome.warnings, &[]);
+        assert!(text.contains("Valid:     yes"), "{text}");
+        assert!(text.contains("Warnings:"), "{text}");
+        assert!(text.contains("not-a-checksum"), "{text}");
+        assert!(!text.contains("Parser notes:"), "{text}");
+    }
+
+    #[test]
+    fn inspect_json_note_only_dat_keeps_the_note_out_of_warnings() {
+        // Regression: `dat inspect --json` must not report a parser note as a
+        // warning. A note-only TOSEC/No-Intro-shaped DAT (DOCTYPE only) must
+        // produce empty `warnings`/`warning_summary` and the note must appear
+        // only in `notes`, with its severity and code intact.
+        let (_dir, path) = write_temp_file("tosec.dat", &logiqx_with_doctype_and_entries(3));
+        let outcome = parse_dat_file(&path, DatLimits::default()).expect("the TOSEC DAT parses");
+
+        let output = inspect_json(&outcome.dat, &outcome.warnings);
+        assert!(
+            output.warnings.is_empty(),
+            "a parser note must not appear in warnings: {:?}",
+            output.warnings
+        );
+        assert!(
+            output.warning_summary.is_empty(),
+            "a parser note must not appear in warning_summary: {:?}",
+            output.warning_summary
+        );
+        assert_eq!(output.notes.len(), 1, "{:?}", output.notes);
+        assert_eq!(output.notes[0].severity, DiagnosticSeverity::Note);
+        assert_eq!(output.notes[0].code, "doctype_ignored");
+        assert!(output.notes[0].message.contains("DOCTYPE"), "{output:?}");
+    }
+
+    #[test]
+    fn inspect_json_real_warning_stays_in_warnings() {
+        // A genuine warning must still show up in both `warnings` and
+        // `warning_summary`, exactly as before this fix.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<datafile><game name="G"><rom name="a.bin" size="4" crc="not-a-checksum"/></game></datafile>"#;
+        let (_dir, path) = write_temp_file("warn.dat", xml);
+        let outcome = parse_dat_file(&path, DatLimits::default()).expect("parses with a warning");
+
+        let output = inspect_json(&outcome.dat, &outcome.warnings);
+        assert_eq!(output.warnings.len(), 1, "{:?}", output.warnings);
+        assert_eq!(output.warnings[0].severity, DiagnosticSeverity::Warning);
+        assert_eq!(
+            output.warning_summary.len(),
+            1,
+            "{:?}",
+            output.warning_summary
+        );
+        assert!(
+            output.warning_summary[0].contains("not-a-checksum"),
+            "{:?}",
+            output.warning_summary
+        );
+        assert!(output.notes.is_empty(), "{:?}", output.notes);
+    }
+
+    #[test]
+    fn inspect_json_mixed_note_and_warning_stay_separated() {
+        // A DAT that produces both a DOCTYPE note and a genuine warning must
+        // keep them apart: the note never dilutes or merges with the warning
+        // list in either direction.
+        let mut xml = String::from(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <!DOCTYPE datafile PUBLIC \"-//Logiqx//DTD ROM Management Datafile//EN\" \
+             \"http://www.logiqx.com/Dats/datafile.dtd\">\n\
+             <datafile><header><name>Mixed</name></header>\n",
+        );
+        xml.push_str(
+            "<game name=\"G\"><rom name=\"a.bin\" size=\"4\" crc=\"not-a-checksum\"/></game>\n",
+        );
+        xml.push_str("</datafile>\n");
+        let (_dir, path) = write_temp_file("mixed.dat", &xml);
+        let outcome = parse_dat_file(&path, DatLimits::default()).expect("parses");
+
+        let output = inspect_json(&outcome.dat, &outcome.warnings);
+        assert_eq!(output.warnings.len(), 1, "{:?}", output.warnings);
+        assert_eq!(output.warnings[0].severity, DiagnosticSeverity::Warning);
+        assert_eq!(
+            output.warning_summary.len(),
+            1,
+            "{:?}",
+            output.warning_summary
+        );
+        assert_eq!(output.notes.len(), 1, "{:?}", output.notes);
+        assert_eq!(output.notes[0].severity, DiagnosticSeverity::Note);
+        assert_eq!(output.notes[0].code, "doctype_ignored");
+    }
+
+    #[test]
+    fn inspect_json_error_diagnostics_never_land_in_warnings_or_notes() {
+        // No current parser actually emits an Error-severity ParseWarning, but
+        // the contract must hold regardless: an Error-severity diagnostic
+        // must never be misclassified into `warnings` or `notes`.
+        let (_dir, path) = write_temp_file("tosec.dat", &logiqx_with_doctype_and_entries(1));
+        let outcome = parse_dat_file(&path, DatLimits::default()).expect("parses");
+
+        let mut warnings = outcome.warnings.clone();
+        warnings.push(ParseWarning {
+            byte_offset: None,
+            line: None,
+            column: None,
+            context: String::new(),
+            message: "synthetic error diagnostic".to_string(),
+            severity: DiagnosticSeverity::Error,
+            code: "synthetic_error",
+        });
+
+        let output = inspect_json(&outcome.dat, &warnings);
+        assert!(
+            output
+                .warnings
+                .iter()
+                .all(|w| w.severity == DiagnosticSeverity::Warning),
+            "{:?}",
+            output.warnings
+        );
+        assert!(
+            output
+                .notes
+                .iter()
+                .all(|w| w.severity == DiagnosticSeverity::Note),
+            "{:?}",
+            output.notes
+        );
+        assert!(
+            !output
+                .warning_summary
+                .iter()
+                .any(|line| line.contains("synthetic error diagnostic")),
+            "{:?}",
+            output.warning_summary
+        );
+    }
+
+    #[test]
+    fn validate_json_note_only_dat_keeps_notes_out_of_warnings() {
+        // Regression: `dat validate --json` must not report a parser note as a
+        // warning. A DOCTYPE-only DAT must be `valid`, with empty `warnings`
+        // and the note appearing only in `notes`, severity and code intact.
+        let (_dir, path) = write_temp_file("tosec.dat", &logiqx_with_doctype_and_entries(3));
+        let outcome = parse_dat_file(&path, DatLimits::default()).expect("the TOSEC DAT parses");
+
+        let output = validate_json(&outcome.dat, &outcome.warnings, &[]);
+        assert!(output.valid, "{output:?}");
+        assert!(
+            output.warnings.is_empty(),
+            "a parser note must not appear in warnings: {:?}",
+            output.warnings
+        );
+        assert_eq!(output.notes.len(), 1, "{:?}", output.notes);
+        assert_eq!(output.notes[0].severity, DiagnosticSeverity::Note);
+        assert_eq!(output.notes[0].code, "doctype_ignored");
+        assert!(output.notes[0].message.contains("DOCTYPE"), "{output:?}");
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+    }
+
+    #[test]
+    fn validate_json_real_warning_stays_in_warnings_only() {
+        // A genuine warning must appear in `warnings` and nowhere else, and
+        // must not make `valid` false.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<datafile><game name="G"><rom name="a.bin" size="4" crc="not-a-checksum"/></game></datafile>"#;
+        let (_dir, path) = write_temp_file("warn.dat", xml);
+        let outcome = parse_dat_file(&path, DatLimits::default()).expect("parses with a warning");
+
+        let output = validate_json(&outcome.dat, &outcome.warnings, &[]);
+        assert!(output.valid, "{output:?}");
+        assert_eq!(output.warnings.len(), 1, "{:?}", output.warnings);
+        assert_eq!(output.warnings[0].severity, DiagnosticSeverity::Warning);
+        assert!(output.notes.is_empty(), "{:?}", output.notes);
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+    }
+
+    #[test]
+    fn validate_json_mixed_note_and_warning_stay_separated() {
+        // A DAT that produces both a DOCTYPE note and a genuine warning must
+        // keep them apart: each appears only in its own bucket.
+        let mut xml = String::from(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <!DOCTYPE datafile PUBLIC \"-//Logiqx//DTD ROM Management Datafile//EN\" \
+             \"http://www.logiqx.com/Dats/datafile.dtd\">\n\
+             <datafile><header><name>Mixed</name></header>\n",
+        );
+        xml.push_str(
+            "<game name=\"G\"><rom name=\"a.bin\" size=\"4\" crc=\"not-a-checksum\"/></game>\n",
+        );
+        xml.push_str("</datafile>\n");
+        let (_dir, path) = write_temp_file("mixed.dat", &xml);
+        let outcome = parse_dat_file(&path, DatLimits::default()).expect("parses");
+
+        let output = validate_json(&outcome.dat, &outcome.warnings, &[]);
+        assert!(output.valid, "{output:?}");
+        assert_eq!(output.warnings.len(), 1, "{:?}", output.warnings);
+        assert_eq!(output.warnings[0].severity, DiagnosticSeverity::Warning);
+        assert_eq!(output.notes.len(), 1, "{:?}", output.notes);
+        assert_eq!(output.notes[0].severity, DiagnosticSeverity::Note);
+        assert_eq!(output.notes[0].code, "doctype_ignored");
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+    }
+
+    #[test]
+    fn validate_json_synthetic_error_goes_to_errors_and_invalidates() {
+        // No current parser emits an Error-severity ParseWarning, but the
+        // contract must hold: an Error lands in `errors` (making `valid`
+        // false), a Warning only in `warnings`, a Note only in `notes`, and no
+        // diagnostic appears in more than one bucket.
+        let mut xml = String::from(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <!DOCTYPE datafile PUBLIC \"-//Logiqx//DTD ROM Management Datafile//EN\" \
+             \"http://www.logiqx.com/Dats/datafile.dtd\">\n\
+             <datafile><header><name>Mixed</name></header>\n",
+        );
+        xml.push_str(
+            "<game name=\"G\"><rom name=\"a.bin\" size=\"4\" crc=\"not-a-checksum\"/></game>\n",
+        );
+        xml.push_str("</datafile>\n");
+        let (_dir, path) = write_temp_file("mixed.dat", &xml);
+        let outcome = parse_dat_file(&path, DatLimits::default()).expect("parses");
+
+        let mut warnings = outcome.warnings.clone();
+        warnings.push(ParseWarning {
+            byte_offset: None,
+            line: None,
+            column: None,
+            context: String::new(),
+            message: "synthetic error diagnostic".to_string(),
+            severity: DiagnosticSeverity::Error,
+            code: "synthetic_error",
+        });
+
+        let output = validate_json(&outcome.dat, &warnings, &[]);
+        assert!(!output.valid, "{output:?}");
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|e| e.contains("synthetic error diagnostic")),
+            "the Error must appear in errors: {:?}",
+            output.errors
+        );
+        assert_eq!(output.warnings.len(), 1, "{:?}", output.warnings);
+        assert!(
+            output
+                .warnings
+                .iter()
+                .all(|w| w.severity == DiagnosticSeverity::Warning),
+            "{:?}",
+            output.warnings
+        );
+        assert_eq!(output.notes.len(), 1, "{:?}", output.notes);
+        assert!(
+            output
+                .notes
+                .iter()
+                .all(|w| w.severity == DiagnosticSeverity::Note),
+            "{:?}",
+            output.notes
+        );
+        // No diagnostic appears twice: the synthetic error is not in warnings
+        // or notes.
+        assert!(
+            !output
+                .warnings
+                .iter()
+                .any(|w| w.message == "synthetic error diagnostic")
+                && !output
+                    .notes
+                    .iter()
+                    .any(|w| w.message == "synthetic error diagnostic"),
+            "{:?}",
+            output
+        );
     }
 
     #[test]

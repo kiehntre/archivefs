@@ -93,10 +93,15 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                 // Accepting it as inert text is both safe and required: every
                 // real-world No-Intro and Redump DAT file carries this DOCTYPE,
                 // and rejecting it would mean supporting no DAT files at all.
-                record_warning(
+                // This is expected parser behaviour, so it is a parser note, not
+                // a warning: the DAT is fine and nothing needs to be done.
+                record_note(
                     &mut warnings,
                     limits.max_warnings,
-                    "DOCTYPE declaration accepted as inert text (no DTD fetched, no entity expansion)".to_string(),
+                    "doctype_ignored",
+                    "DOCTYPE declaration accepted as inert text: external DTDs are \
+                     intentionally never fetched and no entity is expanded, for security"
+                        .to_string(),
                 );
             }
             Ok(Event::Start(ref start_bytes)) => {
@@ -232,6 +237,7 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                             record_warning(
                                 &mut warnings,
                                 limits.max_warnings,
+                                "description_truncated",
                                 format!(
                                     "description truncated from {} to {} bytes",
                                     text.len(),
@@ -262,6 +268,7 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                             record_warning(
                                 &mut warnings,
                                 limits.max_warnings,
+                                "game_description_truncated",
                                 format!(
                                     "game description truncated at {} bytes",
                                     limits.max_description_length
@@ -333,6 +340,7 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                             record_warning(
                                 &mut warnings,
                                 limits.max_warnings,
+                                "rom_missing_name",
                                 "ROM element missing required name attribute".to_string(),
                             );
                             text_buf.clear();
@@ -411,6 +419,7 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                             record_warning(
                                 &mut warnings,
                                 limits.max_warnings,
+                                "entity_unresolved_text",
                                 format!(
                                     "unresolvable entity reference in text kept as \
                                      written: {error}"
@@ -423,6 +432,7 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                         record_warning(
                             &mut warnings,
                             limits.max_warnings,
+                            "text_invalid_utf8",
                             format!("text that is not valid UTF-8 was dropped: {error}"),
                         );
                     }
@@ -450,6 +460,7 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                             record_warning(
                                 &mut warnings,
                                 limits.max_warnings,
+                                "entity_unrecognized",
                                 format!(
                                     "unresolvable entity reference in text kept as \
                                      written: unrecognized entity `{name}`"
@@ -464,6 +475,7 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                         record_warning(
                             &mut warnings,
                             limits.max_warnings,
+                            "reference_invalid_utf8",
                             format!("a reference that is not valid UTF-8 was dropped: {error}"),
                         );
                     }
@@ -480,6 +492,7 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                     record_warning(
                         &mut warnings,
                         limits.max_warnings,
+                        "document_truncated",
                         format!(
                             "document ended with {depth} element(s) still open: the DAT is \
                              truncated and these entries may be incomplete"
@@ -549,6 +562,7 @@ fn checksum_attr(
             record_warning(
                 warnings,
                 max_warnings,
+                "checksum_dropped",
                 format!(
                     "{} attribute on {context} is not a well-formed checksum and was dropped: {:?}",
                     String::from_utf8_lossy(attr_name),
@@ -560,9 +574,26 @@ fn checksum_attr(
     }
 }
 
-fn record_warning(warnings: &mut Vec<ParseWarning>, limit: usize, message: String) {
+fn record_warning(
+    warnings: &mut Vec<ParseWarning>,
+    limit: usize,
+    code: &'static str,
+    message: String,
+) {
     if warnings.len() < limit {
-        warnings.push(ParseWarning::new(message));
+        warnings.push(ParseWarning::with_code(code, message));
+    }
+}
+
+/// Records a parser note: expected parser behaviour that needs no action.
+fn record_note(
+    warnings: &mut Vec<ParseWarning>,
+    limit: usize,
+    code: &'static str,
+    message: String,
+) {
+    if warnings.len() < limit {
+        warnings.push(ParseWarning::note(code, message));
     }
 }
 
@@ -648,6 +679,7 @@ fn attr_str_opt(
             record_warning(
                 warnings,
                 max_warnings,
+                "attribute_invalid_utf8",
                 format!(
                     "attribute {} is not valid UTF-8 and was read with replacement \
                      characters: {error}",
@@ -663,6 +695,7 @@ fn attr_str_opt(
             record_warning(
                 warnings,
                 max_warnings,
+                "entity_unresolved_attribute",
                 format!(
                     "unresolvable entity reference in attribute {} kept as written: {error}",
                     String::from_utf8_lossy(attr_name)

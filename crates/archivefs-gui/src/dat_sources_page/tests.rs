@@ -16,9 +16,11 @@ use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant};
 
 use archivefs_core::dat::audit::{AuditReport, AuditSummary};
+use archivefs_core::dat::limits::DatLimits;
 use archivefs_core::dat::model::{DatEcosystem, DatFormat};
+use archivefs_core::dat::parser::DiagnosticSeverity;
 use archivefs_core::dat::sources::{
-    DatFileOutcome, DatFileReport, DatHealthState, DatSourceKind, DatSourceRegistry,
+    DatDiagnostic, DatFileOutcome, DatFileReport, DatHealthState, DatSourceKind, DatSourceRegistry,
     DatValidationReport, audit_run::DatAuditOutcome, load_dat_sources_config_from,
 };
 use archivefs_core::safe_read::TrustedRoots;
@@ -739,6 +741,49 @@ fn discarding_while_a_validation_is_in_flight_stops_it_from_landing() {
 }
 
 #[test]
+fn discarding_forgets_completed_session_validation_records() {
+    // Regression: Revert used to leave `validations` (and now the diagnostic
+    // groups cache) in place, so a source that was validated, then discarded
+    // (never saved), then re-added - reusing its auto-suggested id - showed
+    // stale Inspect detail and stale diagnostic groups next to a "Not checked"
+    // badge.
+    let fixture = Fixture::new();
+    let dat = fixture.write("no-intro.dat", &logiqx_with_doctype_and_entries(1));
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddFile { path: dat.clone() });
+    page.apply(DatSourcesPageAction::Validate {
+        id: "no-intro".to_string(),
+    });
+    run_to_completion(&mut page);
+    assert!(
+        page.validation("no-intro").is_some(),
+        "a completed validation is recorded"
+    );
+    assert_eq!(
+        page.view().rows[0].diagnostic_types(DiagnosticSeverity::Note),
+        1,
+        "the DOCTYPE note is grouped so the discard below is observable"
+    );
+
+    // Discard the never-saved source, then re-add the same file.
+    page.apply(DatSourcesPageAction::Revert);
+    assert!(page.view().rows.is_empty());
+    page.apply(DatSourcesPageAction::AddFile { path: dat });
+
+    let view = page.view();
+    assert_eq!(view.rows[0].id, "no-intro");
+    assert_eq!(view.rows[0].health_state, DatHealthState::NotChecked);
+    assert!(
+        view.rows[0].detail.is_none(),
+        "a re-added source must not show stale Inspect detail from a discarded run"
+    );
+    assert!(
+        view.rows[0].groups.is_empty(),
+        "a re-added source must not show stale diagnostic groups from a discarded run"
+    );
+}
+
+#[test]
 fn a_second_job_is_refused_while_one_is_running() {
     let fixture = Fixture::new();
     let dat = fixture.write("no-intro.dat", LOGIQX);
@@ -772,6 +817,76 @@ fn audit_fixture() -> (Fixture, DatSourcesPageState, PathBuf) {
     let mut page = fixture.page_with_library(vec![roms.clone()]);
     page.apply(DatSourcesPageAction::AddFile { path: dat });
     (fixture, page, roms)
+}
+
+#[test]
+fn the_audit_summary_shows_elapsed_time_and_a_shortened_scan_folder() {
+    let (_fixture, mut page, roms) = audit_fixture();
+    page.apply(DatSourcesPageAction::Audit {
+        id: "collection".to_string(),
+        scan_root: roms.clone(),
+    });
+    run_to_completion(&mut page);
+
+    let view = page.view();
+    let audit = view.audit.as_ref().expect("an audit result");
+    // The full folder is still on the result for provenance...
+    assert_eq!(audit.scan_root, roms.to_string_lossy());
+    // ...but the display uses a shortened form that never exposes the full path.
+    assert_eq!(audit.scan_root_short, shorten_path(&roms.to_string_lossy()));
+    assert!(
+        !audit.scan_root_short.contains("/tmp"),
+        "the full private path must not be shown: {}",
+        audit.scan_root_short
+    );
+    // A completed audit knows how long it took.
+    assert!(audit.elapsed_seconds.is_some());
+
+    let mut ui_state = DatSourcesPageUi::default();
+    let output = render(&view, &mut ui_state);
+    assert!(rendered_text_contains(&output, "Completed in"));
+    assert!(
+        !rendered_text_contains(&output, &roms.to_string_lossy()),
+        "the full scan folder must not be rendered"
+    );
+}
+
+#[test]
+fn the_audit_summary_survives_navigation_and_is_replaced_by_a_new_generation() {
+    let (_fixture, mut page, roms) = audit_fixture();
+    page.apply(DatSourcesPageAction::Audit {
+        id: "collection".to_string(),
+        scan_root: roms.clone(),
+    });
+    run_to_completion(&mut page);
+
+    // Navigating away and back keeps the same summary for this generation.
+    let first = page
+        .view()
+        .audit
+        .as_ref()
+        .expect("summary")
+        .headline
+        .clone();
+    for _ in 0..3 {
+        assert_eq!(
+            page.view().audit.as_ref().map(|a| a.headline.clone()),
+            Some(first.clone()),
+            "the same generation must keep its summary across views"
+        );
+    }
+
+    // A cancelled new generation never shows a success summary.
+    page.apply(DatSourcesPageAction::Audit {
+        id: "collection".to_string(),
+        scan_root: roms,
+    });
+    page.apply(DatSourcesPageAction::CancelJob);
+    run_to_completion(&mut page);
+    assert!(
+        page.view().audit.is_none(),
+        "a cancelled audit never shows a success summary"
+    );
 }
 
 #[test]
@@ -1044,11 +1159,42 @@ fn the_page_states_what_it_supports_and_what_it_will_never_do() {
 // Validation warning presentation
 // ---------------------------------------------------------------------------
 
+/// A warning-severity diagnostic for a test report.
+fn warn(message: impl Into<String>) -> DatDiagnostic {
+    diagnostic(DiagnosticSeverity::Warning, "test_warning", message)
+}
+
+/// A parser-note-severity diagnostic for a test report.
+fn note(message: impl Into<String>) -> DatDiagnostic {
+    diagnostic(DiagnosticSeverity::Note, "test_note", message)
+}
+
+/// An error-severity diagnostic for a test report.
+fn error(message: impl Into<String>) -> DatDiagnostic {
+    diagnostic(DiagnosticSeverity::Error, "test_error", message)
+}
+
+fn diagnostic(
+    severity: DiagnosticSeverity,
+    code: &'static str,
+    message: impl Into<String>,
+) -> DatDiagnostic {
+    DatDiagnostic {
+        severity,
+        code,
+        message: message.into(),
+        line: None,
+        column: None,
+    }
+}
+
 /// A page holding one folder source plus a stored validation report built by
-/// the test, so warning presentation can be driven without depending on parser
-/// wording.
+/// the test, so diagnostic presentation can be driven without depending on
+/// parser wording. The health state is supplied by the test because it now
+/// depends on the severities present.
 fn page_with_report(
-    per_file_warnings: Vec<Vec<String>>,
+    per_file_diagnostics: Vec<Vec<DatDiagnostic>>,
+    state: DatHealthState,
     truncated: bool,
     total_dat_files: Option<usize>,
 ) -> (Fixture, DatSourcesPageState) {
@@ -1059,10 +1205,10 @@ fn page_with_report(
         path: folder.clone(),
     });
     let id = "warn".to_string();
-    let files: Vec<DatFileReport> = per_file_warnings
+    let files: Vec<DatFileReport> = per_file_diagnostics
         .iter()
         .enumerate()
-        .map(|(index, warnings)| DatFileReport {
+        .map(|(index, diagnostics)| DatFileReport {
             path: format!("{}/warn-{index}.dat", folder.display()),
             file_name: format!("warn-{index}.dat"),
             outcome: DatFileOutcome::Parsed {
@@ -1072,7 +1218,7 @@ fn page_with_report(
                 version: Some("2026-01-01".to_string()),
                 entry_count: 1,
                 rom_count: 1,
-                warnings: warnings.clone(),
+                diagnostics: diagnostics.clone(),
             },
         })
         .collect();
@@ -1080,7 +1226,7 @@ fn page_with_report(
         source_id: id.clone(),
         path: folder.to_string_lossy().into_owned(),
         kind: "DAT folder",
-        state: DatHealthState::ValidWithWarnings,
+        state,
         files,
         duplicate_identities: Vec::new(),
         skipped: Vec::new(),
@@ -1109,6 +1255,17 @@ fn render(view: &DatSourcesPageView, ui_state: &mut DatSourcesPageUi) -> egui::F
     })
 }
 
+/// Draws only the running-job card, so the platform line can be asserted
+/// without the source card's own platform control interfering.
+fn render_running_card(running: &RunningJobView) -> egui::FullOutput {
+    let context = egui::Context::default();
+    context.run(egui::RawInput::default(), |context| {
+        egui::CentralPanel::default().show(context, |ui| {
+            let _ = show_running_job(ui, running);
+        });
+    })
+}
+
 /// The same helper the shared widgets' own tests use.
 fn rendered_text_contains(output: &egui::FullOutput, needle: &str) -> bool {
     fn shape_contains(shape: &egui::Shape, needle: &str) -> bool {
@@ -1124,61 +1281,583 @@ fn rendered_text_contains(output: &egui::FullOutput, needle: &str) -> bool {
         .any(|clipped| shape_contains(&clipped.shape, needle))
 }
 
+/// How many times `needle` appears across every rendered text shape.
+fn rendered_text_count(output: &egui::FullOutput, needle: &str) -> usize {
+    fn shape_count(shape: &egui::Shape, needle: &str) -> usize {
+        match shape {
+            egui::Shape::Text(text_shape) => text_shape.galley.text().matches(needle).count(),
+            egui::Shape::Vec(nested) => nested.iter().map(|shape| shape_count(shape, needle)).sum(),
+            _ => 0,
+        }
+    }
+    output
+        .shapes
+        .iter()
+        .map(|clipped| shape_count(&clipped.shape, needle))
+        .sum()
+}
+
 #[test]
 fn warnings_render_count_summary_and_expandable_details() {
     let warnings = vec![
         "The header version differs from the file's name".to_string(),
         "A ROM entry has no SHA-1 checksum; only CRC32 was compared".to_string(),
     ];
-    let (_fixture, page) = page_with_report(vec![warnings.clone()], false, None);
+    let diagnostics = vec![warnings.iter().map(warn).collect::<Vec<_>>()];
+    let (_fixture, page) =
+        page_with_report(diagnostics, DatHealthState::ValidWithWarnings, false, None);
     let view = page.view();
-    assert_eq!(view.rows[0].warnings.len(), 2);
-    assert_eq!(view.rows[0].health_state, DatHealthState::ValidWithWarnings);
+    let row = &view.rows[0];
+    assert_eq!(row.diagnostic_types(DiagnosticSeverity::Warning), 2);
+    assert_eq!(row.diagnostic_occurrences(DiagnosticSeverity::Warning), 2);
+    assert_eq!(row.health_state, DatHealthState::ValidWithWarnings);
 
     let mut ui_state = DatSourcesPageUi::default();
     let collapsed = render(&view, &mut ui_state);
     assert!(
-        rendered_text_contains(&collapsed, "2 warnings"),
-        "the count must sit on the card"
+        rendered_text_contains(&collapsed, "2 warning types, 2 occurrences"),
+        "the type and occurrence counts must sit on the card"
     );
     assert!(
-        rendered_text_contains(&collapsed, "View warning details"),
+        rendered_text_contains(&collapsed, "View locations"),
         "an expandable control must be offered"
     );
-    assert!(
-        !rendered_text_contains(&collapsed, &warnings[1]),
-        "the details list must stay hidden until the user expands it"
-    );
-
-    ui_state.open_warnings = Some(view.rows[0].id.clone());
-    let expanded = render(&view, &mut ui_state);
-    assert!(rendered_text_contains(&expanded, "Hide warning details"));
     for warning in &warnings {
         assert!(
-            rendered_text_contains(&expanded, warning),
-            "the full original text must appear when expanded"
+            rendered_text_contains(&collapsed, warning),
+            "each group's message is visible without expanding"
         );
     }
+    assert!(
+        !rendered_text_contains(&collapsed, "Location unavailable"),
+        "the drill-down must stay hidden until the user expands a group"
+    );
+
+    // Expanding one group reveals its locations (unavailable here, since the
+    // test diagnostics carry no parser location).
+    ui_state.open_diagnostic = Some(row.groups[0].id.clone());
+    let expanded = render(&view, &mut ui_state);
+    assert!(rendered_text_contains(&expanded, "Hide locations"));
+    assert!(rendered_text_contains(&expanded, "Location unavailable"));
 }
 
 #[test]
 fn zero_warnings_show_no_warning_details_control() {
-    let (_fixture, page) = page_with_report(vec![Vec::new()], false, None);
+    let (_fixture, page) = page_with_report(vec![Vec::new()], DatHealthState::Valid, false, None);
     let view = page.view();
-    assert!(view.rows[0].warnings.is_empty());
+    let row = &view.rows[0];
+    assert_eq!(row.diagnostic_types(DiagnosticSeverity::Warning), 0);
+    assert_eq!(row.diagnostic_occurrences(DiagnosticSeverity::Warning), 0);
+    assert!(row.groups.is_empty());
 
     let mut ui_state = DatSourcesPageUi::default();
     let output = render(&view, &mut ui_state);
     assert!(
-        !rendered_text_contains(&output, "View warning details"),
-        "no warnings means no details control"
+        !rendered_text_contains(&output, "View locations"),
+        "no diagnostics means no details control"
     );
+}
+#[test]
+fn warnings_and_parser_notes_render_as_separate_sections() {
+    // A parsed file carrying both a real warning and a parser note must show
+    // them as two distinct, labelled sections - the note must never be counted
+    // as a warning.
+    let note_text = "DOCTYPE declaration accepted as inert text";
+    let warning_text =
+        "crc attribute on a rom element is not a well-formed checksum and was dropped";
+    let (_fixture, page) = page_with_report(
+        vec![vec![warn(warning_text), note(note_text)]],
+        DatHealthState::ValidWithWarnings,
+        false,
+        None,
+    );
+    let view = page.view();
+    let row = &view.rows[0];
+    assert_eq!(row.diagnostic_types(DiagnosticSeverity::Warning), 1);
+    assert_eq!(row.diagnostic_types(DiagnosticSeverity::Note), 1);
+    let warning_group = row.groups_of(DiagnosticSeverity::Warning)[0];
+    let note_group = row.groups_of(DiagnosticSeverity::Note)[0];
+    assert_eq!(warning_group.message, warning_text);
+    assert_eq!(note_group.message, note_text);
+
+    let mut ui_state = DatSourcesPageUi::default();
+    let output = render(&view, &mut ui_state);
+    assert!(rendered_text_contains(
+        &output,
+        "1 warning type, 1 occurrence"
+    ));
+    assert!(rendered_text_contains(
+        &output,
+        "1 parser-note type, 1 occurrence"
+    ));
+    // The note reassurance is always on the card.
+    assert!(rendered_text_contains(
+        &output,
+        "Parser notes are expected parser behaviour and need no action."
+    ));
+
+    // Expanding a note group reveals its (unavailable) location.
+    ui_state.open_diagnostic = Some(note_group.id.clone());
+    let expanded = render(&view, &mut ui_state);
+    assert!(rendered_text_contains(&expanded, "Hide locations"));
+    assert!(rendered_text_contains(&expanded, note_text));
+}
+
+#[test]
+fn an_error_diagnostic_renders_in_its_own_section_not_as_a_warning() {
+    // An Error-severity diagnostic must not be folded into the warnings list:
+    // it gets its own Blocked section, and the source reads Invalid.
+    let error_text = "the catalogue declares an entry the build refuses to index";
+    let (_fixture, page) = page_with_report(
+        vec![vec![error(error_text)]],
+        DatHealthState::Invalid,
+        false,
+        None,
+    );
+    let view = page.view();
+    let row = &view.rows[0];
+    assert_eq!(row.diagnostic_types(DiagnosticSeverity::Error), 1);
+    assert_eq!(row.diagnostic_types(DiagnosticSeverity::Warning), 0);
+    assert_eq!(row.diagnostic_types(DiagnosticSeverity::Note), 0);
+    assert_eq!(row.health_state, DatHealthState::Invalid);
+
+    let mut ui_state = DatSourcesPageUi::default();
+    let output = render(&view, &mut ui_state);
+    assert!(rendered_text_contains(
+        &output,
+        "1 error type, 1 occurrence"
+    ));
+    assert!(rendered_text_contains(&output, error_text));
+    assert!(
+        !rendered_text_contains(&output, "warning type"),
+        "the error must not appear in a warning section"
+    );
+}
+
+#[test]
+fn mixed_errors_warnings_and_notes_render_as_three_sections() {
+    // All three severities present: each gets its own labelled section, and the
+    // badge stays driven by core health (Invalid because an error is present).
+    let error_text = "one entry was refused";
+    let warning_text = "a checksum was dropped";
+    let note_text = "DOCTYPE declaration accepted as inert text";
+    let (_fixture, page) = page_with_report(
+        vec![vec![error(error_text), warn(warning_text), note(note_text)]],
+        DatHealthState::Invalid,
+        false,
+        None,
+    );
+    let view = page.view();
+    let row = &view.rows[0];
+    assert_eq!(row.diagnostic_types(DiagnosticSeverity::Error), 1);
+    assert_eq!(row.diagnostic_types(DiagnosticSeverity::Warning), 1);
+    assert_eq!(row.diagnostic_types(DiagnosticSeverity::Note), 1);
+
+    let mut ui_state = DatSourcesPageUi::default();
+    let output = render(&view, &mut ui_state);
+    assert!(rendered_text_contains(&output, "Invalid"));
+    assert!(rendered_text_contains(
+        &output,
+        "1 error type, 1 occurrence"
+    ));
+    assert!(rendered_text_contains(
+        &output,
+        "1 warning type, 1 occurrence"
+    ));
+    assert!(rendered_text_contains(
+        &output,
+        "1 parser-note type, 1 occurrence"
+    ));
+}
+
+#[test]
+fn repeated_identical_notes_group_into_one_type_with_full_occurrence_count() {
+    // A folder of 512 DAT files all carrying the same DOCTYPE note must render
+    // as ONE group with an occurrence count - never 512 separate lines.
+    let fixture = Fixture::new();
+    let folder = fixture.dir("dats");
+    for index in 0..512 {
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE datafile PUBLIC "-//Logiqx//DTD ROM Management Datafile//EN" "http://www.logiqx.com/Dats/datafile.dtd">
+<datafile><header><name>Set {index}</name><version>1</version></header>
+<game name="Game {index}"><rom name="g.bin" size="16" crc="0c7e7fd8"/></game></datafile>"#
+        );
+        std::fs::write(folder.join(format!("set-{index:04}.dat")), &xml).unwrap();
+    }
+
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddFolder { path: folder });
+    page.apply(DatSourcesPageAction::Validate {
+        id: "dats".to_string(),
+    });
+    run_to_completion(&mut page);
+
+    let view = page.view();
+    let row = &view.rows[0];
+    assert_eq!(
+        row.health_state,
+        DatHealthState::Valid,
+        "parser notes do not lower the verdict"
+    );
+    assert_eq!(row.diagnostic_types(DiagnosticSeverity::Note), 1);
+    assert_eq!(row.diagnostic_occurrences(DiagnosticSeverity::Note), 512);
+    let note_group = &row.groups_of(DiagnosticSeverity::Note)[0];
+    assert_eq!(note_group.affected_file_count, 512);
+    assert_eq!(
+        note_group.occurrences.len(),
+        MAX_DIAGNOSTIC_OCCURRENCES_SHOWN,
+        "the drill-down must be bounded"
+    );
+    assert!(note_group.occurrences_truncated);
+
+    let mut ui_state = DatSourcesPageUi::default();
+    let output = render(&view, &mut ui_state);
+    assert!(rendered_text_contains(
+        &output,
+        "1 parser-note type, 512 occurrences"
+    ));
+}
+
+#[test]
+fn thousands_of_diagnostics_stay_bounded_and_deterministic() {
+    // 100 files x 30 identical warnings = 3000 occurrences: one group, exact
+    // counts, a drill-down capped at MAX_DIAGNOSTIC_OCCURRENCES_SHOWN rows, and
+    // a deterministic message order alongside a second distinct type.
+    let per_file: Vec<Vec<DatDiagnostic>> = (0..100)
+        .map(|_| (0..30).map(|_| warn("repeated checksum dropped")).collect())
+        .collect();
+    let mut with_second_type = per_file.clone();
+    with_second_type[0].push(note("DOCTYPE declaration accepted as inert text"));
+
+    let (_fixture, page) = page_with_report(
+        with_second_type,
+        DatHealthState::ValidWithWarnings,
+        false,
+        None,
+    );
+    let row = &page.view().rows[0];
+    assert_eq!(row.diagnostic_types(DiagnosticSeverity::Warning), 1);
+    assert_eq!(
+        row.diagnostic_occurrences(DiagnosticSeverity::Warning),
+        3000
+    );
+    assert_eq!(row.diagnostic_types(DiagnosticSeverity::Note), 1);
+
+    let warning_group = &row.groups_of(DiagnosticSeverity::Warning)[0];
+    assert_eq!(warning_group.affected_file_count, 100);
+    assert_eq!(
+        warning_group.occurrences.len(),
+        MAX_DIAGNOSTIC_OCCURRENCES_SHOWN,
+        "the drill-down must stay bounded however many diagnostics exist"
+    );
+    assert!(warning_group.occurrences_truncated);
+    assert_eq!(
+        warning_group.occurrences[0].file_name, "warn-0.dat",
+        "occurrence rows keep the file they belong to"
+    );
+    // 30 per file; the 50-row cap therefore spans warn-0.dat and warn-1.dat.
+    assert_eq!(
+        warning_group.occurrences[29].file_name, "warn-0.dat",
+        "occurrences stay in file order"
+    );
+    assert_eq!(
+        warning_group.occurrences.last().unwrap().file_name,
+        "warn-1.dat",
+        "the cap cuts mid-file, never out of order"
+    );
+
+    // Deterministic: repeated view builds produce identical groups.
+    let first = page.view().rows[0].groups.clone();
+    let second = page.view().rows[0].groups.clone();
+    assert_eq!(first, second);
+}
+
+#[test]
+fn expanding_one_group_does_not_expand_the_others() {
+    let (_fixture, page) = page_with_report(
+        vec![vec![
+            warn("first warning text"),
+            warn("second warning text"),
+            note("first note text"),
+        ]],
+        DatHealthState::ValidWithWarnings,
+        false,
+        None,
+    );
+    let view = page.view();
+    let row = &view.rows[0];
+    let warning_groups = row.groups_of(DiagnosticSeverity::Warning);
+    assert_eq!(warning_groups.len(), 2);
+
+    let mut ui_state = DatSourcesPageUi::default();
+    let collapsed = render(&view, &mut ui_state);
+    assert_eq!(rendered_text_count(&collapsed, "View locations"), 3);
+
+    // Open only the first warning group.
+    ui_state.open_diagnostic = Some(warning_groups[0].id.clone());
+    let expanded = render(&view, &mut ui_state);
+    assert_eq!(
+        rendered_text_count(&expanded, "Hide locations"),
+        1,
+        "exactly one group expands"
+    );
+    assert_eq!(rendered_text_count(&expanded, "View locations"), 2);
+}
+
+#[test]
+fn diagnostics_group_by_code_not_only_by_message() {
+    // The same message text under two different codes is two distinct types.
+    let same_text = "identical wording, different kinds";
+    let (_fixture, page) = page_with_report(
+        vec![vec![
+            DatDiagnostic {
+                severity: DiagnosticSeverity::Warning,
+                code: "code_a",
+                message: same_text.to_string(),
+                line: None,
+                column: None,
+            },
+            DatDiagnostic {
+                severity: DiagnosticSeverity::Warning,
+                code: "code_b",
+                message: same_text.to_string(),
+                line: None,
+                column: None,
+            },
+        ]],
+        DatHealthState::ValidWithWarnings,
+        false,
+        None,
+    );
+    let row = &page.view().rows[0];
+    assert_eq!(row.diagnostic_types(DiagnosticSeverity::Warning), 2);
+    assert_eq!(row.diagnostic_occurrences(DiagnosticSeverity::Warning), 2);
+}
+
+#[test]
+fn diagnostics_with_the_same_message_at_different_severities_stay_separate() {
+    // A Note and a Warning with identical wording are two distinct groups and
+    // the note never drags the warning's verdict down.
+    let same_text = "identical wording, different severities";
+    let (_fixture, page) = page_with_report(
+        vec![vec![note(same_text), warn(same_text)]],
+        DatHealthState::ValidWithWarnings,
+        false,
+        None,
+    );
+    let row = &page.view().rows[0];
+    assert_eq!(row.diagnostic_types(DiagnosticSeverity::Note), 1);
+    assert_eq!(row.diagnostic_types(DiagnosticSeverity::Warning), 1);
+    assert_eq!(row.diagnostic_occurrences(DiagnosticSeverity::Warning), 1);
+}
+
+#[test]
+fn clrmamepro_truncation_warnings_group_across_files() {
+    // Regression: the ClrMamePro parser records a byte offset on its only
+    // warning, and DatDiagnostic used to carry the Display form of the message
+    // ("… (byte 12)"). Every occurrence then had a unique message and grouping
+    // silently failed for TOSEC/ClrMamePro - the exact format this PR exists
+    // for. The message is now the raw text; the offset lives in the location,
+    // so two identical truncations in two files become ONE group.
+    let fixture = Fixture::new();
+    let folder = fixture.dir("dats");
+    let description = "x".repeat(80);
+    for (name, header) in [("a", "A"), ("b", "B")] {
+        std::fs::write(
+            folder.join(format!("{name}.dat")),
+            format!(
+                "clrmamepro (\n\tname {header}\n\tdescription {description}\n)\n\
+                 game ( name G rom ( name {name}.bin size 1 crc deadbeef ) )\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    let mut page = fixture.page();
+    page.limits = DatLimits::builder().max_description_length(10).build();
+    page.apply(DatSourcesPageAction::AddFolder { path: folder });
+    page.apply(DatSourcesPageAction::Validate {
+        id: "dats".to_string(),
+    });
+    run_to_completion(&mut page);
+
+    let view = page.view();
+    let row = &view.rows[0];
+    assert_eq!(
+        row.health_state,
+        DatHealthState::ValidWithWarnings,
+        "a truncated description is a genuine warning"
+    );
+    assert_eq!(
+        row.diagnostic_types(DiagnosticSeverity::Warning),
+        1,
+        "two identical truncations must be one diagnostic type"
+    );
+    assert_eq!(row.diagnostic_occurrences(DiagnosticSeverity::Warning), 2);
+    let group = &row.groups_of(DiagnosticSeverity::Warning)[0];
+    assert_eq!(group.code, "description_truncated");
+    assert_eq!(
+        group.message, "description truncated from 80 to 10 bytes",
+        "the raw message must not carry a per-occurrence byte offset"
+    );
+    assert_eq!(group.affected_file_count, 2);
+    // Each occurrence keeps its own genuine one-based line and no invented
+    // column.
+    assert!(group.occurrences.iter().all(|o| o.line.is_some()));
+    assert!(group.occurrences.iter().all(|o| o.column.is_none()));
+}
+
+#[test]
+fn expanding_a_group_on_one_source_does_not_open_the_same_group_on_another() {
+    // Regression: the group id used to be "{code}:{message}", so expanding the
+    // DOCTYPE note on source A left source B's identical note open on load. The
+    // id is now scoped by source and severity.
+    let note_text = "DOCTYPE declaration accepted as inert text";
+    let fixture = Fixture::new();
+
+    // Build two independent sources that both carry the same note.
+    let mut pages = Vec::new();
+    for name in ["a", "b"] {
+        let folder = fixture.dir(name);
+        let mut page = fixture.page();
+        page.apply(DatSourcesPageAction::AddFolder {
+            path: folder.clone(),
+        });
+        let id = name.to_string();
+        let report = DatValidationReport {
+            source_id: id.clone(),
+            path: folder.to_string_lossy().into_owned(),
+            kind: "DAT folder",
+            state: DatHealthState::Valid,
+            files: vec![DatFileReport {
+                path: format!("{}/x.dat", folder.display()),
+                file_name: format!("{name}.dat"),
+                outcome: DatFileOutcome::Parsed {
+                    format: DatFormat::Logiqx,
+                    ecosystem: DatEcosystem::GenericLogiqx,
+                    name: Some("Test".to_string()),
+                    version: Some("1".to_string()),
+                    entry_count: 1,
+                    rom_count: 1,
+                    diagnostics: vec![note(note_text)],
+                },
+            }],
+            duplicate_identities: Vec::new(),
+            skipped: Vec::new(),
+            truncated: false,
+            total_dat_files: None,
+            summary: "1 DAT files, 1 entries, 1 ROMs".to_string(),
+            entry_count: 1,
+            rom_count: 1,
+            formats: vec!["Logiqx XML".to_string()],
+            path_refusal: None,
+        };
+        page.validations.insert(id, report);
+        pages.push(page);
+    }
+
+    let view_a = pages[0].view();
+    let view_b = pages[1].view();
+    assert_ne!(
+        view_a.rows[0].groups[0].id, view_b.rows[0].groups[0].id,
+        "same-typed groups on different sources must have distinct ids"
+    );
+
+    // Opening A's group must not leave B's group open.
+    let mut ui_state = DatSourcesPageUi {
+        open_diagnostic: Some(view_a.rows[0].groups[0].id.clone()),
+        ..Default::default()
+    };
+    let rendered_a = render(&view_a, &mut ui_state);
+    assert_eq!(rendered_text_count(&rendered_a, "Hide locations"), 1);
+    let rendered_b = render(&view_b, &mut ui_state);
+    assert_eq!(
+        rendered_text_count(&rendered_b, "Hide locations"),
+        0,
+        "source B's identical group must not be open just because A's was"
+    );
+    assert_eq!(rendered_text_count(&rendered_b, "View locations"), 1);
+}
+
+#[test]
+fn drill_down_shows_parser_location_when_available_and_unavailable_otherwise() {
+    // The drill-down shows line/column only when the parser provided one;
+    // otherwise it says "Location unavailable". It never re-parses to build.
+    let with_location = DatDiagnostic {
+        severity: DiagnosticSeverity::Warning,
+        code: "test_warning",
+        message: "has a location".to_string(),
+        line: Some(3),
+        column: Some(12),
+    };
+    // The ClrMamePro parser records a line but no column; that shape must read
+    // "line N", not "line N:0" and not "Location unavailable".
+    let line_only = DatDiagnostic {
+        severity: DiagnosticSeverity::Warning,
+        code: "test_warning",
+        message: "has a line only".to_string(),
+        line: Some(9),
+        column: None,
+    };
+    let without = warn("no location");
+    let (_fixture, page) = page_with_report(
+        vec![vec![with_location, line_only, without]],
+        DatHealthState::ValidWithWarnings,
+        false,
+        None,
+    );
+    let view = page.view();
+    let row = &view.rows[0];
+    let groups = row.groups_of(DiagnosticSeverity::Warning);
+    assert_eq!(groups.len(), 3);
+    let located = groups
+        .iter()
+        .find(|group| group.message == "has a location")
+        .unwrap();
+    assert_eq!(located.occurrences[0].line, Some(3));
+    assert_eq!(located.occurrences[0].column, Some(12));
+
+    let mut ui_state = DatSourcesPageUi {
+        open_diagnostic: Some(located.id.clone()),
+        ..Default::default()
+    };
+    let located_output = render(&view, &mut ui_state);
+    assert!(rendered_text_contains(&located_output, "line 3:12"));
+
+    let line_only_group = groups
+        .iter()
+        .find(|group| group.message == "has a line only")
+        .unwrap();
+    ui_state.open_diagnostic = Some(line_only_group.id.clone());
+    let line_only_output = render(&view, &mut ui_state);
+    assert!(rendered_text_contains(&line_only_output, "line 9"));
+    assert!(
+        !rendered_text_contains(&line_only_output, "line 9:0"),
+        "a missing column must not be rendered as zero"
+    );
+
+    let unlocated = groups
+        .iter()
+        .find(|group| group.message == "no location")
+        .unwrap();
+    ui_state.open_diagnostic = Some(unlocated.id.clone());
+    let unlocated_output = render(&view, &mut ui_state);
+    assert!(rendered_text_contains(
+        &unlocated_output,
+        "Location unavailable"
+    ));
 }
 
 #[test]
 fn a_safety_limit_stop_is_labelled_incomplete_and_counts_are_exact() {
     // Both numbers genuinely known: the read count and the folder's real total.
-    let (_fixture, page) = page_with_report(vec![vec!["w".to_string()]], true, Some(2024));
+    let (_fixture, page) = page_with_report(
+        vec![vec![warn("w")]],
+        DatHealthState::ValidWithWarnings,
+        true,
+        Some(2024),
+    );
     let row = &page.view().rows[0];
     assert!(row.incomplete_load);
     assert_eq!(row.dat_files_read, Some(1));
@@ -1189,7 +1868,12 @@ fn a_safety_limit_stop_is_labelled_incomplete_and_counts_are_exact() {
     );
 
     // An unknown total never invents one: the safety limit is named instead.
-    let (_fixture, page) = page_with_report(vec![vec!["w".to_string()]], true, None);
+    let (_fixture, page) = page_with_report(
+        vec![vec![warn("w")]],
+        DatHealthState::ValidWithWarnings,
+        true,
+        None,
+    );
     let row = &page.view().rows[0];
     assert!(row.incomplete_load);
     assert_eq!(row.dat_files_total, None);
@@ -1201,7 +1885,12 @@ fn a_safety_limit_stop_is_labelled_incomplete_and_counts_are_exact() {
 
 #[test]
 fn an_incomplete_load_is_drawn_prominently_with_its_counts() {
-    let (_fixture, page) = page_with_report(vec![vec!["w".to_string()]], true, Some(2024));
+    let (_fixture, page) = page_with_report(
+        vec![vec![warn("w")]],
+        DatHealthState::ValidWithWarnings,
+        true,
+        Some(2024),
+    );
     let view = page.view();
     let mut ui_state = DatSourcesPageUi::default();
     let output = render(&view, &mut ui_state);
@@ -1217,7 +1906,12 @@ fn unknown_total_never_invents_a_count_or_percentage() {
     assert_eq!(format_percentage(5, 0), None);
     assert_eq!(format_percentage(0, 0), None);
 
-    let (_fixture, page) = page_with_report(vec![vec!["w".to_string()]], true, None);
+    let (_fixture, page) = page_with_report(
+        vec![vec![warn("w")]],
+        DatHealthState::ValidWithWarnings,
+        true,
+        None,
+    );
     let row = &page.view().rows[0];
     assert_eq!(row.dat_files_read, Some(1), "the read count is still known");
     assert_eq!(row.dat_files_total, None);
@@ -1231,21 +1925,32 @@ fn unknown_total_never_invents_a_count_or_percentage() {
 #[test]
 fn warning_order_is_deterministic() {
     let per_file = vec![
-        vec!["first-a".to_string(), "second-a".to_string()],
-        vec!["first-b".to_string(), "second-b".to_string()],
+        vec![warn("first-a"), warn("second-a")],
+        vec![warn("first-b"), warn("second-b")],
     ];
-    let (_fixture, page) = page_with_report(per_file, false, None);
+    let (_fixture, page) =
+        page_with_report(per_file, DatHealthState::ValidWithWarnings, false, None);
     let row = &page.view().rows[0];
+    let messages: Vec<&str> = row
+        .groups
+        .iter()
+        .map(|group| group.message.as_str())
+        .collect();
     assert_eq!(
-        row.warnings,
-        vec!["first-a", "second-a", "first-b", "second-b"],
-        "warnings must come in file order, files in name order, never in read_dir order"
+        messages,
+        vec!["first-a", "first-b", "second-a", "second-b"],
+        "groups must come in a deterministic order (by message), never in read_dir order"
     );
 }
 
 #[test]
 fn the_history_and_logs_reference_is_only_drawn_when_details_are_recorded_there() {
-    let (_fixture, page) = page_with_report(vec![vec!["w".to_string()]], false, None);
+    let (_fixture, page) = page_with_report(
+        vec![vec![warn("w")]],
+        DatHealthState::ValidWithWarnings,
+        false,
+        None,
+    );
     let mut view = page.view();
     // Nothing is recorded in History & Logs today, so the honest card does not
     // point there.
@@ -1270,27 +1975,246 @@ fn the_history_and_logs_reference_is_only_drawn_when_details_are_recorded_there(
 fn warnings_are_prominent_on_the_card_not_buried_behind_inspect() {
     // Regression: the old card showed the "Valid, with warnings" badge, but
     // the warning text was only reachable by opening Inspect and reading a
-    // nested per-file list. The count and an expandable "View warning details"
-    // control now sit on the card itself.
-    let warnings = vec![
-        "A ROM entry has no SHA-1 checksum; only CRC32 was compared".to_string(),
-        "The header declares a version that differs from the filename".to_string(),
-    ];
-    let (_fixture, page) = page_with_report(vec![warnings.clone()], false, None);
+    // nested per-file list. The type/occurrence counts and the expandable
+    // drill-down control now sit on the card itself.
+    let diagnostics = vec![vec![
+        warn("A ROM entry has no SHA-1 checksum; only CRC32 was compared"),
+        warn("The header declares a version that differs from the filename"),
+    ]];
+    let (_fixture, page) =
+        page_with_report(diagnostics, DatHealthState::ValidWithWarnings, false, None);
     let view = page.view();
-    assert_eq!(view.rows[0].health_state, DatHealthState::ValidWithWarnings);
+    let row = &view.rows[0];
+    assert_eq!(row.health_state, DatHealthState::ValidWithWarnings);
+    assert_eq!(row.diagnostic_types(DiagnosticSeverity::Warning), 2);
 
     let mut ui_state = DatSourcesPageUi::default();
     let output = render(&view, &mut ui_state);
     assert!(rendered_text_contains(&output, "Valid, with warnings"));
     assert!(
-        rendered_text_contains(&output, "2 warnings"),
-        "the count must be visible without any disclosure click"
+        rendered_text_contains(&output, "2 warning types, 2 occurrences"),
+        "the counts must be visible without any disclosure click"
     );
     assert!(
-        rendered_text_contains(&output, "View warning details"),
+        rendered_text_contains(&output, "View locations"),
         "the expandable control must be visible without opening Inspect"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostic severity: the TOSEC DOCTYPE reproduction and its neighbours
+// ---------------------------------------------------------------------------
+
+/// A Logiqx XML DAT carrying the standard DOCTYPE plus `games` entries.
+///
+/// The DOCTYPE is expected parser behaviour and must surface as a parser note,
+/// never as a warning. This is the reproduction reported against the GUI: a
+/// single TOSEC DAT whose only diagnostic was the DOCTYPE, shown as "Valid,
+/// with warnings" and "1 warning".
+fn logiqx_with_doctype_and_entries(games: usize) -> String {
+    let mut xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <!DOCTYPE datafile PUBLIC \"-//Logiqx//DTD ROM Management Datafile//EN\" \
+         \"http://www.logiqx.com/Dats/datafile.dtd\">\n\
+         <datafile>\n\
+         <header><name>Test TOSEC Set</name><version>2026-01-01</version></header>\n",
+    );
+    for index in 0..games {
+        xml.push_str(&format!(
+            "<game name=\"Game {index}\"><rom name=\"g{index}.bin\" size=\"16\" crc=\"{index:08x}\"/></game>\n"
+        ));
+    }
+    xml.push_str("</datafile>\n");
+    xml
+}
+
+/// A Logiqx XML DAT whose checksum is malformed: the parser drops it and warns,
+/// so the DAT parses but carries a real warning.
+fn logiqx_with_malformed_checksum(doctype: bool) -> String {
+    let doctype = if doctype {
+        "<!DOCTYPE datafile PUBLIC \"-//Logiqx//DTD ROM Management Datafile//EN\" \
+         \"http://www.logiqx.com/Dats/datafile.dtd\">\n"
+    } else {
+        ""
+    };
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+{doctype}<datafile><game name="G"><rom name="a.bin" size="4" crc="not-a-checksum"/></game></datafile>"#
+    )
+}
+
+#[test]
+fn a_doctype_parser_note_shows_valid_with_no_warnings() {
+    // The exact reproduction: a single TOSEC DAT, 1005 entries, whose only
+    // diagnostic is the DOCTYPE parser note. It must read "Valid" and "1 parser
+    // note", never "Valid, with warnings" or "1 warning".
+    let fixture = Fixture::new();
+    let dat = fixture.write("tosec.dat", &logiqx_with_doctype_and_entries(1005));
+
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddFile { path: dat });
+    page.apply(DatSourcesPageAction::Validate {
+        id: "tosec".to_string(),
+    });
+    run_to_completion(&mut page);
+
+    let view = page.view();
+    let row = &view.rows[0];
+    assert_eq!(row.entry_count, Some(1005));
+    assert_eq!(row.rom_count, Some(1005));
+    assert_eq!(
+        row.health_state,
+        DatHealthState::Valid,
+        "a parser note must not lower the verdict"
+    );
+    assert_eq!(
+        row.diagnostic_types(DiagnosticSeverity::Warning),
+        0,
+        "the DOCTYPE must not surface as a warning"
+    );
+    assert_eq!(
+        row.diagnostic_types(DiagnosticSeverity::Note),
+        1,
+        "the DOCTYPE must be a single parser-note type"
+    );
+    assert_eq!(row.diagnostic_occurrences(DiagnosticSeverity::Note), 1);
+    let note_group = &row.groups_of(DiagnosticSeverity::Note)[0];
+    assert!(
+        note_group.message.contains("DOCTYPE"),
+        "{}",
+        note_group.message
+    );
+
+    let mut ui_state = DatSourcesPageUi::default();
+    let output = render(&view, &mut ui_state);
+    assert!(!rendered_text_contains(&output, "with warnings"));
+    assert!(
+        !rendered_text_contains(&output, "warning type"),
+        "the note must not be called a warning"
+    );
+    assert!(rendered_text_contains(
+        &output,
+        "1 parser-note type, 1 occurrence"
+    ));
+    assert!(rendered_text_contains(&output, "View locations"));
+}
+
+#[test]
+fn a_real_warning_shows_valid_with_warnings() {
+    let fixture = Fixture::new();
+    let dat = fixture.write("warn.dat", &logiqx_with_malformed_checksum(false));
+
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddFile { path: dat });
+    page.apply(DatSourcesPageAction::Validate {
+        id: "warn".to_string(),
+    });
+    run_to_completion(&mut page);
+
+    let view = page.view();
+    let row = &view.rows[0];
+    assert_eq!(row.health_state, DatHealthState::ValidWithWarnings);
+    assert_eq!(row.diagnostic_types(DiagnosticSeverity::Warning), 1);
+    assert_eq!(row.diagnostic_occurrences(DiagnosticSeverity::Warning), 1);
+    assert_eq!(row.diagnostic_types(DiagnosticSeverity::Note), 0);
+
+    let mut ui_state = DatSourcesPageUi::default();
+    let output = render(&view, &mut ui_state);
+    assert!(rendered_text_contains(&output, "Valid, with warnings"));
+    assert!(rendered_text_contains(
+        &output,
+        "1 warning type, 1 occurrence"
+    ));
+    assert!(rendered_text_contains(&output, "View locations"));
+}
+
+#[test]
+fn a_real_parser_failure_shows_invalid() {
+    let fixture = Fixture::new();
+    let dat = fixture.write("broken.dat", "<?xml version=\"1.0\"?><datafile><game");
+
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddFile { path: dat });
+    page.apply(DatSourcesPageAction::Validate {
+        id: "broken".to_string(),
+    });
+    run_to_completion(&mut page);
+
+    let view = page.view();
+    let row = &view.rows[0];
+    assert_eq!(row.health_state, DatHealthState::Invalid);
+    assert_eq!(row.diagnostic_types(DiagnosticSeverity::Warning), 0);
+    assert_eq!(row.diagnostic_types(DiagnosticSeverity::Note), 0);
+    assert!(row.groups.is_empty());
+
+    let mut ui_state = DatSourcesPageUi::default();
+    let output = render(&view, &mut ui_state);
+    assert!(rendered_text_contains(&output, "Invalid"));
+    assert!(!rendered_text_contains(&output, "View locations"));
+}
+
+#[test]
+fn mixed_warning_and_notes_shows_valid_with_warnings() {
+    let fixture = Fixture::new();
+    let dat = fixture.write("mixed.dat", &logiqx_with_malformed_checksum(true));
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddFile { path: dat });
+    page.apply(DatSourcesPageAction::Validate {
+        id: "mixed".to_string(),
+    });
+    run_to_completion(&mut page);
+
+    let view = page.view();
+    let row = &view.rows[0];
+    assert_eq!(
+        row.health_state,
+        DatHealthState::ValidWithWarnings,
+        "a warning overrides parser notes in the verdict"
+    );
+    assert_eq!(row.diagnostic_types(DiagnosticSeverity::Warning), 1);
+    assert_eq!(row.diagnostic_types(DiagnosticSeverity::Note), 1);
+
+    let mut ui_state = DatSourcesPageUi::default();
+    let output = render(&view, &mut ui_state);
+    assert!(rendered_text_contains(&output, "Valid, with warnings"));
+    assert!(rendered_text_contains(
+        &output,
+        "1 warning type, 1 occurrence"
+    ));
+    assert!(rendered_text_contains(
+        &output,
+        "1 parser-note type, 1 occurrence"
+    ));
+}
+
+#[test]
+fn mixed_errors_warnings_and_notes_shows_invalid() {
+    let fixture = Fixture::new();
+    let folder = fixture.dir("mixed");
+    std::fs::write(
+        folder.join("broken.dat"),
+        "<?xml version=\"1.0\"?><datafile><game",
+    )
+    .unwrap();
+    std::fs::write(folder.join("ok.dat"), logiqx_with_malformed_checksum(true)).unwrap();
+
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddFolder { path: folder });
+    page.apply(DatSourcesPageAction::Validate {
+        id: "mixed".to_string(),
+    });
+    run_to_completion(&mut page);
+
+    let view = page.view();
+    assert_eq!(
+        view.rows[0].health_state,
+        DatHealthState::Invalid,
+        "an error in any file makes the whole source invalid"
+    );
+
+    let mut ui_state = DatSourcesPageUi::default();
+    let output = render(&view, &mut ui_state);
+    assert!(rendered_text_contains(&output, "Invalid"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1473,6 +2397,7 @@ fn draining_a_progress_backlog_keeps_the_eta_stable() {
         latest: "Starting…".to_string(),
         started_at: Instant::now() - Duration::from_secs(60),
         audit_progress: Some(AuditProgressTracker::new()),
+        platform_display: None,
     });
 
     let total = 1000;
@@ -1504,6 +2429,9 @@ fn draining_a_progress_backlog_keeps_the_eta_stable() {
     let running = page.view().running.expect("the job is still running");
     let progress = running.progress.as_ref().expect("audit progress");
     assert_eq!(progress.files_checked, 103);
+    // Coalescing: after draining a 101-message backlog in one pass, the detail
+    // line is the last event's, not the first's.
+    assert_eq!(running.detail, "Checking 103 of 1000: f103.bin");
     match &progress.eta {
         EtaView::About { seconds_remaining } => {
             // ~50 files/s with 897 left is on the order of 18 seconds. A
@@ -1591,6 +2519,7 @@ fn take_over_job(page: &mut DatSourcesPageState, latest: &str) -> SyncSender<Job
         latest: latest.to_string(),
         started_at: Instant::now(),
         audit_progress: Some(AuditProgressTracker::new()),
+        platform_display: None,
     });
     sender
 }
@@ -1726,4 +2655,80 @@ fn a_cancelled_audit_never_appears_complete() {
         "a cancelled audit never appears complete"
     );
     assert!(view.audit_error.is_none(), "cancelling is not a failure");
+}
+
+// ---------------------------------------------------------------------------
+// Richer live audit context
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_running_card_shows_the_platform_only_when_authoritative() {
+    let (_fixture, mut page, roms) = audit_fixture();
+    // An unassigned source gets no platform line at all.
+    page.apply(DatSourcesPageAction::Audit {
+        id: "collection".to_string(),
+        scan_root: roms.clone(),
+    });
+    let unassigned = page.view().running.expect("running").clone();
+    assert!(
+        unassigned.platform_display.is_none(),
+        "no platform may be claimed for an unassigned source"
+    );
+    assert!(!rendered_text_contains(
+        &render_running_card(&unassigned),
+        "Platform:"
+    ));
+    page.apply(DatSourcesPageAction::CancelJob);
+    run_to_completion(&mut page);
+
+    // A recognised assignment is authoritative and appears on the running card.
+    let canonical = archivefs_core::platform::canonical_ids()[0];
+    page.apply(DatSourcesPageAction::SetPlatform {
+        id: "collection".to_string(),
+        platform: Some(canonical.to_string()),
+    });
+    page.apply(DatSourcesPageAction::Audit {
+        id: "collection".to_string(),
+        scan_root: roms.clone(),
+    });
+
+    let assigned = page.view().running.expect("running").clone();
+    assert_eq!(
+        assigned.platform_display.as_deref(),
+        Some(archivefs_core::platform::display_name_for(canonical)),
+        "a resolved assignment must be shown"
+    );
+    assert!(rendered_text_contains(
+        &render_running_card(&assigned),
+        "Platform:"
+    ));
+    page.apply(DatSourcesPageAction::CancelJob);
+    run_to_completion(&mut page);
+}
+
+#[test]
+fn an_unresolved_platform_is_never_presented_on_the_running_card() {
+    // An assignment this build does not recognise is kept, but must not be
+    // presented as authoritative during a run.
+    let (_fixture, mut page, roms) = audit_fixture();
+    page.apply(DatSourcesPageAction::SetPlatform {
+        id: "collection".to_string(),
+        platform: Some("APlatformFromALaterBuild".to_string()),
+    });
+    page.apply(DatSourcesPageAction::Audit {
+        id: "collection".to_string(),
+        scan_root: roms,
+    });
+
+    let running = page.view().running.expect("running").clone();
+    assert!(
+        running.platform_display.is_none(),
+        "an unresolved platform must not be claimed"
+    );
+    assert!(!rendered_text_contains(
+        &render_running_card(&running),
+        "Platform:"
+    ));
+    page.apply(DatSourcesPageAction::CancelJob);
+    run_to_completion(&mut page);
 }

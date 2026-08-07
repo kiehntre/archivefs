@@ -45,6 +45,7 @@ use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::time::Instant;
 
 use archivefs_core::dat::limits::DatLimits;
+use archivefs_core::dat::parser::DiagnosticSeverity;
 use archivefs_core::dat::sources::audit_run::{
     DatAuditOutcome, DatAuditProgress, DatAuditRequest, run_dat_audit,
 };
@@ -128,9 +129,10 @@ pub(crate) struct DatSourceRowView {
     pub(crate) busy: bool,
     /// The last validation run's per-file breakdown, if one has been run.
     pub(crate) detail: Option<InspectView>,
-    /// Every warning the last validation found, flattened across files in the
-    /// deterministic order the files were read. Empty when there were none.
-    pub(crate) warnings: Vec<String>,
+    /// The last validation's diagnostics, grouped by (severity, code, message)
+    /// and sorted by severity then code then message. Deterministic, bounded,
+    /// and never reparsed to build.
+    pub(crate) groups: Vec<DiagnosticGroupView>,
     /// The bounded safety limit stopped the last validation part-way through a
     /// folder, so the verdict covers only part of it. Must never be presented
     /// as "everything was checked".
@@ -161,6 +163,27 @@ impl DatSourceRowView {
             _ => Some("Processing stopped at the configured safety limit".to_string()),
         }
     }
+
+    /// The groups of one severity, in deterministic order.
+    pub(crate) fn groups_of(&self, severity: DiagnosticSeverity) -> Vec<&DiagnosticGroupView> {
+        self.groups
+            .iter()
+            .filter(|group| group.severity == severity)
+            .collect()
+    }
+
+    /// How many distinct diagnostic types (groups) have this severity.
+    pub(crate) fn diagnostic_types(&self, severity: DiagnosticSeverity) -> usize {
+        self.groups_of(severity).len()
+    }
+
+    /// How many total occurrences of this severity were found.
+    pub(crate) fn diagnostic_occurrences(&self, severity: DiagnosticSeverity) -> usize {
+        self.groups_of(severity)
+            .iter()
+            .map(|group| group.occurrence_count)
+            .sum()
+    }
 }
 
 /// One DAT file inside a source, as the Inspect panel lists it.
@@ -170,7 +193,46 @@ pub(crate) struct InspectFileView {
     pub(crate) status: &'static str,
     /// The format and counts, or the parser's error.
     pub(crate) detail: String,
+    pub(crate) errors: Vec<String>,
     pub(crate) warnings: Vec<String>,
+    pub(crate) notes: Vec<String>,
+}
+
+/// How many occurrence rows a diagnostic group will show before truncating.
+/// The drill-down is bounded so a folder of hundreds of affected files cannot
+/// produce an unbounded list.
+pub(crate) const MAX_DIAGNOSTIC_OCCURRENCES_SHOWN: usize = 50;
+
+/// One occurrence of a diagnostic, with the safe DAT filename and the location
+/// the parser recorded (when it records one).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DiagnosticOccurrenceView {
+    /// The DAT file's name only - never an absolute path.
+    pub(crate) file_name: String,
+    pub(crate) line: Option<usize>,
+    pub(crate) column: Option<usize>,
+}
+
+/// Repeated diagnostics from a validation run, grouped into one row per
+/// distinct (severity, code, message) so 512 identical DOCTYPE notes render as
+/// one group with an occurrence count instead of 512 lines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DiagnosticGroupView {
+    pub(crate) severity: DiagnosticSeverity,
+    /// The stable parser code, e.g. "doctype_ignored".
+    pub(crate) code: &'static str,
+    /// The diagnostic message, verbatim, deduplicated by the group key.
+    pub(crate) message: String,
+    /// Total occurrences across every DAT file in the source.
+    pub(crate) occurrence_count: usize,
+    /// Distinct DAT files that produced at least one occurrence.
+    pub(crate) affected_file_count: usize,
+    /// A bounded, deterministic list of occurrences (safe filename + location).
+    pub(crate) occurrences: Vec<DiagnosticOccurrenceView>,
+    /// More occurrences exist than are listed in `occurrences`.
+    pub(crate) occurrences_truncated: bool,
+    /// A stable id for the disclosure toggle.
+    pub(crate) id: String,
 }
 
 /// What the last validation run found, in detail.
@@ -208,6 +270,9 @@ pub(crate) struct RunningJobView {
     pub(crate) cancellation_requested: bool,
     /// Structured audit progress, when the running job is an audit.
     pub(crate) progress: Option<AuditProgressView>,
+    /// The source's assigned platform, shown only when it is authoritative
+    /// (assigned and recognised by this build). Never guessed from the path.
+    pub(crate) platform_display: Option<String>,
 }
 
 impl RunningJobView {
@@ -333,9 +398,14 @@ pub(crate) struct AuditResultView {
     pub(crate) source_id: String,
     pub(crate) dat_path: String,
     pub(crate) scan_root: String,
+    /// The scan folder shortened for display, so a long private path does not
+    /// take over the summary.
+    pub(crate) scan_root_short: String,
     pub(crate) catalogue_names: Vec<String>,
     pub(crate) catalogue_entries: usize,
     pub(crate) headline: String,
+    /// How long the run took, when it completed.
+    pub(crate) elapsed_seconds: Option<u64>,
     pub(crate) categories: Vec<AuditCategoryView>,
     /// Per-file lines, capped for display.
     pub(crate) entries: Vec<AuditEntryView>,
@@ -433,6 +503,9 @@ struct RunningJob {
     started_at: Instant,
     /// Structured progress for audit jobs. `None` for validation.
     audit_progress: Option<AuditProgressTracker>,
+    /// The source's resolved platform at job start, shown on the running card
+    /// only when it is authoritative (assigned and recognised).
+    platform_display: Option<String>,
 }
 
 /// Sends without blocking, dropping the message when the queue is full.
@@ -506,31 +579,98 @@ fn shorten_path(path: &str) -> String {
     format!("…/{}", kept.join("/"))
 }
 
-/// A warning's text cut to a bounded length so the inline summary stays one
-/// readable line. The full text is always preserved in the expandable details.
-fn truncate_inline(text: &str) -> String {
-    const MAX_INLINE_CHARS: usize = 120;
-    let mut chars = text.chars();
-    let mut out: String = chars.by_ref().take(MAX_INLINE_CHARS).collect();
-    if chars.next().is_some() {
-        out.push('…');
-    }
-    out
+/// The source's platform, shown on the running card only when it is
+/// authoritative: assigned by the user and recognised by this build. An
+/// unassigned source has no platform to claim, and an unresolved one is not
+/// presented as if it were real.
+fn authoritative_platform(entry: &DatSourceEntry) -> Option<String> {
+    entry
+        .platform
+        .as_ref()
+        .filter(|_| entry.platform_is_resolved())
+        .and_then(|_| entry.platform_display())
 }
 
-/// Every warning the last validation found, flattened across files in the
-/// deterministic order the files were read (files are sorted by name; each
-/// file's warnings keep the parser's own order).
-fn flatten_warnings(report: &DatValidationReport) -> Vec<String> {
-    report
-        .files
-        .iter()
-        .filter_map(|file| match &file.outcome {
-            DatFileOutcome::Parsed { warnings, .. } => Some(warnings.as_slice()),
-            DatFileOutcome::Failed { .. } => None,
+/// Groups the last validation's diagnostics by (severity, code, message),
+/// accumulating per-group occurrence and affected-file counts.
+///
+/// The result is sorted by severity (Error, Warning, Note) then code then
+/// message, so two runs over the same folder produce identical output. Occurrence
+/// rows are kept bounded; the message string is cloned once per distinct type,
+/// never once per occurrence. `source_id` scopes each group's stable id so the
+/// open-group state can never bleed across sources.
+fn group_diagnostics(source_id: &str, report: &DatValidationReport) -> Vec<DiagnosticGroupView> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn severity_rank(severity: DiagnosticSeverity) -> u8 {
+        match severity {
+            DiagnosticSeverity::Error => 0,
+            DiagnosticSeverity::Warning => 1,
+            DiagnosticSeverity::Note => 2,
+        }
+    }
+
+    struct GroupAcc {
+        severity: DiagnosticSeverity,
+        occurrence_count: usize,
+        affected_files: BTreeSet<String>,
+        occurrences: Vec<DiagnosticOccurrenceView>,
+        occurrences_truncated: bool,
+    }
+
+    // The key is ordered so the BTreeMap yields severity- then code- then
+    // message-sorted groups.
+    let mut groups: BTreeMap<(u8, &'static str, String), GroupAcc> = BTreeMap::new();
+
+    for file in &report.files {
+        let DatFileOutcome::Parsed { diagnostics, .. } = &file.outcome else {
+            continue;
+        };
+        for diagnostic in diagnostics {
+            let key = (
+                severity_rank(diagnostic.severity),
+                diagnostic.code,
+                diagnostic.message.clone(),
+            );
+            let acc = groups.entry(key).or_insert_with(|| GroupAcc {
+                severity: diagnostic.severity,
+                occurrence_count: 0,
+                affected_files: BTreeSet::new(),
+                occurrences: Vec::new(),
+                occurrences_truncated: false,
+            });
+            acc.occurrence_count += 1;
+            acc.affected_files.insert(file.file_name.clone());
+            if acc.occurrences.len() < MAX_DIAGNOSTIC_OCCURRENCES_SHOWN {
+                acc.occurrences.push(DiagnosticOccurrenceView {
+                    file_name: file.file_name.clone(),
+                    line: diagnostic.line,
+                    column: diagnostic.column,
+                });
+            } else {
+                acc.occurrences_truncated = true;
+            }
+        }
+    }
+
+    groups
+        .into_iter()
+        .map(|((_, code, message), acc)| DiagnosticGroupView {
+            severity: acc.severity,
+            code,
+            message: message.clone(),
+            occurrence_count: acc.occurrence_count,
+            affected_file_count: acc.affected_files.len(),
+            occurrences: acc.occurrences,
+            occurrences_truncated: acc.occurrences_truncated,
+            // The id is scoped by source and severity so expanding a group on
+            // one source can never leave another source's same-typed group
+            // open, and a code reused at two severities cannot collide.
+            id: format!(
+                "{source_id}:{}:{code}:{message}",
+                severity_rank(acc.severity)
+            ),
         })
-        .flatten()
-        .cloned()
         .collect()
 }
 
@@ -723,8 +863,15 @@ pub(crate) struct DatSourcesPageState {
     action_error: Option<String>,
     /// The last validation report for each source, this session.
     validations: BTreeMap<String, DatValidationReport>,
+    /// The grouped diagnostics for each validated source, derived once when the
+    /// report lands and cached so the per-frame view rebuild does not re-group
+    /// thousands of diagnostics. Kept in lockstep with `validations`.
+    diagnostic_groups: BTreeMap<String, Vec<DiagnosticGroupView>>,
     audit: Option<Box<DatAuditOutcome>>,
     audit_error: Option<String>,
+    /// How long the most recent completed audit took, read from the job's start
+    /// instant when its result arrived. `None` until an audit completes.
+    audit_elapsed_seconds: Option<u64>,
     job: Option<RunningJob>,
     /// Decides whether a symlinked ROM may be followed while hashing, exactly
     /// as it does everywhere else in the build.
@@ -767,8 +914,10 @@ impl DatSourcesPageState {
             save_state: DatSaveState::Idle,
             action_error: None,
             validations: BTreeMap::new(),
+            diagnostic_groups: BTreeMap::new(),
             audit: None,
             audit_error: None,
+            audit_elapsed_seconds: None,
             job: None,
             trusted,
             library_folders,
@@ -844,6 +993,11 @@ impl DatSourcesPageState {
         // which clears `self.job` after the loop - so reading `job.started_at`
         // here is safe.
         let elapsed = job.started_at.elapsed().as_secs_f64();
+        // Coalescing: the detail line is derived once per drain pass from the
+        // last progress event, so a backlog of a thousand messages builds one
+        // string instead of a thousand. The tracker still ingests every event
+        // (that is what keeps the ETA smooth); only the string work is shared.
+        let mut last_audit_progress: Option<DatAuditProgress> = None;
         loop {
             match job.messages.try_recv() {
                 Ok(JobMessage::Progress(line)) => {
@@ -862,7 +1016,7 @@ impl DatSourcesPageState {
                         && let Some(tracker) = job.audit_progress.as_mut()
                     {
                         tracker.update(&event, elapsed);
-                        job.latest = describe(&event);
+                        last_audit_progress = Some(event);
                     }
                     changed = true;
                 }
@@ -879,7 +1033,13 @@ impl DatSourcesPageState {
                         if let Some(entry) = self.draft.get_mut(&id) {
                             entry.health = report.to_health(&entry.path.clone(), entry.kind);
                         }
-                        self.validations.insert(id, *report);
+                        // The grouped diagnostics are derived once here, when
+                        // the report lands, and cached: the view is rebuilt
+                        // every frame, and re-grouping thousands of diagnostics
+                        // per frame would be pure churn for an unchanged report.
+                        let groups = group_diagnostics(&id, &report);
+                        self.validations.insert(id.clone(), *report);
+                        self.diagnostic_groups.insert(id, groups);
                         changed = true;
                         finished = true;
                     }
@@ -892,6 +1052,10 @@ impl DatSourcesPageState {
                         // audit.
                         finished = true;
                     } else {
+                        // The elapsed time is measured from the job's own start
+                        // instant, so the summary can say how long the run took
+                        // without the worker carrying any timestamps.
+                        self.audit_elapsed_seconds = Some(job.started_at.elapsed().as_secs());
                         self.audit = Some(outcome);
                         self.audit_error = None;
                         changed = true;
@@ -902,6 +1066,7 @@ impl DatSourcesPageState {
                     match job.kind {
                         JobKind::Audit => {
                             self.audit = None;
+                            self.audit_elapsed_seconds = None;
                             if !job.cancel_requested {
                                 self.audit_error = Some(error);
                             }
@@ -916,6 +1081,9 @@ impl DatSourcesPageState {
                     finished = true;
                 }
                 Ok(JobMessage::Cancelled) => {
+                    // A cancelled audit produces no summary and no elapsed time.
+                    self.audit = None;
+                    self.audit_elapsed_seconds = None;
                     changed = true;
                     finished = true;
                 }
@@ -925,6 +1093,10 @@ impl DatSourcesPageState {
                     break;
                 }
             }
+        }
+        // Derive the detail line once from the last progress event of the pass.
+        if let Some(event) = last_audit_progress {
+            job.latest = describe(&event);
         }
         if finished {
             self.job = None;
@@ -966,6 +1138,7 @@ impl DatSourcesPageState {
                 // are untouched - see `DatSourceRegistry::remove`.
                 if self.draft.remove(&id).is_some() {
                     self.validations.remove(&id);
+                    self.diagnostic_groups.remove(&id);
                     if self
                         .audit
                         .as_ref()
@@ -1002,6 +1175,12 @@ impl DatSourcesPageState {
                 self.abandon_running_job();
                 self.draft = self.saved.clone();
                 self.action_error = None;
+                // Discard also forgets the session's validation records: a
+                // re-added source (which reuses its auto-suggested id) must not
+                // show yesterday's Inspect detail or diagnostic groups next to
+                // a "Not checked" badge. Both maps are discarded together.
+                self.validations.clear();
+                self.diagnostic_groups.clear();
             }
             DatSourcesPageAction::Save => self.save(),
         }
@@ -1053,6 +1232,7 @@ impl DatSourcesPageState {
         let cancel = Arc::new(AtomicBool::new(false));
         let limits = self.limits;
         let name = entry.display_name.clone();
+        let platform_display = authoritative_platform(&entry);
 
         std::thread::spawn(move || {
             send_progress(&sender, JobMessage::Progress(format!("Reading {name}…")));
@@ -1069,6 +1249,7 @@ impl DatSourcesPageState {
             latest: "Starting…".to_string(),
             started_at: Instant::now(),
             audit_progress: None,
+            platform_display,
         });
     }
 
@@ -1081,10 +1262,12 @@ impl DatSourcesPageState {
         };
         self.audit = None;
         self.audit_error = None;
+        self.audit_elapsed_seconds = None;
         let (sender, messages) = sync_channel(PROGRESS_QUEUE_DEPTH);
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = cancel.clone();
         let trusted = self.trusted.clone();
+        let platform_display = authoritative_platform(&entry);
         let request = DatAuditRequest {
             source_id: entry.id.clone(),
             source_display_name: entry.display_name.clone(),
@@ -1117,6 +1300,7 @@ impl DatSourcesPageState {
             latest: "Starting…".to_string(),
             started_at: Instant::now(),
             audit_progress: Some(AuditProgressTracker::new()),
+            platform_display,
         });
     }
 
@@ -1172,12 +1356,13 @@ impl DatSourcesPageState {
                     .audit_progress
                     .as_ref()
                     .map(|tracker| tracker.view(job.started_at.elapsed().as_secs())),
+                platform_display: job.platform_display.clone(),
             }),
             library_folders: self.library_folders.clone(),
             audit: self
                 .audit
                 .as_ref()
-                .map(|outcome| Box::new(audit_view(outcome))),
+                .map(|outcome| Box::new(audit_view(outcome, self.audit_elapsed_seconds))),
             audit_error: self.audit_error.clone(),
             rows,
         }
@@ -1190,7 +1375,18 @@ impl DatSourcesPageState {
             Some(saved) => saved != entry,
         };
         let validation = self.validation(&entry.id);
-        let warnings = validation.map(flatten_warnings).unwrap_or_default();
+        // Read the cached groups when the report landed through a validation
+        // run; fall back to deriving them on demand so test-injected reports
+        // (which bypass the poll path) still render.
+        let groups = self
+            .diagnostic_groups
+            .get(&entry.id)
+            .cloned()
+            .unwrap_or_else(|| {
+                validation
+                    .map(|report| group_diagnostics(&entry.id, report))
+                    .unwrap_or_default()
+            });
         let incomplete_load = validation.is_some_and(|report| report.truncated);
         let dat_files_read = incomplete_load.then(|| validation.unwrap().files.len() as u64);
         let dat_files_total = incomplete_load
@@ -1225,7 +1421,7 @@ impl DatSourcesPageState {
                 .as_ref()
                 .is_some_and(|job| job.source_id == entry.id),
             detail: self.validation(&entry.id).map(inspect_view),
-            warnings,
+            groups,
             incomplete_load,
             dat_files_read,
             dat_files_total,
@@ -1316,38 +1512,61 @@ fn inspect_view(report: &DatValidationReport) -> InspectView {
                     version,
                     entry_count,
                     rom_count,
-                    warnings,
-                } => InspectFileView {
-                    file_name: file.file_name.clone(),
-                    status: if warnings.is_empty() {
-                        "OK"
-                    } else {
-                        "OK, with warnings"
-                    },
-                    detail: {
-                        let mut parts = vec![
-                            format.label().to_string(),
-                            ecosystem.label().to_string(),
-                            format!("{entry_count} entries, {rom_count} ROMs"),
-                        ];
-                        if let Some(name) = name {
-                            parts.insert(
-                                0,
-                                match version {
-                                    Some(version) => format!("{name} ({version})"),
-                                    None => name.clone(),
-                                },
-                            );
-                        }
-                        parts.join(" · ")
-                    },
-                    warnings: warnings.clone(),
-                },
+                    diagnostics,
+                } => {
+                    let errors: Vec<String> = diagnostics
+                        .iter()
+                        .filter(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
+                        .map(|diagnostic| diagnostic.message.clone())
+                        .collect();
+                    let warnings: Vec<String> = diagnostics
+                        .iter()
+                        .filter(|diagnostic| diagnostic.severity == DiagnosticSeverity::Warning)
+                        .map(|diagnostic| diagnostic.message.clone())
+                        .collect();
+                    let notes: Vec<String> = diagnostics
+                        .iter()
+                        .filter(|diagnostic| diagnostic.severity == DiagnosticSeverity::Note)
+                        .map(|diagnostic| diagnostic.message.clone())
+                        .collect();
+                    InspectFileView {
+                        file_name: file.file_name.clone(),
+                        status: if !errors.is_empty() {
+                            "Failed"
+                        } else if warnings.is_empty() {
+                            "OK"
+                        } else {
+                            "OK, with warnings"
+                        },
+                        detail: {
+                            let mut parts = vec![
+                                format.label().to_string(),
+                                ecosystem.label().to_string(),
+                                format!("{entry_count} entries, {rom_count} ROMs"),
+                            ];
+                            if let Some(name) = name {
+                                parts.insert(
+                                    0,
+                                    match version {
+                                        Some(version) => format!("{name} ({version})"),
+                                        None => name.clone(),
+                                    },
+                                );
+                            }
+                            parts.join(" · ")
+                        },
+                        errors,
+                        warnings,
+                        notes,
+                    }
+                }
                 DatFileOutcome::Failed { error } => InspectFileView {
                     file_name: file.file_name.clone(),
                     status: "Failed",
                     detail: error.clone(),
+                    errors: Vec::new(),
                     warnings: Vec::new(),
+                    notes: Vec::new(),
                 },
             })
             .collect(),
@@ -1403,8 +1622,9 @@ fn describe(progress: &DatAuditProgress) -> String {
     }
 }
 
-/// Turns a core outcome into rows, without adding or merging any category.
-fn audit_view(outcome: &DatAuditOutcome) -> AuditResultView {
+/// Turns a core outcome into rows, without adding or merging any category. The
+/// in-memory outcome is the only input; nothing is re-scanned to build this.
+fn audit_view(outcome: &DatAuditOutcome, elapsed_seconds: Option<u64>) -> AuditResultView {
     let summary = &outcome.report.summary;
     // Every category the core counts, each with the meaning the core documents
     // for it. Zero counts are kept: "0 ambiguous" is a result, and hiding it
@@ -1470,9 +1690,11 @@ fn audit_view(outcome: &DatAuditOutcome) -> AuditResultView {
         source_id: outcome.source_id.clone(),
         dat_path: outcome.dat_path.clone(),
         scan_root: outcome.scan_root.clone(),
+        scan_root_short: shorten_path(&outcome.scan_root),
         catalogue_names: outcome.catalogue_names.clone(),
         catalogue_entries: outcome.catalogue_entries,
         headline: outcome.headline(),
+        elapsed_seconds,
         categories,
         entries,
         entries_truncated,
@@ -1564,8 +1786,9 @@ pub(crate) struct DatSourcesPageUi {
     pub(crate) open_audit_picker: Option<String>,
     /// Which source is awaiting removal confirmation.
     pub(crate) confirm_remove: Option<String>,
-    /// Which source's warning-details disclosure is open.
-    pub(crate) open_warnings: Option<String>,
+    /// Which diagnostic group's drill-down is open, as the group's stable id.
+    /// One group expands at a time; expanding another collapses this one.
+    pub(crate) open_diagnostic: Option<String>,
 }
 
 impl DatSourcesPageUi {
@@ -1576,7 +1799,7 @@ impl DatSourcesPageUi {
         self.platform_query.clear();
         self.open_audit_picker = None;
         self.confirm_remove = None;
-        self.open_warnings = None;
+        self.open_diagnostic = None;
     }
 }
 
@@ -1795,6 +2018,15 @@ fn show_running_job(ui: &mut egui::Ui, running: &RunningJobView) -> Option<DatSo
             }
         });
         ui.label(egui::RichText::new(&running.detail).color(theme::muted(ui)));
+        if let Some(platform) = &running.platform_display {
+            // Shown only when the source's assigned platform is authoritative;
+            // never guessed from the path.
+            ui.label(
+                egui::RichText::new(format!("Platform: {platform}"))
+                    .color(theme::muted(ui))
+                    .small(),
+            );
+        }
         if let Some(progress) = &running.progress {
             ui.add_space(4.0);
             ui.label(egui::RichText::new(progress.line()).color(theme::muted(ui)));
@@ -1898,7 +2130,7 @@ fn show_source_row(
             );
         }
 
-        show_warning_summary(ui, row, ui_state);
+        show_diagnostics_summary(ui, row, ui_state);
 
         ui.add_space(6.0);
         if action.is_none()
@@ -2026,68 +2258,169 @@ fn health_label(row: &DatSourceRowView) -> String {
     }
 }
 
-/// The warning count, a concise inline summary, and the expandable warning
-/// details, drawn directly on the source card so "Valid, with warnings" is
-/// never a bare badge with the reasons hidden behind Inspect.
-fn show_warning_summary(
+/// Warnings and parser notes, each with a count, a concise inline summary, and
+/// an expandable list, drawn directly on the source card so the health badge is
+/// never the only thing the user can see.
+///
+/// Warnings are worth investigating; parser notes are expected behaviour and
+/// are never presented as if something is wrong.
+/// The pluralised, type-oriented label for a severity, as used in the section
+/// badge: "error type", "warning type", "parser-note type".
+fn severity_type_label(severity: DiagnosticSeverity, types: usize) -> String {
+    let base = match severity {
+        DiagnosticSeverity::Error => "error type",
+        DiagnosticSeverity::Warning => "warning type",
+        DiagnosticSeverity::Note => "parser-note type",
+    };
+    if types == 1 {
+        base.to_string()
+    } else {
+        format!("{base}s")
+    }
+}
+
+/// "line 3:12" / "line 3" / "Location unavailable", from what the parser
+/// actually recorded. Never invents a location the parser did not provide.
+fn format_location(line: Option<usize>, column: Option<usize>) -> String {
+    match (line, column) {
+        (Some(line), Some(column)) => format!("line {line}:{column}"),
+        (Some(line), None) => format!("line {line}"),
+        _ => "Location unavailable".to_string(),
+    }
+}
+
+/// One group's drill-down: the verbatim message, the counts, and a bounded
+/// occurrence list with safe filenames and parser-provided locations.
+fn show_diagnostic_group(
+    ui: &mut egui::Ui,
+    group: &DiagnosticGroupView,
+    ui_state: &mut DatSourcesPageUi,
+) {
+    let open = ui_state.open_diagnostic.as_deref() == Some(group.id.as_str());
+    ui.horizontal_top(|ui| {
+        ui.label(egui::RichText::new("•").color(theme::muted(ui)));
+        ui.vertical(|ui| {
+            // The original diagnostic message, preserved verbatim.
+            ui.add(egui::Label::new(&group.message).wrap());
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} occurrence{} · affects {} DAT file{}",
+                    group.occurrence_count,
+                    if group.occurrence_count == 1 { "" } else { "s" },
+                    group.affected_file_count,
+                    if group.affected_file_count == 1 {
+                        ""
+                    } else {
+                        "s"
+                    },
+                ))
+                .color(theme::muted(ui))
+                .small(),
+            );
+            let toggle = if open {
+                "Hide locations"
+            } else {
+                "View locations"
+            };
+            if widgets::action_button(ui, toggle, widgets::ActionStyle::Quiet, true).clicked() {
+                ui_state.open_diagnostic = if open { None } else { Some(group.id.clone()) };
+            }
+            if open {
+                for occurrence in &group.occurrences {
+                    ui.horizontal_top(|ui| {
+                        ui.label(
+                            egui::RichText::new(format_location(
+                                occurrence.line,
+                                occurrence.column,
+                            ))
+                            .color(theme::muted(ui))
+                            .small()
+                            .monospace(),
+                        );
+                        ui.label(egui::RichText::new(&occurrence.file_name).small());
+                    });
+                }
+                if group.occurrences_truncated {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "… and {} more occurrence(s)",
+                            group.occurrence_count - group.occurrences.len()
+                        ))
+                        .color(theme::muted(ui))
+                        .small(),
+                    );
+                }
+            }
+        });
+    });
+}
+
+/// Diagnostics grouped by type, drawn directly on the source card so the health
+/// badge is never the only thing the user can see.
+///
+/// Each severity (Errors, Warnings, Parser notes) is one section showing how
+/// many distinct types and total occurrences there are, followed by one row per
+/// diagnostic type. Expanding a row reveals its locations. One row expands at a
+/// time; parser notes carry the reassurance that no action is needed.
+fn show_diagnostics_summary(
     ui: &mut egui::Ui,
     row: &DatSourceRowView,
     ui_state: &mut DatSourcesPageUi,
 ) {
-    if row.warnings.is_empty() {
-        return;
-    }
-    let open = ui_state.open_warnings.as_deref() == Some(row.id.as_str());
-    let count = row.warnings.len();
+    for severity in [
+        DiagnosticSeverity::Error,
+        DiagnosticSeverity::Warning,
+        DiagnosticSeverity::Note,
+    ] {
+        let groups = row.groups_of(severity);
+        if groups.is_empty() {
+            continue;
+        }
+        let types = row.diagnostic_types(severity);
+        let occurrences = row.diagnostic_occurrences(severity);
+        let tone = match severity {
+            DiagnosticSeverity::Error => widgets::StatusTone::Blocked,
+            DiagnosticSeverity::Warning => widgets::StatusTone::Warning,
+            DiagnosticSeverity::Note => widgets::StatusTone::Info,
+        };
 
-    ui.add_space(6.0);
-    ui.horizontal(|ui| {
+        ui.add_space(6.0);
         widgets::status_badge(
             ui,
             format!(
-                "{count} {}",
-                if count == 1 { "warning" } else { "warnings" }
+                "{types} {}, {} occurrence{}",
+                severity_type_label(severity, types),
+                occurrences,
+                if occurrences == 1 { "" } else { "s" }
             ),
-            widgets::StatusTone::Warning,
+            tone,
         );
-        let label = if open {
-            "Hide warning details"
-        } else {
-            "View warning details"
-        };
-        if widgets::action_button(ui, label, widgets::ActionStyle::Quiet, true).clicked() {
-            ui_state.open_warnings = if open { None } else { Some(row.id.clone()) };
-        }
-        if row.history_link_available {
-            // Only ever drawn when the full details really are recorded in
-            // History & Logs; today they are kept inline, so this is off.
+
+        if severity == DiagnosticSeverity::Note {
             ui.label(
-                egui::RichText::new("Full details are recorded in History & Logs.")
-                    .color(theme::muted(ui))
-                    .small(),
+                egui::RichText::new(
+                    "Parser notes are expected parser behaviour and need no action.",
+                )
+                .color(theme::muted(ui))
+                .small(),
             );
         }
-    });
 
-    // Concise inline summary: the first warning, kept to one line. The full
-    // text of every warning is in the expandable list below.
-    if let Some(first) = row.warnings.first() {
+        for group in groups {
+            ui.add_space(2.0);
+            show_diagnostic_group(ui, group, ui_state);
+        }
+    }
+
+    if row.history_link_available {
+        // Only ever drawn when the full details really are recorded in
+        // History & Logs; today they are kept inline, so this is off.
+        ui.add_space(6.0);
         ui.label(
-            egui::RichText::new(format!("Summary: {}", truncate_inline(first)))
+            egui::RichText::new("Full details are recorded in History & Logs.")
                 .color(theme::muted(ui))
                 .small(),
         );
-    }
-
-    if open {
-        for warning in &row.warnings {
-            ui.horizontal_top(|ui| {
-                ui.label(egui::RichText::new("•").color(widgets::StatusTone::Warning.color(ui)));
-                // The original warning text is preserved verbatim; only the
-                // inline summary is ever truncated.
-                ui.add(egui::Label::new(warning).wrap());
-            });
-        }
     }
 }
 
@@ -2380,10 +2713,24 @@ fn show_inspect(ui: &mut egui::Ui, row: &DatSourceRowView) {
                             .color(theme::muted(ui))
                             .small(),
                     );
+                    for error in file.errors.iter().take(20) {
+                        ui.label(
+                            egui::RichText::new(format!("error: {error}"))
+                                .color(widgets::StatusTone::Blocked.color(ui))
+                                .small(),
+                        );
+                    }
                     for warning in file.warnings.iter().take(20) {
                         ui.label(
                             egui::RichText::new(format!("warning: {warning}"))
                                 .color(widgets::StatusTone::Warning.color(ui))
+                                .small(),
+                        );
+                    }
+                    for note in file.notes.iter().take(20) {
+                        ui.label(
+                            egui::RichText::new(format!("note: {note}"))
+                                .color(theme::muted(ui))
                                 .small(),
                         );
                     }
@@ -2437,7 +2784,10 @@ fn show_audit_result(ui: &mut egui::Ui, audit: &AuditResultView) {
         ui.label(
             egui::RichText::new(format!(
                 "Source '{}' ({}) · checked {} · {} files read",
-                audit.source_display_name, audit.source_id, audit.scan_root, audit.files_scanned
+                audit.source_display_name,
+                audit.source_id,
+                audit.scan_root_short,
+                audit.files_scanned
             ))
             .color(theme::muted(ui)),
         );
@@ -2451,6 +2801,13 @@ fn show_audit_result(ui: &mut egui::Ui, audit: &AuditResultView) {
             .color(theme::muted(ui))
             .small(),
         );
+        if let Some(elapsed) = audit.elapsed_seconds {
+            ui.label(
+                egui::RichText::new(format!("Completed in {}", format_elapsed(elapsed)))
+                    .color(theme::muted(ui))
+                    .small(),
+            );
+        }
         ui.add_space(6.0);
 
         for category in &audit.categories {

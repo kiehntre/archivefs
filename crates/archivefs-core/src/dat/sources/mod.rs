@@ -51,9 +51,9 @@ pub use config::{
     save_dat_sources_config_to,
 };
 pub use validation::{
-    DatFileOutcome, DatFileReport, DatPathRefusal, DatValidationReport, DuplicateDatIdentity,
-    MAX_FOLDER_DAT_FILES, SkippedFolderEntry, discover_dat_files, validate_dat_path,
-    validate_dat_source,
+    DatDiagnostic, DatFileOutcome, DatFileReport, DatPathRefusal, DatValidationReport,
+    DuplicateDatIdentity, MAX_FOLDER_DAT_FILES, SkippedFolderEntry, discover_dat_files,
+    validate_dat_path, validate_dat_source,
 };
 
 /// What a registered path is: one DAT file, or a folder holding several.
