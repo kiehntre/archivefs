@@ -3586,7 +3586,12 @@ fn an_audit_builds_a_read_only_rename_plan_and_changes_nothing() {
         Some("Game (Europe).bin"),
         "the preferred region's name is proposed"
     );
-    assert!(plan.rows[0].explanations.iter().any(|e| e.contains("preferred region matched")));
+    assert!(
+        plan.rows[0]
+            .explanations
+            .iter()
+            .any(|e| e.contains("preferred region matched"))
+    );
     assert_eq!(
         snapshot(&fixture.root),
         before,
