@@ -1043,6 +1043,95 @@ a_future_entry_key = 7
 }
 
 #[test]
+fn a_policy_the_user_sets_round_trips_through_the_registry() {
+    let dir = temp();
+    let path = write(dir.path(), "a.dat", LOGIQX);
+    let config_path = dir.path().join("dat_sources.toml");
+    let mut registry = DatSourceRegistry::new();
+    registry.add(entry_for(&path, DatSourceKind::File)).unwrap();
+    let policy = registry.policy_mut();
+    policy.region_preferences = Some(vec!["europe".into(), "usa".into()]);
+    policy.revision_policy = Some("latest_verified".into());
+    save_dat_sources_config_to(&config_path, &registry.to_config()).unwrap();
+
+    let loaded = load_dat_sources_config_from(&config_path).unwrap();
+    assert_eq!(
+        loaded.policy.as_ref().unwrap().region_preferences,
+        Some(vec!["europe".to_string(), "usa".to_string()])
+    );
+    let (reloaded, problems) = DatSourceRegistry::from_config(&loaded);
+    assert!(problems.is_empty(), "{problems:?}");
+    assert_eq!(
+        reloaded.policy().region_preferences,
+        Some(vec!["europe".to_string(), "usa".to_string()])
+    );
+    assert_eq!(reloaded.policy().revision_policy.as_deref(), Some("latest_verified"));
+}
+
+#[test]
+fn a_default_policy_is_not_written_until_the_user_sets_something() {
+    let dir = temp();
+    let path = write(dir.path(), "a.dat", LOGIQX);
+    let config_path = dir.path().join("dat_sources.toml");
+    let mut registry = DatSourceRegistry::new();
+    registry.add(entry_for(&path, DatSourceKind::File)).unwrap();
+    save_dat_sources_config_to(&config_path, &registry.to_config()).unwrap();
+    let text = std::fs::read_to_string(&config_path).unwrap();
+    assert!(!text.contains("[policy]"), "{text}");
+    assert!(!text.contains("format_version"), "{text}");
+}
+
+#[test]
+fn unknown_policy_values_and_platform_keys_survive_a_load_edit_save() {
+    let dir = temp();
+    let path = write(dir.path(), "a.dat", LOGIQX);
+    let config_path = dir.path().join("dat_sources.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[policy]
+region_preferences = ["europe", "moon"]
+revision_policy = "newest_future_policy"
+a_future_policy_key = "kept"
+
+[policy.platforms.SNES]
+clone_policy = "prefer_parent"
+"#,
+    )
+    .unwrap();
+
+    let config = load_dat_sources_config_from(&config_path).unwrap();
+    let (mut registry, problems) = DatSourceRegistry::from_config(&config);
+    assert!(problems.is_empty(), "{problems:?}");
+
+    // Edit something unrelated, the way a user would: add a source.
+    let (id, display_name) = (registry.suggest_id(&path), suggest_display_name(&path));
+    registry
+        .add(DatSourceEntry::new(id, display_name, path.clone(), DatSourceKind::File))
+        .unwrap();
+    save_dat_sources_config_to(&config_path, &registry.to_config()).unwrap();
+
+    let text = std::fs::read_to_string(&config_path).unwrap();
+    assert!(text.contains("moon"), "{text}");
+    assert!(text.contains("newest_future_policy"), "{text}");
+    assert!(text.contains("a_future_policy_key"), "{text}");
+    assert!(text.contains("SNES"), "{text}");
+
+    // The unknown preference value round-trips through the typed registry.
+    let reloaded = load_dat_sources_config_from(&config_path).unwrap();
+    let (reloaded_registry, _) = DatSourceRegistry::from_config(&reloaded);
+    assert_eq!(
+        reloaded_registry.policy().region_preferences.as_deref(),
+        Some(&["europe".to_string(), "moon".to_string()][..])
+    );
+    assert_eq!(
+        reloaded_registry.policy().revision_policy.as_deref(),
+        Some("newest_future_policy")
+    );
+    assert!(reloaded_registry.get("a").is_some(), "the unrelated edit was saved");
+}
+
+#[test]
 fn a_second_save_of_reloaded_content_is_byte_identical() {
     // The written form must be a fixed point, or every save would rewrite the
     // user's file and "did anything change?" would stop being answerable.
@@ -1093,6 +1182,7 @@ fn bare_config_entry(id: &str, path: &str) -> DatSourceConfigEntry {
 fn an_entry_with_an_unusable_id_is_reported_rather_than_silently_dropped() {
     let config = DatSourcesConfig {
         sources: Some(vec![bare_config_entry("../escape", "/tmp/x.dat")]),
+        policy: None,
         unknown_fields: toml::Table::new(),
     };
     let (registry, problems) = DatSourceRegistry::from_config(&config);
@@ -1108,6 +1198,7 @@ fn a_second_entry_claiming_one_id_is_reported_rather_than_shadowing_the_first() 
             bare_config_entry("x", "/tmp/first.dat"),
             bare_config_entry("x", "/tmp/second.dat"),
         ]),
+        policy: None,
         unknown_fields: toml::Table::new(),
     };
     let (registry, problems) = DatSourceRegistry::from_config(&config);
@@ -1125,6 +1216,7 @@ fn a_hand_edited_priority_is_clamped_into_range() {
     entry.priority = Some(0);
     let (registry, _) = DatSourceRegistry::from_config(&DatSourcesConfig {
         sources: Some(vec![entry]),
+        policy: None,
         unknown_fields: toml::Table::new(),
     });
     assert_eq!(registry.get("x").unwrap().priority, MIN_DAT_PRIORITY);
@@ -1316,6 +1408,7 @@ fn audit_fixture() -> (TempDir, DatAuditRequest) {
         dat_kind: DatSourceKind::File,
         scan_root: roms,
         limits: DatLimits::default(),
+        policy: None,
     };
     (dir, request)
 }
@@ -1456,6 +1549,7 @@ fn an_audit_against_a_folder_source_merges_its_catalogues() {
         dat_kind: DatSourceKind::Folder,
         scan_root: roms,
         limits: DatLimits::default(),
+        policy: None,
     };
     let cancel = no_cancel();
     let outcome =
@@ -1478,6 +1572,7 @@ fn an_audit_of_an_empty_folder_says_so_rather_than_reporting_all_clear() {
         dat_kind: DatSourceKind::File,
         scan_root: empty,
         limits: DatLimits::default(),
+        policy: None,
     };
     let cancel = no_cancel();
     let error = run_dat_audit(&request, &TrustedRoots::none(), &cancel, &|_| {})
@@ -1507,6 +1602,7 @@ fn an_audit_against_an_unparseable_catalogue_fails_with_a_reason() {
         dat_kind: DatSourceKind::File,
         scan_root: roms,
         limits: DatLimits::default(),
+        policy: None,
     };
     let cancel = no_cancel();
     let error = run_dat_audit(&request, &TrustedRoots::none(), &cancel, &|_| {})
@@ -1530,6 +1626,7 @@ fn an_audit_descends_into_subfolders_within_its_depth_limit() {
         dat_kind: DatSourceKind::File,
         scan_root: roms,
         limits: DatLimits::default(),
+        policy: None,
     };
     let cancel = no_cancel();
     let outcome =
@@ -1555,6 +1652,7 @@ fn an_audit_does_not_follow_a_symlinked_rom_without_trusted_roots() {
         dat_kind: DatSourceKind::File,
         scan_root: roms,
         limits: DatLimits::default(),
+        policy: None,
     };
     let cancel = no_cancel();
     let outcome = run_dat_audit(&request, &TrustedRoots::none(), &cancel, &|_| {})
@@ -1583,6 +1681,89 @@ fn hashing_is_what_turns_a_name_match_into_an_exact_one() {
     assert_eq!(outcome.report.summary.filename_only, 0);
     assert!(outcome.unhashed.is_empty());
     assert!(outcome.bytes_hashed > 0);
+}
+
+#[test]
+fn an_audit_without_a_policy_annotates_nothing() {
+    let (_dir, request) = audit_fixture();
+    let cancel = no_cancel();
+    let outcome =
+        run_dat_audit(&request, &TrustedRoots::none(), &cancel, &|_| {}).expect("the audit runs");
+    assert!(outcome.policy.is_none(), "no policy supplied, no annotation");
+}
+
+#[test]
+fn an_audit_annotates_multi_candidate_verdicts_with_the_policy_preference() {
+    use crate::dat::policy::config::DatPolicyConfig;
+    use crate::dat::policy::evaluate::{ParticipatingSource, resolve};
+
+    // Two catalogue entries share the same MD5: a "test" dump in two regions.
+    let dat_text = r#"<?xml version="1.0" encoding="UTF-8"?>
+<datafile>
+    <header>
+        <name>Multi Candidate</name>
+        <version>1</version>
+        <author>Test</author>
+    </header>
+    <game name="Game (USA)">
+        <rom name="game.bin" size="4" md5="098f6bcd4621d373cade4e832627b4f6"/>
+    </game>
+    <game name="Game (Europe)">
+        <rom name="game.bin" size="4" md5="098f6bcd4621d373cade4e832627b4f6"/>
+    </game>
+</datafile>"#;
+    let dir = temp();
+    let dat = write(dir.path(), "multi.dat", dat_text);
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    std::fs::write(roms.join("game.bin"), SUPER_BIN_CONTENTS).unwrap();
+
+    let policy = resolve(
+        &DatPolicyConfig {
+            region_preferences: Some(vec!["europe".to_string(), "usa".to_string()]),
+            ..Default::default()
+        },
+        None,
+        vec![ParticipatingSource {
+            id: "multi".to_string(),
+            display_name: "Multi".to_string(),
+            priority: 100,
+        }],
+    );
+
+    let request = DatAuditRequest {
+        source_id: "multi".to_string(),
+        source_display_name: "Multi".to_string(),
+        dat_path: dat,
+        dat_kind: DatSourceKind::File,
+        scan_root: roms,
+        limits: DatLimits::default(),
+        policy: Some(policy),
+    };
+    let cancel = no_cancel();
+    let outcome =
+        run_dat_audit(&request, &TrustedRoots::none(), &cancel, &|_| {}).expect("the audit runs");
+
+    // The verdict still says what the evidence says: multiple candidates.
+    assert_eq!(outcome.report.summary.exact_multiple, 1);
+    let policy_outcome = outcome.policy.expect("a policy annotation");
+    assert_eq!(policy_outcome.notes.len(), 1);
+    let note = &policy_outcome.notes[0];
+    assert_eq!(note.verdict_label, "Exact (multiple)");
+    assert!(note.resolution.decided);
+    assert_eq!(
+        note.resolution.entries[0].candidate.game_name,
+        "Game (Europe)",
+        "the preferred region wins"
+    );
+    assert!(
+        note.resolution
+            .explanations
+            .iter()
+            .any(|line| line.contains("preferred region matched")),
+        "{:?}",
+        note.resolution.explanations
+    );
 }
 
 #[test]
