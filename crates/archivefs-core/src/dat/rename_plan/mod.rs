@@ -34,9 +34,13 @@
 //! to extend - that is out of scope here. See
 //! `docs/design/DAT_RENAME_PLANNING_STAGE1.md`.
 
+pub mod collisions;
 pub mod derive;
 pub mod model;
 
+pub use collisions::{
+    DirSiblings, detect_proposal_collisions, detect_target_collision,
+};
 pub use derive::{DeriveOutcome, DerivedName, derive_proposed_basename};
 pub use model::{
     CollisionInfo, CollisionKind, ExtensionStatus, ProposalState, RenamePlan, RenamePlanCounts,
