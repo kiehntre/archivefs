@@ -119,7 +119,7 @@ impl TrustedRoots {
     ///
     /// Compares whole path components via `starts_with`, so `/mnt/roms-backup`
     /// is not treated as being inside `/mnt/roms`.
-    fn contains_canonical(&self, candidate: &Path) -> bool {
+    pub fn contains_canonical(&self, candidate: &Path) -> bool {
         self.roots.iter().any(|root| candidate.starts_with(root))
     }
 }

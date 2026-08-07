@@ -36,6 +36,8 @@
 pub mod identity;
 pub mod journal;
 pub mod model;
+pub mod noclobber;
+pub mod preflight;
 
 pub use identity::{capture_identity, classify_at, identity_matches};
 pub use journal::{
@@ -47,3 +49,5 @@ pub use model::{
     EntryState, ObjectIdentity, ObjectKind, RenameTransaction, RollbackResult, RollbackStatus,
     TransactionEntry, TransactionState, TransactionSummary,
 };
+pub use noclobber::{NoClobberError, rename_noreplace};
+pub use preflight::{PreflightFailure, PreflightOptions, batch_destinations, run_preflight};
