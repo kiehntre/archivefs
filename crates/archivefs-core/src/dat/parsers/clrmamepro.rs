@@ -77,6 +77,7 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
     let mut in_rom = false;
     let mut current_game_name: Option<String> = None;
     let mut current_game_desc: Option<String> = None;
+    let mut current_game_clone_of: Option<String> = None;
     let mut current_rom_name: Option<String> = None;
     let mut current_rom_size: Option<u64> = None;
     let mut current_rom_crc: Option<String> = None;
@@ -142,6 +143,7 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
             emit_game(
                 &mut current_game_name,
                 &mut current_game_desc,
+                &mut current_game_clone_of,
                 &mut current_roms,
                 &mut games,
                 &limits,
@@ -149,6 +151,7 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
 
             current_game_name = None;
             current_game_desc = None;
+            current_game_clone_of = None;
             current_roms = Vec::new();
 
             if let Some(inner) = inner {
@@ -161,6 +164,13 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
                     "description" => {
                         current_game_desc = Some(v.to_string());
                     }
+                    // `cloneof` / `romof` both declare a parent relationship;
+                    // `romof` names the parent's ROM set, so either is a parent
+                    // reference for the clone policy. `cloneof` wins when both
+                    // are present.
+                    "cloneof" | "romof" => {
+                        capture_parent(&mut current_game_clone_of, k, v);
+                    }
                     _ => {}
                 });
             }
@@ -169,12 +179,14 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
                 emit_game(
                     &mut current_game_name,
                     &mut current_game_desc,
+                    &mut current_game_clone_of,
                     &mut current_roms,
                     &mut games,
                     &limits,
                 )?;
                 current_game_name = None;
                 current_game_desc = None;
+                current_game_clone_of = None;
                 current_roms = Vec::new();
                 in_game = false;
             } else {
@@ -201,12 +213,14 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
                 emit_game(
                     &mut current_game_name,
                     &mut current_game_desc,
+                    &mut current_game_clone_of,
                     &mut current_roms,
                     &mut games,
                     &limits,
                 )?;
                 current_game_name = None;
                 current_game_desc = None;
+                current_game_clone_of = None;
                 current_roms = Vec::new();
                 in_game = false;
             }
@@ -309,6 +323,8 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
                         current_game_name = Some(v.to_string());
                     } else if k == "description" {
                         current_game_desc = Some(v.to_string());
+                    } else if k == "cloneof" || k == "romof" {
+                        capture_parent(&mut current_game_clone_of, k, v);
                     }
                 });
                 in_game = false;
@@ -318,6 +334,8 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
                         current_game_name = Some(v.to_string());
                     } else if k == "description" {
                         current_game_desc = Some(v.to_string());
+                    } else if k == "cloneof" || k == "romof" {
+                        capture_parent(&mut current_game_clone_of, k, v);
                     }
                 });
             }
@@ -340,6 +358,7 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
     emit_game(
         &mut current_game_name,
         &mut current_game_desc,
+        &mut current_game_clone_of,
         &mut current_roms,
         &mut games,
         &limits,
@@ -370,6 +389,17 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
         dat: ParsedDat { source, games },
         warnings,
     })
+}
+
+/// Records a parent reference, with `cloneof` taking precedence over `romof`.
+///
+/// Both keys declare a parent relationship (a `romof` names the parent's ROM
+/// set), so either is a parent reference for the clone policy; `cloneof` wins
+/// when both are present on one game.
+fn capture_parent(clone_of: &mut Option<String>, key: &str, value: &str) {
+    if key == "cloneof" || clone_of.is_none() {
+        *clone_of = Some(value.to_string());
+    }
 }
 
 /// Extract the content inside `prefix(...)`, stripping the closing `)` if present.
@@ -548,6 +578,7 @@ fn emit_rom_flush(
 fn emit_game(
     name: &mut Option<String>,
     desc: &mut Option<String>,
+    clone_of: &mut Option<String>,
     roms: &mut Vec<DatRomEntry>,
     games: &mut Vec<DatGameEntry>,
     limits: &DatLimits,
@@ -563,7 +594,7 @@ fn emit_game(
             name: game_name,
             description: desc.take(),
             roms: std::mem::take(roms),
-            clone_of: None,
+            clone_of: clone_of.take(),
             sample_of: None,
             board: None,
             rebuild_to: None,
@@ -719,6 +750,38 @@ mod tests {
         let result = parse_clrmamepro(&path, limits).unwrap();
         assert_eq!(result.dat.games.len(), 1);
         assert_eq!(result.dat.games[0].roms.len(), 3);
+    }
+
+    #[test]
+    fn cloneof_and_romof_declare_the_parent_entry() {
+        let content = concat!(
+            "clrmamepro (\n",
+            "\tname Test\n",
+            ")\n",
+            "game (\n",
+            "\tname \"Parent Game\"\n",
+            "\trom ( name parent.bin size 100 crc AAAAAAAA )\n",
+            ")\n",
+            "game (\n",
+            "\tname \"Clone Game\"\n",
+            "\tcloneof \"Parent Game\"\n",
+            "\trom ( name clone.bin size 100 crc BBBBBBBB )\n",
+            ")\n",
+            "game (\n",
+            "\tname \"ROM Clone Game\"\n",
+            "\tromof \"Parent Game\"\n",
+            "\trom ( name romclone.bin size 100 crc CCCCCCCC )\n",
+            ")\n"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clone.dat");
+        std::fs::write(&path, content).unwrap();
+        let limits = DatLimits::default();
+        let result = parse_clrmamepro(&path, limits).unwrap();
+        assert_eq!(result.dat.games.len(), 3);
+        assert_eq!(result.dat.games[0].clone_of, None);
+        assert_eq!(result.dat.games[1].clone_of.as_deref(), Some("Parent Game"));
+        assert_eq!(result.dat.games[2].clone_of.as_deref(), Some("Parent Game"));
     }
 
     #[test]

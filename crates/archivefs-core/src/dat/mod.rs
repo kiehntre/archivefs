@@ -39,6 +39,7 @@ pub mod limits;
 pub mod model;
 pub mod parser;
 pub mod parsers;
+pub mod policy;
 #[cfg(test)]
 mod regression;
 pub mod sources;
