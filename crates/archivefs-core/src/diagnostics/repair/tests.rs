@@ -57,6 +57,7 @@ impl Fixture {
             source_folders: vec![self.dir("roms")],
             mount_root: self.dir("mnt"),
             ratarmount_bin: "ratarmount".to_string(),
+            master_rom_root: None,
         }
     }
 
@@ -350,6 +351,7 @@ fn a_path_inside_a_configured_source_folder_is_always_refused() {
         source_folders: vec![source],
         mount_root: fixture.dir("roms/mnt"),
         ratarmount_bin: "ratarmount".to_string(),
+        master_rom_root: None,
     };
     let inside = fixture.dir("roms/mnt/SNES/Old Game");
     let before = snapshot(&fixture.root);
@@ -744,6 +746,7 @@ fn a_refused_rebuild_leaves_the_previous_valid_index_byte_identical() {
         source_folders: vec![fixture.root.join("roms-missing")],
         mount_root: fixture.dir("mnt"),
         ratarmount_bin: "ratarmount".to_string(),
+        master_rom_root: None,
     };
     let index_path = fixture.index_path();
     let previous = ArchiveIndex {

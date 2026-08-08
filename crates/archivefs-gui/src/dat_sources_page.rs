@@ -2228,6 +2228,9 @@ impl DatSourcesPageState {
                 journal_dir,
                 hard_conflict_mode: mode,
                 cancel: &worker_cancel,
+                directory_policy:
+                    archivefs_core::dat::rename_apply::preflight::DirectoryPolicy::SameDirectory,
+                allow_symlink_source: false,
             });
             let _ = match result {
                 Ok(outcome) => apply_sender.send(ApplyJobMessage::Applied(Box::new(outcome))),

@@ -86,6 +86,7 @@ mod platform_artwork;
 mod retroarch_cheat_cache;
 mod retroarch_cheat_setup;
 mod retroarch_cheat_sources;
+mod rom_organise;
 mod romm_identity;
 
 static LOGGER: StderrLogger = StderrLogger;
@@ -396,6 +397,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "cheat-source" => {
             let input_args = args.collect::<Vec<_>>();
             cheat_source::run(input_args)?;
+        }
+        "rom-organise" => {
+            rom_organise::run(args.collect())?;
         }
         "pcsx2-patch-preview" => {
             let mut input_args = args.collect::<Vec<_>>();
@@ -7052,6 +7056,7 @@ mod tests {
             source_folders: vec![source_dir.to_path_buf()],
             mount_root: mount_dir.to_path_buf(),
             ratarmount_bin: "ratarmount".to_string(),
+            master_rom_root: None,
         }
     }
 
@@ -7240,6 +7245,7 @@ mod tests {
             source_folders: vec![source_a.clone(), source_b.clone()],
             mount_root: mount,
             ratarmount_bin: "ratarmount".to_string(),
+            master_rom_root: None,
         };
         run_library_scan(&config, &database_path, "test").unwrap();
 

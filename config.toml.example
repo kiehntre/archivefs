@@ -35,3 +35,16 @@ mount_root = "/mnt/archivefs"
 # PATH) if this line is omitted. Set an absolute path here instead if
 # ratarmount is not on PATH.
 ratarmount_bin = "ratarmount"
+
+# Optional canonical ROM root. When set, ArchiveFS can *plan* - and, only
+# after explicit approval, apply - moving identified games into canonical
+# RomM-compatible platform directories beneath this root (for example
+# /mnt/games/roms/psp/Game (Europe).iso). Setting this line never moves
+# anything by itself; organisation always requires an explicit plan and
+# approval. Platform directory names always come from the canonical RomM
+# slug mapping, never from display text. Omit the line when you do not want
+# organisation.
+#
+#   archivefs-cli rom-organise set-master-root /mnt/games/roms
+#
+# master_rom_root = "/mnt/games/roms"

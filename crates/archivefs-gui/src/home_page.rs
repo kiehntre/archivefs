@@ -37,6 +37,7 @@ pub(crate) enum HomeCard {
     BuildLibrary,
     BrowseGames,
     CheatsAndMods,
+    CanonicalOrganisation,
     CheatSources,
     DatSources,
     RomM,
@@ -241,6 +242,14 @@ pub(crate) fn build_home_view(inputs: &HomeInputs) -> HomeView {
             readiness: Some(cheats_readiness),
             action_label: "Open Cheats & Mods",
             secondary: Some((HomeCard::CheatSources, "Manage Cheat Sources")),
+        },
+        HomeCardView {
+            card: HomeCard::CanonicalOrganisation,
+            title: "Organise my library",
+            explanation: "Plan and, only after your explicit approval, move identified games into canonical platform folders under your master ROM root.",
+            readiness: None,
+            action_label: "Open Canonical Organisation",
+            secondary: None,
         },
         HomeCardView {
             card: HomeCard::DatSources,

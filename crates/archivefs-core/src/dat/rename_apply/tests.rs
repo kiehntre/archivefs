@@ -110,6 +110,8 @@ fn apply_exec(
         journal_dir: journal_dir.to_path_buf(),
         hard_conflict_mode: mode,
         cancel,
+        directory_policy: super::preflight::DirectoryPolicy::SameDirectory,
+        allow_symlink_source: false,
     })
 }
 
@@ -962,6 +964,7 @@ fn crash_after_journal_write_before_first_rename_is_recoverable() {
             rolled_back_at_unix: None,
             unknown: Default::default(),
         }],
+        created_directories: Vec::new(),
         unknown: Default::default(),
     };
     write_journal(&journal, &tx).unwrap();
@@ -988,6 +991,7 @@ fn crash_after_first_of_n_renames_is_recoverable() {
         source_scan_root: "/tmp/roms".to_string(),
         state: TransactionState::Applying,
         entries: Vec::new(),
+        created_directories: Vec::new(),
         unknown: Default::default(),
     };
     let mk = |source: &str, state: EntryState| TransactionEntry {
@@ -1040,6 +1044,7 @@ fn recovery_never_auto_resumes() {
         source_scan_root: "/tmp/roms".to_string(),
         state: TransactionState::Applying,
         entries: Vec::new(),
+        created_directories: Vec::new(),
         unknown: Default::default(),
     };
     write_journal(&journal, &tx).unwrap();
@@ -1931,6 +1936,7 @@ fn stress_crash_recovery_fixtures_are_detected() {
             source_scan_root: "/tmp/roms".to_string(),
             state: TransactionState::Applying,
             entries: Vec::new(),
+            created_directories: Vec::new(),
             unknown: Default::default(),
         };
         tx.entries.push(TransactionEntry {

@@ -57,7 +57,9 @@ pub use model::{
     TransactionEntry, TransactionState, TransactionSummary,
 };
 pub use noclobber::{NoClobberError, rename_noreplace};
-pub use preflight::{PreflightFailure, PreflightOptions, batch_destinations, run_preflight};
+pub use preflight::{
+    DirectoryPolicy, PreflightFailure, PreflightOptions, batch_destinations, run_preflight,
+};
 pub use reconcile::{RecoveryIssue, RecoveryIssueKind, reconcile_recovery};
 pub use rollback::{RollbackOutcome, rollback_transaction};
 

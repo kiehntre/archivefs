@@ -218,6 +218,7 @@ mod tests {
             source_scan_root: "/tmp/roms".to_string(),
             state: super::super::model::TransactionState::Applying,
             entries: vec![entry],
+            created_directories: Vec::new(),
             unknown: Default::default(),
         }
     }

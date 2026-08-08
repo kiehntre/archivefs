@@ -181,6 +181,10 @@ fn every_primary_card_action_reports_its_own_card() {
         (HomeCard::BuildLibrary, "Open Sources"),
         (HomeCard::BrowseGames, "Open Library"),
         (HomeCard::CheatsAndMods, "Open Cheats & Mods"),
+        (
+            HomeCard::CanonicalOrganisation,
+            "Open Canonical Organisation",
+        ),
         (HomeCard::DatSources, "Open DAT Sources"),
         (HomeCard::RomM, "Open Sources"),
         (HomeCard::CheckSetup, "Open Doctor"),

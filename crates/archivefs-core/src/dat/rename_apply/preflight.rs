@@ -9,6 +9,7 @@
 //! rather than continuing blindly.
 
 use std::collections::BTreeSet;
+use std::path::Path;
 
 use crate::safe_read::TrustedRoots;
 
@@ -29,6 +30,7 @@ pub enum PreflightFailure {
     DestinationParentChanged,
     OutsideTrustedRoot,
     CrossFilesystemUnsupported,
+    DestinationOnDifferentFilesystem,
     GenerationMismatch { current: u64, expected: u64 },
     NotApproved,
     NotActionable,
@@ -68,6 +70,11 @@ impl PreflightFailure {
             Self::CrossFilesystemUnsupported => {
                 "the source and destination are not in the same directory".to_string()
             }
+            Self::DestinationOnDifferentFilesystem => {
+                "the source and destination are on different filesystems; a cross-filesystem \
+                 move is not yet supported safely"
+                    .to_string()
+            }
             Self::GenerationMismatch { current, expected } => format!(
                 "the plan generation changed since approval (now {current}, expected {expected}); \
                  the plan is stale"
@@ -85,6 +92,22 @@ impl PreflightFailure {
     }
 }
 
+/// Where the destination may live relative to the source.
+///
+/// [`DirectoryPolicy::SameDirectory`] is the rename-apply default: a rename
+/// may only stay in the source's own directory. [`DirectoryPolicy::SameFilesystem`]
+/// additionally permits a move into a different directory **on the same
+/// filesystem** - the master-ROM-root case - and rejects a genuine
+/// cross-filesystem move outright.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DirectoryPolicy {
+    /// The destination must be in the source's exact directory.
+    #[default]
+    SameDirectory,
+    /// The destination may be elsewhere, but must be on the same filesystem.
+    SameFilesystem,
+}
+
 /// Options that shape a preflight pass.
 #[derive(Debug, Clone)]
 pub struct PreflightOptions<'a> {
@@ -100,6 +123,14 @@ pub struct PreflightOptions<'a> {
     /// The destination paths of every entry in the batch (to detect two
     /// entries targeting one destination).
     pub batch_destinations: &'a BTreeSet<String>,
+    /// Whether the destination may live outside the source's directory.
+    pub directory_policy: DirectoryPolicy,
+    /// Whether a symlink object (not its target) is an acceptable source.
+    /// Defaults to false: rename-apply only ever renames regular files. The
+    /// ROM organiser's symlink-only mode sets this so the *link object itself*
+    /// is moved; the target is never dereferenced and the link's identity is
+    /// still re-verified.
+    pub allow_symlink_source: bool,
 }
 
 /// Runs every preflight check for one entry. Returns `Ok(())` when the entry
@@ -130,11 +161,22 @@ pub fn run_preflight(
         failures.push(PreflightFailure::DestinationUnsafe);
     }
 
-    // Same-directory requirement.
+    // Directory placement. Same-directory (rename-apply) requires the exact
+    // same parent; same-filesystem (master-ROM-root move) allows a different
+    // directory on the same device and rejects a genuine cross-filesystem move.
     let source_parent = entry.source_path.parent();
     let destination_parent = entry.destination_path.parent();
-    if source_parent != destination_parent {
-        failures.push(PreflightFailure::CrossFilesystemUnsupported);
+    match options.directory_policy {
+        DirectoryPolicy::SameDirectory => {
+            if source_parent != destination_parent {
+                failures.push(PreflightFailure::CrossFilesystemUnsupported);
+            }
+        }
+        DirectoryPolicy::SameFilesystem => {
+            if !same_filesystem(source_parent, destination_parent) {
+                failures.push(PreflightFailure::DestinationOnDifferentFilesystem);
+            }
+        }
     }
 
     // Trusted-root containment. Only meaningful when there are roots.
@@ -163,7 +205,9 @@ pub fn run_preflight(
             if current.kind == super::model::ObjectKind::Symlink
                 || current.kind == super::model::ObjectKind::BrokenSymlink
             {
-                failures.push(PreflightFailure::SourceIsSymlink);
+                if !options.allow_symlink_source {
+                    failures.push(PreflightFailure::SourceIsSymlink);
+                }
             } else if current.kind != super::model::ObjectKind::RegularFile {
                 failures.push(PreflightFailure::SourceNotRegular);
             }
@@ -186,10 +230,10 @@ pub fn run_preflight(
     if std::fs::symlink_metadata(&entry.destination_path).is_ok() {
         failures.push(PreflightFailure::DestinationExists);
     } else {
-        // Case-only collision re-checked against the live directory: a file
-        // whose name differs from the destination only by case may have
-        // appeared since the plan was built.
-        if let Some(parent) = entry.source_path.parent()
+        // Case-only collision re-checked against the live destination
+        // directory: a file whose name differs from the destination only by
+        // case may have appeared since the plan was built.
+        if let Some(parent) = entry.destination_path.parent()
             && let Ok(entries) = std::fs::read_dir(parent)
         {
             let proposed_lower = entry.proposed_basename.to_ascii_lowercase();
@@ -218,6 +262,31 @@ pub fn run_preflight(
         Ok(())
     } else {
         Err(failures)
+    }
+}
+
+/// Whether `left` and `right` are on the same filesystem, judged by the device
+/// id of the two directories. A missing directory, or a platform without a
+/// reliable device comparison, is treated as *not* the same filesystem so a
+/// move is refused rather than guessed.
+fn same_filesystem(left: Option<&Path>, right: Option<&Path>) -> bool {
+    let (Some(left), Some(right)) = (left, right) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let left_dev = std::fs::metadata(left).map(|meta| meta.dev());
+        let right_dev = std::fs::metadata(right).map(|meta| meta.dev());
+        match (left_dev, right_dev) {
+            (Ok(left), Ok(right)) => left == right,
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (left, right);
+        false
     }
 }
 
@@ -285,6 +354,8 @@ mod tests {
             approved_paths: approved,
             trusted,
             batch_destinations: destinations,
+            directory_policy: DirectoryPolicy::SameDirectory,
+            allow_symlink_source: false,
         }
     }
 
@@ -364,6 +435,39 @@ mod tests {
                 .iter()
                 .any(|f| f == &PreflightFailure::SourceIsSymlink)
         );
+    }
+
+    #[test]
+    fn same_filesystem_policy_refuses_a_different_device_destination() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let dir = tempfile::tempdir().unwrap();
+            let source = dir.path().join("a.bin");
+            std::fs::write(&source, b"data").unwrap();
+            let proc = std::path::Path::new("/proc");
+            let dir_dev = std::fs::metadata(dir.path()).map(|m| m.dev()).ok();
+            let proc_dev = std::fs::metadata(proc).map(|m| m.dev()).ok();
+            if dir_dev.is_none() || proc_dev.is_none() || dir_dev == proc_dev {
+                // No second filesystem observable in this environment; the
+                // refusal path is covered by the organiser integration test.
+                return;
+            }
+            let destination = proc.join("archivefs-crossfs-test").join("a.bin");
+            let entry = entry(&source, &destination);
+            let approved = BTreeSet::from([source.to_string_lossy().into_owned()]);
+            let trusted = TrustedRoots::from_paths([dir.path()]);
+            let destinations = BTreeSet::new();
+            let mut opts = options(&approved, &trusted, &destinations, 1);
+            opts.directory_policy = DirectoryPolicy::SameFilesystem;
+            let failures = run_preflight(&entry, &opts).unwrap_err();
+            assert!(
+                failures
+                    .iter()
+                    .any(|f| f == &PreflightFailure::DestinationOnDifferentFilesystem),
+                "{failures:?}"
+            );
+        }
     }
 
     #[test]

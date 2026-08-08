@@ -2268,7 +2268,7 @@ impl Database {
         Ok(summary)
     }
 
-    fn current_platform_identity_evidence(
+    pub fn current_platform_identity_evidence(
         &self,
         archive_id: i64,
         generation: u64,
@@ -3776,6 +3776,7 @@ fn scan_and_persist_folders_transaction(
             source_folders: vec![folder.path.clone()],
             mount_root: PathBuf::new(),
             ratarmount_bin: String::new(),
+            master_rom_root: None,
         };
 
         let discovery = match ArchiveScanner::new(&folder_config).scan_archives_with_summary() {
@@ -4124,6 +4125,7 @@ mod tests {
             source_folders: vec![source_dir.to_path_buf()],
             mount_root: mount_dir.to_path_buf(),
             ratarmount_bin: "ratarmount".to_string(),
+            master_rom_root: None,
         }
     }
 
@@ -5948,6 +5950,7 @@ mod tests {
             source_folders: vec![source_a.clone(), source_b.clone()],
             mount_root: mount,
             ratarmount_bin: "ratarmount".to_string(),
+            master_rom_root: None,
         };
         let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
         let first = scan_and_persist(&mut database, &config, "test").unwrap();
@@ -6005,6 +6008,7 @@ mod tests {
             source_folders: vec![source_a.clone(), source_b.clone()],
             mount_root: mount,
             ratarmount_bin: "ratarmount".to_string(),
+            master_rom_root: None,
         };
         let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
         scan_and_persist(&mut database, &config, "test").unwrap();
@@ -6058,6 +6062,7 @@ mod tests {
             source_folders: vec![source_a.clone(), source_b.clone()],
             mount_root: mount,
             ratarmount_bin: "ratarmount".to_string(),
+            master_rom_root: None,
         };
         let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
 
@@ -8542,6 +8547,7 @@ mod tests {
             source_folders: vec![source_a.clone(), source_b.clone(), source_c.clone()],
             mount_root: mount,
             ratarmount_bin: "ratarmount".to_string(),
+            master_rom_root: None,
         };
         let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
         let first = scan_and_persist(&mut database, &config, "test").unwrap();

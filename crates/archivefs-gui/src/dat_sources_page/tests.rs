@@ -3893,6 +3893,7 @@ fn an_interrupted_transaction_is_offered_for_recovery_and_never_auto_resumes() {
             rolled_back_at_unix: None,
             unknown: Default::default(),
         }],
+        created_directories: Vec::new(),
         unknown: Default::default(),
     };
     archivefs_core::dat::rename_apply::write_journal(
