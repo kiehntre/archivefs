@@ -463,6 +463,7 @@ pub(crate) struct DatSourcesPageView {
     pub(crate) library_folders: Vec<PathBuf>,
     pub(crate) audit: Option<Box<AuditResultView>>,
     pub(crate) audit_error: Option<String>,
+    pub(crate) identity_enrichment: Option<Box<archivefs_core::PlatformIdentityEnrichmentSummary>>,
     /// The DAT Matching Policy section, including the Effective Policy
     /// Summary resolved for the scope the user is inspecting.
     pub(crate) policy: DatPolicyView,
@@ -954,6 +955,7 @@ enum JobMessage {
         /// one.
         generation: u64,
         outcome: Box<DatAuditOutcome>,
+        enrichment: Option<Box<archivefs_core::PlatformIdentityEnrichmentSummary>>,
         /// The read-only rename plan derived from the audit, when one could be
         /// built (and was not cancelled).
         plan: Option<Box<RenamePlan>>,
@@ -1471,6 +1473,9 @@ impl EtaEstimator {
 
 pub(crate) struct DatSourcesPageState {
     config_path: PathBuf,
+    /// Existing ArchiveFS catalogue to enrich after a completed audit. Absent
+    /// in injected tests and when no catalogue exists.
+    database_path: Option<PathBuf>,
     /// What is on disk, as last read or last written.
     saved: DatSourceRegistry,
     /// What the user has edited but not yet saved.
@@ -1507,6 +1512,10 @@ pub(crate) struct DatSourcesPageState {
     /// Monotonically increasing audit generation. Each audit start bumps it;
     /// a result carrying an older generation is a stale plan and is dropped.
     audit_generation: u64,
+    /// Set when a current audit has had a chance to enrich the catalogue; the
+    /// shell consumes it to reload Library metadata once.
+    identity_enrichment_completed: bool,
+    identity_enrichment: Option<Box<archivefs_core::PlatformIdentityEnrichmentSummary>>,
     /// Session-only review decisions, keyed by source path. Recording one
     /// never touches a file; nothing here persists them (deferral documented).
     review_decisions: BTreeMap<String, ReviewDecision>,
@@ -1578,6 +1587,7 @@ impl DatSourcesPageState {
             archivefs_core::dat::rename_apply::find_recovery_transactions(&transaction_dir);
         Self {
             config_path,
+            database_path: None,
             saved,
             draft,
             load_error,
@@ -1597,6 +1607,8 @@ impl DatSourcesPageState {
             rename_plan: None,
             rename_plan_error: None,
             audit_generation: 0,
+            identity_enrichment_completed: false,
+            identity_enrichment: None,
             review_decisions: BTreeMap::new(),
             transaction_dir,
             apply_review: None,
@@ -1612,6 +1624,15 @@ impl DatSourcesPageState {
             recovery_transactions,
             history_records: Vec::new(),
         }
+    }
+
+    pub(crate) fn with_database_path(mut self, database_path: Option<PathBuf>) -> Self {
+        self.database_path = database_path.filter(|path| path.is_file());
+        self
+    }
+
+    pub(crate) fn take_identity_enrichment_completed(&mut self) -> bool {
+        std::mem::take(&mut self.identity_enrichment_completed)
     }
 
     /// How many sources are registered on disk, right now - what Home
@@ -1853,6 +1874,7 @@ impl DatSourcesPageState {
                 Ok(JobMessage::Audited {
                     generation,
                     outcome,
+                    enrichment,
                     plan,
                 }) => {
                     if job.cancel_requested {
@@ -1872,6 +1894,8 @@ impl DatSourcesPageState {
                         // without the worker carrying any timestamps.
                         self.audit_elapsed_seconds = Some(job.started_at.elapsed().as_secs());
                         self.audit = Some(outcome);
+                        self.identity_enrichment_completed = self.database_path.is_some();
+                        self.identity_enrichment = enrichment;
                         self.audit_error = None;
                         match plan {
                             Some(plan) => {
@@ -2443,6 +2467,8 @@ impl DatSourcesPageState {
             return;
         };
         self.audit = None;
+        self.identity_enrichment_completed = false;
+        self.identity_enrichment = None;
         self.audit_error = None;
         self.audit_elapsed_seconds = None;
         self.rename_plan = None;
@@ -2481,6 +2507,7 @@ impl DatSourcesPageState {
             policy: Some(policy),
             platform: canonical_platform.map(str::to_string),
         };
+        let database_path = self.database_path.clone();
 
         std::thread::spawn(move || {
             let report_sender = sender.clone();
@@ -2489,6 +2516,43 @@ impl DatSourcesPageState {
             });
             let _ = match outcome {
                 Ok(outcome) => {
+                    // Cancellation may race with the audit's final comparison.
+                    // Re-check at the metadata-write boundary so a result the
+                    // page will discard cannot still enrich the catalogue.
+                    let enrichment = if worker_cancel.load(Ordering::Acquire) {
+                        None
+                    } else if let Some(database_path) = database_path {
+                        match archivefs_core::Database::open_or_create(&database_path).and_then(
+                            |mut database| {
+                                database.enrich_platforms_from_dat_audit(&outcome, generation)
+                            },
+                        ) {
+                            Ok(enrichment) => {
+                                send_progress(
+                                    &sender,
+                                    JobMessage::Progress(format!(
+                                        "Platform identity enrichment: {} applied, {} already current, {} manual assignment(s) preserved, {} conflict(s) require review.",
+                                        enrichment.applied,
+                                        enrichment.unchanged,
+                                        enrichment.manual_preserved,
+                                        enrichment.conflicts,
+                                    )),
+                                );
+                                Some(Box::new(enrichment))
+                            }
+                            Err(error) => {
+                                send_progress(
+                                    &sender,
+                                    JobMessage::Progress(format!(
+                                        "DAT audit completed, but platform identity metadata could not be updated: {error}"
+                                    )),
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     // Build the read-only rename plan from the finished audit.
                     // This is cheap (no re-scan, no hashing) but cancellable and
                     // runs on the worker, never on the UI thread.
@@ -2506,6 +2570,7 @@ impl DatSourcesPageState {
                     sender.send(JobMessage::Audited {
                         generation,
                         outcome: Box::new(outcome),
+                        enrichment,
                         plan,
                     })
                 }
@@ -2589,6 +2654,7 @@ impl DatSourcesPageState {
                 .as_ref()
                 .map(|outcome| Box::new(audit_view(outcome, self.audit_elapsed_seconds))),
             audit_error: self.audit_error.clone(),
+            identity_enrichment: self.identity_enrichment.clone(),
             policy: self.policy_view(),
             rename_plan: self.rename_plan_view(),
             rename_apply: self.rename_apply_view(),
@@ -3455,6 +3521,52 @@ pub(crate) fn show_dat_sources_page(
             error,
             widgets::StatusTone::Blocked,
         );
+    }
+    if let Some(enrichment) = &view.identity_enrichment {
+        ui.add_space(8.0);
+        if enrichment.conflicts > 0 {
+            let mut detail = String::new();
+            for conflict in enrichment.conflict_details.iter().take(3) {
+                if !detail.is_empty() {
+                    detail.push('\n');
+                }
+                let evidence = conflict
+                    .evidence
+                    .iter()
+                    .map(|item| {
+                        format!(
+                            "{}: {}",
+                            item.source.label(),
+                            archivefs_core::platform::display_name_for(&item.platform)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                detail.push_str(&format!("{evidence} — Review required"));
+            }
+            if enrichment.conflict_details.len() > 3 {
+                detail.push_str(&format!(
+                    "\n…and {} more conflict(s)",
+                    enrichment.conflict_details.len() - 3
+                ));
+            }
+            widgets::banner(
+                ui,
+                "Platform conflict",
+                &detail,
+                widgets::StatusTone::Warning,
+            );
+        } else if enrichment.applied > 0 {
+            widgets::banner(
+                ui,
+                "Platform identity enriched",
+                &format!(
+                    "{} library item(s) received verified DAT platform provenance. No ROM files or links were changed.",
+                    enrichment.applied
+                ),
+                widgets::StatusTone::Success,
+            );
+        }
     }
     if let Some(audit) = &view.audit {
         ui.add_space(10.0);

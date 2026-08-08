@@ -263,6 +263,20 @@ impl IdentityCache {
             .find(|record| record.archivefs_path.as_deref() == Some(path))
     }
 
+    /// The RomM platform slug this imported instance uses for a canonical
+    /// ArchiveFS platform. This is the safe future directory-organisation seam:
+    /// it returns provider data already mapped through the registry, never a
+    /// slug guessed from a display label. If an instance reports duplicates,
+    /// the lexicographically first slug is chosen deterministically.
+    pub fn romm_slug_for_platform(&self, canonical_platform: &str) -> Option<&str> {
+        crate::platform::platform_by_id(canonical_platform)?;
+        self.platforms
+            .iter()
+            .filter(|platform| platform.canonical.as_deref() == Some(canonical_platform))
+            .map(|platform| platform.provider_slug.as_str())
+            .min()
+    }
+
     /// Every record with a conflict.
     pub fn conflicts(&self) -> Vec<&ExternalIdentityRecord> {
         self.records

@@ -298,6 +298,7 @@ pub(crate) struct RommImportSummary {
     pub(crate) failure: Option<String>,
     pub(crate) failure_code: Option<String>,
     pub(crate) previous_cache_usable: bool,
+    pub(crate) platform_enrichment: Option<Box<archivefs_core::PlatformIdentityEnrichmentSummary>>,
 }
 
 /// Live progress, kept small because it is replaced many times a second.
@@ -1150,6 +1151,41 @@ fn build_import_result(summary: &RommImportSummary, sample: bool) -> RommResultV
                     .collect::<Vec<_>>()
                     .join(", ")
             ));
+        }
+    }
+    if let Some(enrichment) = &summary.platform_enrichment {
+        rows.push(row("Platforms enriched", enrichment.applied.to_string()));
+        rows.push(row(
+            "Manual assignments preserved",
+            enrichment.manual_preserved.to_string(),
+        ));
+        if enrichment.conflicts > 0 {
+            rows.push(row(
+                "Platform conflicts",
+                format!("{} — Review required", enrichment.conflicts),
+            ));
+            for conflict in enrichment.conflict_details.iter().take(3) {
+                notes.push(
+                    conflict
+                        .evidence
+                        .iter()
+                        .map(|item| {
+                            format!(
+                                "{}: {}",
+                                item.source.label(),
+                                archivefs_core::platform::display_name_for(&item.platform)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" · "),
+                );
+            }
+        }
+        if enrichment.applied > 0 {
+            notes.push(
+                "Platform identity metadata was updated; no ROM files or links were changed."
+                    .to_string(),
+            );
         }
     }
 

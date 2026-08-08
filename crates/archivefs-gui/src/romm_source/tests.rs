@@ -712,6 +712,7 @@ fn import_summary(published: bool, records: usize) -> RommImportSummary {
         failure: None,
         failure_code: None,
         previous_cache_usable: true,
+        platform_enrichment: None,
     }
 }
 
@@ -751,6 +752,55 @@ fn a_sample_result_says_plainly_that_nothing_was_published() {
         !rows.contains(&"Published to".to_string()),
         "a sample has no cache path"
     );
+}
+
+#[test]
+fn romm_import_result_surfaces_platform_conflict_for_review() {
+    use archivefs_core::platform::identity::{
+        PlatformIdentityConfidence, PlatformIdentityEvidence, PlatformIdentitySource,
+    };
+
+    let mut summary = import_summary(true, 1);
+    summary.platform_enrichment = Some(Box::new(
+        archivefs_core::PlatformIdentityEnrichmentSummary {
+            conflicts: 1,
+            conflict_details: vec![archivefs_core::PlatformIdentityConflictDetail {
+                archive_id: 1,
+                evidence: vec![
+                    PlatformIdentityEvidence::canonical(
+                        "PSX",
+                        PlatformIdentitySource::VerifiedDat,
+                        PlatformIdentityConfidence::Verified,
+                        1,
+                        "DAT fixture",
+                    )
+                    .unwrap(),
+                    PlatformIdentityEvidence::canonical(
+                        "PSP",
+                        PlatformIdentitySource::Romm,
+                        PlatformIdentityConfidence::High,
+                        1,
+                        "RomM fixture",
+                    )
+                    .unwrap(),
+                ],
+            }],
+            ..Default::default()
+        },
+    ));
+    let view = build_result_view(
+        &RommOperation::FullImport,
+        Ok(&RommOperationOutcome::Import(Box::new(summary))),
+    );
+    assert!(
+        view.rows
+            .iter()
+            .any(|row| row.label == "Platform conflicts" && row.value.contains("Review required"))
+    );
+    assert!(view.notes.iter().any(|note| {
+        note.contains("Verified DAT: Sony PlayStation")
+            && note.contains("RomM: Sony PlayStation Portable")
+    }));
 }
 
 #[test]

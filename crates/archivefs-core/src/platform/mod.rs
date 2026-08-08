@@ -37,6 +37,7 @@
 use std::path::Path;
 
 pub mod detect;
+pub mod identity;
 
 #[cfg(test)]
 mod tests;
@@ -44,6 +45,10 @@ mod tests;
 pub use detect::{
     DetectionConfidence, DetectionEvidence, DetectionRequest, DetectionSource, PlatformCandidate,
     PlatformDetectionReport, detect_platform_report,
+};
+pub use identity::{
+    PlatformIdentityConfidence, PlatformIdentityEvidence, PlatformIdentityResolution,
+    PlatformIdentitySource, resolve_platform_identity,
 };
 
 /// One bounded, read-only signature check.

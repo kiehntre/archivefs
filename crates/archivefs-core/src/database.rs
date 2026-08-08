@@ -38,6 +38,7 @@ use crate::emulator_environment::EncodedPath;
 use crate::game_identity::{
     GameIdentityReport, IdentityPlatform, inspect_catalogued_game_identity,
 };
+use crate::platform::identity::{PlatformIdentityResolution, PlatformIdentitySource};
 
 use crate::{
     Archive, ArchiveFsError, ArchiveKind, ArchiveScanner, Config, PlatformProvenance, Result,
@@ -1426,6 +1427,14 @@ pub const MANUAL_PLATFORM_SOURCE: &str = "manual";
 /// wins) - see [`provenance_priority`].
 pub const CUSTOM_FOLDER_ALIAS_SOURCE: &str = "custom_folder_alias";
 pub const SOURCE_PLATFORM_ASSIGNMENT_SOURCE: &str = "source_assignment";
+/// Automatic platform identity established by a usable, canonically mapped
+/// RomM record.
+pub const ROMM_PLATFORM_SOURCE: &str = "romm";
+/// Automatic platform identity established by a cryptographic exact DAT audit
+/// match whose source is assigned to a canonical platform.
+pub const VERIFIED_DAT_PLATFORM_SOURCE: &str = "verified_dat";
+/// RomM and verified DAT independently established the same platform.
+pub const DAT_ROMM_AGREEMENT_SOURCE: &str = "verified_dat+romm";
 
 /// Relative strength of a `platform_assignments.source` value, used by
 /// [`Database::assign_platform`] to decide whether a new assignment may
@@ -1460,8 +1469,71 @@ fn provenance_priority(source: &str) -> u8 {
         CUSTOM_FOLDER_ALIAS_SOURCE => 2,
         SOURCE_PLATFORM_ASSIGNMENT_SOURCE => 3,
         "header_identity" => 4,
-        MANUAL_PLATFORM_SOURCE => 5,
+        ROMM_PLATFORM_SOURCE => 5,
+        VERIFIED_DAT_PLATFORM_SOURCE | DAT_ROMM_AGREEMENT_SOURCE => 6,
+        MANUAL_PLATFORM_SOURCE => 7,
         _ => 1,
+    }
+}
+
+fn enrichment_source(
+    evidence: &[crate::platform::identity::PlatformIdentityEvidence],
+) -> Option<&'static str> {
+    let dat = evidence
+        .iter()
+        .any(|item| item.source == PlatformIdentitySource::VerifiedDat);
+    let romm = evidence
+        .iter()
+        .any(|item| item.source == PlatformIdentitySource::Romm);
+    match (dat, romm) {
+        (true, true) => Some(DAT_ROMM_AGREEMENT_SOURCE),
+        (true, false) => Some(VERIFIED_DAT_PLATFORM_SOURCE),
+        (false, true) => Some(ROMM_PLATFORM_SOURCE),
+        (false, false) => None,
+    }
+}
+
+/// What persisting one current-generation platform identity resolution did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlatformIdentityApplyOutcome {
+    Applied,
+    Unchanged,
+    ManualPreserved,
+    ConflictRequiresReview,
+    StaleGenerationIgnored,
+    UnknownIgnored,
+}
+
+/// Counts from enriching a catalogue with one current provider snapshot.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct PlatformIdentityEnrichmentSummary {
+    pub evidence_considered: usize,
+    pub archives_matched: usize,
+    pub applied: usize,
+    pub unchanged: usize,
+    pub manual_preserved: usize,
+    pub conflicts: usize,
+    pub stale_ignored: usize,
+    pub unknown_ignored: usize,
+    pub conflict_details: Vec<PlatformIdentityConflictDetail>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PlatformIdentityConflictDetail {
+    pub archive_id: i64,
+    pub evidence: Vec<crate::platform::identity::PlatformIdentityEvidence>,
+}
+
+impl PlatformIdentityEnrichmentSummary {
+    fn note(&mut self, outcome: PlatformIdentityApplyOutcome) {
+        match outcome {
+            PlatformIdentityApplyOutcome::Applied => self.applied += 1,
+            PlatformIdentityApplyOutcome::Unchanged => self.unchanged += 1,
+            PlatformIdentityApplyOutcome::ManualPreserved => self.manual_preserved += 1,
+            PlatformIdentityApplyOutcome::ConflictRequiresReview => self.conflicts += 1,
+            PlatformIdentityApplyOutcome::StaleGenerationIgnored => self.stale_ignored += 1,
+            PlatformIdentityApplyOutcome::UnknownIgnored => self.unknown_ignored += 1,
+        }
     }
 }
 
@@ -2011,6 +2083,259 @@ impl Database {
         tx.commit()
             .map_err(|error| db_error("failed to commit assign_platform", error))?;
         Ok(())
+    }
+
+    /// Persists a provider-neutral platform identity resolution in the
+    /// existing assignment history. Only a resolution from `current_generation`
+    /// is eligible, so an older worker cannot overwrite a newer library view.
+    ///
+    /// Manual assignment remains current unconditionally. A DAT/RomM conflict
+    /// is never persisted as either provider's platform; if an earlier
+    /// enrichment assignment is current, it is retired so arrival order cannot
+    /// leave that earlier provider looking like the answer. The typed conflict
+    /// remains the caller's session-level review state because the existing
+    /// schema has no conflict row and this feature deliberately adds no
+    /// migration.
+    pub fn apply_platform_identity_resolution(
+        &mut self,
+        archive_id: i64,
+        resolution: &PlatformIdentityResolution,
+        current_generation: u64,
+    ) -> Result<PlatformIdentityApplyOutcome> {
+        if resolution.generation() != current_generation {
+            return Ok(PlatformIdentityApplyOutcome::StaleGenerationIgnored);
+        }
+
+        let current: Option<(String, String)> = self
+            .connection
+            .query_row(
+                "SELECT platform, source FROM platform_assignments \
+                 WHERE archive_id = ?1 AND is_current = 1",
+                params![archive_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| db_error("failed to read platform before enrichment", error))?;
+        if current
+            .as_ref()
+            .is_some_and(|(_, source)| source == MANUAL_PLATFORM_SOURCE)
+        {
+            return Ok(PlatformIdentityApplyOutcome::ManualPreserved);
+        }
+
+        match resolution {
+            PlatformIdentityResolution::Unknown { .. } => {
+                Ok(PlatformIdentityApplyOutcome::UnknownIgnored)
+            }
+            PlatformIdentityResolution::Conflict { .. } => {
+                if current.as_ref().is_some_and(|(_, source)| {
+                    matches!(
+                        source.as_str(),
+                        ROMM_PLATFORM_SOURCE
+                            | VERIFIED_DAT_PLATFORM_SOURCE
+                            | DAT_ROMM_AGREEMENT_SOURCE
+                    )
+                }) {
+                    self.connection
+                        .execute(
+                            "UPDATE platform_assignments SET is_current = 0 \
+                             WHERE archive_id = ?1 AND is_current = 1",
+                            params![archive_id],
+                        )
+                        .map_err(|error| {
+                            db_error("failed to retire conflicted platform enrichment", error)
+                        })?;
+                }
+                Ok(PlatformIdentityApplyOutcome::ConflictRequiresReview)
+            }
+            PlatformIdentityResolution::Resolved {
+                platform, evidence, ..
+            } => {
+                // A manual resolution describes the already-persisted manual
+                // row; provider enrichment never writes manual provenance.
+                if evidence
+                    .iter()
+                    .any(|item| item.source == PlatformIdentitySource::Manual)
+                {
+                    return Ok(PlatformIdentityApplyOutcome::ManualPreserved);
+                }
+                let Some(source) = enrichment_source(evidence) else {
+                    // Existing identity/inference is already represented by
+                    // its owning scanner assignment. Do not manufacture new
+                    // provenance merely because it also participated in the
+                    // resolver.
+                    return Ok(PlatformIdentityApplyOutcome::Unchanged);
+                };
+                if current
+                    .as_ref()
+                    .is_some_and(|(current_platform, current_source)| {
+                        current_platform == platform && current_source == source
+                    })
+                {
+                    return Ok(PlatformIdentityApplyOutcome::Unchanged);
+                }
+                self.assign_platform(archive_id, Some(platform), source)?;
+                Ok(PlatformIdentityApplyOutcome::Applied)
+            }
+        }
+    }
+
+    /// Enriches catalogue rows addressed by a published RomM cache. The cache
+    /// is derived provider metadata; this method writes only ArchiveFS's
+    /// platform assignment history and never opens a ROM path.
+    pub fn enrich_platforms_from_romm_cache(
+        &mut self,
+        cache: &crate::identity_source::cache::IdentityCache,
+        generation: u64,
+    ) -> Result<PlatformIdentityEnrichmentSummary> {
+        let mut summary = PlatformIdentityEnrichmentSummary::default();
+        for record in &cache.records {
+            let Some(provider) =
+                crate::platform::identity::PlatformIdentityEvidence::from_romm(record, generation)
+            else {
+                continue;
+            };
+            summary.evidence_considered += 1;
+            let Some(path) = record.archivefs_path.as_deref() else {
+                continue;
+            };
+            let Some(archive_id) = self.find_archive_id_by_absolute_path(path)? else {
+                continue;
+            };
+            summary.archives_matched += 1;
+            let mut evidence = self.current_platform_identity_evidence(archive_id, generation)?;
+            evidence.push(provider);
+            let resolution =
+                crate::platform::identity::resolve_platform_identity(generation, evidence);
+            if let PlatformIdentityResolution::Conflict { evidence, .. } = &resolution {
+                summary
+                    .conflict_details
+                    .push(PlatformIdentityConflictDetail {
+                        archive_id,
+                        evidence: evidence.clone(),
+                    });
+            }
+            summary.note(self.apply_platform_identity_resolution(
+                archive_id,
+                &resolution,
+                generation,
+            )?);
+        }
+        Ok(summary)
+    }
+
+    /// Enriches catalogue rows addressed by one completed DAT audit. Only the
+    /// audit adapter's cryptographic exact matches participate; probable,
+    /// filename-only, ambiguous and unmatched rows never reach persistence.
+    pub fn enrich_platforms_from_dat_audit(
+        &mut self,
+        outcome: &crate::dat::sources::audit_run::DatAuditOutcome,
+        generation: u64,
+    ) -> Result<PlatformIdentityEnrichmentSummary> {
+        let mut summary = PlatformIdentityEnrichmentSummary::default();
+        for entry in &outcome.report.entries {
+            let path = Path::new(&entry.local_path);
+            let Some(provider) =
+                crate::platform::identity::PlatformIdentityEvidence::from_verified_dat(
+                    outcome, path, generation,
+                )
+            else {
+                continue;
+            };
+            summary.evidence_considered += 1;
+            let Some(archive_id) = self.find_archive_id_by_absolute_path(path)? else {
+                continue;
+            };
+            summary.archives_matched += 1;
+            let mut evidence = self.current_platform_identity_evidence(archive_id, generation)?;
+            evidence.push(provider);
+            let resolution =
+                crate::platform::identity::resolve_platform_identity(generation, evidence);
+            if let PlatformIdentityResolution::Conflict { evidence, .. } = &resolution {
+                summary
+                    .conflict_details
+                    .push(PlatformIdentityConflictDetail {
+                        archive_id,
+                        evidence: evidence.clone(),
+                    });
+            }
+            summary.note(self.apply_platform_identity_resolution(
+                archive_id,
+                &resolution,
+                generation,
+            )?);
+        }
+        Ok(summary)
+    }
+
+    fn current_platform_identity_evidence(
+        &self,
+        archive_id: i64,
+        generation: u64,
+    ) -> Result<Vec<crate::platform::identity::PlatformIdentityEvidence>> {
+        use crate::platform::identity::{PlatformIdentityConfidence, PlatformIdentityEvidence};
+        let current: Option<(String, String)> = self
+            .connection
+            .query_row(
+                "SELECT platform, source FROM platform_assignments \
+                 WHERE archive_id = ?1 AND is_current = 1",
+                params![archive_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| db_error("failed to read identity enrichment baseline", error))?;
+        let Some((platform, source)) = current else {
+            return Ok(Vec::new());
+        };
+        if source == MANUAL_PLATFORM_SOURCE {
+            return Ok(PlatformIdentityEvidence::manual(&platform, generation)
+                .into_iter()
+                .collect());
+        }
+        let (identity_source, confidence) = match source.as_str() {
+            VERIFIED_DAT_PLATFORM_SOURCE => (
+                PlatformIdentitySource::VerifiedDat,
+                PlatformIdentityConfidence::Verified,
+            ),
+            ROMM_PLATFORM_SOURCE => (
+                PlatformIdentitySource::Romm,
+                PlatformIdentityConfidence::High,
+            ),
+            DAT_ROMM_AGREEMENT_SOURCE => {
+                let dat = PlatformIdentityEvidence::canonical(
+                    &platform,
+                    PlatformIdentitySource::VerifiedDat,
+                    PlatformIdentityConfidence::Verified,
+                    generation,
+                    "persisted DAT/RomM agreement",
+                );
+                let romm = PlatformIdentityEvidence::canonical(
+                    &platform,
+                    PlatformIdentitySource::Romm,
+                    PlatformIdentityConfidence::High,
+                    generation,
+                    "persisted DAT/RomM agreement",
+                );
+                return Ok(dat.into_iter().chain(romm).collect());
+            }
+            "header_identity" => (
+                PlatformIdentitySource::ExistingStrongIdentity,
+                PlatformIdentityConfidence::Strong,
+            ),
+            _ => (
+                PlatformIdentitySource::Inference,
+                PlatformIdentityConfidence::Inferred,
+            ),
+        };
+        Ok(PlatformIdentityEvidence::canonical(
+            &platform,
+            identity_source,
+            confidence,
+            generation,
+            format!("persisted platform assignment from {source}"),
+        )
+        .into_iter()
+        .collect())
     }
 
     /// Records `platform`/`source` as a non-current historical row for
@@ -8369,5 +8694,333 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    fn provider_evidence(
+        platform: &str,
+        source: PlatformIdentitySource,
+        generation: u64,
+    ) -> crate::platform::identity::PlatformIdentityEvidence {
+        use crate::platform::identity::{PlatformIdentityConfidence, PlatformIdentityEvidence};
+        PlatformIdentityEvidence::canonical(
+            platform,
+            source,
+            match source {
+                PlatformIdentitySource::VerifiedDat => PlatformIdentityConfidence::Verified,
+                PlatformIdentitySource::Romm => PlatformIdentityConfidence::High,
+                _ => PlatformIdentityConfidence::Strong,
+            },
+            generation,
+            source.label(),
+        )
+        .unwrap()
+    }
+
+    fn unknown_archive_database(name: &str) -> (PathBuf, Database, i64) {
+        let root = temp_dir(name);
+        let source = root.join("source");
+        let mount = root.join("mount");
+        write_archive_file(&source, "Mystery.zip", b"rom bytes");
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut database, &config_for(&source, &mount), "test").unwrap();
+        let archive_id = find_archive(&database.load_archives().unwrap(), "Mystery.zip").id;
+        (root, database, archive_id)
+    }
+
+    #[test]
+    fn romm_enrichment_persists_through_existing_platform_assignments() {
+        let (root, mut database, archive_id) = unknown_archive_database("romm-platform-enrichment");
+        let generation = 3;
+        let resolution = crate::platform::identity::resolve_platform_identity(
+            generation,
+            [provider_evidence(
+                "PSP",
+                PlatformIdentitySource::Romm,
+                generation,
+            )],
+        );
+        assert_eq!(
+            database
+                .apply_platform_identity_resolution(archive_id, &resolution, generation)
+                .unwrap(),
+            PlatformIdentityApplyOutcome::Applied
+        );
+        let archive = database
+            .load_archives()
+            .unwrap()
+            .into_iter()
+            .find(|archive| archive.id == archive_id)
+            .unwrap();
+        assert_eq!(archive.platform.as_deref(), Some("PSP"));
+        assert_eq!(
+            archive.platform_source.as_deref(),
+            Some(ROMM_PLATFORM_SOURCE)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agreement_persists_both_sources_as_one_provenance_value() {
+        let (root, mut database, archive_id) =
+            unknown_archive_database("agreement-platform-enrichment");
+        let generation = 4;
+        let resolution = crate::platform::identity::resolve_platform_identity(
+            generation,
+            [
+                provider_evidence("PSP", PlatformIdentitySource::Romm, generation),
+                provider_evidence("PSP", PlatformIdentitySource::VerifiedDat, generation),
+            ],
+        );
+        database
+            .apply_platform_identity_resolution(archive_id, &resolution, generation)
+            .unwrap();
+        let archive = database
+            .load_archives()
+            .unwrap()
+            .into_iter()
+            .find(|archive| archive.id == archive_id)
+            .unwrap();
+        assert_eq!(archive.platform.as_deref(), Some("PSP"));
+        assert_eq!(
+            archive.platform_source.as_deref(),
+            Some(DAT_ROMM_AGREEMENT_SOURCE)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn manual_assignment_cannot_be_overwritten_by_enrichment() {
+        let (root, mut database, archive_id) =
+            unknown_archive_database("manual-platform-enrichment");
+        database.set_manual_platform(archive_id, "PSP").unwrap();
+        let generation = 5;
+        let resolution = crate::platform::identity::resolve_platform_identity(
+            generation,
+            [provider_evidence(
+                "PSX",
+                PlatformIdentitySource::VerifiedDat,
+                generation,
+            )],
+        );
+        assert_eq!(
+            database
+                .apply_platform_identity_resolution(archive_id, &resolution, generation)
+                .unwrap(),
+            PlatformIdentityApplyOutcome::ManualPreserved
+        );
+        let archive = database
+            .load_archives()
+            .unwrap()
+            .into_iter()
+            .find(|archive| archive.id == archive_id)
+            .unwrap();
+        assert_eq!(archive.platform.as_deref(), Some("PSP"));
+        assert_eq!(
+            archive.platform_source.as_deref(),
+            Some(MANUAL_PLATFORM_SOURCE)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn conflict_retires_an_earlier_provider_winner_instead_of_choosing_it() {
+        let (root, mut database, archive_id) =
+            unknown_archive_database("conflicting-platform-enrichment");
+        let generation = 6;
+        let romm_only = crate::platform::identity::resolve_platform_identity(
+            generation,
+            [provider_evidence(
+                "PSP",
+                PlatformIdentitySource::Romm,
+                generation,
+            )],
+        );
+        database
+            .apply_platform_identity_resolution(archive_id, &romm_only, generation)
+            .unwrap();
+        let conflict = crate::platform::identity::resolve_platform_identity(
+            generation,
+            [
+                provider_evidence("PSP", PlatformIdentitySource::Romm, generation),
+                provider_evidence("PSX", PlatformIdentitySource::VerifiedDat, generation),
+            ],
+        );
+        assert_eq!(
+            database
+                .apply_platform_identity_resolution(archive_id, &conflict, generation)
+                .unwrap(),
+            PlatformIdentityApplyOutcome::ConflictRequiresReview
+        );
+        let archive = database
+            .load_archives()
+            .unwrap()
+            .into_iter()
+            .find(|archive| archive.id == archive_id)
+            .unwrap();
+        assert_eq!(archive.platform, None);
+        assert_eq!(archive.platform_source, None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stale_resolution_does_not_overwrite_a_newer_manual_assignment() {
+        let (root, mut database, archive_id) =
+            unknown_archive_database("stale-platform-enrichment");
+        database.set_manual_platform(archive_id, "PSP").unwrap();
+        let resolution = crate::platform::identity::resolve_platform_identity(
+            8,
+            [provider_evidence("PSX", PlatformIdentitySource::Romm, 8)],
+        );
+        assert_eq!(
+            database
+                .apply_platform_identity_resolution(archive_id, &resolution, 9)
+                .unwrap(),
+            PlatformIdentityApplyOutcome::StaleGenerationIgnored
+        );
+        assert_eq!(
+            database
+                .load_archives()
+                .unwrap()
+                .into_iter()
+                .find(|archive| archive.id == archive_id)
+                .unwrap()
+                .platform
+                .as_deref(),
+            Some("PSP")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn published_romm_cache_enriches_matching_unknown_archive_without_reading_it() {
+        use crate::identity_source::cache::{CACHE_FORMAT_VERSION, IdentityCache};
+        use crate::identity_source::model::{
+            ExternalIdentityRecord, ExternalVerification, IdentityProvider,
+        };
+
+        let (root, mut database, archive_id) =
+            unknown_archive_database("romm-cache-platform-enrichment");
+        let archive = database
+            .load_archives()
+            .unwrap()
+            .into_iter()
+            .find(|archive| archive.id == archive_id)
+            .unwrap();
+        let before = fs::read(&archive.absolute_path).unwrap();
+        let cache = IdentityCache {
+            format_version: CACHE_FORMAT_VERSION,
+            provider: IdentityProvider::Romm,
+            server_id: "https://romm.example".to_string(),
+            server_version: None,
+            source_fingerprint: "fixture".to_string(),
+            imported_at_unix_seconds: 10,
+            platforms: Vec::new(),
+            records: vec![ExternalIdentityRecord {
+                provider: IdentityProvider::Romm,
+                server_id: "https://romm.example".to_string(),
+                provider_platform_id: Some("4".to_string()),
+                provider_game_id: "42".to_string(),
+                provider_file_id: None,
+                provider_path: "roms/psp/Mystery.zip".to_string(),
+                archivefs_path: Some(archive.absolute_path.clone()),
+                title: Some("Mystery".to_string()),
+                platform_candidate: Some("PSP".to_string()),
+                provider_platform_name: Some("psp".to_string()),
+                regions: Vec::new(),
+                revision: None,
+                hashes: Vec::new(),
+                file_size_bytes: archive.size_bytes,
+                metadata_provider_ids: Vec::new(),
+                artwork: None,
+                related_files: Vec::new(),
+                sibling_game_ids: Vec::new(),
+                imported_at_unix_seconds: 10,
+                provider_updated_at: None,
+                verification: ExternalVerification::StrongExternal,
+                conflicts: Vec::new(),
+                evidence: Vec::new(),
+            }],
+            rejected_hashes: Vec::new(),
+            unknown_platforms: Vec::new(),
+            server_reported_total: Some(1),
+        };
+
+        let summary = database
+            .enrich_platforms_from_romm_cache(&cache, 10)
+            .unwrap();
+        assert_eq!(summary.applied, 1);
+        assert_eq!(fs::read(&archive.absolute_path).unwrap(), before);
+        let enriched = database
+            .load_archives()
+            .unwrap()
+            .into_iter()
+            .find(|archive| archive.id == archive_id)
+            .unwrap();
+        assert_eq!(enriched.platform.as_deref(), Some("PSP"));
+        assert_eq!(
+            enriched.platform_source.as_deref(),
+            Some(ROMM_PLATFORM_SOURCE)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn completed_dat_audit_enriches_only_cryptographic_exact_matches() {
+        use crate::dat::audit::{AuditEntry, AuditReport, AuditSummary, AuditVerdict};
+        use crate::dat::sources::audit_run::DatAuditOutcome;
+
+        let (root, mut database, archive_id) =
+            unknown_archive_database("dat-audit-platform-enrichment");
+        let archive = database
+            .load_archives()
+            .unwrap()
+            .into_iter()
+            .find(|archive| archive.id == archive_id)
+            .unwrap();
+        let outcome = DatAuditOutcome {
+            source_id: "psp-dat".to_string(),
+            source_display_name: "No-Intro PSP".to_string(),
+            dat_path: "/catalogues/psp.dat".to_string(),
+            scan_root: root.display().to_string(),
+            catalogue_names: vec!["PSP".to_string()],
+            catalogue_entries: 1,
+            catalogue_roms: 1,
+            unreadable_catalogues: Vec::new(),
+            report: AuditReport {
+                entries: vec![AuditEntry {
+                    local_path: archive.absolute_path.display().to_string(),
+                    local_filename: "Mystery.zip".to_string(),
+                    verdict: AuditVerdict::Exact {
+                        game_name: "Mystery".to_string(),
+                        rom_name: "Mystery.zip".to_string(),
+                        algorithm: "SHA-1",
+                    },
+                }],
+                summary: AuditSummary::default(),
+            },
+            unhashed: Vec::new(),
+            files_scanned: 1,
+            bytes_hashed: archive.size_bytes.unwrap_or(0),
+            truncated: false,
+            policy: None,
+            platform: Some("PSP".to_string()),
+        };
+
+        let summary = database
+            .enrich_platforms_from_dat_audit(&outcome, 11)
+            .unwrap();
+        assert_eq!(summary.applied, 1);
+        let enriched = database
+            .load_archives()
+            .unwrap()
+            .into_iter()
+            .find(|archive| archive.id == archive_id)
+            .unwrap();
+        assert_eq!(enriched.platform.as_deref(), Some("PSP"));
+        assert_eq!(
+            enriched.platform_source.as_deref(),
+            Some(VERIFIED_DAT_PLATFORM_SOURCE)
+        );
+        let _ = fs::remove_dir_all(root);
     }
 }
