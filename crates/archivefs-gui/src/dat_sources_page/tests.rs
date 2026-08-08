@@ -2675,6 +2675,7 @@ fn a_cancelled_audit_never_appears_complete() {
         .send(JobMessage::Audited {
             generation: 0,
             outcome: Box::new(minimal_outcome()),
+            enrichment: None,
             plan: None,
         })
         .unwrap();
@@ -2687,6 +2688,56 @@ fn a_cancelled_audit_never_appears_complete() {
         "a cancelled audit never appears complete"
     );
     assert!(view.audit_error.is_none(), "cancelling is not a failure");
+}
+
+#[test]
+fn platform_conflict_names_each_source_and_requires_review() {
+    use archivefs_core::platform::identity::{
+        PlatformIdentityConfidence, PlatformIdentityEvidence, PlatformIdentitySource,
+    };
+
+    let (_fixture, mut page, _roms) = audit_fixture();
+    page.identity_enrichment = Some(Box::new(
+        archivefs_core::PlatformIdentityEnrichmentSummary {
+            conflicts: 1,
+            conflict_details: vec![archivefs_core::PlatformIdentityConflictDetail {
+                archive_id: 1,
+                evidence: vec![
+                    PlatformIdentityEvidence::canonical(
+                        "PSX",
+                        PlatformIdentitySource::VerifiedDat,
+                        PlatformIdentityConfidence::Verified,
+                        1,
+                        "verified DAT fixture",
+                    )
+                    .unwrap(),
+                    PlatformIdentityEvidence::canonical(
+                        "PSP",
+                        PlatformIdentitySource::Romm,
+                        PlatformIdentityConfidence::High,
+                        1,
+                        "RomM fixture",
+                    )
+                    .unwrap(),
+                ],
+            }],
+            ..Default::default()
+        },
+    ));
+
+    let mut ui_state = DatSourcesPageUi::default();
+    let output = render(&page.view(), &mut ui_state);
+    for expected in [
+        "Platform conflict",
+        "Verified DAT: Sony PlayStation",
+        "RomM: Sony PlayStation Portable",
+        "Review required",
+    ] {
+        assert!(
+            rendered_text_contains(&output, expected),
+            "missing conflict text {expected:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

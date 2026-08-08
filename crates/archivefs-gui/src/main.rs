@@ -164,25 +164,26 @@ use archivefs_core::{
     ArchiveRecord, ArchiveSnapshot, ArchiveStats, ArchiveStatus, ArchiveUnmountSession,
     BulkPlatformAssignmentResult, CUSTOM_FOLDER_ALIAS_SOURCE, CatalogueDuplicateArchive,
     CatalogueDuplicateGroup, CatalogueDuplicateReport, CatalogueStats, CompletedScanSummary,
-    Config, ConfigIdentity, Database, DatabaseHealth, DatabaseHealthReport, DoctorReport,
-    DoctorStatus, HealthCategory, HealthIssue, InspectorEntry, InspectorEntryClassification,
-    InspectorEntryKind, InspectorReport, LazyUnmountCleanupResult, LibraryViewApplyReport,
-    LibraryViewConfig, LibraryViewLayoutTemplate, LibraryViewPlan, LibraryViewPlanAction,
-    LibraryViewPlanEntry, MANUAL_PLATFORM_SOURCE, MissingArchiveRemovalResult, MountOneOutcome,
-    MountState, PersistedArchive, PlatformAlias, PlatformAssignmentChange,
-    PlatformProvenanceDetails, RecentScanAdditions, RecoveryAction, RecoveryOffer,
-    RemoveSourceFolderOutcome, ScanPersistSummary, SetSourceFolderEnabledOutcome,
-    SetupDiagnosticStatus, SetupDiagnostics, SourceAvailability, SourceFolderConfig,
-    SourceFolderView, SourceHealthIssue, UnmountOneOutcome, add_library_view_default,
-    add_source_folder_default, apply_library_view_default, assign_source_platform_default,
-    build_source_folder_views, canonical_platform_names, catalogue_filename_duplicates,
-    check_archive_index_freshness, check_database_health, classify_archive_health,
-    cleanup_selected_mount_tree, create_configured_mount_root_default,
-    create_starter_config_default, default_config_path, default_database_path, default_index_path,
-    diagnose_database, edit_library_view_default, format_unix_timestamp_utc, inspect_archive,
-    is_inspectable, latest_schema_version, lazy_unmount_one_archive_path_with_progress,
-    list_source_folder_views_default, load_library_view_configs_default,
-    load_read_only_snapshot_default, load_source_folder_configs_from, mount_one_archive_path,
+    Config, ConfigIdentity, DAT_ROMM_AGREEMENT_SOURCE, Database, DatabaseHealth,
+    DatabaseHealthReport, DoctorReport, DoctorStatus, HealthCategory, HealthIssue, InspectorEntry,
+    InspectorEntryClassification, InspectorEntryKind, InspectorReport, LazyUnmountCleanupResult,
+    LibraryViewApplyReport, LibraryViewConfig, LibraryViewLayoutTemplate, LibraryViewPlan,
+    LibraryViewPlanAction, LibraryViewPlanEntry, MANUAL_PLATFORM_SOURCE,
+    MissingArchiveRemovalResult, MountOneOutcome, MountState, PersistedArchive, PlatformAlias,
+    PlatformAssignmentChange, PlatformProvenanceDetails, ROMM_PLATFORM_SOURCE, RecentScanAdditions,
+    RecoveryAction, RecoveryOffer, RemoveSourceFolderOutcome, ScanPersistSummary,
+    SetSourceFolderEnabledOutcome, SetupDiagnosticStatus, SetupDiagnostics, SourceAvailability,
+    SourceFolderConfig, SourceFolderView, SourceHealthIssue, UnmountOneOutcome,
+    VERIFIED_DAT_PLATFORM_SOURCE, add_library_view_default, add_source_folder_default,
+    apply_library_view_default, assign_source_platform_default, build_source_folder_views,
+    canonical_platform_names, catalogue_filename_duplicates, check_archive_index_freshness,
+    check_database_health, classify_archive_health, cleanup_selected_mount_tree,
+    create_configured_mount_root_default, create_starter_config_default, default_config_path,
+    default_database_path, default_index_path, diagnose_database, edit_library_view_default,
+    format_unix_timestamp_utc, inspect_archive, is_inspectable, latest_schema_version,
+    lazy_unmount_one_archive_path_with_progress, list_source_folder_views_default,
+    load_library_view_configs_default, load_read_only_snapshot_default,
+    load_source_folder_configs_from, mount_one_archive_path,
     persisted_archive_has_unknown_platform, plan_stale_mount_directories,
     preview_library_view_default, read_archive_index, remount_one_archive_path,
     remove_library_view_default, remove_source_folder_default, repair_library_view_default,
@@ -4869,11 +4870,10 @@ impl ArchiveFsApp {
                 .as_ref()
                 .map(archivefs_core::safe_read::TrustedRoots::from_config)
                 .unwrap_or_else(archivefs_core::safe_read::TrustedRoots::none);
-            self.dat_sources_page = Some(dat_sources_page::DatSourcesPageState::load(
-                path,
-                library_folders,
-                trusted,
-            ));
+            self.dat_sources_page = Some(
+                dat_sources_page::DatSourcesPageState::load(path, library_folders, trusted)
+                    .with_database_path(database_state_path(&self.database_state)),
+            );
         }
 
         let Some(page) = self.dat_sources_page.as_mut() else {
@@ -4910,6 +4910,10 @@ impl ArchiveFsApp {
                 ),
             };
             self.history.record(entry);
+        }
+        let reload_enriched_catalogue = page.take_identity_enrichment_completed();
+        if reload_enriched_catalogue {
+            self.start_database_action(ui.ctx().clone(), false);
         }
     }
 
@@ -5602,14 +5606,21 @@ impl ArchiveFsApp {
             cancellation_requested: false,
         });
         let trusted_roots = self.gui_config.source_roots().map(|roots| roots.to_vec());
+        let database_path = database_state_path(&self.database_state);
         let progress_context = context.clone();
         thread::spawn(move || {
             let report = |event: RommProgressEvent| {
                 let _ = progress_sender.send((generation, event));
                 progress_context.request_repaint();
             };
-            let result =
-                run_romm_operation(&operation, &trusted_roots, &worker_cancellation, &report);
+            let result = run_romm_operation(
+                &operation,
+                &trusted_roots,
+                database_path.as_deref(),
+                generation,
+                &worker_cancellation,
+                &report,
+            );
             let _ = sender.send((generation, result));
             context.request_repaint();
         });
@@ -5828,6 +5839,10 @@ impl ArchiveFsApp {
             if let Some(worker) = self.gamer_cover_worker.as_ref() {
                 worker.reindex();
             }
+            // The same worker may have enriched platform metadata in the
+            // existing catalogue. Reload the read-only snapshot so Library and
+            // Gamer View show it immediately; no rescan or ROM read is needed.
+            self.start_database_action(context.clone(), false);
         }
         if let Ok(RommOperationOutcome::Preview(summary)) = &result {
             // A preview is only meaningful while the dialog that asked for it is
@@ -14884,6 +14899,9 @@ fn unknown_platform_banner_visible(filters: &LibraryRowFilters, unknown_count: u
 fn platform_source_label(source: Option<&str>) -> &'static str {
     match source {
         Some(MANUAL_PLATFORM_SOURCE) => "Manual assignment",
+        Some(VERIFIED_DAT_PLATFORM_SOURCE) => "Verified by DAT",
+        Some(ROMM_PLATFORM_SOURCE) => "Detected from RomM",
+        Some(DAT_ROMM_AGREEMENT_SOURCE) => "Verified by DAT and RomM",
         Some(CUSTOM_FOLDER_ALIAS_SOURCE) => "Custom folder alias",
         Some("source_assignment") => "Source assignment",
         Some("header_identity") => "Format/header identity",
@@ -14908,9 +14926,11 @@ fn platform_confidence_label(details: &PlatformProvenanceDetails) -> &'static st
         return DetectionConfidence::Unknown.label();
     }
     match details.source.as_deref() {
-        Some(MANUAL_PLATFORM_SOURCE) | Some("header_identity") => {
-            DetectionConfidence::Confirmed.label()
-        }
+        Some(MANUAL_PLATFORM_SOURCE)
+        | Some("header_identity")
+        | Some(VERIFIED_DAT_PLATFORM_SOURCE)
+        | Some(DAT_ROMM_AGREEMENT_SOURCE) => DetectionConfidence::Confirmed.label(),
+        Some(ROMM_PLATFORM_SOURCE) => "High",
         Some(_) => DetectionConfidence::Probable.label(),
         None => DetectionConfidence::Unknown.label(),
     }
@@ -52137,6 +52157,30 @@ $Instant Growth [Nayr]\n";
     }
 
     #[test]
+    fn provider_enrichment_provenance_is_clear_and_does_not_overclaim() {
+        for (source, label, confidence) in [
+            (ROMM_PLATFORM_SOURCE, "Detected from RomM", "High"),
+            (VERIFIED_DAT_PLATFORM_SOURCE, "Verified by DAT", "Confirmed"),
+            (
+                DAT_ROMM_AGREEMENT_SOURCE,
+                "Verified by DAT and RomM",
+                "Confirmed",
+            ),
+        ] {
+            let details = PlatformProvenanceDetails {
+                platform: Some("PSP".to_string()),
+                source: Some(source.to_string()),
+                matched_component: None,
+                automatic_fallback: None,
+            };
+            let lines = provenance_line_map(&details);
+            assert_eq!(lines["Platform"], "Sony PlayStation Portable (PSP)");
+            assert_eq!(lines["Source"], label);
+            assert_eq!(lines["Confidence"], confidence);
+        }
+    }
+
+    #[test]
     fn manual_platform_provenance_shows_the_correct_detailed_automatic_fallback() {
         let details = PlatformProvenanceDetails {
             platform: Some("GameCube".to_string()),
@@ -65907,6 +65951,8 @@ fn load_romm_snapshot() -> Result<RommSnapshot, String> {
 fn run_romm_operation(
     operation: &RommOperation,
     trusted_roots: &Result<Vec<PathBuf>, String>,
+    database_path: Option<&Path>,
+    generation: u64,
     cancellation: &Arc<AtomicBool>,
     report: &dyn Fn(RommProgressEvent),
 ) -> Result<RommOperationOutcome, String> {
@@ -66283,6 +66329,7 @@ fn run_romm_operation(
                     failure: None,
                     failure_code: None,
                     previous_cache_usable: api.open_cache(None).is_ok(),
+                    platform_enrichment: None,
                 },
             )))
         }
@@ -66302,6 +66349,46 @@ fn run_romm_operation(
             );
             match summary {
                 Ok(summary) => {
+                    if cancellation.load(Ordering::Acquire) {
+                        return Err(
+                            "The import was cancelled before platform metadata was updated."
+                                .to_string(),
+                        );
+                    }
+                    let platform_enrichment = if let Some(database_path) = database_path
+                        && database_path.is_file()
+                    {
+                        let enrichment = api
+                            .open_cache(None)
+                            .map_err(|error| error.detail())
+                            .and_then(|cache| {
+                                let mut database = Database::open_or_create(database_path)
+                                    .map_err(|error| error.to_string())?;
+                                database
+                                    .enrich_platforms_from_romm_cache(&cache, generation)
+                                    .map_err(|error| error.to_string())
+                            });
+                        match enrichment {
+                            Ok(enrichment) => {
+                                report(RommProgressEvent::Note(format!(
+                                    "Platform identity enrichment: {} applied, {} already current, {} manual assignment(s) preserved, {} conflict(s) require review.",
+                                    enrichment.applied,
+                                    enrichment.unchanged,
+                                    enrichment.manual_preserved,
+                                    enrichment.conflicts,
+                                )));
+                                Some(Box::new(enrichment))
+                            }
+                            Err(error) => {
+                                report(RommProgressEvent::Note(format!(
+                                    "RomM identity was published, but platform metadata could not be updated: {error}"
+                                )));
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     report_file_detail_omissions(report, &summary.adaptive);
                     let cache_bytes = std::fs::metadata(&summary.cache_path)
                         .ok()
@@ -66328,6 +66415,7 @@ fn run_romm_operation(
                             failure: None,
                             failure_code: None,
                             previous_cache_usable: true,
+                            platform_enrichment,
                         },
                     )))
                 }

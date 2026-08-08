@@ -86,6 +86,7 @@ fn dispatch(
     source_roots: Option<Vec<PathBuf>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut args = args;
+    let use_default_catalogue = source_roots.is_none();
     let json = take_flag(&mut args, "--json");
     // An explicit root exists so a test can drive the whole surface without
     // touching the real data directory.
@@ -97,6 +98,9 @@ fn dispatch(
         json,
         output,
         source_roots: source_roots.unwrap_or_else(configured_source_roots),
+        database_path: use_default_catalogue
+            .then(archivefs_core::default_database_path)
+            .transpose()?,
         identity_root: identity_root.clone(),
         settings: SettingsLocation::new(&identity_root, IdentityProvider::Romm),
         api: IdentitySourceApi::new(&identity_root, IdentityProvider::Romm),
@@ -194,6 +198,10 @@ struct Context<'a> {
     /// The configured source folders. Mapping destinations must be inside one,
     /// and so must any path `verify-hash` is asked to read.
     source_roots: Vec<PathBuf>,
+    /// Normal commands enrich the normal library database. Tests inject source
+    /// roots and therefore leave this absent, so fixtures can never touch a
+    /// user's catalogue.
+    database_path: Option<PathBuf>,
     /// Where ArchiveFS keeps its own identity data, including the artwork cache.
     identity_root: PathBuf,
     settings: SettingsLocation,
@@ -1520,6 +1528,34 @@ fn import(
     let elapsed = started.elapsed().as_millis();
     match outcome {
         Ok(summary) => {
+            if let Some(database_path) = context.database_path.as_deref()
+                && database_path.is_file()
+            {
+                let enrichment = context
+                    .api
+                    .open_cache(None)
+                    .map_err(|error| error.detail())
+                    .and_then(|cache| {
+                        let generation = u64::try_from(cache.imported_at_unix_seconds).unwrap_or(0);
+                        let mut database = archivefs_core::Database::open_or_create(database_path)
+                            .map_err(|error| error.to_string())?;
+                        database
+                            .enrich_platforms_from_romm_cache(&cache, generation)
+                            .map_err(|error| error.to_string())
+                    });
+                match enrichment {
+                    Ok(enrichment) => context.progress(&format!(
+                        "Platform identity enrichment: {} applied, {} already current, {} manual assignment(s) preserved, {} conflict(s) require review.",
+                        enrichment.applied,
+                        enrichment.unchanged,
+                        enrichment.manual_preserved,
+                        enrichment.conflicts,
+                    )),
+                    Err(error) => context.progress(&format!(
+                        "RomM identity was published, but platform metadata could not be updated: {error}"
+                    )),
+                }
+            }
             let result = ImportResult {
                 mode: if is_refresh { "refresh" } else { "import" },
                 sample_limit: None,
