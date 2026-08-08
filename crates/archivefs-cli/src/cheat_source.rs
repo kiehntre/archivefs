@@ -1,8 +1,9 @@
 use std::path::Path;
 
 use archivefs_core::patch_manager::{
-    CheatSourceRegistry, build_default_registry, default_cheat_sources_config_path,
-    load_cheat_sources_config_from, save_cheat_sources_config_to,
+    CheatSourceEntry, CheatSourceRegistry, build_default_registry, default_cheat_source_data_root,
+    default_cheat_sources_config_path, load_cheat_sources_config_from,
+    save_cheat_sources_config_to,
 };
 
 /// One machine-readable response from a mutating command.
@@ -131,7 +132,7 @@ pub(crate) fn run_with_config_path(
 }
 
 fn render_source_list(config_path: &Path, json: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let registry = load_registry_with_config(config_path)?;
+    let registry = load_registry_with_config_and_health(config_path)?;
     print!("{}", source_list_output(&registry, json)?);
     Ok(())
 }
@@ -164,6 +165,12 @@ fn source_list_output(
         .max()
         .unwrap_or(0)
         .max(2);
+    let status_width = entries
+        .iter()
+        .map(|e| source_health_marker(e).len())
+        .max()
+        .unwrap_or(0)
+        .max(4);
     let mut out = String::new();
     for entry in &entries {
         // A disabled source is marked and labelled: the marker alone is easy to
@@ -172,11 +179,39 @@ fn source_list_output(
         let suffix = if entry.enabled { "" } else { "  (disabled)" };
         writeln!(
             &mut out,
-            "{mark} {:>3}  {:<id_width$}  {}{suffix}",
-            entry.priority, entry.spec.id, entry.spec.display_name,
+            "{mark} {:>3}  {:<id_width$}  {:>status_width$}  {}{suffix}",
+            entry.priority,
+            entry.spec.id,
+            source_health_marker(entry),
+            entry.spec.display_name,
         )?;
     }
     Ok(out)
+}
+
+/// A compact, human status token for one source's probed health.
+fn source_health_marker(entry: &CheatSourceEntry) -> &'static str {
+    match entry.health.as_ref().map(|health| health.state) {
+        None => "unknown",
+        Some(archivefs_core::patch_manager::CheatProviderSourceState::Ready) => "ready",
+        Some(archivefs_core::patch_manager::CheatProviderSourceState::NotInstalled) => {
+            "not installed"
+        }
+        Some(archivefs_core::patch_manager::CheatProviderSourceState::Downloading)
+        | Some(archivefs_core::patch_manager::CheatProviderSourceState::Validating) => "busy",
+        Some(archivefs_core::patch_manager::CheatProviderSourceState::Invalid)
+        | Some(archivefs_core::patch_manager::CheatProviderSourceState::UnsupportedSchema)
+        | Some(archivefs_core::patch_manager::CheatProviderSourceState::ValidationFailed) => {
+            "invalid"
+        }
+        Some(archivefs_core::patch_manager::CheatProviderSourceState::DownloadFailed) => {
+            "download failed"
+        }
+        Some(archivefs_core::patch_manager::CheatProviderSourceState::UpdateAvailable) => {
+            "update available"
+        }
+        Some(archivefs_core::patch_manager::CheatProviderSourceState::Disabled) => "disabled",
+    }
 }
 
 fn render_source_info(
@@ -184,7 +219,7 @@ fn render_source_info(
     id: &str,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let registry = load_registry_with_config(config_path)?;
+    let registry = load_registry_with_config_and_health(config_path)?;
     let entry = registry
         .get(id)
         .ok_or_else(|| format!("unknown cheat source: {id}"))?;
@@ -302,6 +337,19 @@ fn load_registry_with_config(
     let cfg = load_cheat_sources_config_from(config_path)?;
     let mut registry = build_default_registry();
     registry.apply_config(&cfg);
+    Ok(registry)
+}
+
+/// The registry loaded like [`load_registry_with_config`], plus a best-effort
+/// read-only health probe for every source. The probe runs only where the data
+/// directory is resolvable; it never fails the command when it is not.
+fn load_registry_with_config_and_health(
+    config_path: &Path,
+) -> Result<CheatSourceRegistry, Box<dyn std::error::Error>> {
+    let mut registry = load_registry_with_config(config_path)?;
+    if let Some(data_root) = default_cheat_source_data_root() {
+        registry.probe_health(&data_root);
+    }
     Ok(registry)
 }
 
