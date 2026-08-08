@@ -28,11 +28,13 @@
 //! dirty?" cannot drift from "would saving change anything?" - they are the
 //! same comparison.
 
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use archivefs_core::patch_manager::{
-    CheatSourceEntry, CheatSourceRegistry, UnresolvedPreference, build_default_registry,
-    load_cheat_sources_config_from, save_cheat_sources_config_to,
+    CheatProviderSourceState, CheatSourceEntry, CheatSourceHealth, CheatSourceRegistry,
+    UnresolvedPreference, build_default_registry, load_cheat_sources_config_from,
+    probe_cheat_source_health, save_cheat_sources_config_to,
 };
 use eframe::egui;
 
@@ -70,6 +72,26 @@ fn provider_kind_label(entry: &CheatSourceEntry) -> &'static str {
         (false, _, false) => "Local, read-only",
         (true, false, _) => "Remote, read-only",
     }
+}
+
+/// Runs the read-only health probe for every source in `registry`, keyed by
+/// source id. With no resolvable data root the map stays empty, so every row
+/// reads as "not checked" rather than the page claiming a status it could not
+/// derive.
+fn probe_registry_health(
+    registry: &CheatSourceRegistry,
+    data_root: Option<&Path>,
+) -> BTreeMap<String, Option<CheatSourceHealth>> {
+    let mut health = BTreeMap::new();
+    if let Some(data_root) = data_root {
+        for entry in registry.entries() {
+            health.insert(
+                entry.spec.id.clone(),
+                probe_cheat_source_health(&entry.spec.id, data_root),
+            );
+        }
+    }
+    health
 }
 
 /// One platform toggle on a source's row.
@@ -190,6 +212,8 @@ pub(crate) struct CheatSourceRowView {
     pub(crate) supports_platform_exceptions: bool,
     /// This row differs from what is on disk.
     pub(crate) changed: bool,
+    /// Best-effort, read-only status of the source's persisted cache state.
+    pub(crate) health: Option<CheatSourceHealth>,
 }
 
 /// A preferences entry this build cannot act on, shown read-only.
@@ -238,6 +262,9 @@ pub(crate) enum CheatSourcesPageAction {
     },
     Save,
     Revert,
+    /// Re-runs the read-only health probe for every source and refreshes the
+    /// displayed statuses without touching preferences.
+    RefreshHealth,
 }
 
 /// The page's authoritative state.
@@ -247,6 +274,14 @@ pub(crate) struct CheatSourcesPageState {
     saved: CheatSourceRegistry,
     /// What the user has edited but not yet saved.
     draft: CheatSourceRegistry,
+    /// Best-effort health per source id, keyed by the source id. Separate from
+    /// the editable registries: health is runtime state, never part of what a
+    /// save writes.
+    health: BTreeMap<String, Option<CheatSourceHealth>>,
+    /// Where the probe reads cache state from. Stored so `RefreshHealth` and
+    /// the initial probe agree on the same directory (and so tests can inject
+    /// a temporary one instead of reading the real data directory).
+    data_root: Option<PathBuf>,
     load_error: Option<String>,
     save_state: SaveState,
 }
@@ -259,18 +294,21 @@ impl CheatSourcesPageState {
     /// read-only-safe state: the draft equals the defaults, so a save would
     /// not silently overwrite a file that failed to parse. Refusing to save
     /// in that case is enforced in [`Self::apply`].
-    pub(crate) fn load(config_path: PathBuf) -> Self {
+    pub(crate) fn load(config_path: PathBuf, data_root: Option<PathBuf>) -> Self {
         let mut saved = build_default_registry();
         let mut load_error = None;
         match load_cheat_sources_config_from(&config_path) {
             Ok(cfg) => saved.apply_config(&cfg),
             Err(error) => load_error = Some(error.to_string()),
         }
+        let health = probe_registry_health(&saved, data_root.as_deref());
         let draft = saved.clone();
         Self {
             config_path,
             saved,
             draft,
+            health,
+            data_root,
             load_error,
             save_state: SaveState::Idle,
         }
@@ -324,6 +362,12 @@ impl CheatSourcesPageState {
             }
             CheatSourcesPageAction::Revert => {
                 self.draft = self.saved.clone();
+                self.save_state = SaveState::Idle;
+            }
+            CheatSourcesPageAction::RefreshHealth => {
+                // Runtime data only: re-probes every source and leaves the
+                // editable registries (and therefore any unsaved edits) alone.
+                self.health = probe_registry_health(&self.draft, self.data_root.as_deref());
                 self.save_state = SaveState::Idle;
             }
             CheatSourcesPageAction::Save => {
@@ -411,6 +455,7 @@ impl CheatSourcesPageState {
             platforms: self.platform_views(entry),
             supports_platform_exceptions: entry.spec.platforms.is_empty(),
             changed,
+            health: self.health.get(&entry.spec.id).cloned().flatten(),
         }
     }
 
@@ -736,6 +781,12 @@ fn show_save_bar(ui: &mut egui::Ui, view: &CheatSourcesPageView) -> Option<Cheat
             {
                 action = Some(CheatSourcesPageAction::Revert);
             }
+            ui.add_space(8.0);
+            if widgets::action_button(ui, "Refresh status", widgets::ActionStyle::Quiet, true)
+                .clicked()
+            {
+                action = Some(CheatSourcesPageAction::RefreshHealth);
+            }
         });
 
         if view.dirty {
@@ -770,6 +821,105 @@ fn show_save_bar(ui: &mut egui::Ui, view: &CheatSourcesPageView) -> Option<Cheat
         );
     });
     action
+}
+
+/// Draws one source's probed health: a state badge, entry count and freshness
+/// when the probe could derive them, and the last error when there is one.
+/// A source with no probed state says so instead of claiming anything.
+fn show_source_health(ui: &mut egui::Ui, health: &Option<CheatSourceHealth>) {
+    let Some(health) = health else {
+        ui.label(
+            egui::RichText::new("Status: not checked")
+                .color(theme::muted(ui))
+                .small(),
+        );
+        return;
+    };
+    ui.horizontal(|ui| {
+        widgets::status_badge(
+            ui,
+            health_state_label(health.state),
+            health_tone(health.state),
+        );
+        if let Some(count) = health.entry_count {
+            ui.label(
+                egui::RichText::new(format!("{count} entries"))
+                    .color(theme::muted(ui))
+                    .small(),
+            );
+        }
+        if let Some(checked) = health.last_checked_unix_seconds {
+            ui.label(
+                egui::RichText::new(format!("last checked {}", time_ago(checked)))
+                    .color(theme::muted(ui))
+                    .small(),
+            );
+        }
+    });
+    if let Some(error) = &health.last_error {
+        ui.label(
+            egui::RichText::new(format!("Last error: {error}"))
+                .color(widgets::StatusTone::Blocked.color(ui))
+                .small(),
+        );
+    }
+}
+
+fn health_state_label(state: CheatProviderSourceState) -> &'static str {
+    match state {
+        CheatProviderSourceState::NotInstalled => "Not installed",
+        CheatProviderSourceState::Downloading => "Downloading",
+        CheatProviderSourceState::Validating => "Validating",
+        CheatProviderSourceState::Ready => "Ready",
+        CheatProviderSourceState::UpdateAvailable => "Update available",
+        CheatProviderSourceState::Invalid => "Invalid",
+        CheatProviderSourceState::UnsupportedSchema => "Unsupported schema",
+        CheatProviderSourceState::DownloadFailed => "Download failed",
+        CheatProviderSourceState::ValidationFailed => "Validation failed",
+        CheatProviderSourceState::Disabled => "Disabled",
+    }
+}
+
+fn health_tone(state: CheatProviderSourceState) -> widgets::StatusTone {
+    match state {
+        CheatProviderSourceState::Ready => widgets::StatusTone::Success,
+        CheatProviderSourceState::UpdateAvailable
+        | CheatProviderSourceState::Downloading
+        | CheatProviderSourceState::Validating => widgets::StatusTone::Active,
+        CheatProviderSourceState::Invalid
+        | CheatProviderSourceState::UnsupportedSchema
+        | CheatProviderSourceState::DownloadFailed
+        | CheatProviderSourceState::ValidationFailed => widgets::StatusTone::Blocked,
+        CheatProviderSourceState::NotInstalled | CheatProviderSourceState::Disabled => {
+            widgets::StatusTone::Pending
+        }
+    }
+}
+
+/// A compact "N seconds/minutes/hours/days ago" phrase for a Unix timestamp.
+fn time_ago(unix_seconds: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let seconds = now.saturating_sub(unix_seconds);
+    if seconds < 60 {
+        "just now".to_string()
+    } else if seconds < 3600 {
+        format_quantity(seconds / 60, "minute")
+    } else if seconds < 86400 {
+        format_quantity(seconds / 3600, "hour")
+    } else {
+        format_quantity(seconds / 86400, "day")
+    }
+}
+
+fn format_quantity(value: u64, unit: &str) -> String {
+    if value == 1 {
+        format!("1 {unit} ago")
+    } else {
+        format!("{value} {unit}s ago")
+    }
 }
 
 fn show_source_row(
@@ -818,6 +968,9 @@ fn show_source_row(
         ui.label(egui::RichText::new(row.trust_label).color(theme::muted(ui)));
         ui.add_space(4.0);
         ui.label(&row.description);
+
+        ui.add_space(6.0);
+        show_source_health(ui, &row.health);
 
         ui.add_space(6.0);
         if action.is_none()
