@@ -215,6 +215,7 @@ mod tests {
             source_scan_root: "/tmp/roms".to_string(),
             state,
             entries: vec![entry("/tmp/roms/a.bin", "/tmp/roms/A.bin")],
+            created_directories: Vec::new(),
             unknown: Default::default(),
         }
     }

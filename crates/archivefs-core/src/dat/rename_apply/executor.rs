@@ -116,6 +116,7 @@ pub fn build_transaction(
         source_scan_root: plan.scan_root.clone(),
         state: TransactionState::Planned,
         entries,
+        created_directories: Vec::new(),
         unknown: Default::default(),
     })
 }
@@ -195,6 +196,13 @@ pub struct ApplyExecution<'a> {
     pub journal_dir: PathBuf,
     pub hard_conflict_mode: HardConflictMode,
     pub cancel: &'a AtomicBool,
+    /// Whether the destination may live outside the source's directory.
+    /// `SameDirectory` (the default) preserves rename-apply's behaviour.
+    pub directory_policy: super::preflight::DirectoryPolicy,
+    /// Whether a symlink object is an acceptable source (the ROM organiser's
+    /// symlink-only mode). The link object itself is renamed; its target is
+    /// never dereferenced and its identity is still re-verified.
+    pub allow_symlink_source: bool,
 }
 
 /// Applies a prebuilt transaction. This is the only place a rename happens.
@@ -217,6 +225,8 @@ pub fn apply_transaction(execution: &mut ApplyExecution<'_>) -> Result<ApplyOutc
         approved_paths: &execution.approved_paths,
         trusted: &execution.trusted,
         batch_destinations: &destinations,
+        directory_policy: execution.directory_policy,
+        allow_symlink_source: execution.allow_symlink_source,
     };
 
     // Preflight the whole batch first.
