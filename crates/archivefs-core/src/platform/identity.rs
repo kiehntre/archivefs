@@ -264,7 +264,29 @@ pub fn resolve_platform_identity(
         .cloned()
         .collect();
     if !authoritative.is_empty() {
-        return settle_tier(generation, authoritative);
+        let authoritative_resolution = settle_tier(generation, authoritative);
+        let authoritative_platform = match &authoritative_resolution {
+            PlatformIdentityResolution::Conflict { .. } => return authoritative_resolution,
+            PlatformIdentityResolution::Resolved { platform, .. } => platform,
+            PlatformIdentityResolution::Unknown { .. } => unreachable!("non-empty tier"),
+        };
+        let existing_strong: Vec<_> = evidence
+            .iter()
+            .filter(|item| item.source == PlatformIdentitySource::ExistingStrongIdentity)
+            .cloned()
+            .collect();
+        if existing_strong
+            .iter()
+            .any(|item| item.platform != *authoritative_platform)
+        {
+            let mut conflicting_evidence = authoritative_resolution.evidence().to_vec();
+            conflicting_evidence.extend(existing_strong);
+            return PlatformIdentityResolution::Conflict {
+                generation,
+                evidence: conflicting_evidence,
+            };
+        }
+        return authoritative_resolution;
     }
 
     for source in [

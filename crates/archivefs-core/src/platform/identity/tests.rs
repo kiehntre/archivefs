@@ -165,6 +165,44 @@ fn conflicting_dat_and_romm_require_review() {
 }
 
 #[test]
+fn existing_strong_psp_and_conflicting_romm_require_review() {
+    let resolution = resolve_platform_identity(GENERATION, [strong("PSP"), romm("PSX")]);
+    assert!(resolution.is_conflict());
+    assert_eq!(resolution.platform(), None);
+}
+
+#[test]
+fn existing_strong_psp_and_conflicting_dat_require_review() {
+    let resolution = resolve_platform_identity(GENERATION, [strong("PSP"), dat("PSX")]);
+    assert!(resolution.is_conflict());
+    assert_eq!(resolution.platform(), None);
+}
+
+#[test]
+fn existing_strong_psp_and_agreeing_romm_resolve_to_psp() {
+    let resolution = resolve_platform_identity(GENERATION, [strong("PSP"), romm("PSP")]);
+    assert_eq!(resolved(&resolution).0, "PSP");
+    assert!(!resolution.is_conflict());
+}
+
+#[test]
+fn existing_strong_psp_and_agreeing_dat_resolve_to_psp() {
+    let resolution = resolve_platform_identity(GENERATION, [strong("PSP"), dat("PSP")]);
+    assert_eq!(resolved(&resolution).0, "PSP");
+    assert!(!resolution.is_conflict());
+}
+
+#[test]
+fn strong_identity_and_authoritative_resolution_are_order_independent() {
+    for provider in [romm("PSX"), dat("PSX")] {
+        let forward = resolve_platform_identity(GENERATION, [strong("PSP"), provider.clone()]);
+        let reverse = resolve_platform_identity(GENERATION, [provider, strong("PSP")]);
+        assert_eq!(forward, reverse);
+        assert!(forward.is_conflict());
+    }
+}
+
+#[test]
 fn conflict_is_independent_of_input_order_and_timing() {
     let forward = resolve_platform_identity(GENERATION, [dat("PSX"), romm("PSP")]);
     let reverse = resolve_platform_identity(GENERATION, [romm("PSP"), dat("PSX")]);
