@@ -7,7 +7,9 @@
 //! restored before marking the entry RolledBack. A rollback that cannot meet
 //! those checks stops and reports - it never claims a full rollback for a
 //! partial one, and a repeated rollback request is a safe no-op for entries
-//! already rolled back.
+//! already rolled back. Cancellation stops the loop with any not-yet-reversed
+//! Applied entries left untouched (and retryable); it is an incomplete
+//! rollback, never reported as a full one.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,6 +32,12 @@ pub struct RollbackOutcome {
 /// durably after every transition. Idempotent: entries already RolledBack (or
 /// never Applied) are skipped, so calling this twice never renames anything
 /// twice, and a transaction already RolledBack returns a no-op full result.
+///
+/// Cancellation stops the loop without marking the untouched Applied entries as
+/// failed, so they stay eligible for a later rollback. Because the rollback is
+/// then incomplete, the result is never `FullyRolledBack` and the transaction
+/// is not persisted as `RolledBack`; the leftover entries are reported with a
+/// "rollback cancelled" reason.
 pub fn rollback_transaction(
     transaction: &mut RenameTransaction,
     journal_dir: &Path,
@@ -96,10 +104,12 @@ pub fn rollback_transaction(
 
     let mut rolled_back: Vec<std::path::PathBuf> = Vec::new();
     let mut failed: Vec<(std::path::PathBuf, String)> = Vec::new();
+    let mut stopped_by_cancellation = false;
 
     // Reverse order of successful operations only.
     for index in (0..transaction.entries.len()).rev() {
         if cancelled(cancel) {
+            stopped_by_cancellation = true;
             break;
         }
         if !transaction.entries[index].is_eligible_for_rollback() {
@@ -128,15 +138,49 @@ pub fn rollback_transaction(
         write_journal(journal_dir, transaction).map_err(|error| error.to_string())?;
     }
 
-    transaction.state = if failed.is_empty() {
+    // A rollback is complete only when no entry is left Applied or in-flight
+    // (`RollingBack`; unresolved recovery states already blocked the pass
+    // above). Cancellation leaves the untouched entries Applied rather than
+    // marking them failed, so a later retry can finish them - and it must never
+    // be read as a full rollback.
+    let remaining_incomplete: Vec<std::path::PathBuf> = transaction
+        .entries
+        .iter()
+        .filter(|entry| matches!(entry.state, EntryState::Applied | EntryState::RollingBack))
+        .map(|entry| entry.source_path.clone())
+        .collect();
+
+    let fully_rolled_back = failed.is_empty() && remaining_incomplete.is_empty();
+
+    transaction.state = if fully_rolled_back {
         TransactionState::RolledBack
     } else {
         TransactionState::RollbackFailed
     };
     write_journal(journal_dir, transaction).map_err(|error| error.to_string())?;
 
-    let result = if failed.is_empty() {
+    let result = if fully_rolled_back {
         RollbackResult::FullyRolledBack
+    } else if stopped_by_cancellation {
+        let cancelled_remaining: Vec<(std::path::PathBuf, String)> = remaining_incomplete
+            .iter()
+            .map(|path| {
+                (
+                    path.clone(),
+                    "rollback cancelled while entries were still applied".to_string(),
+                )
+            })
+            .collect();
+        if rolled_back.is_empty() {
+            RollbackResult::RollbackFailed {
+                failed: cancelled_remaining,
+            }
+        } else {
+            RollbackResult::PartiallyRolledBack {
+                rolled_back,
+                failed: cancelled_remaining,
+            }
+        }
     } else if rolled_back.is_empty() {
         RollbackResult::RollbackFailed { failed }
     } else {

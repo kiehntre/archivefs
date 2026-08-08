@@ -4,7 +4,8 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::*;
 use crate::dat::rename_plan::{
@@ -1261,6 +1262,341 @@ fn a_completed_transaction_cannot_be_applied_twice() {
     )
     .unwrap_err();
     assert_eq!(error, ApplyError::NothingApproved);
+}
+
+// ---------------------------------------------------------------------------
+// Cancellation during rollback: never report a cancelled rollback as fully
+// complete, and leave the remaining Applied entries retryable.
+// ---------------------------------------------------------------------------
+
+/// Applies three renames and then starts a rollback that is cancelled after the
+/// first reverse rename (the highest-index entry, restored first), returning
+/// the rollback outcome.
+///
+/// The rollback runs on a helper thread; this thread busy-waits for the first
+/// reverse rename to land (the original path of the last-applied entry
+/// reappears) and flips cancellation from the durable `RollingBack`/journal
+/// checkpoint window, so exactly the first entry reverses.
+fn apply_three_and_cancel_after_first_reverse_rename(
+    dir: &Path,
+) -> (RollbackOutcome, std::path::PathBuf) {
+    let roms = dir.join("roms");
+    std::fs::create_dir_all(&roms).unwrap();
+    let a = write(&roms, "a.bin");
+    let b = write(&roms, "b.bin");
+    let c = write(&roms, "c.bin");
+    let journal = dir.join("journal");
+    std::fs::create_dir_all(&journal).unwrap();
+    let proposals = vec![
+        proposal(
+            a.to_str().unwrap(),
+            "a.bin",
+            "A.bin",
+            ProposalState::Suggested,
+        ),
+        proposal(
+            b.to_str().unwrap(),
+            "b.bin",
+            "B.bin",
+            ProposalState::Suggested,
+        ),
+        proposal(
+            c.to_str().unwrap(),
+            "c.bin",
+            "C.bin",
+            ProposalState::Suggested,
+        ),
+    ];
+    let plan = plan(proposals, 1, &roms);
+    let cancel = no_cancel();
+    let outcome = apply(
+        &plan,
+        approved_of(&[&a, &b, &c]),
+        TrustedRoots::from_paths([&roms]),
+        &journal,
+        HardConflictMode::AbortAll,
+        &cancel,
+    )
+    .unwrap();
+    assert_eq!(outcome.summary.applied, 3, "three renames applied");
+
+    let mut tx = outcome.transaction;
+    let rollback_cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = rollback_cancel.clone();
+    let journal_for_thread = journal.clone();
+    let handle = std::thread::spawn(move || {
+        rollback_transaction(&mut tx, &journal_for_thread, &worker_cancel).unwrap()
+    });
+
+    // Rollback runs in reverse order: index 2 is reversed first, restoring
+    // c.bin. Spin (without yielding) for that reverse rename, then cancel: the
+    // durable journal write after the reversal gives this thread the window.
+    let mut seen = false;
+    for _ in 0..200_000 {
+        if roms.join("c.bin").exists() {
+            seen = true;
+            break;
+        }
+        std::hint::spin_loop();
+    }
+    assert!(
+        seen,
+        "the first reverse rename should run before cancellation"
+    );
+    rollback_cancel.store(true, Ordering::Relaxed);
+    let outcome = handle.join().unwrap();
+    (outcome, journal)
+}
+
+#[test]
+fn cancelled_rollback_before_the_first_step_is_never_full() {
+    // CONFIRMED BUG: cancellation stopped the rollback loop before any reverse
+    // rename; the destination stayed applied, the original path stayed absent,
+    // and yet the old code reported FullyRolledBack + TransactionState::RolledBack
+    // because `failed` was empty.
+    let dir = tempfile::tempdir().unwrap();
+    let (_plan, mut tx, _) = apply_one(dir.path());
+    let journal = dir.path().join("journal");
+    let cancel = cancelled(); // cancellation is already true
+    let outcome = rollback_transaction(&mut tx, &journal, &cancel).unwrap();
+
+    assert_ne!(
+        outcome.result,
+        RollbackResult::FullyRolledBack,
+        "a cancelled rollback is not a full rollback"
+    );
+    assert_ne!(
+        outcome.transaction.state,
+        TransactionState::RolledBack,
+        "a cancelled rollback must stay honestly incomplete"
+    );
+    assert_eq!(
+        outcome.transaction.entries[0].state,
+        EntryState::Applied,
+        "the applied entry is untouched and still eligible"
+    );
+    let roms = dir.path().join("roms");
+    assert!(
+        roms.join("b.bin").exists(),
+        "the destination remains applied"
+    );
+    assert!(
+        !roms.join("a.bin").exists(),
+        "the original path is still absent"
+    );
+    // The incomplete rollback is recorded in the durable journal.
+    let reloaded =
+        read_journal(&journal_path(&journal, &outcome.transaction.transaction_id).unwrap())
+            .unwrap();
+    assert_eq!(reloaded.state, TransactionState::RollbackFailed);
+    assert_eq!(reloaded.entries[0].state, EntryState::Applied);
+    assert!(reloaded.entries[0].is_eligible_for_rollback());
+}
+
+#[test]
+fn cancelled_mid_rollback_is_partial_with_remaining_applied() {
+    let dir = tempfile::tempdir().unwrap();
+    let (outcome, _journal) = apply_three_and_cancel_after_first_reverse_rename(dir.path());
+    let roms = dir.path().join("roms");
+
+    let rolled_back = outcome.result.rolled_back_paths();
+    assert_eq!(
+        rolled_back.len(),
+        1,
+        "exactly one entry reversed: {rolled_back:?}"
+    );
+    assert!(
+        matches!(outcome.result, RollbackResult::PartiallyRolledBack { .. }),
+        "a cancelled mid-batch rollback is partial: {:?}",
+        outcome.result
+    );
+    assert_ne!(outcome.transaction.state, TransactionState::RolledBack);
+    assert_eq!(
+        outcome.transaction.state,
+        TransactionState::RollbackFailed,
+        "the transaction remains honestly incomplete"
+    );
+
+    let rolled_back: Vec<PathBuf> = outcome
+        .transaction
+        .entries
+        .iter()
+        .filter(|entry| entry.state == EntryState::RolledBack)
+        .map(|entry| entry.source_path.clone())
+        .collect();
+    assert_eq!(rolled_back.len(), 1, "exactly one entry is RolledBack");
+    let remaining: Vec<&str> = outcome
+        .transaction
+        .entries
+        .iter()
+        .filter(|entry| entry.state == EntryState::Applied)
+        .map(|entry| entry.source_path.file_name().unwrap().to_str().unwrap())
+        .collect();
+    assert_eq!(remaining, vec!["a.bin", "b.bin"], "the rest stay Applied");
+
+    assert!(
+        roms.join("c.bin").exists(),
+        "the reversed entry is restored"
+    );
+    assert!(roms.join("B.bin").exists(), "still applied");
+    assert!(roms.join("A.bin").exists(), "still applied");
+    assert!(!roms.join("b.bin").exists());
+    assert!(!roms.join("a.bin").exists());
+
+    // The remaining Applied entries are still eligible for a later rollback.
+    let eligible: Vec<&str> = outcome
+        .transaction
+        .entries
+        .iter()
+        .filter(|entry| entry.is_eligible_for_rollback())
+        .map(|entry| entry.source_path.file_name().unwrap().to_str().unwrap())
+        .collect();
+    assert_eq!(eligible, vec!["a.bin", "b.bin"]);
+}
+
+#[test]
+fn rollback_without_cancellation_stays_fully_rolled_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_plan, mut tx, _) = apply_one(dir.path());
+    let journal = dir.path().join("journal");
+    let cancel = no_cancel();
+    let outcome = rollback_transaction(&mut tx, &journal, &cancel).unwrap();
+    assert_eq!(outcome.result, RollbackResult::FullyRolledBack);
+    assert_eq!(outcome.transaction.state, TransactionState::RolledBack);
+    assert_eq!(outcome.transaction.entries[0].state, EntryState::RolledBack);
+}
+
+#[test]
+fn cancellation_after_completion_still_reports_fully_rolled_back() {
+    // Cancellation that arrives only after every reverse rename already ran
+    // must not downgrade a genuine full rollback.
+    let dir = tempfile::tempdir().unwrap();
+    let (_plan, mut tx, _) = apply_one(dir.path());
+    let journal = dir.path().join("journal");
+    let cancel = no_cancel();
+    let outcome = rollback_transaction(&mut tx, &journal, &cancel).unwrap();
+    assert_eq!(outcome.result, RollbackResult::FullyRolledBack);
+    assert_eq!(outcome.transaction.state, TransactionState::RolledBack);
+    // Cancel afterwards: nothing remains Applied, so full rollback stays true.
+    cancel.store(true, Ordering::Relaxed);
+    let second = rollback_transaction(&mut tx, &journal, &cancel).unwrap();
+    assert_eq!(second.result, RollbackResult::FullyRolledBack);
+    assert_eq!(second.transaction.state, TransactionState::RolledBack);
+}
+
+#[test]
+fn repeated_rollback_after_cancellation_finishes_the_remaining_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let (outcome, journal) = apply_three_and_cancel_after_first_reverse_rename(dir.path());
+    let roms = dir.path().join("roms");
+
+    // Already-RolledBack entries are not touched again; the remaining Applied
+    // entries finish safely on a fresh (uncancelled) retry.
+    let mut tx = outcome.transaction;
+    let retry_cancel = no_cancel();
+    let final_outcome = rollback_transaction(&mut tx, &journal, &retry_cancel).unwrap();
+    assert_eq!(final_outcome.result, RollbackResult::FullyRolledBack);
+    assert_eq!(
+        final_outcome.transaction.state,
+        TransactionState::RolledBack
+    );
+
+    for name in ["a.bin", "b.bin", "c.bin"] {
+        assert_eq!(
+            std::fs::read(roms.join(name)).unwrap(),
+            b"fixture contents",
+            "{name} restored exactly once"
+        );
+    }
+    for name in ["A.bin", "B.bin", "C.bin"] {
+        assert!(!roms.join(name).exists(), "{name} gone after rollback");
+    }
+}
+
+#[test]
+fn crash_reconciled_applied_entry_with_cancellation_is_never_full() {
+    // A crash-reconciled Applying -> Applied entry must not be reported as
+    // fully rolled back when cancellation stops the rollback before reversal.
+    let dir = tempfile::tempdir().unwrap();
+    let roms = dir.path().join("roms");
+    std::fs::create_dir_all(&roms).unwrap();
+    let source = write(&roms, "a.bin");
+    let journal = dir.path().join("journal");
+    std::fs::create_dir_all(&journal).unwrap();
+    let plan = plan(
+        vec![proposal(
+            source.to_str().unwrap(),
+            "a.bin",
+            "b.bin",
+            ProposalState::Suggested,
+        )],
+        1,
+        &roms,
+    );
+    let approved = approved_of(&[&source]);
+    let mut tx = build_transaction(&plan, &approved, 1).unwrap();
+    let destination = tx.entries[0].destination_path.clone();
+    tx.entries[0].state = ApplyEntryState::Applying;
+    write_journal(&journal, &tx).unwrap();
+    // The rename happened but the journal was never updated: the crash.
+    super::noclobber::rename_noreplace(&source, &destination).unwrap();
+
+    let issues = reconcile_recovery(&mut tx, &journal).unwrap();
+    assert_eq!(tx.entries[0].state, ApplyEntryState::Applied);
+    assert_eq!(
+        issues[0].kind,
+        super::reconcile::RecoveryIssueKind::RenameConfirmed
+    );
+
+    // Cancellation before the reverse rename.
+    let cancel = cancelled();
+    let outcome = rollback_transaction(&mut tx, &journal, &cancel).unwrap();
+    assert_ne!(outcome.result, RollbackResult::FullyRolledBack);
+    assert_ne!(outcome.transaction.state, TransactionState::RolledBack);
+    assert_eq!(
+        outcome.transaction.entries[0].state,
+        ApplyEntryState::Applied
+    );
+    assert!(destination.exists(), "still applied");
+    assert!(!source.exists(), "original path still absent");
+}
+
+#[test]
+fn cancelled_rollback_persists_durably_and_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_plan, mut tx, _) = apply_one(dir.path());
+    let journal = dir.path().join("journal");
+    let cancel = cancelled();
+    let outcome = rollback_transaction(&mut tx, &journal, &cancel).unwrap();
+    assert_ne!(outcome.result, RollbackResult::FullyRolledBack);
+    assert_eq!(outcome.transaction.state, TransactionState::RollbackFailed);
+
+    // A restart reloads the journal: the incomplete rollback is durable and
+    // the remaining Applied entry is still offered for rollback.
+    let transaction_id = outcome.transaction.transaction_id.clone();
+    let reloaded = read_journal(&journal_path(&journal, &transaction_id).unwrap()).unwrap();
+    assert_eq!(reloaded.state, TransactionState::RollbackFailed);
+    assert_eq!(reloaded.entries[0].state, EntryState::Applied);
+    assert!(reloaded.entries[0].is_eligible_for_rollback());
+    let (recovery, _) = find_recovery_transactions(&journal);
+    assert_eq!(
+        recovery.len(),
+        1,
+        "incomplete rollback is surfaced for recovery"
+    );
+
+    // Retrying from the reloaded journal completes the rollback.
+    let mut retry = reloaded;
+    let retry_cancel = no_cancel();
+    let final_outcome = rollback_transaction(&mut retry, &journal, &retry_cancel).unwrap();
+    assert_eq!(final_outcome.result, RollbackResult::FullyRolledBack);
+    assert_eq!(
+        final_outcome.transaction.state,
+        TransactionState::RolledBack
+    );
+    let roms = dir.path().join("roms");
+    assert!(roms.join("a.bin").exists());
+    assert!(!roms.join("b.bin").exists());
 }
 
 // ---------------------------------------------------------------------------
