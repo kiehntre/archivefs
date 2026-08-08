@@ -226,41 +226,54 @@ fn render_source_info(
     if json {
         println!("{}", serde_json::to_string_pretty(entry)?);
     } else {
-        println!("ID:               {}", entry.spec.id);
-        println!("Display name:     {}", entry.spec.display_name);
-        println!("Emulator:         {}", entry.spec.emulator);
-        if !entry.spec.platforms.is_empty() {
-            println!("Platforms:        {}", entry.spec.platforms.join(", "));
-        } else {
-            println!("Platforms:        (all)");
-        }
-        println!("Enabled:          {}", entry.enabled);
-        println!("Priority:         {}", entry.priority);
-        println!(
-            "Capabilities:     browse={} search={} preview={} install={} download={} refresh={} health={} remote={} local={}",
-            entry.spec.capabilities.browse,
-            entry.spec.capabilities.search,
-            entry.spec.capabilities.preview,
-            entry.spec.capabilities.install,
-            entry.spec.capabilities.download,
-            entry.spec.capabilities.refresh,
-            entry.spec.capabilities.health_check,
-            entry.spec.capabilities.remote,
-            entry.spec.capabilities.local,
-        );
-        println!("Upstream:         {}", entry.spec.upstream_project);
-        println!("Description:      {}", entry.spec.description);
-        if let Some(ref health) = entry.health {
-            println!("Health:           {:?}", health.state);
-            if let Some(ref err) = health.last_error {
-                println!("Last error:       {err}");
-            }
-            if let Some(count) = health.entry_count {
-                println!("Entry count:      {count}");
-            }
-        }
+        print!("{}", source_info_output(entry));
     }
     Ok(())
+}
+
+/// The exact text `info` prints for one source, returned rather than printed.
+///
+/// Separated so a test can assert on what the command actually emits, including
+/// the probed health block, without capturing stdout.
+fn source_info_output(entry: &CheatSourceEntry) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    writeln!(out, "ID:               {}", entry.spec.id).unwrap();
+    writeln!(out, "Display name:     {}", entry.spec.display_name).unwrap();
+    writeln!(out, "Emulator:         {}", entry.spec.emulator).unwrap();
+    if !entry.spec.platforms.is_empty() {
+        writeln!(out, "Platforms:        {}", entry.spec.platforms.join(", ")).unwrap();
+    } else {
+        writeln!(out, "Platforms:        (all)").unwrap();
+    }
+    writeln!(out, "Enabled:          {}", entry.enabled).unwrap();
+    writeln!(out, "Priority:         {}", entry.priority).unwrap();
+    writeln!(
+        out,
+        "Capabilities:     browse={} search={} preview={} install={} download={} refresh={} health={} remote={} local={}",
+        entry.spec.capabilities.browse,
+        entry.spec.capabilities.search,
+        entry.spec.capabilities.preview,
+        entry.spec.capabilities.install,
+        entry.spec.capabilities.download,
+        entry.spec.capabilities.refresh,
+        entry.spec.capabilities.health_check,
+        entry.spec.capabilities.remote,
+        entry.spec.capabilities.local,
+    )
+    .unwrap();
+    writeln!(out, "Upstream:         {}", entry.spec.upstream_project).unwrap();
+    writeln!(out, "Description:      {}", entry.spec.description).unwrap();
+    if let Some(ref health) = entry.health {
+        writeln!(out, "Health:           {:?}", health.state).unwrap();
+        if let Some(ref err) = health.last_error {
+            writeln!(out, "Last error:       {err}").unwrap();
+        }
+        if let Some(count) = health.entry_count {
+            writeln!(out, "Entry count:      {count}").unwrap();
+        }
+    }
+    out
 }
 
 fn set_enabled(
@@ -878,5 +891,50 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_str(&text).expect("an escaped ID must still parse");
         assert_eq!(value["id"], hostile);
+    }
+
+    #[test]
+    fn an_unreadable_existing_cache_is_exposed_by_list_info_and_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_root = dir.path().join("data");
+        // A directory where the catalogue file belongs makes every read fail
+        // deterministically, including when the test runs as root.
+        std::fs::create_dir_all(data_root.join("cache").join("gamehacking")).unwrap();
+        std::fs::create_dir(
+            data_root
+                .join("cache")
+                .join("gamehacking")
+                .join("ps2-catalogue.json"),
+        )
+        .unwrap();
+
+        let mut registry = build_default_registry();
+        registry.probe_health(&data_root);
+
+        let text = source_list_output(&registry, false).expect("list output");
+        assert!(
+            text.lines()
+                .any(|line| line.contains("gamehacking.org-ps2") && line.contains("invalid")),
+            "the human list must mark the unreadable source as invalid:\n{text}"
+        );
+
+        let json: serde_json::Value =
+            serde_json::from_str(&source_list_output(&registry, true).expect("list --json"))
+                .expect("list --json must parse");
+        let entry = json
+            .as_array()
+            .expect("an array")
+            .iter()
+            .find(|entry| entry["spec"]["id"] == "gamehacking.org-ps2")
+            .expect("the ps2 source must appear in JSON");
+        assert_eq!(entry["health"]["state"], "invalid");
+        assert!(
+            entry["health"]["last_error"].as_str().is_some(),
+            "the JSON health must carry the read error reason"
+        );
+
+        let info = source_info_output(registry.get("gamehacking.org-ps2").expect("entry"));
+        assert!(info.contains("Health:           Invalid"), "{info}");
+        assert!(info.contains("Last error:"), "{info}");
     }
 }

@@ -123,6 +123,20 @@ const PS2_CATALOGUE_FILE: &str = "ps2-catalogue.json";
 const GAMECUBE_CATALOGUE_FILE: &str = "gamecube-catalogue.json";
 const WII_CATALOGUE_FILE: &str = "wii-catalogue.json";
 
+/// A concise, actionable label for a cache file that exists but cannot be
+/// read. Deliberately never includes the path: the reason travels with a
+/// per-source description, and dumping private cache paths into a status line
+/// would leak layout for no benefit.
+fn cache_read_error_reason(error: &std::io::Error) -> &'static str {
+    match error.kind() {
+        std::io::ErrorKind::PermissionDenied => "permission denied",
+        std::io::ErrorKind::NotFound => "no longer present",
+        std::io::ErrorKind::IsADirectory => "is a directory, not a cache file",
+        std::io::ErrorKind::NotADirectory => "is not a directory",
+        _ => "unreadable",
+    }
+}
+
 /// Minimal projection of the libretro cache metadata, enough for a health
 /// snapshot without pulling in the provider's full manifest (which carries a
 /// large per-file list this probe does not need).
@@ -160,10 +174,28 @@ fn probe_retroarch_metadata(source_id: &str, data_root: &Path) -> Option<CheatSo
         .join("cheat-sources")
         .join(source_id)
         .join("metadata.json");
-    if !metadata_path.exists() {
-        return Some(CheatSourceHealth::unknown());
-    }
-    let bytes = std::fs::read(&metadata_path).ok()?;
+    // A missing file means "never fetched". A file that exists but cannot be
+    // read is a real error and must not collapse into "not checked": matching
+    // directly on `read` also closes the race where the file disappears
+    // between an `exists` check and the read.
+    let bytes = match std::fs::read(&metadata_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Some(CheatSourceHealth::unknown());
+        }
+        Err(error) => {
+            return Some(CheatSourceHealth {
+                state: CheatProviderSourceState::Invalid,
+                last_checked_unix_seconds: None,
+                last_error: Some(format!(
+                    "libretro cache exists but could not be read: {}",
+                    cache_read_error_reason(&error)
+                )),
+                entry_count: None,
+                freshness_seconds: None,
+            });
+        }
+    };
     let metadata: RetroArchMetadataProbe = match serde_json::from_slice(&bytes) {
         Ok(parsed) => parsed,
         Err(_) => {
@@ -286,10 +318,24 @@ struct GameHackingCatalogueProbe {
 /// so "present but wrong shape" is an error, not a false ready.
 fn probe_gamehacking(data_root: &Path, file: &str) -> Option<CheatSourceHealth> {
     let path = data_root.join("cache").join("gamehacking").join(file);
-    if !path.exists() {
-        return Some(CheatSourceHealth::unknown());
-    }
-    let bytes = std::fs::read(&path).ok()?;
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Some(CheatSourceHealth::unknown());
+        }
+        Err(error) => {
+            return Some(CheatSourceHealth {
+                state: CheatProviderSourceState::Invalid,
+                last_checked_unix_seconds: None,
+                last_error: Some(format!(
+                    "GameHacking cache exists but could not be read: {}",
+                    cache_read_error_reason(&error)
+                )),
+                entry_count: None,
+                freshness_seconds: None,
+            });
+        }
+    };
     let catalogue: GameHackingCatalogueProbe = match serde_json::from_slice(&bytes) {
         Ok(catalogue) => catalogue,
         Err(_) => {
@@ -350,10 +396,24 @@ fn probe_dolphin_catalogue(data_root: &Path) -> Option<CheatSourceHealth> {
     let catalogue_path = data_root
         .join("dolphin-cheat-catalogue")
         .join("catalogue.json");
-    if !catalogue_path.exists() {
-        return Some(CheatSourceHealth::unknown());
-    }
-    let bytes = std::fs::read(&catalogue_path).ok()?;
+    let bytes = match std::fs::read(&catalogue_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Some(CheatSourceHealth::unknown());
+        }
+        Err(error) => {
+            return Some(CheatSourceHealth {
+                state: CheatProviderSourceState::Invalid,
+                last_checked_unix_seconds: None,
+                last_error: Some(format!(
+                    "Dolphin catalogue exists but could not be read: {}",
+                    cache_read_error_reason(&error)
+                )),
+                entry_count: None,
+                freshness_seconds: None,
+            });
+        }
+    };
     let catalogue: DolphinCatalogueProbe = match serde_json::from_slice(&bytes) {
         Ok(catalogue) => catalogue,
         Err(_) => {
@@ -393,7 +453,23 @@ fn probe_dolphin_gecko_cache(data_root: &Path) -> Option<CheatSourceHealth> {
     let mut newest = None;
     let entries = match std::fs::read_dir(&cache_root) {
         Ok(entries) => entries,
-        Err(_) => return Some(CheatSourceHealth::unknown()),
+        // A missing directory means "never fetched"; a directory that exists
+        // but cannot be read is a real error, not "not checked".
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Some(CheatSourceHealth::unknown());
+        }
+        Err(error) => {
+            return Some(CheatSourceHealth {
+                state: CheatProviderSourceState::Invalid,
+                last_checked_unix_seconds: None,
+                last_error: Some(format!(
+                    "Gecko cache exists but could not be read: {}",
+                    cache_read_error_reason(&error)
+                )),
+                entry_count: None,
+                freshness_seconds: None,
+            });
+        }
     };
     for entry in entries.flatten() {
         let path = entry.path();
@@ -433,10 +509,24 @@ struct XeniaIndexProbe {
 /// pinned commit it downloaded. `None` = never fetched.
 fn probe_xenia_index(data_root: &Path) -> Option<CheatSourceHealth> {
     let index_path = data_root.join("xenia-provider-cache").join("index.json");
-    if !index_path.exists() {
-        return Some(CheatSourceHealth::unknown());
-    }
-    let bytes = std::fs::read(&index_path).ok()?;
+    let bytes = match std::fs::read(&index_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Some(CheatSourceHealth::unknown());
+        }
+        Err(error) => {
+            return Some(CheatSourceHealth {
+                state: CheatProviderSourceState::Invalid,
+                last_checked_unix_seconds: None,
+                last_error: Some(format!(
+                    "Xenia index exists but could not be read: {}",
+                    cache_read_error_reason(&error)
+                )),
+                entry_count: None,
+                freshness_seconds: None,
+            });
+        }
+    };
     let index: XeniaIndexProbe = match serde_json::from_slice(&bytes) {
         Ok(index) => index,
         Err(_) => {
@@ -795,5 +885,129 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Makes `std::fs::read(path)` fail deterministically, including when the
+    /// test runs as root, by putting a directory where the probe expects a
+    /// regular file (EISDIR). The parent is created first.
+    fn make_unreadable_file(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::create_dir(path).unwrap();
+    }
+
+    #[test]
+    fn an_existing_but_unreadable_cache_is_invalid_never_not_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = data_root(dir.path());
+
+        make_unreadable_file(
+            &root
+                .join("cheat-sources")
+                .join("libretro-buildbot-cheats")
+                .join("metadata.json"),
+        );
+        make_unreadable_file(
+            &root
+                .join("cache")
+                .join("gamehacking")
+                .join("ps2-catalogue.json"),
+        );
+        make_unreadable_file(&root.join("dolphin-cheat-catalogue").join("catalogue.json"));
+        make_unreadable_file(&root.join("xenia-provider-cache").join("index.json"));
+        // The Gecko cache is read as a directory; a regular file where the
+        // directory belongs makes `read_dir` fail (ENOTDIR).
+        std::fs::write(root.join("gecko-provider-cache"), b"not a directory").unwrap();
+
+        for source_id in [
+            "libretro-buildbot-cheats",
+            "gamehacking.org-ps2",
+            "dolphin_upstream_catalogue",
+            "dolphin_upstream_gamesettings",
+            "xenia_canary_game_patches",
+        ] {
+            let health = probe_cheat_source_health(source_id, &root)
+                .unwrap_or_else(|| panic!("{source_id} must report a health, never None"));
+            assert_eq!(
+                health.state,
+                CheatProviderSourceState::Invalid,
+                "{source_id} has an existing-but-unreadable cache and must be Invalid"
+            );
+            let reason = health.last_error.as_deref().unwrap_or_default();
+            assert!(!reason.is_empty(), "{source_id} must carry a reason");
+            assert!(
+                !reason.contains("data/") && !reason.contains("archivefs"),
+                "{source_id} reason must not leak private cache paths: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_existing_cache_is_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = data_root(dir.path());
+        std::fs::create_dir_all(root.join("cheat-sources").join("libretro-buildbot-cheats"))
+            .unwrap();
+        std::fs::write(
+            root.join("cheat-sources")
+                .join("libretro-buildbot-cheats")
+                .join("metadata.json"),
+            b"not json",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("cache").join("gamehacking")).unwrap();
+        std::fs::write(
+            root.join("cache")
+                .join("gamehacking")
+                .join("ps2-catalogue.json"),
+            b"not json",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("dolphin-cheat-catalogue")).unwrap();
+        std::fs::write(
+            root.join("dolphin-cheat-catalogue").join("catalogue.json"),
+            b"not json",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("xenia-provider-cache")).unwrap();
+        std::fs::write(
+            root.join("xenia-provider-cache").join("index.json"),
+            b"not json",
+        )
+        .unwrap();
+
+        for source_id in [
+            "libretro-buildbot-cheats",
+            "gamehacking.org-ps2",
+            "dolphin_upstream_catalogue",
+            "xenia_canary_game_patches",
+        ] {
+            let health = probe_cheat_source_health(source_id, &root)
+                .unwrap_or_else(|| panic!("{source_id} must report a health, never None"));
+            assert_eq!(
+                health.state,
+                CheatProviderSourceState::Invalid,
+                "{source_id} has a malformed cache and must be Invalid"
+            );
+            assert!(health.last_error.is_some(), "{source_id} must explain");
+        }
+    }
+
+    #[test]
+    fn registry_probe_health_retains_an_invalid_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = data_root(dir.path());
+        make_unreadable_file(
+            &root
+                .join("cache")
+                .join("gamehacking")
+                .join("ps2-catalogue.json"),
+        );
+
+        let mut registry = crate::patch_manager::build_default_registry();
+        registry.probe_health(&root);
+        let ps2 = registry.get("gamehacking.org-ps2").expect("entry");
+        let health = ps2.health.as_ref().expect("health is probed, not dropped");
+        assert_eq!(health.state, CheatProviderSourceState::Invalid);
+        assert!(health.last_error.is_some());
     }
 }

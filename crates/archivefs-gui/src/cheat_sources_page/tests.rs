@@ -1608,3 +1608,50 @@ fn refresh_health_reprobes_after_a_source_is_fetched() {
         "refreshing health must not dirty the page"
     );
 }
+
+#[test]
+fn an_unreadable_existing_cache_is_drawn_as_invalid_not_not_checked() {
+    let root = test_root("health-unreadable");
+    let data_root = root.join("data");
+    // A directory where metadata.json belongs makes reads fail
+    // deterministically, including when the test runs as root.
+    std::fs::create_dir_all(
+        data_root
+            .join("cheat-sources")
+            .join("libretro-buildbot-cheats"),
+    )
+    .unwrap();
+    std::fs::create_dir(
+        data_root
+            .join("cheat-sources")
+            .join("libretro-buildbot-cheats")
+            .join("metadata.json"),
+    )
+    .unwrap();
+
+    let page = CheatSourcesPageState::load(root.join("cheat_sources.toml"), Some(data_root));
+    let view = page.view();
+    let libretro = view
+        .rows
+        .iter()
+        .find(|row| row.id == "libretro-buildbot-cheats")
+        .expect("libretro row");
+    let health = libretro
+        .health
+        .as_ref()
+        .expect("an unreadable existing cache must report a health, not None");
+    assert_eq!(
+        health.state,
+        archivefs_core::patch_manager::CheatProviderSourceState::Invalid
+    );
+    assert!(
+        health.last_error.as_ref().is_some(),
+        "the invalid health must explain the read failure"
+    );
+
+    let output = render(&view);
+    assert!(
+        rendered_text_contains(&output, "Invalid"),
+        "the page must draw the Invalid state, not 'Status: not checked'"
+    );
+}
