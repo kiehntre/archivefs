@@ -136,7 +136,7 @@ impl fmt::Display for IdentityStatus {
             Self::Candidate => "Candidate",
             Self::Missing => "Missing",
             Self::Unsupported => "Unsupported",
-            Self::Deferred => "Deferred",
+            Self::Deferred => "Not available yet",
             Self::Invalid => "Invalid",
             Self::Ambiguous => "Ambiguous",
             Self::ResourceLimitReached => "Resource limit reached",
@@ -3644,4 +3644,10 @@ mod tests {
         assert_eq!(report.verified_xex_title_id(), None);
         assert_eq!(report.format, IdentityImageFormat::Unsupported);
     }
+}
+
+#[test]
+fn a_deferred_identity_status_reads_not_available_yet() {
+    assert_eq!(IdentityStatus::Deferred.to_string(), "Not available yet");
+    assert_ne!(IdentityStatus::Deferred.to_string(), "Deferred");
 }

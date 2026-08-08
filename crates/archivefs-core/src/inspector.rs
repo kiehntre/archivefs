@@ -803,3 +803,25 @@ mod tests {
         assert!(!is_inspectable(Path::new("/roms/game.txt")));
     }
 }
+
+#[test]
+fn a_cue_sheet_is_a_companion_file_not_an_independent_missing_game() {
+    // The library model does not pair BIN/CUE into one game, so a .cue sheet
+    // is deliberately classified as a disc-image companion (Documentation),
+    // never as likely game content and never as an independently missing
+    // game. This pins the confirmed behavior so a future scanner change
+    // cannot silently start reporting .cue files as missing games.
+    let classification = classify_entry("game.cue", false);
+    assert_eq!(classification, InspectorEntryClassification::Documentation);
+    assert_ne!(classification, InspectorEntryClassification::LikelyContent);
+    assert_ne!(classification, InspectorEntryClassification::Other);
+    // Same for m3u playlists and the bin files they describe are content.
+    assert_eq!(
+        classify_entry("disc.m3u", false),
+        InspectorEntryClassification::Documentation
+    );
+    assert_eq!(
+        classify_entry("game.bin", false),
+        InspectorEntryClassification::LikelyContent
+    );
+}
