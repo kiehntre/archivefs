@@ -53,7 +53,6 @@ pub fn build_organisation_transaction(
         ));
     }
     let mut entries = Vec::new();
-    let mut created_directories = Vec::new();
     for entry in plan
         .entries
         .iter()
@@ -92,17 +91,14 @@ pub fn build_organisation_transaction(
             rolled_back_at_unix: None,
             unknown: Default::default(),
         });
-        if entry.mode != OrganisationMode::RenameInPlace
-            && let Some(parent) = entry.destination_path.parent()
-            && is_platform_directory_candidate(parent, &plan.master_root)
-            && !created_directories.contains(&parent.to_path_buf())
-        {
-            created_directories.push(parent.to_path_buf());
-        }
     }
     if entries.is_empty() {
         return Err("no approved Suggested entries in the plan".to_string());
     }
+    // `created_directories` is deliberately left empty here. Directories are
+    // only ever recorded as ArchiveFS-owned *after* `create_dir` succeeds (see
+    // `apply_organisation_transaction`), so a pre-existing user directory is
+    // never journalled as owned and recovery/rollback can never remove it.
     Ok(RenameTransaction {
         transaction_id: crate::dat::rename_apply::journal::new_transaction_id(
             crate::dat::sources::now_unix(),
@@ -112,7 +108,7 @@ pub fn build_organisation_transaction(
         source_scan_root: plan.master_root.to_string_lossy().into_owned(),
         state: TransactionState::Planned,
         entries,
-        created_directories,
+        created_directories: Vec::new(),
         unknown: Default::default(),
     })
 }
@@ -131,12 +127,112 @@ fn is_platform_directory_candidate(parent: &Path, master_root: &Path) -> bool {
     parent.parent().is_some_and(|root| root == master_root)
 }
 
+/// The distinct platform directories an organisation transaction may need to
+/// create, derived from the entries' destinations. These are *prospective*
+/// only - each becomes owned (and rollback-removable) only once `create_dir`
+/// succeeds in `apply_organisation_transaction`.
+fn planned_platform_directories(
+    transaction: &RenameTransaction,
+    master_root: &Path,
+) -> Vec<std::path::PathBuf> {
+    let mut planned = Vec::new();
+    for entry in &transaction.entries {
+        if let Some(parent) = entry.destination_path.parent()
+            && is_platform_directory_candidate(parent, master_root)
+            && !planned.contains(&parent.to_path_buf())
+        {
+            planned.push(parent.to_path_buf());
+        }
+    }
+    planned
+}
+
+/// Re-resolves the current platform identity for every Suggested plan entry
+/// against the live database and RomM identity data, and re-derives the
+/// destination.
+///
+/// Returns `Ok(())` only when nothing changed; otherwise a reason naming the
+/// entry that went stale. The GUI calls this immediately before applying, so
+/// a platform identity changed by another process (or a changed canonical
+/// slug / canonical name / archive destination) is detected and the apply is
+/// refused without any mutation.
+pub fn revalidate_organisation_plan(
+    plan: &OrganisationPlan,
+    database_path: &Path,
+    canonical_name_for: &dyn Fn(&Path) -> Option<String>,
+    slug_for_platform: &dyn Fn(&str) -> Option<String>,
+) -> Result<(), String> {
+    use super::plan::{OrganisationCandidate, OrganisationPlanRequest, build_organisation_plan};
+
+    let database = crate::Database::open_read_only(database_path)
+        .map_err(|error| format!("could not open the platform identity database: {error}"))?;
+    for entry in plan.suggested() {
+        let candidate = OrganisationCandidate {
+            source_path: entry.source_path.clone(),
+            resolution: live_resolution_for(&database, &entry.source_path, plan.generation),
+            canonical_name: canonical_name_for(&entry.source_path),
+        };
+        let re_plan = build_organisation_plan(&OrganisationPlanRequest {
+            master_root: &plan.master_root,
+            mode: plan.mode,
+            candidates: std::slice::from_ref(&candidate),
+            slug_for_platform,
+            generation: plan.generation,
+        });
+        let re_entry = &re_plan.entries[0];
+        if re_entry.status != super::model::OrganisationStatus::Suggested
+            || re_entry.destination_path != entry.destination_path
+            || re_entry.platform.as_deref() != entry.platform.as_deref()
+            || re_entry.slug.as_deref() != entry.slug.as_deref()
+        {
+            return Err(format!(
+                "the platform identity for {} changed since the plan was generated; regenerate \
+                 the plan",
+                entry.source_path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn live_resolution_for(
+    database: &crate::Database,
+    source: &Path,
+    generation: u64,
+) -> crate::platform::identity::PlatformIdentityResolution {
+    match database
+        .find_archive_id_by_absolute_path(source)
+        .ok()
+        .flatten()
+    {
+        Some(archive_id) => {
+            let evidence = database
+                .current_platform_identity_evidence(archive_id, generation)
+                .ok()
+                .unwrap_or_default();
+            crate::platform::identity::resolve_platform_identity(generation, evidence)
+        }
+        None => crate::platform::identity::PlatformIdentityResolution::Unknown { generation },
+    }
+}
+
 /// Applies an organisation transaction.
 ///
 /// Ordering is the same as rename-apply: durable journal of intent first,
-/// then the platform directories this transaction owns, then the shared
-/// executor's per-entry Applying checkpoint + no-clobber move. A cancellation
-/// before any file mutation leaves zero file mutations.
+/// then the platform directories this transaction proves it created, then the
+/// shared executor's per-entry Applying checkpoint + no-clobber move. A
+/// cancellation before any file mutation leaves zero file mutations.
+///
+/// # Directory ownership contract
+///
+/// A directory is appended to `transaction.created_directories` **only after
+/// `create_dir` succeeds**, and the journal is rewritten durably immediately
+/// afterwards. A directory that already exists is never recorded as owned, so
+/// a pre-existing user directory can never be removed by rollback. If the
+/// process crashes after a `create_dir` but before the ownership journal
+/// write, the directory is unproven: recovery conservatively leaves it alone
+/// rather than deleting it.
+#[allow(clippy::too_many_arguments)]
 pub fn apply_organisation_transaction(
     transaction: &mut RenameTransaction,
     approved_sources: &BTreeSet<String>,
@@ -145,37 +241,48 @@ pub fn apply_organisation_transaction(
     journal_dir: &Path,
     cancel: &AtomicBool,
     mode: OrganisationMode,
+    master_root: &Path,
 ) -> Result<ApplyOutcome, ApplyError> {
     if cancel.load(std::sync::atomic::Ordering::Relaxed) {
         return Err(ApplyError::Cancelled);
     }
 
     // Record durable intent before creating any directory or moving anything.
+    // At this point `created_directories` is empty, so a crash here cannot
+    // claim ownership of any directory.
     transaction.state = TransactionState::Applying;
     write_journal(journal_dir, transaction)
         .map_err(|error| ApplyError::Journal(error.to_string()))?;
 
-    // Create only the platform directories that do not already exist. A
-    // directory that exists is a pre-existing user directory and is never
-    // recorded as ours (so rollback never removes it).
-    let planned: Vec<std::path::PathBuf> = transaction.created_directories.clone();
-    let mut actually_created: Vec<std::path::PathBuf> = Vec::new();
+    // The platform directories this transaction may need, derived from the
+    // entries' destinations (never persisted as owned up front).
+    let planned = planned_platform_directories(transaction, master_root);
+
+    // Create only the platform directories that do not already exist. Each one
+    // is appended to `created_directories` and journalled durably as soon as
+    // `create_dir` succeeds, so the persisted ownership claim and the on-disk
+    // directory are as close as the filesystem allows.
     for directory in &planned {
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             break;
         }
         match std::fs::symlink_metadata(directory) {
             Ok(_) => {
-                // Appeared (or pre-existed); never ours.
+                // Already present (or appeared concurrently): pre-existing,
+                // never ours.
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 match std::fs::create_dir(directory) {
-                    Ok(()) => actually_created.push(directory.clone()),
+                    Ok(()) => {
+                        transaction.created_directories.push(directory.clone());
+                        write_journal(journal_dir, transaction).map_err(|journal_error| {
+                            ApplyError::Journal(journal_error.to_string())
+                        })?;
+                    }
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                         // Appeared concurrently; pre-existing, not ours.
                     }
                     Err(error) => {
-                        transaction.created_directories = actually_created;
                         transaction.state = TransactionState::ApplyFailed;
                         write_journal(journal_dir, transaction).map_err(|journal_error| {
                             ApplyError::Journal(journal_error.to_string())
@@ -188,7 +295,6 @@ pub fn apply_organisation_transaction(
                 }
             }
             Err(_) => {
-                transaction.created_directories = actually_created;
                 transaction.state = TransactionState::ApplyFailed;
                 write_journal(journal_dir, transaction)
                     .map_err(|journal_error| ApplyError::Journal(journal_error.to_string()))?;
@@ -198,11 +304,6 @@ pub fn apply_organisation_transaction(
                 )));
             }
         }
-    }
-    if actually_created.len() != planned.len() {
-        transaction.created_directories = actually_created;
-        write_journal(journal_dir, transaction)
-            .map_err(|error| ApplyError::Journal(error.to_string()))?;
     }
 
     // Batch preflight immediately before the shared executor runs, so a
