@@ -33,6 +33,7 @@ pub mod config;
 pub mod health;
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -43,7 +44,7 @@ pub use config::{
     load_cheat_sources_config_from, save_cheat_sources_config_default,
     save_cheat_sources_config_to,
 };
-pub use health::CheatSourceHealth;
+pub use health::{CheatSourceHealth, default_cheat_source_data_root, probe_cheat_source_health};
 
 /// Per-platform participation for one source, as the GUI edits it.
 ///
@@ -386,6 +387,19 @@ impl CheatSourceRegistry {
             }
         }
         self.platform_overrides = cfg.platform_overrides.clone().unwrap_or_default();
+    }
+
+    /// Populates every entry's `health` from a best-effort, read-only probe of
+    /// the source's persisted cache state under `data_root`.
+    ///
+    /// Sources that keep no persisted state (or ids this build does not know)
+    /// keep `health = None`, meaning "not checked", as before. The probe never
+    /// touches the network and never creates, locks, or modifies a file, so a
+    /// caller can run it freely before displaying a status.
+    pub fn probe_health(&mut self, data_root: &Path) {
+        for entry in &mut self.entries {
+            entry.health = health::probe_cheat_source_health(&entry.spec.id, data_root);
+        }
     }
 
     /// Serialises current state back to the preferences shape.

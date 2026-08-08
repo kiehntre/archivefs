@@ -41,7 +41,7 @@ fn config_path(name: &str) -> PathBuf {
 
 /// A page over a path that does not exist: built-in defaults, nothing saved.
 fn fresh(name: &str) -> CheatSourcesPageState {
-    CheatSourcesPageState::load(config_path(name))
+    CheatSourcesPageState::load(config_path(name), None)
 }
 
 fn write_config(path: &Path, cfg: &CheatSourcesConfig) {
@@ -328,7 +328,7 @@ fn pending_changes_are_explained_in_plain_language() {
 #[test]
 fn nothing_is_written_until_the_user_saves() {
     let path = config_path("no-write-before-save");
-    let mut state = CheatSourcesPageState::load(path.clone());
+    let mut state = CheatSourcesPageState::load(path.clone(), None);
     state.apply(CheatSourcesPageAction::SetEnabled {
         id: KNOWN_ID.to_string(),
         enabled: false,
@@ -347,7 +347,7 @@ fn nothing_is_written_until_the_user_saves() {
 #[test]
 fn saving_persists_and_clears_the_dirty_state() {
     let path = config_path("save");
-    let mut state = CheatSourcesPageState::load(path.clone());
+    let mut state = CheatSourcesPageState::load(path.clone(), None);
     state.apply(CheatSourcesPageAction::SetEnabled {
         id: KNOWN_ID.to_string(),
         enabled: false,
@@ -359,7 +359,7 @@ fn saving_persists_and_clears_the_dirty_state() {
     assert_eq!(state.view().save_state, SaveState::Saved);
 
     // And it is what a fresh load sees.
-    let reloaded = CheatSourcesPageState::load(path);
+    let reloaded = CheatSourcesPageState::load(path, None);
     assert!(
         !reloaded
             .view()
@@ -374,7 +374,7 @@ fn saving_persists_and_clears_the_dirty_state() {
 #[test]
 fn discarding_after_a_save_returns_to_what_was_saved_not_to_defaults() {
     let path = config_path("revert-after-save");
-    let mut state = CheatSourcesPageState::load(path);
+    let mut state = CheatSourcesPageState::load(path, None);
     state.apply(CheatSourcesPageAction::SetPriority {
         id: KNOWN_ID.to_string(),
         priority: 7,
@@ -403,7 +403,7 @@ fn discarding_after_a_save_returns_to_what_was_saved_not_to_defaults() {
 #[test]
 fn an_untouched_page_that_saves_writes_only_defaults() {
     let path = config_path("save-untouched");
-    let mut state = CheatSourcesPageState::load(path.clone());
+    let mut state = CheatSourcesPageState::load(path.clone(), None);
     state.apply(CheatSourcesPageAction::Save);
 
     let reloaded = load_cheat_sources_config_from(&path).unwrap();
@@ -470,7 +470,7 @@ fn a_source_disabled_everywhere_reports_that_the_platform_toggle_cannot_help() {
 #[test]
 fn participation_survives_a_save_and_reload() {
     let path = config_path("participation-persist");
-    let mut state = CheatSourcesPageState::load(path.clone());
+    let mut state = CheatSourcesPageState::load(path.clone(), None);
     state.apply(CheatSourcesPageAction::SetPlatformParticipation {
         id: PS2_SOURCE.to_string(),
         platform: "PS2".to_string(),
@@ -478,7 +478,7 @@ fn participation_survives_a_save_and_reload() {
     });
     state.apply(CheatSourcesPageAction::Save);
 
-    let reloaded = CheatSourcesPageState::load(path);
+    let reloaded = CheatSourcesPageState::load(path, None);
     let row = reloaded
         .view()
         .rows
@@ -688,7 +688,7 @@ fn an_alias_cannot_create_a_second_exception_for_one_platform() {
 #[test]
 fn removing_an_exception_restores_participation_and_leaves_no_residue() {
     let path = config_path("remove-exception");
-    let mut state = CheatSourcesPageState::load(path.clone());
+    let mut state = CheatSourcesPageState::load(path.clone(), None);
     state.apply(CheatSourcesPageAction::SetPlatformParticipation {
         id: KNOWN_ID.to_string(),
         platform: "PS2".to_string(),
@@ -720,7 +720,7 @@ fn removing_an_exception_restores_participation_and_leaves_no_residue() {
 #[test]
 fn an_exception_survives_save_and_reload() {
     let path = config_path("exception-persist");
-    let mut state = CheatSourcesPageState::load(path.clone());
+    let mut state = CheatSourcesPageState::load(path.clone(), None);
     state.apply(CheatSourcesPageAction::SetPlatformParticipation {
         id: KNOWN_ID.to_string(),
         platform: "GameCube".to_string(),
@@ -729,7 +729,7 @@ fn an_exception_survives_save_and_reload() {
     state.apply(CheatSourcesPageAction::Save);
     assert_eq!(state.view().save_state, SaveState::Saved);
 
-    let reloaded = CheatSourcesPageState::load(path);
+    let reloaded = CheatSourcesPageState::load(path, None);
     let view = reloaded.view();
     let row = view.rows.iter().find(|r| r.id == KNOWN_ID).unwrap();
     assert_eq!(row.platforms.len(), 1);
@@ -741,7 +741,7 @@ fn an_exception_survives_save_and_reload() {
 #[test]
 fn an_unsaved_exception_never_reaches_disk() {
     let path = config_path("exception-not-saved");
-    let mut state = CheatSourcesPageState::load(path.clone());
+    let mut state = CheatSourcesPageState::load(path.clone(), None);
     state.apply(CheatSourcesPageAction::SetPlatformParticipation {
         id: KNOWN_ID.to_string(),
         platform: "PS2".to_string(),
@@ -777,7 +777,7 @@ fn discarding_removes_an_unsaved_exception() {
 #[test]
 fn discarding_returns_to_a_saved_exception_not_to_none() {
     let path = config_path("exception-discard-after-save");
-    let mut state = CheatSourcesPageState::load(path);
+    let mut state = CheatSourcesPageState::load(path, None);
     state.apply(CheatSourcesPageAction::SetPlatformParticipation {
         id: KNOWN_ID.to_string(),
         platform: "PS2".to_string(),
@@ -829,7 +829,7 @@ fn an_already_saved_exception_is_not_announced_as_a_pending_change() {
     // priority announced an exception the user saved long ago as though
     // saving would newly apply it.
     let path = config_path("consequence-only-pending");
-    let mut state = CheatSourcesPageState::load(path);
+    let mut state = CheatSourcesPageState::load(path, None);
     state.apply(CheatSourcesPageAction::SetPlatformParticipation {
         id: KNOWN_ID.to_string(),
         platform: "PS2".to_string(),
@@ -861,7 +861,7 @@ fn a_platform_exception_under_a_disabled_source_does_not_promise_it_stays_enable
     // switched off at source level it is consulted nowhere, so that sentence
     // described behaviour the user would never see.
     let path = config_path("consequence-disabled-source");
-    let mut state = CheatSourcesPageState::load(path);
+    let mut state = CheatSourcesPageState::load(path, None);
     state.apply(CheatSourcesPageAction::SetEnabled {
         id: KNOWN_ID.to_string(),
         enabled: false,
@@ -886,7 +886,7 @@ fn a_platform_exception_under_a_disabled_source_does_not_promise_it_stays_enable
 #[test]
 fn removing_a_saved_exception_is_announced() {
     let path = config_path("consequence-removal");
-    let mut state = CheatSourcesPageState::load(path);
+    let mut state = CheatSourcesPageState::load(path, None);
     state.apply(CheatSourcesPageAction::SetPlatformParticipation {
         id: KNOWN_ID.to_string(),
         platform: "PS2".to_string(),
@@ -932,7 +932,7 @@ fn a_toggle_takes_effect_even_with_duplicate_platform_blocks() {
         },
     );
 
-    let mut state = CheatSourcesPageState::load(path.clone());
+    let mut state = CheatSourcesPageState::load(path.clone(), None);
     let row = state
         .view()
         .rows
@@ -1001,7 +1001,7 @@ fn removing_an_exception_preserves_unrelated_unknown_data() {
         },
     );
 
-    let mut state = CheatSourcesPageState::load(path.clone());
+    let mut state = CheatSourcesPageState::load(path.clone(), None);
     state.apply(CheatSourcesPageAction::SetPlatformParticipation {
         id: KNOWN_ID.to_string(),
         platform: "PS2".to_string(),
@@ -1038,7 +1038,7 @@ fn a_failed_save_keeps_the_changes_pending_and_does_not_claim_success() {
     let blocked = root.join("cheat_sources.toml");
     fs::create_dir_all(&blocked).expect("a directory where the file should be");
 
-    let mut state = CheatSourcesPageState::load(blocked);
+    let mut state = CheatSourcesPageState::load(blocked, None);
     state.apply(CheatSourcesPageAction::SetEnabled {
         id: KNOWN_ID.to_string(),
         enabled: false,
@@ -1081,7 +1081,7 @@ fn adding_an_exception_preserves_unknown_entries() {
     };
     write_config(&path, &original);
 
-    let mut state = CheatSourcesPageState::load(path.clone());
+    let mut state = CheatSourcesPageState::load(path.clone(), None);
     state.apply(CheatSourcesPageAction::SetPlatformParticipation {
         id: KNOWN_ID.to_string(),
         platform: "PS2".to_string(),
@@ -1142,7 +1142,7 @@ fn the_picker_writes_no_new_config_keys() {
     // The Milestone 1 floor: this flow uses `disabled_providers`, which has
     // always existed. It must not introduce a field.
     let path = config_path("exception-no-new-keys");
-    let mut state = CheatSourcesPageState::load(path.clone());
+    let mut state = CheatSourcesPageState::load(path.clone(), None);
     state.apply(CheatSourcesPageAction::SetPlatformParticipation {
         id: KNOWN_ID.to_string(),
         platform: "PS2".to_string(),
@@ -1254,7 +1254,7 @@ fn an_unknown_provider_is_shown_not_hidden() {
         },
     );
 
-    let view = CheatSourcesPageState::load(path).view();
+    let view = CheatSourcesPageState::load(path, None).view();
     assert_eq!(view.unresolved.len(), 1);
     assert_eq!(view.unresolved[0].detail, UNKNOWN_ID);
     assert!(
@@ -1283,7 +1283,7 @@ fn an_unresolved_platform_override_is_shown() {
         },
     );
 
-    let view = CheatSourcesPageState::load(path).view();
+    let view = CheatSourcesPageState::load(path, None).view();
     assert_eq!(view.unresolved.len(), 1);
     assert_eq!(view.unresolved[0].detail, "NotAPlatformThisBuildKnows");
 }
@@ -1310,7 +1310,7 @@ fn saving_from_the_page_preserves_every_unresolved_entry() {
     };
     write_config(&path, &original);
 
-    let mut state = CheatSourcesPageState::load(path.clone());
+    let mut state = CheatSourcesPageState::load(path.clone(), None);
     state.apply(CheatSourcesPageAction::SetEnabled {
         id: KNOWN_ID.to_string(),
         enabled: false,
@@ -1339,7 +1339,7 @@ fn an_unreadable_file_is_reported_and_never_overwritten() {
     fs::write(&path, "this is not valid toml {{[").unwrap();
     let before = fs::read_to_string(&path).unwrap();
 
-    let mut state = CheatSourcesPageState::load(path.clone());
+    let mut state = CheatSourcesPageState::load(path.clone(), None);
     assert!(
         state.view().load_error.is_some(),
         "a parse failure must be surfaced, not swallowed"
@@ -1488,12 +1488,170 @@ fn the_rendered_page_draws_unresolved_entries_rather_than_hiding_them() {
             platform_overrides: None,
         },
     );
-    let view = CheatSourcesPageState::load(path).view();
+    let view = CheatSourcesPageState::load(path, None).view();
     let output = render(&view);
 
     assert!(rendered_text_contains(&output, "Kept but not recognised"));
     assert!(
         rendered_text_contains(&output, UNKNOWN_ID),
         "the unrecognised ID must be named so the user can correct it"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Health display and refresh
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_probed_ready_source_is_drawn_with_its_status_and_entry_count() {
+    let root = test_root("health-ready");
+    let data_root = root.join("data");
+    let source_root = data_root
+        .join("cheat-sources")
+        .join("libretro-buildbot-cheats");
+    std::fs::create_dir_all(source_root.join("snapshots").join("abc123")).unwrap();
+    std::fs::write(
+        source_root.join("metadata.json"),
+        r#"{
+  "format_version": 1,
+  "source_id": "libretro-buildbot-cheats",
+  "current_snapshot": "abc123",
+  "manifest": {
+    "fetched_at_unix_seconds": 1000,
+    "valid_cheat_count": 42
+  },
+  "last_fetch_succeeded": true,
+  "last_error": null
+}
+"#,
+    )
+    .unwrap();
+
+    let page = CheatSourcesPageState::load(root.join("cheat_sources.toml"), Some(data_root));
+    let rows = page.view().rows;
+    let libretro = rows
+        .iter()
+        .find(|row| row.id == "libretro-buildbot-cheats")
+        .expect("libretro source row");
+    let health = libretro.health.as_ref().expect("libretro health is probed");
+    assert_eq!(
+        health.state,
+        archivefs_core::patch_manager::CheatProviderSourceState::Ready
+    );
+    assert_eq!(health.entry_count, Some(42));
+    assert!(health.last_checked_unix_seconds.is_some());
+
+    let output = render(&page.view());
+    assert!(rendered_text_contains(&output, "Ready"));
+    assert!(rendered_text_contains(&output, "42 entries"));
+}
+
+#[test]
+fn refresh_health_reprobes_after_a_source_is_fetched() {
+    let root = test_root("health-refresh");
+    let data_root = root.join("data");
+    let page_path = root.join("cheat_sources.toml");
+    let mut page = CheatSourcesPageState::load(page_path.clone(), Some(data_root.clone()));
+    assert!(
+        page.view()
+            .rows
+            .iter()
+            .find(|row| row.id == "libretro-buildbot-cheats")
+            .expect("libretro row")
+            .health
+            .as_ref()
+            .is_none_or(|health| {
+                health.state != archivefs_core::patch_manager::CheatProviderSourceState::Ready
+            }),
+        "nothing fetched yet, so libretro must not read ready"
+    );
+
+    // Simulate a fetch completing between visits.
+    let source_root = data_root
+        .join("cheat-sources")
+        .join("libretro-buildbot-cheats");
+    std::fs::create_dir_all(source_root.join("snapshots").join("abc123")).unwrap();
+    std::fs::write(
+        source_root.join("metadata.json"),
+        r#"{
+  "format_version": 1,
+  "source_id": "libretro-buildbot-cheats",
+  "current_snapshot": "abc123",
+  "manifest": {
+    "fetched_at_unix_seconds": 1000,
+    "valid_cheat_count": 42
+  },
+  "last_fetch_succeeded": true,
+  "last_error": null
+}
+"#,
+    )
+    .unwrap();
+
+    page.apply(CheatSourcesPageAction::RefreshHealth);
+    let health = page
+        .view()
+        .rows
+        .iter()
+        .find(|row| row.id == "libretro-buildbot-cheats")
+        .expect("libretro row")
+        .health
+        .clone()
+        .expect("health after refresh");
+    assert_eq!(
+        health.state,
+        archivefs_core::patch_manager::CheatProviderSourceState::Ready
+    );
+    assert_eq!(health.entry_count, Some(42));
+    assert!(
+        !page.is_dirty(),
+        "refreshing health must not dirty the page"
+    );
+}
+
+#[test]
+fn an_unreadable_existing_cache_is_drawn_as_invalid_not_not_checked() {
+    let root = test_root("health-unreadable");
+    let data_root = root.join("data");
+    // A directory where metadata.json belongs makes reads fail
+    // deterministically, including when the test runs as root.
+    std::fs::create_dir_all(
+        data_root
+            .join("cheat-sources")
+            .join("libretro-buildbot-cheats"),
+    )
+    .unwrap();
+    std::fs::create_dir(
+        data_root
+            .join("cheat-sources")
+            .join("libretro-buildbot-cheats")
+            .join("metadata.json"),
+    )
+    .unwrap();
+
+    let page = CheatSourcesPageState::load(root.join("cheat_sources.toml"), Some(data_root));
+    let view = page.view();
+    let libretro = view
+        .rows
+        .iter()
+        .find(|row| row.id == "libretro-buildbot-cheats")
+        .expect("libretro row");
+    let health = libretro
+        .health
+        .as_ref()
+        .expect("an unreadable existing cache must report a health, not None");
+    assert_eq!(
+        health.state,
+        archivefs_core::patch_manager::CheatProviderSourceState::Invalid
+    );
+    assert!(
+        health.last_error.as_ref().is_some(),
+        "the invalid health must explain the read failure"
+    );
+
+    let output = render(&view);
+    assert!(
+        rendered_text_contains(&output, "Invalid"),
+        "the page must draw the Invalid state, not 'Status: not checked'"
     );
 }
