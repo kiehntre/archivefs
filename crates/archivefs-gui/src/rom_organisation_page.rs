@@ -11,7 +11,7 @@
 //! approves, and never offers Apply for conflicts, blocked or unknown entries.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use archivefs_core::dat::rom_organisation::*;
 use archivefs_core::identity_source::cache::{IdentityCacheLocation, load_cache};
@@ -154,12 +154,15 @@ impl RomOrganisationPageState {
             self.plan = None;
             return;
         };
-        let Some(candidates) = build_candidates(&self.sources, self.plan_generation) else {
+        let cache = load_romm_cache();
+        let slug_map = build_slug_map(cache.as_ref());
+        let Some(candidates) =
+            build_candidates(&self.sources, self.plan_generation, cache.as_ref())
+        else {
             self.error = Some("could not read the platform identity database".to_string());
             self.plan = None;
             return;
         };
-        let slug_map = load_slug_map();
         let plan = build_organisation_plan(&OrganisationPlanRequest {
             master_root: &master_root,
             mode: self.mode,
@@ -193,6 +196,38 @@ impl RomOrganisationPageState {
         let Some(master_root) = self.saved_master_root.clone() else {
             return;
         };
+        // Revalidate the live platform identity before building the
+        // transaction: a platform/slug/canonical name changed by another
+        // process since the plan was generated must reject the apply with
+        // zero mutation.
+        let cache = load_romm_cache();
+        let canonical_name_for = |source: &Path| canonical_name_for(source, cache.as_ref());
+        let slug_map = build_slug_map(cache.as_ref());
+        let slug_for_platform = |platform: &str| slug_map.get(platform).cloned();
+        let database_path = default_database_path();
+        match database_path {
+            Ok(path) => {
+                match archivefs_core::dat::rom_organisation::revalidate_organisation_plan(
+                    plan,
+                    &path,
+                    &canonical_name_for,
+                    &slug_for_platform,
+                ) {
+                    Ok(()) => {}
+                    Err(reason) => {
+                        self.error = Some(reason);
+                        return;
+                    }
+                }
+            }
+            Err(_) => {
+                self.error = Some(
+                    "could not resolve the platform identity database; the plan is stale"
+                        .to_string(),
+                );
+                return;
+            }
+        }
         let approved = self.approved.clone();
         let mut transaction = match build_organisation_transaction(plan, &approved, plan.generation)
         {
@@ -221,6 +256,7 @@ impl RomOrganisationPageState {
             &journal,
             cancel.as_ref(),
             self.mode,
+            &master_root,
         ) {
             Ok(outcome) => {
                 self.applied = Some(outcome.transaction.clone());
@@ -267,8 +303,10 @@ impl RomOrganisationPageState {
     }
 }
 
-/// Walks the configured source folders (bounded) and collects candidate file
-/// paths. Read-only; never follows symlinked directories.
+/// Walks the configured source folders (bounded) and collects candidate
+/// paths: regular files and symlink *objects*. Symlinked directories are
+/// collected as link objects but never traversed, so a symlink loop cannot
+/// recurse. Read-only.
 fn collect_source_files(roots: &[PathBuf]) -> Vec<PathBuf> {
     const MAX_DEPTH: usize = 4;
     const MAX_FILES: usize = 2_000;
@@ -290,7 +328,12 @@ fn collect_source_files(roots: &[PathBuf]) -> Vec<PathBuf> {
                 let Ok(metadata) = std::fs::symlink_metadata(&path) else {
                     continue;
                 };
-                if metadata.is_dir() {
+                let file_type = metadata.file_type();
+                if file_type.is_symlink() {
+                    // The link object itself is a candidate; its target is
+                    // never followed or traversed.
+                    out.push(path);
+                } else if metadata.is_dir() {
                     if depth < MAX_DEPTH {
                         queue.push((path, depth + 1));
                     }
@@ -305,8 +348,14 @@ fn collect_source_files(roots: &[PathBuf]) -> Vec<PathBuf> {
 }
 
 /// Builds organisation candidates by resolving each source file's platform
-/// identity from the database. Returns `None` when the database is unreadable.
-fn build_candidates(sources: &[PathBuf], generation: u64) -> Option<Vec<OrganisationCandidate>> {
+/// identity from the database, and attaching the canonical game name (with the
+/// source's extension) from the authoritative RomM identity cache record when
+/// one exists. Returns `None` when the database is unreadable.
+fn build_candidates(
+    sources: &[PathBuf],
+    generation: u64,
+    cache: Option<&archivefs_core::identity_source::cache::IdentityCache>,
+) -> Option<Vec<OrganisationCandidate>> {
     let database_path = default_database_path().ok()?;
     let database = Database::open_read_only(&database_path).ok()?;
     let mut candidates = Vec::new();
@@ -328,20 +377,54 @@ fn build_candidates(sources: &[PathBuf], generation: u64) -> Option<Vec<Organisa
         candidates.push(OrganisationCandidate {
             source_path: source.clone(),
             resolution,
-            canonical_name: None,
+            canonical_name: canonical_name_for(source, cache),
         });
     }
     Some(candidates)
 }
 
-/// Loads the canonical RomM slug map from the imported identity cache, if any.
-fn load_slug_map() -> std::collections::BTreeMap<String, String> {
-    let mut map = std::collections::BTreeMap::new();
-    let Ok(identity_root) = default_identity_root() else {
-        return map;
+/// The authoritative canonical game name for a source, when the RomM identity
+/// cache records one: the record's title with the source's extension appended,
+/// so `derive_proposed_basename` preserves extension semantics. Returns `None`
+/// when there is no record (the planner then falls back to the source
+/// basename). Never derived from a display label.
+fn canonical_name_for(
+    source: &Path,
+    cache: Option<&archivefs_core::identity_source::cache::IdentityCache>,
+) -> Option<String> {
+    let cache = cache?;
+    let title = cache.records.iter().find_map(|record| {
+        (record.archivefs_path.as_deref() == Some(source)
+            || record.provider_path == source.to_string_lossy())
+        .then(|| record.title.clone())
+        .flatten()
+    })?;
+    let title = title.trim().to_string();
+    if title.is_empty() {
+        return None;
+    }
+    let Some(extension) = source.extension().map(|ext| ext.to_string_lossy()) else {
+        return Some(title);
     };
+    if extension.is_empty() {
+        return Some(title);
+    }
+    Some(format!("{title}.{extension}"))
+}
+
+/// Loads the imported RomM identity cache, if any.
+fn load_romm_cache() -> Option<archivefs_core::identity_source::cache::IdentityCache> {
+    let identity_root = default_identity_root().ok()?;
     let location = IdentityCacheLocation::new(&identity_root, IdentityProvider::Romm);
-    let Ok(cache) = load_cache(&location, None) else {
+    load_cache(&location, None).ok()
+}
+
+/// The canonical RomM slug map from the identity cache, if any.
+fn build_slug_map(
+    cache: Option<&archivefs_core::identity_source::cache::IdentityCache>,
+) -> std::collections::BTreeMap<String, String> {
+    let mut map = std::collections::BTreeMap::new();
+    let Some(cache) = cache else {
         return map;
     };
     for platform in archivefs_core::platform::canonical_ids() {
@@ -640,5 +723,146 @@ mod tests {
         assert!(state.saved_master_root.is_none());
         assert!(state.sources.is_empty());
         assert_eq!(state.mode, OrganisationMode::MoveRealFile);
+    }
+
+    // ------------------------------------------------------------------
+    // Symlink discovery (blocker: symlink-only mode discovered zero symlinks)
+    // ------------------------------------------------------------------
+
+    /// A private directory for one test (the page tests cannot rely on a
+    /// configured source folder; they build their own fixtures).
+    fn test_root(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "archivefs-rom-org-page-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn collected(roots: &[PathBuf]) -> Vec<String> {
+        collect_source_files(roots)
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn relative_absolute_broken_and_dir_symlinks_are_collected_as_link_objects() {
+        let root = test_root("rom-org-symlinks");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("real.bin"), b"data").unwrap();
+        // Relative symlink.
+        std::os::unix::fs::symlink("real.bin", root.join("rel.iso")).unwrap();
+        // Absolute symlink.
+        std::os::unix::fs::symlink(root.join("real.bin"), root.join("abs.iso")).unwrap();
+        // Broken symlink.
+        std::os::unix::fs::symlink(root.join("nowhere.bin"), root.join("broken.iso")).unwrap();
+        // Symlink to a directory.
+        std::os::unix::fs::symlink(root.join("sub"), root.join("dirlink.iso")).unwrap();
+        // A regular file for contrast.
+        std::fs::write(root.join("regular.iso"), b"data").unwrap();
+
+        let files = collected(std::slice::from_ref(&root));
+        for name in [
+            "rel.iso",
+            "abs.iso",
+            "broken.iso",
+            "dirlink.iso",
+            "regular.iso",
+        ] {
+            assert!(
+                files.iter().any(|path| path.ends_with(name)),
+                "{name} must be collected: {files:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn symlink_loops_do_not_recurse_and_directories_traverse_within_bounds() {
+        let root = test_root("rom-org-loop");
+        let dir_a = root.join("a");
+        let dir_b = root.join("b");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        std::fs::write(dir_a.join("in_a.iso"), b"data").unwrap();
+        // Symlink loop: a/b -> a and a/a -> b. Neither may be traversed.
+        std::os::unix::fs::symlink(&dir_a, dir_b.join("a")).unwrap();
+        std::os::unix::fs::symlink(&dir_b, dir_a.join("b")).unwrap();
+
+        let files = collected(std::slice::from_ref(&root));
+        // The nested regular file is collected; the loop must not explode or
+        // recurse (no infinite loop, and only the bounded set is returned).
+        assert!(files.iter().any(|path| path.ends_with("in_a.iso")));
+        assert!(
+            files.len() <= 10,
+            "the symlink loop must not recurse: {}",
+            files.len()
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Canonical-name supply (blocker: GUI never supplied canonical names)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn canonical_name_for_uses_the_romm_record_title_with_the_source_extension() {
+        use archivefs_core::identity_source::cache::{CACHE_FORMAT_VERSION, IdentityCache};
+        use archivefs_core::identity_source::model::{
+            ExternalIdentityRecord, ExternalVerification, IdentityProvider,
+        };
+
+        let source = PathBuf::from("/roms/library/Game_ugly.iso");
+        let record = ExternalIdentityRecord {
+            provider: IdentityProvider::Romm,
+            server_id: "test".to_string(),
+            provider_platform_id: Some("1".to_string()),
+            provider_game_id: "g1".to_string(),
+            provider_file_id: None,
+            provider_path: "roms/Game_ugly.iso".to_string(),
+            archivefs_path: Some(source.clone()),
+            title: Some("Game (Europe)".to_string()),
+            platform_candidate: Some("PSP".to_string()),
+            provider_platform_name: Some("psp".to_string()),
+            regions: Vec::new(),
+            revision: None,
+            hashes: Vec::new(),
+            file_size_bytes: None,
+            metadata_provider_ids: Vec::new(),
+            artwork: None,
+            related_files: Vec::new(),
+            sibling_game_ids: Vec::new(),
+            imported_at_unix_seconds: 1,
+            provider_updated_at: None,
+            verification: ExternalVerification::StrongExternal,
+            conflicts: Vec::new(),
+            evidence: Vec::new(),
+        };
+        let cache = IdentityCache {
+            format_version: CACHE_FORMAT_VERSION,
+            provider: IdentityProvider::Romm,
+            server_id: "test".to_string(),
+            server_version: None,
+            source_fingerprint: "f".to_string(),
+            imported_at_unix_seconds: 1,
+            platforms: Vec::new(),
+            records: vec![record],
+            rejected_hashes: Vec::new(),
+            unknown_platforms: Vec::new(),
+            server_reported_total: Some(1),
+        };
+        assert_eq!(
+            canonical_name_for(&source, Some(&cache)).as_deref(),
+            Some("Game (Europe).iso"),
+            "the title must be combined with the source extension"
+        );
+        // A source with no cache record falls back to None.
+        assert_eq!(
+            canonical_name_for(&PathBuf::from("/roms/library/Other.iso"), Some(&cache)),
+            None
+        );
+        // No cache at all falls back to None.
+        assert_eq!(canonical_name_for(&source, None), None);
     }
 }
