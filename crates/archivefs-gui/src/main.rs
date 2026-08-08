@@ -3871,6 +3871,38 @@ struct FilePickRequest {
     receiver: mpsc::Receiver<Option<PathBuf>>,
 }
 
+/// The outcome of draining one file-picker channel, as a tiny pure state
+/// machine so the caller (and tests) reason about it without a real dialog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FilePickDrain {
+    /// The picker is still running - leave `pending_pick` intact.
+    Pending,
+    /// The user pressed Cancel (`Ok(None)`): clear the picker, change nothing,
+    /// show no error.
+    Cancelled,
+    /// The user chose a file: clear the picker and continue the import.
+    Picked(PathBuf),
+    /// The picker thread ended without sending a result: clear the picker and
+    /// surface a friendly error so the buttons become available again.
+    Disconnected,
+}
+
+/// Reads one state from the picker channel. Pure and deterministic: no file
+/// dialog is required.
+fn drain_file_pick(receiver: &mpsc::Receiver<Option<PathBuf>>) -> FilePickDrain {
+    match receiver.try_recv() {
+        Ok(Some(path)) => FilePickDrain::Picked(path),
+        Ok(None) => FilePickDrain::Cancelled,
+        Err(mpsc::TryRecvError::Empty) => FilePickDrain::Pending,
+        Err(mpsc::TryRecvError::Disconnected) => FilePickDrain::Disconnected,
+    }
+}
+
+/// The plain-language error shown when the picker thread exits without a
+/// result (for example the dialog failed to open).
+const FILE_PICKER_DISCONNECTED_MESSAGE: &str =
+    "The image picker closed unexpectedly. Please try again.";
+
 impl ArchiveFsApp {
     fn is_busy(&self) -> bool {
         self.operation.is_some()
@@ -30177,31 +30209,39 @@ fn show_platform_artwork_manager(
     // thread so the frame was never blocked. When it returns, process exactly
     // what the inline call used to.
     if let Some(pick) = manager.pending_pick.as_mut() {
-        match pick.receiver.try_recv() {
-            Ok(source) => {
+        match drain_file_pick(&pick.receiver) {
+            FilePickDrain::Pending => {
+                // Picker still open: keep `pending_pick` so no second dialog
+                // starts and the frame keeps draining.
+            }
+            FilePickDrain::Cancelled => {
+                // User pressed Cancel: nothing changed, no error, buttons
+                // become available again.
+                manager.pending_pick = None;
+            }
+            FilePickDrain::Disconnected => {
+                // Thread ended without a result: release the picker and tell
+                // the user, so the buttons are usable again.
+                manager.pending_pick = None;
+                manager.message = Some((false, FILE_PICKER_DISCONNECTED_MESSAGE.to_string()));
+            }
+            FilePickDrain::Picked(source) => {
                 let FilePickRequest {
                     platform_id,
                     custom,
                     ..
                 } = manager.pending_pick.take().expect("just drained");
-                if let Some(source) = source {
-                    if custom {
-                        manager.pending_import = Some((platform_id, source));
-                    } else {
-                        manager.replace_existing = false;
-                        *action = Some(SettingsPageAction::PlatformArtwork(
-                            PlatformArtworkManagerAction::Import {
-                                platform_id,
-                                source,
-                            },
-                        ));
-                    }
+                if custom {
+                    manager.pending_import = Some((platform_id, source));
+                } else {
+                    manager.replace_existing = false;
+                    *action = Some(SettingsPageAction::PlatformArtwork(
+                        PlatformArtworkManagerAction::Import {
+                            platform_id,
+                            source,
+                        },
+                    ));
                 }
-            }
-            Err(
-                std::sync::mpsc::TryRecvError::Empty | std::sync::mpsc::TryRecvError::Disconnected,
-            ) => {
-                // Still open, or the thread ended without a choice.
             }
         }
     }
@@ -68969,4 +69009,167 @@ fn benign_loose_rom_doctor_findings_use_a_friendly_summary() {
     // A different kind keeps its precise heading (technical detail preserved).
     finding.id = "mounts.historical_failure".to_string();
     assert!(repeated_doctor_group_heading(&finding, 12).contains("Historical mount failures"));
+}
+
+/// Local text check for the artwork-picker tests (they live at the module
+/// top level, outside the main test module's helper scope).
+#[cfg(test)]
+fn picker_output_text_contains(output: &egui::FullOutput, needle: &str) -> bool {
+    fn shape_contains(shape: &egui::Shape, needle: &str) -> bool {
+        match shape {
+            egui::Shape::Text(text_shape) => text_shape.galley.text().contains(needle),
+            egui::Shape::Vec(nested) => nested.iter().any(|shape| shape_contains(shape, needle)),
+            _ => false,
+        }
+    }
+    output
+        .shapes
+        .iter()
+        .any(|clipped| shape_contains(&clipped.shape, needle))
+}
+
+#[test]
+fn file_pick_drain_keeps_pending_while_empty() {
+    let (sender, receiver) = mpsc::channel();
+    assert_eq!(drain_file_pick(&receiver), FilePickDrain::Pending);
+    // A second drain on the still-open channel is still Pending.
+    assert_eq!(drain_file_pick(&receiver), FilePickDrain::Pending);
+    drop(sender);
+}
+
+#[test]
+fn file_pick_drain_disconnected_is_reported_and_repeated_drains_do_not_panic() {
+    let (_sender, receiver) = mpsc::channel::<Option<PathBuf>>();
+    drop(_sender);
+    assert_eq!(drain_file_pick(&receiver), FilePickDrain::Disconnected);
+    assert_eq!(drain_file_pick(&receiver), FilePickDrain::Disconnected);
+    assert_eq!(drain_file_pick(&receiver), FilePickDrain::Disconnected);
+}
+
+#[test]
+fn file_pick_drain_cancel_is_not_an_error() {
+    let (sender, receiver) = mpsc::channel();
+    sender.send(None).unwrap();
+    assert_eq!(drain_file_pick(&receiver), FilePickDrain::Cancelled);
+    // A cancelled channel then disconnects cleanly.
+    drop(sender);
+    assert_eq!(drain_file_pick(&receiver), FilePickDrain::Disconnected);
+}
+
+#[test]
+fn file_pick_drain_picked_returns_the_path() {
+    let (sender, receiver) = mpsc::channel();
+    sender.send(Some(PathBuf::from("/tmp/pic.png"))).unwrap();
+    assert_eq!(
+        drain_file_pick(&receiver),
+        FilePickDrain::Picked(PathBuf::from("/tmp/pic.png"))
+    );
+}
+
+#[test]
+fn a_disconnected_picker_releases_and_shows_a_friendly_error() {
+    let (_sender, receiver) = mpsc::channel::<Option<PathBuf>>();
+    drop(_sender);
+    let mut manager = PlatformArtworkManagerState {
+        pending_pick: Some(FilePickRequest {
+            platform_id: "gamecube".to_string(),
+            custom: false,
+            receiver,
+        }),
+        ..Default::default()
+    };
+    let mut cache = PlatformArtworkCache {
+        directory: None,
+        entries: std::collections::HashMap::new(),
+        bundled_entries: std::collections::HashMap::new(),
+    };
+    let mut action = None;
+    let context = egui::Context::default();
+    let output = context.run(egui::RawInput::default(), |context| {
+        egui::CentralPanel::default().show(context, |ui| {
+            show_platform_artwork_manager(ui, None, &mut cache, &mut manager, &mut action);
+        });
+    });
+    assert!(
+        manager.pending_pick.is_none(),
+        "a disconnected picker must release pending_pick so a new picker can start"
+    );
+    assert!(
+        picker_output_text_contains(
+            &output,
+            "The image picker closed unexpectedly. Please try again."
+        ),
+        "the friendly error must be visible"
+    );
+}
+
+#[test]
+fn a_still_pending_picker_is_not_released_and_blocks_a_second_one() {
+    let (sender, receiver) = mpsc::channel();
+    let mut manager = PlatformArtworkManagerState {
+        pending_pick: Some(FilePickRequest {
+            platform_id: "gamecube".to_string(),
+            custom: false,
+            receiver,
+        }),
+        ..Default::default()
+    };
+    let mut cache = PlatformArtworkCache {
+        directory: None,
+        entries: std::collections::HashMap::new(),
+        bundled_entries: std::collections::HashMap::new(),
+    };
+    let mut action = None;
+    let context = egui::Context::default();
+    let _output = context.run(egui::RawInput::default(), |context| {
+        egui::CentralPanel::default().show(context, |ui| {
+            show_platform_artwork_manager(ui, None, &mut cache, &mut manager, &mut action);
+        });
+    });
+    assert!(
+        manager.pending_pick.is_some(),
+        "an open picker stays pending; no second dialog can start"
+    );
+    drop(sender);
+}
+
+#[test]
+fn a_cancelled_picker_releases_without_an_error() {
+    let (sender, receiver) = mpsc::channel();
+    sender.send(None).unwrap();
+    let mut manager = PlatformArtworkManagerState {
+        pending_pick: Some(FilePickRequest {
+            platform_id: "gamecube".to_string(),
+            custom: false,
+            receiver,
+        }),
+        ..Default::default()
+    };
+    let mut cache = PlatformArtworkCache {
+        directory: None,
+        entries: std::collections::HashMap::new(),
+        bundled_entries: std::collections::HashMap::new(),
+    };
+    let mut action = None;
+    let context = egui::Context::default();
+    let output = context.run(egui::RawInput::default(), |context| {
+        egui::CentralPanel::default().show(context, |ui| {
+            show_platform_artwork_manager(ui, None, &mut cache, &mut manager, &mut action);
+        });
+    });
+    assert!(
+        manager.pending_pick.is_none(),
+        "a cancelled picker is released"
+    );
+    assert!(
+        !picker_output_text_contains(
+            &output,
+            "The image picker closed unexpectedly. Please try again."
+        ),
+        "cancelling must not show an error"
+    );
+    assert!(
+        manager.pending_import.is_none() && action.is_none(),
+        "cancelling changes nothing"
+    );
 }
