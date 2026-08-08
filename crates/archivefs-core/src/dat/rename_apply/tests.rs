@@ -1460,3 +1460,169 @@ fn a_path_traversal_proposed_name_is_blocked_by_preflight() {
     assert!(!super::preflight::is_safe_basename(".."));
     assert!(!super::preflight::is_safe_basename(""));
 }
+
+// ---------------------------------------------------------------------------
+// Repeated stress runs (destination race, cancellation, rollback, recovery)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn stress_destination_creation_race_never_overwrites() {
+    // Run the "destination appears after review" hostile case repeatedly; the
+    // destination must never be overwritten and the source must never move.
+    for _ in 0..25 {
+        let dir = tempfile::tempdir().unwrap();
+        let roms = dir.path().join("roms");
+        std::fs::create_dir_all(&roms).unwrap();
+        let source = write(&roms, "a.bin");
+        let journal = dir.path().join("journal");
+        std::fs::create_dir_all(&journal).unwrap();
+        let plan = plan(
+            vec![proposal(
+                source.to_str().unwrap(),
+                "a.bin",
+                "b.bin",
+                ProposalState::Suggested,
+            )],
+            1,
+            &roms,
+        );
+        let approved = approved_of(&[&source]);
+        let tx = build_transaction(&plan, &approved, 1).unwrap();
+        write(&roms, "b.bin"); // destination appears after review
+        let cancel = no_cancel();
+        let outcome = apply_exec(
+            tx,
+            approved,
+            TrustedRoots::from_paths([&roms]),
+            &journal,
+            HardConflictMode::SkipUnsafeSubset,
+            &cancel,
+            1,
+        )
+        .unwrap();
+        assert_eq!(outcome.summary.applied, 0);
+        assert!(source.exists(), "iteration: source must not move");
+        assert_eq!(
+            std::fs::read(roms.join("b.bin")).unwrap(),
+            b"fixture contents"
+        );
+    }
+}
+
+#[test]
+fn stress_cancellation_leaves_everything_untouched() {
+    for _ in 0..25 {
+        let dir = tempfile::tempdir().unwrap();
+        let roms = dir.path().join("roms");
+        std::fs::create_dir_all(&roms).unwrap();
+        let source = write(&roms, "a.bin");
+        let journal = dir.path().join("journal");
+        std::fs::create_dir_all(&journal).unwrap();
+        let plan = plan(
+            vec![proposal(
+                source.to_str().unwrap(),
+                "a.bin",
+                "b.bin",
+                ProposalState::Suggested,
+            )],
+            1,
+            &roms,
+        );
+        let cancel = cancelled();
+        let error = apply(
+            &plan,
+            approved_of(&[&source]),
+            TrustedRoots::from_paths([&roms]),
+            &journal,
+            HardConflictMode::AbortAll,
+            &cancel,
+        )
+        .unwrap_err();
+        assert_eq!(error, ApplyError::Cancelled);
+        assert!(source.exists());
+        assert!(!roms.join("b.bin").exists());
+    }
+}
+
+#[test]
+fn stress_apply_and_rollback_round_trip_preserves_bytes() {
+    for _ in 0..25 {
+        let dir = tempfile::tempdir().unwrap();
+        let roms = dir.path().join("roms");
+        std::fs::create_dir_all(&roms).unwrap();
+        let source = write(&roms, "a.bin");
+        let journal = dir.path().join("journal");
+        std::fs::create_dir_all(&journal).unwrap();
+        let before = std::fs::read(&source).unwrap();
+        let plan = plan(
+            vec![proposal(
+                source.to_str().unwrap(),
+                "a.bin",
+                "b.bin",
+                ProposalState::Suggested,
+            )],
+            1,
+            &roms,
+        );
+        let cancel = no_cancel();
+        let outcome = apply(
+            &plan,
+            approved_of(&[&source]),
+            TrustedRoots::from_paths([&roms]),
+            &journal,
+            HardConflictMode::AbortAll,
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(roms.join("b.bin")).unwrap(), before);
+        let mut tx = outcome.transaction;
+        rollback_transaction(&mut tx, &journal, &cancel).unwrap();
+        assert_eq!(std::fs::read(roms.join("a.bin")).unwrap(), before);
+        assert!(!roms.join("b.bin").exists());
+    }
+}
+
+#[test]
+fn stress_crash_recovery_fixtures_are_detected() {
+    for _ in 0..25 {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("journal");
+        std::fs::create_dir_all(&journal).unwrap();
+        let mut tx = RenameTransaction {
+            transaction_id: "stress-recovery".to_string(),
+            plan_generation: 1,
+            created_at_unix: 1,
+            source_scan_root: "/tmp/roms".to_string(),
+            state: TransactionState::Applying,
+            entries: Vec::new(),
+            unknown: Default::default(),
+        };
+        tx.entries.push(TransactionEntry {
+            source_path: PathBuf::from("/tmp/roms/a.bin"),
+            destination_path: PathBuf::from("/tmp/roms/b.bin"),
+            original_basename: "a.bin".to_string(),
+            proposed_basename: "b.bin".to_string(),
+            identity: ObjectIdentity {
+                size_bytes: 1,
+                modified_unix: 1,
+                kind: ObjectKind::RegularFile,
+                #[cfg(unix)]
+                ino: 1,
+                #[cfg(unix)]
+                dev: 1,
+            },
+            preflight_passed: false,
+            preflight_failures: Vec::new(),
+            state: EntryState::Applied,
+            failure_reason: None,
+            applied_at_unix: Some(2),
+            rolled_back_at_unix: None,
+            unknown: Default::default(),
+        });
+        write_journal(&journal, &tx).unwrap();
+        let (recovery, problems) = find_recovery_transactions(&journal);
+        assert!(problems.is_empty());
+        assert_eq!(recovery.len(), 1);
+        assert_eq!(recovery[0].applied_count(), 1);
+    }
+}

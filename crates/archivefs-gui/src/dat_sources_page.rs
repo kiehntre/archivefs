@@ -5167,7 +5167,7 @@ fn show_rename_plan_section(
             if approved_count > 0 {
                 if widgets::action_button(
                     ui,
-                    &format!("Apply approved renames ({approved_count})"),
+                    format!("Apply approved renames ({approved_count})"),
                     widgets::ActionStyle::Destructive,
                     true,
                 )

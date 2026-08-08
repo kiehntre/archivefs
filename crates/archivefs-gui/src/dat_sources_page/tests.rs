@@ -83,11 +83,27 @@ impl Fixture {
     /// A page whose registry lives in the fixture, with no library folders and
     /// no trusted roots - the strictest, and the one a fresh install has.
     fn page(&self) -> DatSourcesPageState {
-        DatSourcesPageState::load(self.config_path.clone(), Vec::new(), TrustedRoots::none())
+        // The rename-transaction journal directory is a temp path inside the
+        // fixture, so no test ever reads or writes the real home directory.
+        let journal = self.root.join("journal");
+        std::fs::create_dir_all(&journal).unwrap();
+        DatSourcesPageState::load_with_transaction_dir(
+            self.config_path.clone(),
+            Vec::new(),
+            TrustedRoots::none(),
+            journal,
+        )
     }
 
     fn page_with_library(&self, folders: Vec<PathBuf>) -> DatSourcesPageState {
-        DatSourcesPageState::load(self.config_path.clone(), folders, TrustedRoots::none())
+        let journal = self.root.join("journal");
+        std::fs::create_dir_all(&journal).unwrap();
+        DatSourcesPageState::load_with_transaction_dir(
+            self.config_path.clone(),
+            folders,
+            TrustedRoots::none(),
+            journal,
+        )
     }
 }
 

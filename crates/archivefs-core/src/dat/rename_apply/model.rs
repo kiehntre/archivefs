@@ -24,10 +24,11 @@ use serde::{Deserialize, Serialize};
 /// `Applied` (every requested entry applied) or `RolledBack` is settled;
 /// anything else may be an interrupted transaction that recovery should
 /// surface.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TransactionState {
     /// Journal written, nothing renamed yet.
+    #[default]
     Planned,
     /// At least one entry is being renamed.
     Applying,
@@ -77,9 +78,10 @@ impl TransactionState {
 /// `Skipped` records an entry the batch deliberately did not rename (a hard
 /// preflight conflict in the "apply only the safe subset" mode, or a later
 /// hard failure that stopped the batch without touching that entry).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntryState {
+    #[default]
     Planned,
     PreflightPassed,
     Applying,
@@ -89,18 +91,6 @@ pub enum EntryState {
     RolledBack,
     RollbackFailed,
     Skipped,
-}
-
-impl Default for TransactionState {
-    fn default() -> Self {
-        Self::Planned
-    }
-}
-
-impl Default for EntryState {
-    fn default() -> Self {
-        Self::Planned
-    }
 }
 
 impl EntryState {
