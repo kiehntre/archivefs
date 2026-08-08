@@ -38,5 +38,5 @@ pub use model::{OrganisationMode, OrganisationPlan, OrganisationPlanEntry, Organ
 pub use plan::{OrganisationCandidate, OrganisationPlanRequest, build_organisation_plan};
 pub use transaction::{
     OrganisationRollbackOutcome, apply_organisation_transaction, build_organisation_transaction,
-    rollback_organisation_transaction,
+    revalidate_organisation_plan, rollback_organisation_transaction,
 };

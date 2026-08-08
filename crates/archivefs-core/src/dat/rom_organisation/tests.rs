@@ -11,7 +11,7 @@ use std::sync::atomic::AtomicBool;
 use crate::dat::rom_organisation::*;
 use crate::platform::identity::{
     PlatformIdentityConfidence, PlatformIdentityEvidence, PlatformIdentityResolution,
-    PlatformIdentitySource,
+    PlatformIdentitySource, resolve_platform_identity,
 };
 use crate::safe_read::TrustedRoots;
 
@@ -113,6 +113,7 @@ fn apply_plan(
         journal_dir,
         cancel,
         plan.mode,
+        &plan.master_root,
     )
     .expect("apply")
 }
@@ -546,6 +547,7 @@ fn cross_filesystem_move_is_refused_without_mutation() {
         &journal,
         &cancel,
         plan.mode,
+        &plan.master_root,
     );
     assert!(result.is_err(), "a cross-filesystem move must be refused");
     assert!(source_file.exists(), "the source is never touched");
@@ -580,6 +582,7 @@ fn apply_plan_result(
         journal_dir,
         cancel,
         plan.mode,
+        &plan.master_root,
     )
 }
 
@@ -731,6 +734,7 @@ fn source_identity_changed_is_rejected_at_apply() {
         &journal,
         &cancel,
         plan.mode,
+        &plan.master_root,
     );
     assert!(result.is_err());
     assert!(cand.source_path.exists());
@@ -782,6 +786,7 @@ fn destination_created_after_preview_is_rejected_at_apply() {
         &journal,
         &cancel,
         plan.mode,
+        &plan.master_root,
     );
     assert!(
         result.is_err(),
@@ -832,6 +837,7 @@ fn stale_generation_is_rejected() {
         &journal,
         &cancel,
         plan.mode,
+        &plan.master_root,
     );
     assert!(result.is_err(), "a stale plan must never apply");
 }
@@ -1061,4 +1067,586 @@ fn no_filesystem_escape_from_the_master_root() {
         !master.join("..").join("escape.iso").exists(),
         "destination must never escape the master root"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Canonical-name supply (blocker: GUI never supplied canonical filenames)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_verified_canonical_name_produces_the_canonical_destination_filename() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = dir.path().join("roms");
+    let source = dir.path().join("library");
+    std::fs::create_dir_all(&source).unwrap();
+    let source_path = source.join("Game_ugly.iso");
+    std::fs::write(&source_path, b"data").unwrap();
+    let mut cand = OrganisationCandidate {
+        source_path: source_path.clone(),
+        resolution: resolved("PSP", PlatformIdentitySource::Romm),
+        canonical_name: None,
+    };
+    // Ugly source name + authoritative canonical name.
+    cand.canonical_name = Some("Game (Europe).iso".to_string());
+    let plan = plan_for(
+        &master,
+        OrganisationMode::MoveRealFile,
+        std::slice::from_ref(&cand),
+        1,
+    );
+    let entry = &plan.entries[0];
+    assert_eq!(entry.status, OrganisationStatus::Suggested);
+    assert_eq!(
+        entry.destination_path,
+        master.join("psp").join("Game (Europe).iso"),
+        "the canonical name must drive the destination filename"
+    );
+}
+
+#[test]
+fn rename_in_place_proposes_a_rename_when_the_canonical_name_differs() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = dir.path().join("roms");
+    let source = dir.path().join("library");
+    std::fs::create_dir_all(&source).unwrap();
+    let source_path = source.join("game_ugly.iso");
+    std::fs::write(&source_path, b"data").unwrap();
+    let mut cand = OrganisationCandidate {
+        source_path: source_path.clone(),
+        resolution: resolved("PSP", PlatformIdentitySource::Romm),
+        canonical_name: None,
+    };
+    cand.canonical_name = Some("Game (Europe).iso".to_string());
+    let plan = plan_for(
+        &master,
+        OrganisationMode::RenameInPlace,
+        std::slice::from_ref(&cand),
+        1,
+    );
+    let entry = &plan.entries[0];
+    assert_eq!(
+        entry.status,
+        OrganisationStatus::Suggested,
+        "a differing canonical name must propose a rename, not read as already organised"
+    );
+    assert_eq!(entry.destination_path, source.join("Game (Europe).iso"));
+}
+
+#[test]
+fn move_mode_uses_the_canonical_filename() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = dir.path().join("roms");
+    let source = dir.path().join("library");
+    std::fs::create_dir_all(&source).unwrap();
+    let source_path = source.join("whatever.nds");
+    std::fs::write(&source_path, b"data").unwrap();
+    let mut cand = OrganisationCandidate {
+        source_path: source_path.clone(),
+        resolution: resolved("Nintendo DS", PlatformIdentitySource::Romm),
+        canonical_name: None,
+    };
+    cand.canonical_name = Some("Sonic Rush (Europe).nds".to_string());
+    let plan = plan_for(&master, OrganisationMode::MoveRealFile, &[cand], 1);
+    assert_eq!(
+        plan.entries[0].destination_path,
+        master.join("nds").join("Sonic Rush (Europe).nds")
+    );
+}
+
+#[test]
+fn no_canonical_evidence_falls_back_to_the_source_basename() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = dir.path().join("roms");
+    let source = dir.path().join("library");
+    std::fs::create_dir_all(&source).unwrap();
+    let source_path = source.join("Game_ugly.iso");
+    std::fs::write(&source_path, b"data").unwrap();
+    let cand = OrganisationCandidate {
+        source_path: source_path.clone(),
+        resolution: resolved("PSP", PlatformIdentitySource::Romm),
+        canonical_name: None,
+    };
+    let plan = plan_for(&master, OrganisationMode::MoveRealFile, &[cand], 1);
+    assert_eq!(
+        plan.entries[0].destination_path,
+        master.join("psp").join("Game_ugly.iso"),
+        "without a canonical name the existing basename is preserved"
+    );
+}
+
+#[test]
+fn an_unverified_identity_never_supplies_an_authoritative_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = dir.path().join("roms");
+    let source = dir.path().join("library");
+    std::fs::create_dir_all(&source).unwrap();
+    let source_path = source.join("Game.iso");
+    std::fs::write(&source_path, b"data").unwrap();
+    // An Unknown identity with a (suspiciously supplied) canonical name must
+    // still be Blocked - the name never rescues an unverified platform.
+    let cand = OrganisationCandidate {
+        source_path: source_path.clone(),
+        resolution: PlatformIdentityResolution::Unknown { generation: 1 },
+        canonical_name: Some("Trusted (USA).iso".to_string()),
+    };
+    let plan = plan_for(&master, OrganisationMode::MoveRealFile, &[cand], 1);
+    assert_eq!(plan.entries[0].status, OrganisationStatus::Blocked);
+}
+
+// ---------------------------------------------------------------------------
+// Directory ownership (blocker: pre-existing platform dir could be journalled
+// as ArchiveFS-owned and removed by rollback)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_pre_existing_empty_platform_directory_is_never_recorded_as_owned() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = dir.path().join("roms");
+    std::fs::create_dir_all(&master).unwrap();
+    // The platform directory already exists (empty).
+    let psp = master.join("psp");
+    std::fs::create_dir(&psp).unwrap();
+    let source = dir.path().join("library");
+    std::fs::create_dir_all(&source).unwrap();
+    let cand = candidate(
+        &source,
+        "Game.iso",
+        resolved("PSP", PlatformIdentitySource::Romm),
+    );
+    let plan = plan_for(
+        &master,
+        OrganisationMode::MoveRealFile,
+        std::slice::from_ref(&cand),
+        1,
+    );
+    let journal = dir.path().join("journal");
+    std::fs::create_dir_all(&journal).unwrap();
+    let cancel = no_cancel();
+    let outcome = apply_plan(&plan, &approved_of(&[&cand.source_path]), &journal, &cancel);
+    assert!(
+        !outcome.transaction.created_directories.contains(&psp),
+        "a pre-existing directory must never be recorded as owned: {:?}",
+        outcome.transaction.created_directories
+    );
+    assert!(psp.exists(), "the pre-existing directory stays");
+
+    // Rollback (and recovery, which relies on created_directories) never
+    // removes it.
+    let mut tx = outcome.transaction;
+    let _ = rollback_organisation_transaction(&mut tx, &journal, &cancel, &master).unwrap();
+    assert!(
+        psp.exists(),
+        "rollback never removes a pre-existing directory"
+    );
+}
+
+#[test]
+fn a_newly_created_platform_directory_is_recorded_as_owned_and_removed_when_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = dir.path().join("roms");
+    std::fs::create_dir_all(&master).unwrap();
+    let source = dir.path().join("library");
+    std::fs::create_dir_all(&source).unwrap();
+    let cand = candidate(
+        &source,
+        "Game.iso",
+        resolved("PSP", PlatformIdentitySource::Romm),
+    );
+    let plan = plan_for(
+        &master,
+        OrganisationMode::MoveRealFile,
+        std::slice::from_ref(&cand),
+        1,
+    );
+    let journal = dir.path().join("journal");
+    std::fs::create_dir_all(&journal).unwrap();
+    let cancel = no_cancel();
+    let outcome = apply_plan(&plan, &approved_of(&[&cand.source_path]), &journal, &cancel);
+    let psp = master.join("psp");
+    assert!(
+        outcome.transaction.created_directories.contains(&psp),
+        "a directory this apply created must be recorded as owned"
+    );
+    let mut tx = outcome.transaction;
+    let rollback = rollback_organisation_transaction(&mut tx, &journal, &cancel, &master).unwrap();
+    assert!(
+        rollback.directories_removed.contains(&psp),
+        "the owned, now-empty directory is removed: {:?}",
+        rollback.directories_removed
+    );
+    assert!(!psp.exists());
+}
+
+#[test]
+fn two_files_sharing_one_created_platform_directory_own_it_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = dir.path().join("roms");
+    std::fs::create_dir_all(&master).unwrap();
+    let source = dir.path().join("library");
+    std::fs::create_dir_all(&source).unwrap();
+    let a = candidate(
+        &source,
+        "A.iso",
+        resolved("PSP", PlatformIdentitySource::Romm),
+    );
+    let b = candidate(
+        &source,
+        "B.iso",
+        resolved("PSP", PlatformIdentitySource::Romm),
+    );
+    let plan = plan_for(
+        &master,
+        OrganisationMode::MoveRealFile,
+        &[a.clone(), b.clone()],
+        1,
+    );
+    let journal = dir.path().join("journal");
+    std::fs::create_dir_all(&journal).unwrap();
+    let cancel = no_cancel();
+    let outcome = apply_plan(
+        &plan,
+        &approved_of(&[&a.source_path, &b.source_path]),
+        &journal,
+        &cancel,
+    );
+    let psp = master.join("psp");
+    let owned = outcome
+        .transaction
+        .created_directories
+        .iter()
+        .filter(|dir| **dir == psp)
+        .count();
+    assert_eq!(owned, 1, "one shared directory is owned once");
+    let mut tx = outcome.transaction;
+    let rollback = rollback_organisation_transaction(&mut tx, &journal, &cancel, &master).unwrap();
+    assert!(rollback.directories_removed.contains(&psp));
+    assert!(!psp.exists());
+}
+
+#[test]
+fn partial_rollback_leaves_a_non_empty_directory_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = dir.path().join("roms");
+    std::fs::create_dir_all(&master).unwrap();
+    let source = dir.path().join("library");
+    std::fs::create_dir_all(&source).unwrap();
+    let cand = candidate(
+        &source,
+        "Game.iso",
+        resolved("PSP", PlatformIdentitySource::Romm),
+    );
+    let plan = plan_for(
+        &master,
+        OrganisationMode::MoveRealFile,
+        std::slice::from_ref(&cand),
+        1,
+    );
+    let journal = dir.path().join("journal");
+    std::fs::create_dir_all(&journal).unwrap();
+    let cancel = no_cancel();
+    let outcome = apply_plan(&plan, &approved_of(&[&cand.source_path]), &journal, &cancel);
+    // A user file appears in the created directory after apply.
+    let psp = master.join("psp");
+    std::fs::write(psp.join("user-note.txt"), b"mine").unwrap();
+    let mut tx = outcome.transaction;
+    let rollback = rollback_organisation_transaction(&mut tx, &journal, &cancel, &master).unwrap();
+    assert!(
+        rollback.directories_remaining.contains(&psp),
+        "a non-empty owned directory is reported as remaining: {:?}",
+        rollback.directories_remaining
+    );
+    assert!(psp.exists());
+    assert_eq!(std::fs::read(psp.join("user-note.txt")).unwrap(), b"mine");
+}
+
+#[test]
+fn an_old_journal_without_the_created_directories_field_loads_safely() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = dir.path().join("journal");
+    std::fs::create_dir_all(&journal).unwrap();
+    // An old-format journal with no created_directories key.
+    std::fs::write(
+        journal.join("old-1.json"),
+        r#"{
+  "transaction_id": "old-1",
+  "plan_generation": 1,
+  "created_at_unix": 1,
+  "source_scan_root": "/tmp/roms",
+  "state": "applying",
+  "entries": []
+}
+"#,
+    )
+    .unwrap();
+    let loaded =
+        crate::dat::rename_apply::journal::read_journal(&journal.join("old-1.json")).unwrap();
+    assert!(
+        loaded.created_directories.is_empty(),
+        "a legacy journal must default to no owned directories"
+    );
+}
+
+#[test]
+fn a_crash_between_create_dir_and_ownership_journal_is_conservative() {
+    // Simulate: a platform directory exists but the journal never recorded it
+    // as owned (the crash window between create_dir and the ownership write).
+    // Recovery/rollback must not delete it.
+    let dir = tempfile::tempdir().unwrap();
+    let master = dir.path().join("roms");
+    std::fs::create_dir_all(&master).unwrap();
+    let psp = master.join("psp");
+    std::fs::create_dir(&psp).unwrap();
+    let source = dir.path().join("library");
+    std::fs::create_dir_all(&source).unwrap();
+    let cand = candidate(
+        &source,
+        "Game.iso",
+        resolved("PSP", PlatformIdentitySource::Romm),
+    );
+    let plan = plan_for(
+        &master,
+        OrganisationMode::MoveRealFile,
+        std::slice::from_ref(&cand),
+        1,
+    );
+    let journal = dir.path().join("journal");
+    std::fs::create_dir_all(&journal).unwrap();
+    let mut tx =
+        build_organisation_transaction(&plan, &approved_of(&[&cand.source_path]), 1).unwrap();
+    // The journal that was durable before the ownership write: created_directories empty.
+    tx.state = crate::dat::rename_apply::TransactionState::Applying;
+    crate::dat::rename_apply::journal::write_journal(&journal, &tx).unwrap();
+    assert!(tx.created_directories.is_empty());
+
+    let cancel = no_cancel();
+    let _ = rollback_organisation_transaction(&mut tx, &journal, &cancel, &master).unwrap();
+    assert!(
+        psp.exists(),
+        "an unproven (un-journalled) directory is never deleted by recovery"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Live identity revalidation (blocker: stale platform identity not revalidated)
+// ---------------------------------------------------------------------------
+
+use crate::database::Database;
+
+/// Creates a database with `file` registered under its parent folder and a
+/// platform assignment, returning the open handle (assignments must be made
+/// while the mutable handle is alive).
+fn db_with_assignment(dir: &Path, file: &Path, platform: &str, source: &str) -> Database {
+    let db_path = dir.join("test.db");
+    let mut db = Database::open_or_create(&db_path).unwrap();
+    let folder = file.parent().unwrap();
+    let registered = db.register_source_folders(&[folder.to_path_buf()]).unwrap();
+    let archive = crate::Archive::from_path(file).unwrap();
+    db.upsert_archive(registered[0].id, folder, &archive)
+        .unwrap();
+    let archive_id = db
+        .find_archive_id_by_absolute_path(file)
+        .unwrap()
+        .expect("archive registered");
+    db.assign_platform(archive_id, Some(platform), source)
+        .unwrap();
+    db
+}
+
+fn resolution_from_db(db: &Database, file: &Path, generation: u64) -> PlatformIdentityResolution {
+    let archive_id = db.find_archive_id_by_absolute_path(file).unwrap().unwrap();
+    let evidence = db
+        .current_platform_identity_evidence(archive_id, generation)
+        .unwrap();
+    resolve_platform_identity(generation, evidence)
+}
+
+fn plan_from_live_db(
+    dir: &Path,
+    file: &Path,
+    db: &Database,
+    mode: OrganisationMode,
+    generation: u64,
+) -> OrganisationPlan {
+    let master = dir.join("roms");
+    std::fs::create_dir_all(&master).unwrap();
+    let cand = OrganisationCandidate {
+        source_path: file.to_path_buf(),
+        resolution: resolution_from_db(db, file, generation),
+        canonical_name: None,
+    };
+    plan_for(&master, mode, &[cand], generation)
+}
+
+#[test]
+fn a_platform_changed_by_another_process_rejects_the_stale_apply() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_dir = dir.path().join("library");
+    std::fs::create_dir_all(&source_dir).unwrap();
+    let source_file = source_dir.join("Game.iso");
+    std::fs::write(&source_file, b"data").unwrap();
+
+    let mut db = db_with_assignment(dir.path(), &source_file, "PSP", "romm");
+    let plan = plan_from_live_db(
+        dir.path(),
+        &source_file,
+        &db,
+        OrganisationMode::MoveRealFile,
+        1,
+    );
+    assert_eq!(plan.entries[0].platform.as_deref(), Some("PSP"));
+    assert_eq!(plan.entries[0].slug.as_deref(), Some("psp"));
+
+    // Another ArchiveFS process changes PSP -> PS1 after planning.
+    let archive_id = db
+        .find_archive_id_by_absolute_path(&source_file)
+        .unwrap()
+        .unwrap();
+    db.assign_platform(archive_id, Some("PS1"), "romm").unwrap();
+    drop(db);
+
+    let master = dir.path().join("roms");
+    let error = revalidate_organisation_plan(
+        &plan,
+        &dir.path().join("test.db"),
+        &|_| None,
+        &slug_for_platform,
+    )
+    .unwrap_err();
+    assert!(error.contains("changed"), "{error}");
+    assert!(source_file.exists(), "zero mutation");
+    assert!(!master.join("psp").exists(), "zero mutation");
+}
+
+#[test]
+fn a_resolved_identity_becoming_unresolvable_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_dir = dir.path().join("library");
+    std::fs::create_dir_all(&source_dir).unwrap();
+    let source_file = source_dir.join("Game.iso");
+    std::fs::write(&source_file, b"data").unwrap();
+
+    let mut db = db_with_assignment(dir.path(), &source_file, "PSP", "romm");
+    let plan = plan_from_live_db(
+        dir.path(),
+        &source_file,
+        &db,
+        OrganisationMode::MoveRealFile,
+        1,
+    );
+
+    // Another process replaces the assignment with text that cannot resolve
+    // to a canonical platform: the identity becomes Unknown.
+    let archive_id = db
+        .find_archive_id_by_absolute_path(&source_file)
+        .unwrap()
+        .unwrap();
+    db.assign_platform(archive_id, Some("not-a-registered-platform"), "romm")
+        .unwrap();
+    drop(db);
+    let error = revalidate_organisation_plan(
+        &plan,
+        &dir.path().join("test.db"),
+        &|_| None,
+        &slug_for_platform,
+    )
+    .unwrap_err();
+    assert!(error.contains("changed"), "{error}");
+}
+
+#[test]
+fn a_changed_slug_mapping_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_dir = dir.path().join("library");
+    std::fs::create_dir_all(&source_dir).unwrap();
+    let source_file = source_dir.join("Game.iso");
+    std::fs::write(&source_file, b"data").unwrap();
+
+    let db = db_with_assignment(dir.path(), &source_file, "PSP", "romm");
+    let plan = plan_from_live_db(
+        dir.path(),
+        &source_file,
+        &db,
+        OrganisationMode::MoveRealFile,
+        1,
+    );
+    assert_eq!(plan.entries[0].slug.as_deref(), Some("psp"));
+
+    // The slug mapping changes: PSP now maps to "psp-portable".
+    let changed_slug = |platform: &str| -> Option<String> {
+        Some(match platform {
+            "PSP" => "psp-portable".to_string(),
+            other => slug_for_platform(other).unwrap_or_default(),
+        })
+    };
+    let error =
+        revalidate_organisation_plan(&plan, &dir.path().join("test.db"), &|_| None, &changed_slug)
+            .unwrap_err();
+    assert!(error.contains("changed"), "{error}");
+}
+
+#[test]
+fn a_changed_canonical_name_is_rejected_when_the_destination_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_dir = dir.path().join("library");
+    std::fs::create_dir_all(&source_dir).unwrap();
+    let source_file = source_dir.join("Game_ugly.iso");
+    std::fs::write(&source_file, b"data").unwrap();
+
+    let db = db_with_assignment(dir.path(), &source_file, "PSP", "romm");
+    // Plan with a canonical name.
+    let master = dir.path().join("roms");
+    std::fs::create_dir_all(&master).unwrap();
+    let cand = OrganisationCandidate {
+        source_path: source_file.clone(),
+        resolution: resolution_from_db(&db, &source_file, 1),
+        canonical_name: Some("Game (Europe).iso".to_string()),
+    };
+    let plan = plan_for(&master, OrganisationMode::MoveRealFile, &[cand], 1);
+    assert_eq!(
+        plan.entries[0].destination_path,
+        master.join("psp").join("Game (Europe).iso")
+    );
+
+    // The authoritative canonical name changes between plan and apply.
+    let changed_name = |path: &Path| -> Option<String> {
+        if path == source_file {
+            Some("Game (Japan).iso".to_string())
+        } else {
+            None
+        }
+    };
+    let error = revalidate_organisation_plan(
+        &plan,
+        &dir.path().join("test.db"),
+        &changed_name,
+        &slug_for_platform,
+    )
+    .unwrap_err();
+    assert!(error.contains("changed"), "{error}");
+}
+
+#[test]
+fn an_unchanged_live_identity_passes_revalidation() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_dir = dir.path().join("library");
+    std::fs::create_dir_all(&source_dir).unwrap();
+    let source_file = source_dir.join("Game.iso");
+    std::fs::write(&source_file, b"data").unwrap();
+
+    let db = db_with_assignment(dir.path(), &source_file, "PSP", "romm");
+    let plan = plan_from_live_db(
+        dir.path(),
+        &source_file,
+        &db,
+        OrganisationMode::MoveRealFile,
+        1,
+    );
+    drop(db);
+    revalidate_organisation_plan(
+        &plan,
+        &dir.path().join("test.db"),
+        &|_| None,
+        &slug_for_platform,
+    )
+    .expect("an unchanged live identity must pass");
 }
