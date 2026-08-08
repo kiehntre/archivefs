@@ -62,9 +62,16 @@ pub(crate) fn status_badge(ui: &mut egui::Ui, label: impl Into<String>, tone: St
         });
 }
 
-pub(crate) fn page_header(ui: &mut egui::Ui, title: &str, purpose: &str) {
-    ui.heading(title);
-    ui.label(egui::RichText::new(purpose).color(theme::muted(ui)));
+/// A page header with a leading icon, for the major navigation pages. The
+/// icon is a secondary cue; the text label always accompanies it.
+pub(crate) fn page_header_with_icon(ui: &mut egui::Ui, icon: &str, title: &str, purpose: &str) {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(icon).size(24.0));
+        ui.vertical(|ui| {
+            ui.heading(title);
+            ui.label(egui::RichText::new(purpose).color(theme::muted(ui)));
+        });
+    });
     ui.add_space(theme::SECTION_GAP);
 }
 

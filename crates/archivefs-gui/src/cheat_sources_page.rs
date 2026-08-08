@@ -69,6 +69,8 @@ fn provider_kind_label(entry: &CheatSourceEntry) -> &'static str {
         (true, true, true) => "Downloads and installs",
         (true, true, false) => "Downloads (read-only)",
         (false, _, true) => "Local, installs",
+        // A browse-only source (search + browse, no install) is stated plainly.
+        (false, _, false) if caps.browse && caps.search && !caps.download => "Browse only",
         (false, _, false) => "Local, read-only",
         (true, false, _) => "Remote, read-only",
     }
@@ -698,10 +700,11 @@ pub(crate) fn show_cheat_sources_page(
 ) -> Option<CheatSourcesPageAction> {
     let mut action = None;
 
-    widgets::page_header(
+    widgets::page_header_with_icon(
         ui,
+        crate::ui::icons::CHEATS,
         "Cheat sources",
-        "Which cheat catalogues ArchiveFS consults, in which order, and for which platforms.",
+        "Choose where ArchiveFS looks for cheats and patches.",
     );
 
     if let Some(error) = &view.load_error {
@@ -732,13 +735,36 @@ pub(crate) fn show_cheat_sources_page(
     }
     ui.add_space(10.0);
 
+    // Sources are grouped by emulator family for readability (several
+    // providers share one emulator, e.g. the Dolphin GameCube/Wii sources).
+    // This is presentation only: every source is still listed, enabled/disabled
+    // and priority remain per source, and no provider is merged.
+    let mut groups: Vec<(&str, Vec<&CheatSourceRowView>)> = Vec::new();
     for row in &view.rows {
-        if action.is_none()
-            && let Some(row_action) = show_source_row(ui, row, ui_state)
+        if let Some((_, entries)) = groups
+            .iter_mut()
+            .find(|(name, _)| *name == row.emulator.as_str())
         {
-            action = Some(row_action);
+            entries.push(row);
+        } else {
+            groups.push((row.emulator.as_str(), vec![row]));
         }
-        ui.add_space(8.0);
+    }
+    for (emulator, rows) in groups {
+        widgets::section_header(
+            ui,
+            emulator,
+            Some("Sources for this emulator family, in consultation order."),
+        );
+        for row in rows {
+            if action.is_none()
+                && let Some(row_action) = show_source_row(ui, row, ui_state)
+            {
+                action = Some(row_action);
+            }
+            ui.add_space(8.0);
+        }
+        ui.add_space(4.0);
     }
 
     if !view.unresolved.is_empty() {

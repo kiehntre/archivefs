@@ -438,11 +438,11 @@ fn build_slug_map(
 /// Draws the page and returns the confirmation request when the user clicks
 /// Apply (the caller must confirm before any mutation happens).
 pub(crate) fn show_rom_organisation_page(ui: &mut egui::Ui, state: &mut RomOrganisationPageState) {
-    widgets::page_header(
+    widgets::page_header_with_icon(
         ui,
+        crate::ui::icons::ORGANISE,
         "Canonical organisation",
-        "Plan (and only after your approval, apply) moving identified games into canonical \
-         platform directories beneath your master ROM root.",
+        "Preview where your games would go. Nothing moves until you approve it.",
     );
 
     widgets::card(ui, |ui| {

@@ -1655,3 +1655,22 @@ fn an_unreadable_existing_cache_is_drawn_as_invalid_not_not_checked() {
         "the page must draw the Invalid state, not 'Status: not checked'"
     );
 }
+
+#[test]
+fn bsfree_is_labeled_browse_only() {
+    let registry = archivefs_core::patch_manager::build_default_registry();
+    let bsfree = registry.get("bsfree-archive").expect("bsfree entry");
+    assert_eq!(
+        super::provider_kind_label(bsfree),
+        "Browse only",
+        "BSFree must state it browses only and does not install"
+    );
+}
+
+#[test]
+fn the_page_header_shows_its_icon_alongside_the_title() {
+    let view = fresh("icon-header").view();
+    let output = render(&view);
+    assert!(rendered_text_contains(&output, "🧩"));
+    assert!(rendered_text_contains(&output, "Cheat sources"));
+}

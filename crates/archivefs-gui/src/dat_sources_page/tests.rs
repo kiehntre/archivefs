@@ -3971,3 +3971,102 @@ fn the_apply_controls_are_reachable_by_keyboard() {
     }
     assert!(focused_anything, "Tab never focused anything on the page");
 }
+
+// ---------------------------------------------------------------------------
+// Beta UX: safety promise, Any-preference, grouped diagnostics
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_safe_promise_is_rendered_on_the_dat_sources_page() {
+    let fixture = Fixture::new();
+    let page = fixture.page();
+    let view = page.view();
+    let mut ui_state = DatSourcesPageUi::default();
+    let output = render(&view, &mut ui_state);
+    assert!(
+        rendered_text_contains(&output, SAFE_PROMISE),
+        "the simple safety promise must be visible"
+    );
+    assert!(
+        SAFE_PROMISE.contains("Your files won't be renamed unless you approve it."),
+        "the promise uses the exact friendly wording"
+    );
+}
+
+#[test]
+fn any_region_clears_the_region_preference() {
+    let fixture = Fixture::new();
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddRegion {
+        scope: None,
+        region: RegionId::Europe,
+    });
+    page.apply(DatSourcesPageAction::AddRegion {
+        scope: None,
+        region: RegionId::Japan,
+    });
+    assert_eq!(page.view().policy.region_preferences.len(), 2);
+    page.apply(DatSourcesPageAction::ClearRegion { scope: None });
+    assert!(
+        page.view().policy.region_preferences.is_empty(),
+        "Any region clears the preference ordering"
+    );
+    assert_eq!(page.view().policy.effective.region, "Any");
+}
+
+#[test]
+fn any_language_clears_the_language_preference() {
+    let fixture = Fixture::new();
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddLanguage {
+        scope: None,
+        preference: LanguagePreference::Language(LanguageId::En),
+    });
+    assert_eq!(page.view().policy.language_preferences.len(), 1);
+    page.apply(DatSourcesPageAction::ClearLanguage { scope: None });
+    assert!(
+        page.view().policy.language_preferences.is_empty(),
+        "Any language clears the preference ordering"
+    );
+    assert_eq!(page.view().policy.effective.language, "Any");
+}
+
+#[test]
+fn the_effective_policy_renders_any_not_none_all_equal() {
+    assert_eq!(super::render_preference_list(Vec::new()), "Any");
+    assert_eq!(
+        super::render_preference_list(vec!["Europe".to_string()]),
+        "Europe"
+    );
+}
+
+#[test]
+fn repeated_symlink_diagnostics_group_with_an_exact_count_and_bounded_examples() {
+    let context = egui::Context::default();
+    let output = context.run(egui::RawInput::default(), |context| {
+        egui::CentralPanel::default().show(context, |ui| {
+            let mut files = Vec::new();
+            for index in 0..25 {
+                files.push((
+                    format!("disc{index}.bin"),
+                    "symlink refused: it resolves outside every configured source root".to_string(),
+                ));
+            }
+            super::show_unhashed_groups(ui, &files);
+        });
+    });
+    assert!(
+        rendered_text_contains(&output, "25 symlinks could not be hashed"),
+        "the group must carry the exact count"
+    );
+    assert!(
+        rendered_text_contains(&output, "Show all 25"),
+        "the raw findings remain available behind an expansion"
+    );
+    // Examples are bounded to the first 10; the rest are only in "Show all".
+    let example_count = rendered_text_count(&output, "disc");
+    assert!(
+        example_count <= 10,
+        "examples must be bounded (found {example_count})"
+    );
+}

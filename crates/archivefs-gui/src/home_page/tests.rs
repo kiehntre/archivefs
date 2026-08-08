@@ -185,6 +185,7 @@ fn every_primary_card_action_reports_its_own_card() {
             HomeCard::CanonicalOrganisation,
             "Open Canonical Organisation",
         ),
+        (HomeCard::CleanUpLibrary, "Open DAT Sources"),
         (HomeCard::DatSources, "Open DAT Sources"),
         (HomeCard::RomM, "Open Sources"),
         (HomeCard::CheckSetup, "Open Doctor"),
@@ -354,4 +355,57 @@ fn tabbing_through_the_page_visits_cards_top_to_bottom() {
         }
     }
     assert!(last_top.is_some(), "Tab never focused anything on Home");
+}
+
+#[test]
+fn rename_and_organise_are_discoverable_from_home() {
+    let checks = [passing_check("config file")];
+    let view = build_home_view(&established_inputs(&checks));
+    let organise = view
+        .cards
+        .iter()
+        .find(|c| c.card == HomeCard::CanonicalOrganisation)
+        .unwrap();
+    // "Organise by platform" is the primary action; "Review filename
+    // suggestions" (the DAT rename-planning workflow) is the secondary route.
+    assert_eq!(organise.action_label, "Open Canonical Organisation");
+    assert_eq!(
+        organise.secondary,
+        Some((HomeCard::CleanUpLibrary, "Review filename suggestions"))
+    );
+    let clean = view
+        .cards
+        .iter()
+        .find(|c| c.card == HomeCard::CleanUpLibrary)
+        .unwrap();
+    assert_eq!(clean.title, "Clean up my library");
+    assert_eq!(clean.action_label, "Open DAT Sources");
+}
+
+#[test]
+fn every_home_card_shows_its_icon_alongside_its_title() {
+    let checks = [passing_check("config file")];
+    let view = build_home_view(&established_inputs(&checks));
+    for card in &view.cards {
+        assert!(!card.icon.is_empty(), "{} must carry an icon", card.title);
+    }
+    // The icons are drawn next to the text labels - the labels never become
+    // icon-only.
+    let (output, _) = render(&view, 1200.0);
+    for expected in [
+        "🗂️",
+        "🧹",
+        "🎮",
+        "📚",
+        "🩺",
+        "⚙️",
+        "Clean up my library",
+        "Organise my library",
+        "Browse my games",
+    ] {
+        assert!(
+            rendered_text_contains(&output, expected),
+            "expected {expected:?} to be drawn"
+        );
+    }
 }

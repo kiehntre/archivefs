@@ -2973,6 +2973,7 @@ fn main_view_for_home_card(card: home_page::HomeCard) -> MainView {
         home_page::HomeCard::BrowseGames => MainView::Library,
         home_page::HomeCard::CheatsAndMods => MainView::CheatsMods,
         home_page::HomeCard::CanonicalOrganisation => MainView::CanonicalOrganisation,
+        home_page::HomeCard::CleanUpLibrary => MainView::DatSources,
         home_page::HomeCard::CheatSources => MainView::CheatSources,
         home_page::HomeCard::DatSources => MainView::DatSources,
         home_page::HomeCard::CheckSetup => MainView::Doctor,
@@ -3030,8 +3031,9 @@ fn library_tab_label(tab: LibraryTab) -> &'static str {
 /// labels, and that a click returns the right `LibraryTab` - is directly
 /// testable without going through a full `eframe::App::update` call.
 fn show_library_shell_header(ui: &mut egui::Ui, current_tab: LibraryTab) -> Option<LibraryTab> {
-    widgets::page_header(
+    widgets::page_header_with_icon(
         ui,
+        crate::ui::icons::LIBRARY,
         "Library",
         "Archives, health, duplicates, and saved views for your library.",
     );
@@ -3856,7 +3858,50 @@ struct PlatformArtworkManagerState {
     pending_remove: Option<String>,
     message: Option<(bool, String)>,
     task: Option<mpsc::Receiver<PlatformArtworkTaskResult>>,
+    /// An in-flight native file dialog, run on a background thread so the egui
+    /// frame is never blocked while it is open.
+    pending_pick: Option<FilePickRequest>,
 }
+
+/// A native image-picker file dialog running on a background thread.
+struct FilePickRequest {
+    platform_id: String,
+    /// Whether this platform already has a custom image (replacement flow).
+    custom: bool,
+    receiver: mpsc::Receiver<Option<PathBuf>>,
+}
+
+/// The outcome of draining one file-picker channel, as a tiny pure state
+/// machine so the caller (and tests) reason about it without a real dialog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FilePickDrain {
+    /// The picker is still running - leave `pending_pick` intact.
+    Pending,
+    /// The user pressed Cancel (`Ok(None)`): clear the picker, change nothing,
+    /// show no error.
+    Cancelled,
+    /// The user chose a file: clear the picker and continue the import.
+    Picked(PathBuf),
+    /// The picker thread ended without sending a result: clear the picker and
+    /// surface a friendly error so the buttons become available again.
+    Disconnected,
+}
+
+/// Reads one state from the picker channel. Pure and deterministic: no file
+/// dialog is required.
+fn drain_file_pick(receiver: &mpsc::Receiver<Option<PathBuf>>) -> FilePickDrain {
+    match receiver.try_recv() {
+        Ok(Some(path)) => FilePickDrain::Picked(path),
+        Ok(None) => FilePickDrain::Cancelled,
+        Err(mpsc::TryRecvError::Empty) => FilePickDrain::Pending,
+        Err(mpsc::TryRecvError::Disconnected) => FilePickDrain::Disconnected,
+    }
+}
+
+/// The plain-language error shown when the picker thread exits without a
+/// result (for example the dialog failed to open).
+const FILE_PICKER_DISCONNECTED_MESSAGE: &str =
+    "The image picker closed unexpectedly. Please try again.";
 
 impl ArchiveFsApp {
     fn is_busy(&self) -> bool {
@@ -12930,21 +12975,35 @@ impl ArchiveFsApp {
                     });
                     ui.menu_button("Library", |ui| {
                         if ui
-                            .add_enabled(!loading && !busy, egui::Button::new("Scan library"))
+                            .add_enabled(
+                                !loading && !busy,
+                                egui::Button::new("Scan library"),
+                            )
+                            .on_hover_text("Scan your configured source folders for new and changed files.")
                             .clicked()
                         {
                             self.start_database_action(context.clone(), true);
                             ui.close();
                         }
                         if ui
-                            .add_enabled(!busy, egui::Button::new("Refresh database status"))
+                            .add_enabled(
+                                !busy,
+                                egui::Button::new("Refresh database status"),
+                            )
+                            .on_hover_text(
+                                "Re-read the catalogue database status without rescanning your folders.",
+                            )
                             .clicked()
                         {
                             self.start_database_action(context.clone(), false);
                             ui.close();
                         }
                         ui.separator();
-                        if ui.button("Select all visible").clicked() {
+                        if ui
+                            .button("Select all visible")
+                            .on_hover_text("Select every archive currently shown in the Library.")
+                            .clicked()
+                        {
                             self.select_all_visible_requested = true;
                             ui.close();
                         }
@@ -12953,6 +13012,7 @@ impl ArchiveFsApp {
                                 !self.archive_context.selected.is_empty(),
                                 egui::Button::new("Clear selection"),
                             )
+                            .on_hover_text("Deselect every selected archive.")
                             .clicked()
                         {
                             self.archive_context.clear_selection();
@@ -12962,7 +13022,10 @@ impl ArchiveFsApp {
                         if ui
                             .add_enabled(
                                 !loading && !busy,
-                                egui::Button::new("Refresh Live Snapshot"),
+                                egui::Button::new("Refresh"),
+                            )
+                            .on_hover_text(
+                                "Refresh ArchiveFS's current view of your files without running a full scan.",
                             )
                             .clicked()
                         {
@@ -12979,22 +13042,40 @@ impl ArchiveFsApp {
                     });
                     ui.menu_button("Tools", |ui| {
                         if ui
-                            .add_enabled(!busy, egui::Button::new("Diagnostics"))
+                            .add_enabled(
+                                !busy,
+                                egui::Button::new("Diagnostics"),
+                            )
+                            .on_hover_text(
+                                "Check configuration, mount root and source-folder health.",
+                            )
                             .clicked()
                         {
                             self.tools_overlay = ToolsOverlay::Diagnostics;
                             self.refresh_diagnostics(context);
                             ui.close();
                         }
-                        if ui.button("Doctor checks").clicked() {
+                        if ui
+                            .button("Doctor checks")
+                            .on_hover_text("Run the read-only Doctor scan of this ArchiveFS installation.")
+                            .clicked()
+                        {
                             self.tools_overlay = ToolsOverlay::DoctorChecks;
                             ui.close();
                         }
-                        if ui.button("Platform Aliases").clicked() {
+                        if ui
+                            .button("Platform Aliases")
+                            .on_hover_text("Review the folder and filename aliases ArchiveFS uses to recognise platforms.")
+                            .clicked()
+                        {
                             self.tools_overlay = ToolsOverlay::PlatformAliases;
                             ui.close();
                         }
-                        if ui.button("Database Status").clicked() {
+                        if ui
+                            .button("Database Status")
+                            .on_hover_text("Inspect the catalogue database and its health.")
+                            .clicked()
+                        {
                             self.tools_overlay = ToolsOverlay::DatabaseStatus;
                             ui.close();
                         }
@@ -13004,7 +13085,11 @@ impl ArchiveFsApp {
                         } else {
                             "Show Activity"
                         };
-                        if ui.button(activity_label).clicked() {
+                        if ui
+                            .button(activity_label)
+                            .on_hover_text("Show or hide the recent-activity panel.")
+                            .clicked()
+                        {
                             self.show_activity = !self.show_activity;
                             ui.close();
                         }
@@ -13395,8 +13480,9 @@ impl ArchiveFsApp {
                         LoadState::Loading { .. } | LoadState::Error(_) => None,
                     };
 
-                    widgets::page_header(
+                    widgets::page_header_with_icon(
                         ui,
+                        crate::ui::icons::SOURCES,
                         "Sources",
                         "Manage the configured folders ArchiveFS scans for archives, and keep the trusted cheat database up to date.",
                     );
@@ -14070,10 +14156,11 @@ impl ArchiveFsApp {
                 }
 
                 if self.view == MainView::Doctor {
-                    widgets::page_header(
+                    widgets::page_header_with_icon(
                         ui,
+                        crate::ui::icons::DOCTOR,
                         "Doctor",
-                        "A read-only check of this ArchiveFS installation. Running it changes nothing.",
+                        "Check your ArchiveFS setup and find problems. Running it changes nothing.",
                     );
                     let action = show_doctor_page(
                         ui,
@@ -15987,13 +16074,34 @@ fn repeated_doctor_group_is_compact(findings: &[&Finding]) -> bool {
 }
 
 fn repeated_doctor_group_heading(finding: &Finding, count: usize) -> String {
-    let label = match finding.id.as_str() {
-        "mounts.historical_failure" => "Historical mount failures",
-        "mounts.not_required" => "Items needing no archive mount",
-        "mounts.failure_evidence_incomplete" => "Mount results with insufficient evidence",
-        _ => finding.title.as_str(),
-    };
-    format!("{label}: {count}")
+    match finding.id.as_str() {
+        "mounts.historical_failure" => format!("Historical mount failures: {count}"),
+        "mounts.not_required" => format!("{count} loose ROMs are healthy"),
+        "mounts.failure_evidence_incomplete" => {
+            format!("Mount results with insufficient evidence: {count}")
+        }
+        _ => format!("{}: {count}", finding.title),
+    }
+}
+
+/// The friendly plain-language line shown for a compact repeated group, if it
+/// has one. Technical detail stays in the individual findings and the "Show
+/// all" expansion.
+fn repeated_doctor_group_explanation(finding: &Finding) -> Option<&'static str> {
+    match finding.id.as_str() {
+        "mounts.not_required" => {
+            Some("These files are used directly and do not need ArchiveFS mounting.")
+        }
+        "mounts.historical_failure" => Some(
+            "These were mount problems in the past. They are shown for reference; nothing is \
+             broken right now.",
+        ),
+        "mounts.failure_evidence_incomplete" => Some(
+            "Some earlier mount results did not record enough detail to be certain. They are \
+             kept rather than guessed at.",
+        ),
+        _ => None,
+    }
 }
 
 fn repeated_doctor_group_counts(findings: &[&Finding], key: &str) -> String {
@@ -16091,7 +16199,12 @@ fn show_repeated_doctor_group(
                 egui::RichText::new(repeated_doctor_group_heading(first, findings.len())).strong(),
             );
         });
-        ui.add(egui::Label::new(&first.explanation).wrap());
+        ui.add(
+            egui::Label::new(
+                repeated_doctor_group_explanation(first).unwrap_or(&first.explanation),
+            )
+            .wrap(),
+        );
         for (label, key) in [
             ("By reason", "reason"),
             ("By platform", "platform"),
@@ -16345,6 +16458,9 @@ fn show_doctor_finding_details(ui: &mut egui::Ui, finding: &Finding, key: &str) 
         ui.add(egui::Label::new(next).wrap());
     }
     if !finding.evidence.is_empty() {
+        // Evidence (paths, hashes, raw reasons) is already gated behind the
+        // finding's own "Details"/"Hide details" selection, so it stays
+        // visible exactly when the user asked to see it.
         ui.label(egui::RichText::new("Evidence").strong());
         for item in &finding.evidence {
             ui.add(egui::Label::new(format!("• {item}")).wrap());
@@ -20068,8 +20184,9 @@ fn show_about_contents(
     mount_root: Option<&Path>,
     clipboard: &mut dyn ClipboardBackend,
 ) {
-    widgets::page_header(
+    widgets::page_header_with_icon(
         ui,
+        crate::ui::icons::ABOUT,
         "ArchiveFS",
         "A Linux archive library and safe mount manager.",
     );
@@ -20312,8 +20429,9 @@ fn show_selected_page(
         block_reason,
     } = view_state;
     let mut action = None;
-    widgets::page_header(
+    widgets::page_header_with_icon(
         ui,
+        crate::ui::icons::SELECTED,
         "Selected",
         "Review queued archives and their validated destinations before mounting.",
     );
@@ -20563,8 +20681,9 @@ fn show_mount_page(
         block_reason,
     } = view_state;
     let mut action = None;
-    widgets::page_header(
+    widgets::page_header_with_icon(
         ui,
+        crate::ui::icons::MOUNT,
         "Mount",
         "Choose archives, review validated destinations, and mount the ready queue.",
     );
@@ -20814,8 +20933,9 @@ fn show_active_mounts_page(
     busy: bool,
 ) -> Option<ActiveMountsPageAction> {
     let mut action = None;
-    widgets::page_header(
+    widgets::page_header_with_icon(
         ui,
+        crate::ui::icons::MOUNT,
         "Active Mounts",
         "Review current mounts and unmount them normally after closing applications that use them.",
     );
@@ -21123,8 +21243,9 @@ fn show_history_logs_page(
     clipboard: &mut dyn ClipboardBackend,
 ) -> Option<HistoryPageAction> {
     let mut action = None;
-    widgets::page_header(
+    widgets::page_header_with_icon(
         ui,
+        crate::ui::icons::HISTORY,
         "History & Logs",
         "Filter, inspect, copy, or export operations from this application session.",
     );
@@ -28906,8 +29027,9 @@ fn show_cheats_mods_page(
             CheatEmulatorAdapter::Dolphin | CheatEmulatorAdapter::Xenia
         )
     });
-    widgets::page_header(
+    widgets::page_header_with_icon(
         ui,
+        crate::ui::icons::CHEATS,
         "Cheats & Mods",
         if beginner_route {
             "Choose compatible enhancements for the selected game."
@@ -30083,6 +30205,46 @@ fn show_platform_artwork_manager(
     action: &mut Option<SettingsPageAction>,
 ) {
     let running = manager.task.is_some();
+    // Drain a finished background file dialog: pick_file() ran on a worker
+    // thread so the frame was never blocked. When it returns, process exactly
+    // what the inline call used to.
+    if let Some(pick) = manager.pending_pick.as_mut() {
+        match drain_file_pick(&pick.receiver) {
+            FilePickDrain::Pending => {
+                // Picker still open: keep `pending_pick` so no second dialog
+                // starts and the frame keeps draining.
+            }
+            FilePickDrain::Cancelled => {
+                // User pressed Cancel: nothing changed, no error, buttons
+                // become available again.
+                manager.pending_pick = None;
+            }
+            FilePickDrain::Disconnected => {
+                // Thread ended without a result: release the picker and tell
+                // the user, so the buttons are usable again.
+                manager.pending_pick = None;
+                manager.message = Some((false, FILE_PICKER_DISCONNECTED_MESSAGE.to_string()));
+            }
+            FilePickDrain::Picked(source) => {
+                let FilePickRequest {
+                    platform_id,
+                    custom,
+                    ..
+                } = manager.pending_pick.take().expect("just drained");
+                if custom {
+                    manager.pending_import = Some((platform_id, source));
+                } else {
+                    manager.replace_existing = false;
+                    *action = Some(SettingsPageAction::PlatformArtwork(
+                        PlatformArtworkManagerAction::Import {
+                            platform_id,
+                            source,
+                        },
+                    ));
+                }
+            }
+        }
+    }
     widgets::card(ui, |ui| {
         ui.label(format!(
             "Managed folder: {}",
@@ -30319,23 +30481,27 @@ fn show_platform_artwork_manager(
                     ui.label(format!("Current source: {source_label}"));
                     ui.horizontal_wrapped(|ui| {
                         if ui
-                            .add_enabled(!running, egui::Button::new("Choose image"))
+                            .add_enabled(
+                                !running && manager.pending_pick.is_none(),
+                                egui::Button::new("Choose image"),
+                            )
                             .clicked()
-                            && let Some(source) = rfd::FileDialog::new()
-                                .add_filter("Static image", &["png", "jpg", "jpeg", "webp"])
-                                .pick_file()
                         {
-                            if custom {
-                                manager.pending_import = Some((platform.id.to_owned(), source));
-                            } else {
-                                manager.replace_existing = false;
-                                *action = Some(SettingsPageAction::PlatformArtwork(
-                                    PlatformArtworkManagerAction::Import {
-                                        platform_id: platform.id.to_owned(),
-                                        source,
-                                    },
-                                ));
-                            }
+                            // Run the native dialog on a background thread: a
+                            // blocking `pick_file()` on the egui thread freezes
+                            // the UI until the dialog closes.
+                            let (sender, receiver) = mpsc::channel();
+                            std::thread::spawn(move || {
+                                let picked = rfd::FileDialog::new()
+                                    .add_filter("Static image", &["png", "jpg", "jpeg", "webp"])
+                                    .pick_file();
+                                let _ = sender.send(picked);
+                            });
+                            manager.pending_pick = Some(FilePickRequest {
+                                platform_id: platform.id.to_owned(),
+                                custom,
+                                receiver,
+                            });
                         }
                         if let Some((pending_platform, _)) = &manager.pending_import
                             && pending_platform == platform.id
@@ -30403,8 +30569,9 @@ fn show_settings_page(
     artwork_manager: &mut PlatformArtworkManagerState,
 ) -> Option<SettingsPageAction> {
     let mut action = None;
-    widgets::page_header(
+    widgets::page_header_with_icon(
         ui,
+        crate::ui::icons::SETTINGS,
         "Settings",
         "Review ArchiveFS locations, configuration health, and supported integrations.",
     );
@@ -30684,8 +30851,8 @@ fn show_settings_page(
     widgets::section_header(ui, "6. Intentionally unavailable", None);
     widgets::banner(
         ui,
-        "Deferred",
-        "Appearance density, reset controls, cache maintenance, and in-app configuration editing have no supported GUI backing today. Source folders remain managed on the Sources page.",
+        "Not available yet",
+        "These controls have no supported GUI yet: appearance density, reset controls, cache maintenance, and editing the configuration in-app. Source folders remain managed on the Sources page.",
         widgets::StatusTone::Info,
     );
     action
@@ -32416,8 +32583,9 @@ fn show_loaded_data(
     let pending_count = data.stats.pending_count;
     let mounted_count = data.stats.mounted_count;
     if recent_view {
-        widgets::page_header(
+        widgets::page_header_with_icon(
             ui,
+            crate::ui::icons::RECENT,
             "Recently Found",
             "Persistent additions from the most recent completed scan.",
         );
@@ -33430,7 +33598,7 @@ fn show_loaded_data(
         Some(LibraryTableMessage::NoCompletedScan) => {
             widgets::empty_state(
                 ui,
-                "No completed scan yet",
+                &crate::ui::icons::with_icon(crate::ui::icons::RECENT, "No completed scan yet"),
                 "Run a library scan to populate Recently Found.",
                 None,
             );
@@ -33444,12 +33612,17 @@ fn show_loaded_data(
             );
         }
         Some(LibraryTableMessage::EmptyLibrary) => {
-            widgets::empty_state(ui, "Library is empty", EMPTY_LIBRARY_MESSAGE, None);
+            widgets::empty_state(
+                ui,
+                &crate::ui::icons::with_icon(crate::ui::icons::EMPTY_BOX, "Library is empty"),
+                EMPTY_LIBRARY_MESSAGE,
+                None,
+            );
         }
         Some(LibraryTableMessage::NoFilterResults) => {
             widgets::empty_state(
                 ui,
-                "No matching archives",
+                &crate::ui::icons::with_icon(crate::ui::icons::SEARCH, "No matching archives"),
                 ZERO_FILTER_RESULTS_MESSAGE,
                 None,
             );
@@ -68804,4 +68977,199 @@ fn run_romm_preview(
         preview.observed_absolute,
         sample_source,
     ))
+}
+
+#[test]
+fn benign_loose_rom_doctor_findings_use_a_friendly_summary() {
+    use archivefs_core::diagnostics::{DoctorCategory, DoctorSeverity, DoctorSubsystem, Finding};
+    let mut finding = Finding {
+        id: "mounts.not_required".to_string(),
+        category: DoctorCategory::Mounts,
+        subsystem: DoctorSubsystem::ArchiveHealth,
+        severity: DoctorSeverity::Info,
+        title: "No mount required".to_string(),
+        explanation: "This loose ROM is used directly.".to_string(),
+        why_it_matters: None,
+        next_step: None,
+        evidence: Vec::new(),
+        affected: None,
+        recovery: None,
+        repair: None,
+        measurements: std::collections::BTreeMap::new(),
+    };
+    // 840 loose-ROM findings collapse into one friendly, exact heading.
+    assert_eq!(
+        repeated_doctor_group_heading(&finding, 840),
+        "840 loose ROMs are healthy"
+    );
+    assert_eq!(
+        repeated_doctor_group_explanation(&finding),
+        Some("These files are used directly and do not need ArchiveFS mounting.")
+    );
+    // A different kind keeps its precise heading (technical detail preserved).
+    finding.id = "mounts.historical_failure".to_string();
+    assert!(repeated_doctor_group_heading(&finding, 12).contains("Historical mount failures"));
+}
+
+/// Local text check for the artwork-picker tests (they live at the module
+/// top level, outside the main test module's helper scope).
+#[cfg(test)]
+fn picker_output_text_contains(output: &egui::FullOutput, needle: &str) -> bool {
+    fn shape_contains(shape: &egui::Shape, needle: &str) -> bool {
+        match shape {
+            egui::Shape::Text(text_shape) => text_shape.galley.text().contains(needle),
+            egui::Shape::Vec(nested) => nested.iter().any(|shape| shape_contains(shape, needle)),
+            _ => false,
+        }
+    }
+    output
+        .shapes
+        .iter()
+        .any(|clipped| shape_contains(&clipped.shape, needle))
+}
+
+#[test]
+fn file_pick_drain_keeps_pending_while_empty() {
+    let (sender, receiver) = mpsc::channel();
+    assert_eq!(drain_file_pick(&receiver), FilePickDrain::Pending);
+    // A second drain on the still-open channel is still Pending.
+    assert_eq!(drain_file_pick(&receiver), FilePickDrain::Pending);
+    drop(sender);
+}
+
+#[test]
+fn file_pick_drain_disconnected_is_reported_and_repeated_drains_do_not_panic() {
+    let (_sender, receiver) = mpsc::channel::<Option<PathBuf>>();
+    drop(_sender);
+    assert_eq!(drain_file_pick(&receiver), FilePickDrain::Disconnected);
+    assert_eq!(drain_file_pick(&receiver), FilePickDrain::Disconnected);
+    assert_eq!(drain_file_pick(&receiver), FilePickDrain::Disconnected);
+}
+
+#[test]
+fn file_pick_drain_cancel_is_not_an_error() {
+    let (sender, receiver) = mpsc::channel();
+    sender.send(None).unwrap();
+    assert_eq!(drain_file_pick(&receiver), FilePickDrain::Cancelled);
+    // A cancelled channel then disconnects cleanly.
+    drop(sender);
+    assert_eq!(drain_file_pick(&receiver), FilePickDrain::Disconnected);
+}
+
+#[test]
+fn file_pick_drain_picked_returns_the_path() {
+    let (sender, receiver) = mpsc::channel();
+    sender.send(Some(PathBuf::from("/tmp/pic.png"))).unwrap();
+    assert_eq!(
+        drain_file_pick(&receiver),
+        FilePickDrain::Picked(PathBuf::from("/tmp/pic.png"))
+    );
+}
+
+#[test]
+fn a_disconnected_picker_releases_and_shows_a_friendly_error() {
+    let (_sender, receiver) = mpsc::channel::<Option<PathBuf>>();
+    drop(_sender);
+    let mut manager = PlatformArtworkManagerState {
+        pending_pick: Some(FilePickRequest {
+            platform_id: "gamecube".to_string(),
+            custom: false,
+            receiver,
+        }),
+        ..Default::default()
+    };
+    let mut cache = PlatformArtworkCache {
+        directory: None,
+        entries: std::collections::HashMap::new(),
+        bundled_entries: std::collections::HashMap::new(),
+    };
+    let mut action = None;
+    let context = egui::Context::default();
+    let output = context.run(egui::RawInput::default(), |context| {
+        egui::CentralPanel::default().show(context, |ui| {
+            show_platform_artwork_manager(ui, None, &mut cache, &mut manager, &mut action);
+        });
+    });
+    assert!(
+        manager.pending_pick.is_none(),
+        "a disconnected picker must release pending_pick so a new picker can start"
+    );
+    assert!(
+        picker_output_text_contains(
+            &output,
+            "The image picker closed unexpectedly. Please try again."
+        ),
+        "the friendly error must be visible"
+    );
+}
+
+#[test]
+fn a_still_pending_picker_is_not_released_and_blocks_a_second_one() {
+    let (sender, receiver) = mpsc::channel();
+    let mut manager = PlatformArtworkManagerState {
+        pending_pick: Some(FilePickRequest {
+            platform_id: "gamecube".to_string(),
+            custom: false,
+            receiver,
+        }),
+        ..Default::default()
+    };
+    let mut cache = PlatformArtworkCache {
+        directory: None,
+        entries: std::collections::HashMap::new(),
+        bundled_entries: std::collections::HashMap::new(),
+    };
+    let mut action = None;
+    let context = egui::Context::default();
+    let _output = context.run(egui::RawInput::default(), |context| {
+        egui::CentralPanel::default().show(context, |ui| {
+            show_platform_artwork_manager(ui, None, &mut cache, &mut manager, &mut action);
+        });
+    });
+    assert!(
+        manager.pending_pick.is_some(),
+        "an open picker stays pending; no second dialog can start"
+    );
+    drop(sender);
+}
+
+#[test]
+fn a_cancelled_picker_releases_without_an_error() {
+    let (sender, receiver) = mpsc::channel();
+    sender.send(None).unwrap();
+    let mut manager = PlatformArtworkManagerState {
+        pending_pick: Some(FilePickRequest {
+            platform_id: "gamecube".to_string(),
+            custom: false,
+            receiver,
+        }),
+        ..Default::default()
+    };
+    let mut cache = PlatformArtworkCache {
+        directory: None,
+        entries: std::collections::HashMap::new(),
+        bundled_entries: std::collections::HashMap::new(),
+    };
+    let mut action = None;
+    let context = egui::Context::default();
+    let output = context.run(egui::RawInput::default(), |context| {
+        egui::CentralPanel::default().show(context, |ui| {
+            show_platform_artwork_manager(ui, None, &mut cache, &mut manager, &mut action);
+        });
+    });
+    assert!(
+        manager.pending_pick.is_none(),
+        "a cancelled picker is released"
+    );
+    assert!(
+        !picker_output_text_contains(
+            &output,
+            "The image picker closed unexpectedly. Please try again."
+        ),
+        "cancelling must not show an error"
+    );
+    assert!(
+        manager.pending_import.is_none() && action.is_none(),
+        "cancelling changes nothing"
+    );
 }
