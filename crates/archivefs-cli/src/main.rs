@@ -7052,6 +7052,7 @@ mod tests {
             source_folders: vec![source_dir.to_path_buf()],
             mount_root: mount_dir.to_path_buf(),
             ratarmount_bin: "ratarmount".to_string(),
+            master_rom_root: None,
         }
     }
 
@@ -7240,6 +7241,7 @@ mod tests {
             source_folders: vec![source_a.clone(), source_b.clone()],
             mount_root: mount,
             ratarmount_bin: "ratarmount".to_string(),
+            master_rom_root: None,
         };
         run_library_scan(&config, &database_path, "test").unwrap();
 

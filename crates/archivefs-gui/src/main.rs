@@ -3468,6 +3468,7 @@ fn hermetic_gui_config() -> Result<Config, String> {
         source_folders: vec![PathBuf::from("/library")],
         mount_root: PathBuf::from("/mount"),
         ratarmount_bin: "ratarmount".to_string(),
+        master_rom_root: None,
     })
 }
 
@@ -50852,6 +50853,7 @@ $Instant Growth [Nayr]\n";
                 source_folders: vec![scratch.join("sources")],
                 mount_root: scratch.join("mounts"),
                 ratarmount_bin: "ratarmount".to_string(),
+                master_rom_root: None,
             },
             scratch.join("index.json"),
         );
@@ -51101,6 +51103,7 @@ $Instant Growth [Nayr]\n";
                 source_folders: vec![PathBuf::from("/library")],
                 mount_root: PathBuf::from("/mount"),
                 ratarmount_bin: "ratarmount".to_string(),
+                master_rom_root: None,
             }),
             romm_snapshot: None,
             romm_operation: None,
@@ -51309,6 +51312,7 @@ $Instant Growth [Nayr]\n";
             source_folders: vec![source_dir.to_path_buf()],
             mount_root: mount_dir.to_path_buf(),
             ratarmount_bin: "ratarmount".to_string(),
+            master_rom_root: None,
         }
     }
 
@@ -55424,6 +55428,7 @@ $Instant Growth [Nayr]\n";
             source_folders: vec![source_a.clone(), source_b.clone()],
             mount_root: mount,
             ratarmount_bin: "ratarmount".to_string(),
+            master_rom_root: None,
         };
         let database_path = dir.join("library.sqlite3");
         {

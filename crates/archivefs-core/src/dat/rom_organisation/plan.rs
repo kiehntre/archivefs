@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use crate::dat::rename_apply::preflight::is_safe_basename;
 use crate::dat::rename_plan::derive_proposed_basename;
-use crate::platform::identity::{PlatformIdentityResolution, PlatformIdentitySource};
+use crate::platform::identity::PlatformIdentityResolution;
 
 use super::model::{
     OrganisationMode, OrganisationPlan, OrganisationPlanEntry, OrganisationStatus,

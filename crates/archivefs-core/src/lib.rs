@@ -251,6 +251,10 @@ pub struct Config {
     pub source_folders: Vec<PathBuf>,
     pub mount_root: PathBuf,
     pub ratarmount_bin: String,
+    /// The optional canonical ROM root: games organised into canonical
+    /// platform directories beneath it. `None` when the user has not
+    /// configured one; configuring it never moves anything by itself.
+    pub master_rom_root: Option<PathBuf>,
 }
 
 impl Config {
@@ -1636,6 +1640,7 @@ struct ConfigFields {
     source_folders: Option<Vec<String>>,
     mount_root: Option<PathBuf>,
     ratarmount_bin: Option<String>,
+    master_rom_root: Option<PathBuf>,
     /// Populated only when the config uses the newer `[[source]]` block
     /// format (see `parse_config_fields`) - empty for every legacy
     /// `source_folders = [...]`/`sources = [...]` config, which is the
@@ -1712,6 +1717,7 @@ pub fn parse_config(contents: &str) -> Result<Config> {
         ratarmount_bin: fields
             .ratarmount_bin
             .unwrap_or_else(|| "ratarmount".to_string()),
+        master_rom_root: fields.master_rom_root,
     })
 }
 
@@ -1787,6 +1793,9 @@ fn parse_config_fields(contents: &str) -> Result<ConfigFields> {
             }
             "ratarmount_bin" | "ratarmount" => {
                 fields.ratarmount_bin = Some(parse_string(value.trim(), line_number)?);
+            }
+            "master_rom_root" => {
+                fields.master_rom_root = Some(PathBuf::from(parse_string(value.trim(), line_number)?));
             }
             _ => {}
         }
@@ -1866,7 +1875,16 @@ pub fn save_source_folder_configs_default(
     mount_root: &Path,
     ratarmount_bin: &str,
 ) -> Result<()> {
-    save_source_folder_configs_to(default_config_path()?, sources, mount_root, ratarmount_bin)
+    let master_rom_root = Config::load_default()
+        .ok()
+        .and_then(|config| config.master_rom_root);
+    save_source_folder_configs_to(
+        default_config_path()?,
+        sources,
+        mount_root,
+        ratarmount_bin,
+        master_rom_root.as_deref(),
+    )
 }
 
 pub fn save_source_folder_configs_to(
@@ -1874,6 +1892,7 @@ pub fn save_source_folder_configs_to(
     sources: &[SourceFolderConfig],
     mount_root: &Path,
     ratarmount_bin: &str,
+    master_rom_root: Option<&Path>,
 ) -> Result<()> {
     if let Some(source) = sources.iter().find(|source| source.path.to_str().is_none()) {
         return Err(ArchiveFsError::Config(format!(
@@ -1881,8 +1900,77 @@ pub fn save_source_folder_configs_to(
             source.path.display()
         )));
     }
-    let contents = render_source_folder_configs(sources, mount_root, ratarmount_bin);
+    let contents = render_source_folder_configs(sources, mount_root, ratarmount_bin, master_rom_root);
     atomic_write_text(path.as_ref(), &contents)
+}
+
+/// Sets the canonical master ROM root that organised games are moved into.
+///
+/// This only configures the root - no action occurs merely because it is
+/// set; the user must plan and explicitly approve an organisation first.
+/// The path must be absolute and must not be a filesystem root. Returns the
+/// previously configured root, if any.
+pub fn set_master_rom_root_default(path: &Path) -> Result<Option<PathBuf>> {
+    set_master_rom_root_to(&default_config_path()?, path)
+}
+
+/// Sets the master ROM root at an explicit config path (tests).
+pub fn set_master_rom_root_to(config_path: &Path, path: &Path) -> Result<Option<PathBuf>> {
+    validate_master_rom_root(path)?;
+    let sources = load_source_folder_configs_from(config_path)?;
+    let config = Config::load_from(config_path).ok();
+    let mount_root = config
+        .as_ref()
+        .map(|config| config.mount_root.clone())
+        .unwrap_or_default();
+    let ratarmount_bin = config
+        .as_ref()
+        .map(|config| config.ratarmount_bin.clone())
+        .unwrap_or_else(|| "ratarmount".to_string());
+    let previous = config.and_then(|config| config.master_rom_root);
+    save_source_folder_configs_to(config_path, &sources, &mount_root, &ratarmount_bin, Some(path))?;
+    Ok(previous)
+}
+
+/// Clears the configured master ROM root (returns the removed value, if any).
+pub fn clear_master_rom_root_default() -> Result<Option<PathBuf>> {
+    clear_master_rom_root_to(&default_config_path()?)
+}
+
+/// Clears the master ROM root at an explicit config path (tests).
+pub fn clear_master_rom_root_to(config_path: &Path) -> Result<Option<PathBuf>> {
+    let sources = load_source_folder_configs_from(config_path)?;
+    let config = Config::load_from(config_path).ok();
+    let mount_root = config
+        .as_ref()
+        .map(|config| config.mount_root.clone())
+        .unwrap_or_default();
+    let ratarmount_bin = config
+        .as_ref()
+        .map(|config| config.ratarmount_bin.clone())
+        .unwrap_or_else(|| "ratarmount".to_string());
+    let previous = config.and_then(|config| config.master_rom_root);
+    save_source_folder_configs_to(config_path, &sources, &mount_root, &ratarmount_bin, None)?;
+    Ok(previous)
+}
+
+fn validate_master_rom_root(path: &Path) -> Result<()> {
+    if !path.is_absolute() {
+        return Err(ArchiveFsError::Config(
+            "the master ROM root must be an absolute path".to_string(),
+        ));
+    }
+    if path.parent().is_none() {
+        return Err(ArchiveFsError::Config(
+            "the master ROM root cannot be a filesystem root".to_string(),
+        ));
+    }
+    if path.iter().any(|component| component == "..") {
+        return Err(ArchiveFsError::Config(
+            "the master ROM root must not contain '..'".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Renders the config in the current, `[[source]]`-block format - see
@@ -1906,6 +1994,7 @@ fn render_source_folder_configs(
     sources: &[SourceFolderConfig],
     mount_root: &Path,
     ratarmount_bin: &str,
+    master_rom_root: Option<&Path>,
 ) -> String {
     let mut out = String::from("# ArchiveFS configuration\n\n");
     out.push_str(&format!(
@@ -1916,6 +2005,12 @@ fn render_source_folder_configs(
         "ratarmount_bin = {}\n",
         quote_config_string(ratarmount_bin)
     ));
+    if let Some(master_rom_root) = master_rom_root {
+        out.push_str(&format!(
+            "master_rom_root = {}\n",
+            quote_config_string(&master_rom_root.display().to_string())
+        ));
+    }
     for source in sources {
         out.push('\n');
         out.push_str("[[source]]\n");
@@ -2478,6 +2573,7 @@ pub fn add_source_folder_at(
         &sources,
         &config.mount_root,
         &config.ratarmount_bin,
+        config.master_rom_root.as_deref(),
     )?;
 
     let all_paths: Vec<PathBuf> = sources.iter().map(|source| source.path.clone()).collect();
@@ -2536,6 +2632,7 @@ pub fn set_source_folder_enabled_at(
         &sources,
         &config.mount_root,
         &config.ratarmount_bin,
+        config.master_rom_root.as_deref(),
     )?;
 
     let all_paths: Vec<PathBuf> = sources.iter().map(|source| source.path.clone()).collect();
@@ -2627,6 +2724,7 @@ pub fn remove_source_folder_at(
         &sources,
         &config.mount_root,
         &config.ratarmount_bin,
+        config.master_rom_root.as_deref(),
     )?;
 
     let mut database = Database::open_or_create(database_path)?;
@@ -7248,6 +7346,7 @@ mod tests {
             source_folders: vec![root.clone()],
             mount_root: root.join("mount"),
             ratarmount_bin: "ratarmount".into(),
+            master_rom_root: None,
         };
         let discovery = ArchiveScanner::new(&config)
             .scan_archives_with_summary()
@@ -7318,6 +7417,7 @@ mod tests {
             source_folders: vec![root.clone()],
             mount_root: root.join("mount"),
             ratarmount_bin: "ratarmount".into(),
+            master_rom_root: None,
         };
 
         let discovery = ArchiveScanner::new(&config)
@@ -7402,6 +7502,7 @@ mod tests {
             source_folders: vec![root.clone()],
             mount_root: root.join("mount"),
             ratarmount_bin: "ratarmount".into(),
+            master_rom_root: None,
         };
         let archives = ArchiveScanner::new(&config).scan_archives().unwrap();
         assert_eq!(archives[0].path, path);
@@ -7648,6 +7749,7 @@ mod tests {
             source_folders: vec![root.join("roms")],
             mount_root: mount_root.clone(),
             ratarmount_bin: "ratarmount".to_string(),
+            master_rom_root: None,
         };
 
         assert!(validate_mount_target_parent(&config, &mount_root).is_err());
@@ -7670,6 +7772,7 @@ mod tests {
             source_folders: vec![root.join("roms")],
             mount_root: mount_root.clone(),
             ratarmount_bin: "ratarmount".to_string(),
+            master_rom_root: None,
         };
 
         assert!(validate_mount_target_parent(&config, &mount_root.join("escape/Game")).is_err());
@@ -7703,6 +7806,7 @@ mod tests {
             source_folders: vec![root.clone()],
             mount_root,
             ratarmount_bin: "ratarmount".to_string(),
+            master_rom_root: None,
         };
 
         let validations = validate_mount_batch_targets(
@@ -7752,6 +7856,7 @@ mod tests {
             source_folders: vec![root],
             mount_root,
             ratarmount_bin: "ratarmount".to_string(),
+            master_rom_root: None,
         };
         let active_mounts = HashSet::from([real_parent.join("Game")]);
 
@@ -7797,6 +7902,7 @@ mod tests {
             source_folders: vec![root],
             mount_root,
             ratarmount_bin: "ratarmount".to_string(),
+            master_rom_root: None,
         };
         let backend = RecordingBackend::default();
         let active_mounts = HashSet::from([mount_path]);
@@ -7826,6 +7932,7 @@ mod tests {
             source_folders: vec![root],
             mount_root,
             ratarmount_bin: "ratarmount".to_string(),
+            master_rom_root: None,
         };
         let backend = RecordingBackend::default();
 
@@ -7868,6 +7975,7 @@ mod tests {
             source_folders: vec![root.clone()],
             mount_root: mount_root.clone(),
             ratarmount_bin: "ratarmount".to_string(),
+            master_rom_root: None,
         };
         let backend = RecordingBackend::default();
         for mount_path in [mount_root.clone(), root.join("outside/Game")] {
@@ -7898,6 +8006,7 @@ mod tests {
             source_folders: vec![root.join("roms")],
             mount_root: root.join("mounts"),
             ratarmount_bin: "ratarmount".to_string(),
+            master_rom_root: None,
         };
         let plan = ArchiveScanner::new(&config)
             .mount_plans()
@@ -7927,6 +8036,7 @@ mod tests {
             source_folders: vec![root.clone()],
             mount_root,
             ratarmount_bin: "ratarmount".to_string(),
+            master_rom_root: None,
         };
         let plan = MountPlan::new(
             Archive::from_path(root.join("Game.zip")).unwrap(),
@@ -7957,6 +8067,7 @@ mod tests {
             source_folders: vec![root.join("roms")],
             mount_root: root.join("mounts"),
             ratarmount_bin: "ratarmount".to_string(),
+            master_rom_root: None,
         };
         let backend = RecordingBackend::default();
         let plan = MountPlan::new(
@@ -8008,6 +8119,7 @@ mod tests {
             source_folders: vec![root.join("roms")],
             mount_root: root.join("mounts"),
             ratarmount_bin: "ratarmount".to_string(),
+            master_rom_root: None,
         };
         let plan = MountPlan::new(
             Archive::from_path(archive_path).unwrap(),
@@ -8055,6 +8167,7 @@ mod tests {
             source_folders: vec![root],
             mount_root,
             ratarmount_bin: "ratarmount".to_string(),
+            master_rom_root: None,
         };
 
         let validations = validate_mount_batch_targets(&config, &plans, &archives, &HashSet::new());
@@ -8090,6 +8203,7 @@ mod tests {
             source_folders: vec![source_root],
             mount_root: root.join("mounts"),
             ratarmount_bin: "ratarmount".to_string(),
+            master_rom_root: None,
         };
         (config, first, second)
     }
@@ -8177,6 +8291,7 @@ mod tests {
             source_folders: vec![source_root],
             mount_root: mount_root.clone(),
             ratarmount_bin: "ratarmount".to_string(),
+            master_rom_root: None,
         };
         let expected_mount_path = mount_root.join("Xbox360").join("007_Legends");
         fs::create_dir_all(expected_mount_path.parent().unwrap()).unwrap();
@@ -8198,6 +8313,7 @@ mod tests {
             source_folders: vec![source_root],
             mount_root: root.join("mounts"),
             ratarmount_bin: "ratarmount".to_string(),
+            master_rom_root: None,
         };
         let backend = RecordingBackend::default();
         let error = unmount_one_archive_with_backend(&config, "missing", &backend).unwrap_err();
@@ -8219,6 +8335,7 @@ mod tests {
             source_folders: vec![source_root],
             mount_root: root.join("mounts"),
             ratarmount_bin: "ratarmount".to_string(),
+            master_rom_root: None,
         };
         let backend = RecordingBackend::default();
 
@@ -8238,6 +8355,7 @@ mod tests {
             source_folders: vec![root.join("roms")],
             mount_root: root.join("mounts"),
             ratarmount_bin: "ratarmount".to_string(),
+            master_rom_root: None,
         };
         let mount_path = ArchiveScanner::new(&config)
             .mount_plans()
@@ -8256,6 +8374,7 @@ mod tests {
             source_folders: vec![root.join("roms")],
             mount_root: root.clone(),
             ratarmount_bin: "ratarmount".to_string(),
+            master_rom_root: None,
         };
 
         assert!(
@@ -8278,6 +8397,7 @@ mod tests {
             source_folders: vec![root.join("roms")],
             mount_root,
             ratarmount_bin: "ratarmount".to_string(),
+            master_rom_root: None,
         };
 
         assert!(!mount_path.exists());
@@ -8300,6 +8420,7 @@ mod tests {
             source_folders: vec![root.join("roms")],
             mount_root,
             ratarmount_bin: "ratarmount".to_string(),
+            master_rom_root: None,
         };
 
         let error =
@@ -9415,6 +9536,7 @@ mod tests {
             source_folders: vec![root.join("roms")],
             mount_root: root.join("mounts"),
             ratarmount_bin: "ratarmount".to_string(),
+            master_rom_root: None,
         };
         let plan = ArchiveScanner::new(&config)
             .mount_plans()
@@ -9548,6 +9670,7 @@ mod tests {
             source_folders: vec![root.join("roms")],
             mount_root: root.clone(),
             ratarmount_bin: "ratarmount".to_string(),
+            master_rom_root: None,
         };
 
         assert!(cleanup_selected_mount_dir(&config, &mount_path).unwrap());
@@ -9562,6 +9685,7 @@ mod tests {
             source_folders: vec![root.join("roms")],
             mount_root: root.clone(),
             ratarmount_bin: "ratarmount".to_string(),
+            master_rom_root: None,
         };
 
         assert!(!cleanup_selected_mount_dir(&config, &root).unwrap());
@@ -9578,6 +9702,7 @@ mod tests {
             source_folders: vec![root.join("roms")],
             mount_root: root,
             ratarmount_bin: "ratarmount".to_string(),
+            master_rom_root: None,
         };
 
         assert!(!cleanup_selected_mount_dir(&config, &mount_path).unwrap());
@@ -9593,6 +9718,7 @@ mod tests {
             source_folders: vec![root.join("roms")],
             mount_root: root,
             ratarmount_bin: "ratarmount".to_string(),
+            master_rom_root: None,
         };
 
         assert!(!cleanup_selected_mount_dir(&config, &outside).unwrap());
@@ -9609,6 +9735,7 @@ mod tests {
             source_folders: vec![root.join("roms")],
             mount_root: root.clone(),
             ratarmount_bin: "ratarmount".to_string(),
+            master_rom_root: None,
         };
 
         let removed = cleanup_selected_mount_tree(&config, &mount_path).unwrap();
@@ -9626,6 +9753,7 @@ mod tests {
             source_folders: vec![root.join("roms")],
             mount_root: root.clone(),
             ratarmount_bin: "ratarmount".to_string(),
+            master_rom_root: None,
         };
 
         assert!(
@@ -9645,6 +9773,7 @@ mod tests {
             source_folders: vec![root.join("roms")],
             mount_root: root,
             ratarmount_bin: "ratarmount".to_string(),
+            master_rom_root: None,
         };
 
         assert!(
@@ -9670,6 +9799,7 @@ mod tests {
             source_folders: vec![root.join("roms")],
             mount_root: root,
             ratarmount_bin: "ratarmount".to_string(),
+            master_rom_root: None,
         };
 
         assert!(
@@ -9690,6 +9820,7 @@ mod tests {
             source_folders: vec![root.join("roms")],
             mount_root: root.clone(),
             ratarmount_bin: "ratarmount".to_string(),
+            master_rom_root: None,
         };
 
         assert!(
@@ -9713,6 +9844,7 @@ mod tests {
             source_folders: vec![root.join("roms")],
             mount_root: root.clone(),
             ratarmount_bin: "ratarmount".to_string(),
+            master_rom_root: None,
         };
 
         let removed = cleanup_selected_mount_tree(&config, &mount_path).unwrap();
@@ -10782,6 +10914,7 @@ mod tests {
             source_folders: vec![root.to_path_buf()],
             mount_root: root.join("mounts"),
             ratarmount_bin: "ratarmount".to_string(),
+            master_rom_root: None,
         }
     }
 
@@ -10915,6 +11048,7 @@ mod tests {
                 source_folders: vec![source],
                 mount_root: PathBuf::from("/tmp/archivefs-test-mounts"),
                 ratarmount_bin: "ratarmount".to_string(),
+                master_rom_root: None,
             };
             let error = ArchiveScanner::new(&config).scan_archives().unwrap_err();
             assert!(error.to_string().contains("absolute non-root"));
@@ -11484,6 +11618,76 @@ mod tests {
         assert!(config.source_folders.is_empty());
         assert_eq!(config.mount_root, PathBuf::from("/mnt/archivefs"));
         assert_eq!(config.ratarmount_bin, "ratarmount");
+        assert_eq!(config.master_rom_root, None);
+    }
+
+    #[test]
+    fn master_rom_root_round_trips_and_survives_source_saves() {
+        let root = test_root("master_rom_root_round_trip");
+        let config_path = root.join("config.toml");
+        let mount_root = root.join("mounts");
+        fs::write(
+            &config_path,
+            format!(
+                "mount_root = {}\n",
+                quote_config_string(&mount_root.display().to_string())
+            ),
+        )
+        .unwrap();
+
+        let roms = root.join("roms");
+        assert_eq!(set_master_rom_root_to(&config_path, &roms).unwrap(), None);
+        assert_eq!(
+            Config::load_from(&config_path).unwrap().master_rom_root,
+            Some(roms.clone())
+        );
+
+        // A source-management save (the only other writer of config.toml)
+        // must preserve the configured master root, not drop it.
+        let sources = load_source_folder_configs_from(&config_path).unwrap();
+        let config = Config::load_from(&config_path).unwrap();
+        save_source_folder_configs_to(
+            &config_path,
+            &sources,
+            &config.mount_root,
+            &config.ratarmount_bin,
+            config.master_rom_root.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(
+            Config::load_from(&config_path).unwrap().master_rom_root,
+            Some(roms.clone())
+        );
+
+        assert_eq!(
+            clear_master_rom_root_to(&config_path).unwrap(),
+            Some(roms.clone())
+        );
+        assert_eq!(
+            Config::load_from(&config_path).unwrap().master_rom_root,
+            None
+        );
+    }
+
+    #[test]
+    fn a_relative_or_root_master_rom_root_is_rejected() {
+        let root = test_root("master_rom_root_reject");
+        let config_path = root.join("config.toml");
+        let mount_root = root.join("mounts");
+        fs::write(
+            &config_path,
+            format!(
+                "mount_root = {}\n",
+                quote_config_string(&mount_root.display().to_string())
+            ),
+        )
+        .unwrap();
+        assert!(set_master_rom_root_to(&config_path, Path::new("relative/roms")).is_err());
+        assert!(set_master_rom_root_to(&config_path, Path::new("/")).is_err());
+        assert!(
+            Config::load_from(&config_path).unwrap().master_rom_root.is_none(),
+            "a rejected value must not be persisted"
+        );
     }
 
     #[test]
@@ -11537,7 +11741,7 @@ mod tests {
         let config = parse_config(&contents).unwrap();
         assert_eq!(config.source_folders, vec![PathBuf::from("/data/archives")]);
 
-        let rendered = render_source_folder_configs(&sources, &mount_root, "ratarmount");
+        let rendered = render_source_folder_configs(&sources, &mount_root, "ratarmount", None);
         let round_tripped = parse_source_folder_configs(&rendered).unwrap();
         assert_eq!(
             round_tripped, sources,
@@ -11568,7 +11772,7 @@ mod tests {
             created_at: Some("2026-01-01T00:00:00Z".to_string()),
         }];
 
-        save_source_folder_configs_to(&config_path, &sources, &mount_root, "ratarmount").unwrap();
+        save_source_folder_configs_to(&config_path, &sources, &mount_root, "ratarmount", None).unwrap();
 
         let loaded = load_source_folder_configs_from(&config_path).unwrap();
         assert_eq!(loaded, sources);
@@ -11611,6 +11815,7 @@ mod tests {
             &sources,
             &config.mount_root,
             &config.ratarmount_bin,
+            config.master_rom_root.as_deref(),
         )
         .unwrap();
 
@@ -11728,6 +11933,7 @@ mod tests {
             &[source],
             &root.join("mounts"),
             "ratarmount",
+            None,
         )
         .unwrap_err();
 
