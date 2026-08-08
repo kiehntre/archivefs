@@ -99,18 +99,13 @@ impl PreflightFailure {
 /// additionally permits a move into a different directory **on the same
 /// filesystem** - the master-ROM-root case - and rejects a genuine
 /// cross-filesystem move outright.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DirectoryPolicy {
     /// The destination must be in the source's exact directory.
+    #[default]
     SameDirectory,
     /// The destination may be elsewhere, but must be on the same filesystem.
     SameFilesystem,
-}
-
-impl Default for DirectoryPolicy {
-    fn default() -> Self {
-        Self::SameDirectory
-    }
 }
 
 /// Options that shape a preflight pass.
@@ -440,6 +435,39 @@ mod tests {
                 .iter()
                 .any(|f| f == &PreflightFailure::SourceIsSymlink)
         );
+    }
+
+    #[test]
+    fn same_filesystem_policy_refuses_a_different_device_destination() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let dir = tempfile::tempdir().unwrap();
+            let source = dir.path().join("a.bin");
+            std::fs::write(&source, b"data").unwrap();
+            let proc = std::path::Path::new("/proc");
+            let dir_dev = std::fs::metadata(dir.path()).map(|m| m.dev()).ok();
+            let proc_dev = std::fs::metadata(proc).map(|m| m.dev()).ok();
+            if dir_dev.is_none() || proc_dev.is_none() || dir_dev == proc_dev {
+                // No second filesystem observable in this environment; the
+                // refusal path is covered by the organiser integration test.
+                return;
+            }
+            let destination = proc.join("archivefs-crossfs-test").join("a.bin");
+            let entry = entry(&source, &destination);
+            let approved = BTreeSet::from([source.to_string_lossy().into_owned()]);
+            let trusted = TrustedRoots::from_paths([dir.path()]);
+            let destinations = BTreeSet::new();
+            let mut opts = options(&approved, &trusted, &destinations, 1);
+            opts.directory_policy = DirectoryPolicy::SameFilesystem;
+            let failures = run_preflight(&entry, &opts).unwrap_err();
+            assert!(
+                failures
+                    .iter()
+                    .any(|f| f == &PreflightFailure::DestinationOnDifferentFilesystem),
+                "{failures:?}"
+            );
+        }
     }
 
     #[test]

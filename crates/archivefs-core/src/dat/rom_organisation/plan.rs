@@ -20,9 +20,7 @@ use crate::dat::rename_apply::preflight::is_safe_basename;
 use crate::dat::rename_plan::derive_proposed_basename;
 use crate::platform::identity::PlatformIdentityResolution;
 
-use super::model::{
-    OrganisationMode, OrganisationPlan, OrganisationPlanEntry, OrganisationStatus,
-};
+use super::model::{OrganisationMode, OrganisationPlan, OrganisationPlanEntry, OrganisationStatus};
 
 /// One source ROM and its resolved platform identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,7 +79,10 @@ pub fn build_organisation_plan(request: &OrganisationPlanRequest<'_>) -> Organis
 }
 
 /// Plans one candidate into an entry, classifying the status.
-fn plan_entry(request: &OrganisationPlanRequest<'_>, candidate: &OrganisationCandidate) -> OrganisationPlanEntry {
+fn plan_entry(
+    request: &OrganisationPlanRequest<'_>,
+    candidate: &OrganisationCandidate,
+) -> OrganisationPlanEntry {
     let source_basename = candidate
         .source_path
         .file_name()
@@ -138,9 +139,7 @@ fn plan_entry(request: &OrganisationPlanRequest<'_>, candidate: &OrganisationCan
         }
         OrganisationMode::OrganiseSymlinkOnly => {
             if kind != ObjectKind::Symlink && kind != ObjectKind::BrokenSymlink {
-                return blocked(
-                    "this mode organises symlinks only; the source is not a symlink",
-                );
+                return blocked("this mode organises symlinks only; the source is not a symlink");
             }
         }
         OrganisationMode::RenameInPlace => {
@@ -174,7 +173,11 @@ fn plan_entry(request: &OrganisationPlanRequest<'_>, candidate: &OrganisationCan
                 .map(|item| item.source.label())
                 .max()
                 .unwrap_or("Inference");
-            (platform.clone(), display_name.clone(), source_label.to_string())
+            (
+                platform.clone(),
+                display_name.clone(),
+                source_label.to_string(),
+            )
         }
     };
     let platform = match crate::platform::platform_by_id(&platform) {
@@ -214,12 +217,7 @@ fn plan_entry(request: &OrganisationPlanRequest<'_>, candidate: &OrganisationCan
         crate::dat::rename_plan::DeriveOutcome::Ok(derived) => derived.proposed_basename,
         crate::dat::rename_plan::DeriveOutcome::Blocked(reason) => return blocked(&reason),
         crate::dat::rename_plan::DeriveOutcome::Unsupported(reason) => {
-            return unsupported(
-                &reason,
-                Some(platform),
-                &display_name,
-                &platform_source,
-            );
+            return unsupported(&reason, Some(platform), &display_name, &platform_source);
         }
     };
     if !is_safe_basename(&proposed_basename) {
@@ -246,8 +244,9 @@ fn plan_entry(request: &OrganisationPlanRequest<'_>, candidate: &OrganisationCan
     {
         // Same name: already organised when the source already sits in the
         // canonical platform folder.
-        slug.as_deref()
-            .is_some_and(|slug| candidate.source_path.parent() == Some(request.master_root.join(slug).as_path()))
+        slug.as_deref().is_some_and(|slug| {
+            candidate.source_path.parent() == Some(request.master_root.join(slug).as_path())
+        })
     } else {
         false
     };
@@ -313,18 +312,14 @@ fn detect_collisions(master_root: &Path, entries: &mut [OrganisationPlanEntry]) 
             }
             let right_destination = right.destination_path.to_string_lossy().into_owned();
             if left_destination == right_destination {
-                mark_conflict(
-                    entries,
-                    left_index,
-                    "two plans target the same destination",
-                );
+                mark_conflict(entries, left_index, "two plans target the same destination");
                 mark_conflict(
                     entries,
                     right_index,
                     "two plans target the same destination",
                 );
             }
-            if left_destination.to_ascii_lowercase() == right_destination.to_ascii_lowercase()
+            if left_destination.eq_ignore_ascii_case(&right_destination)
                 && left_destination != right_destination
             {
                 mark_conflict(entries, left_index, "two plans differ only by case");
@@ -360,11 +355,10 @@ fn detect_collisions(master_root: &Path, entries: &mut [OrganisationPlanEntry]) 
         if file_name.is_empty() {
             continue;
         }
-        let proposed_lower = file_name.to_ascii_lowercase();
         if let Ok(dir_entries) = std::fs::read_dir(parent) {
             let collision = dir_entries.flatten().any(|dir_entry| {
                 let name = dir_entry.file_name().to_string_lossy().into_owned();
-                name.to_ascii_lowercase() == proposed_lower && name != file_name
+                name.eq_ignore_ascii_case(&file_name) && name != file_name
             });
             if collision {
                 mark_conflict(

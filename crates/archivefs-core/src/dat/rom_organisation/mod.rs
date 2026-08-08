@@ -34,9 +34,7 @@ pub mod transaction;
 #[cfg(test)]
 mod tests;
 
-pub use model::{
-    OrganisationMode, OrganisationPlan, OrganisationPlanEntry, OrganisationStatus,
-};
+pub use model::{OrganisationMode, OrganisationPlan, OrganisationPlanEntry, OrganisationStatus};
 pub use plan::{OrganisationCandidate, OrganisationPlanRequest, build_organisation_plan};
 pub use transaction::{
     OrganisationRollbackOutcome, apply_organisation_transaction, build_organisation_transaction,

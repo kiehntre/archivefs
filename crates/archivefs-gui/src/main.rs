@@ -133,6 +133,7 @@ pub(crate) mod dat_sources_page;
 pub mod game_presentation;
 pub(crate) mod gamer_artwork;
 pub(crate) mod home_page;
+pub(crate) mod rom_organisation_page;
 pub(crate) mod romm_browse;
 pub(crate) mod romm_config;
 pub(crate) mod romm_game;
@@ -2901,6 +2902,9 @@ enum MainView {
     /// Cheats & Mods, because it is configuration that outlives any one
     /// archive being worked on.
     CheatSources,
+    /// Canonical organisation: planning and (only after explicit approval)
+    /// applying moves of identified games into a configured master ROM root.
+    CanonicalOrganisation,
     /// The registered DAT catalogues: which local DAT files and folders
     /// ArchiveFS can check a library against. Its own destination for the
     /// same reason Cheat Sources is: it is configuration that outlives any
@@ -2968,6 +2972,7 @@ fn main_view_for_home_card(card: home_page::HomeCard) -> MainView {
         home_page::HomeCard::BuildLibrary | home_page::HomeCard::RomM => MainView::Sources,
         home_page::HomeCard::BrowseGames => MainView::Library,
         home_page::HomeCard::CheatsAndMods => MainView::CheatsMods,
+        home_page::HomeCard::CanonicalOrganisation => MainView::CanonicalOrganisation,
         home_page::HomeCard::CheatSources => MainView::CheatSources,
         home_page::HomeCard::DatSources => MainView::DatSources,
         home_page::HomeCard::CheckSetup => MainView::Doctor,
@@ -3211,6 +3216,7 @@ fn main_view_title(view: MainView) -> &'static str {
         MainView::Selected => "Selected",
         MainView::CheatsMods => "Cheats & Mods",
         MainView::CheatSources => "Cheat Sources",
+        MainView::CanonicalOrganisation => "Canonical organisation",
         MainView::DatSources => "DAT Sources",
         MainView::ActiveMounts => "Active Mounts",
         MainView::Doctor => "Doctor",
@@ -3235,6 +3241,7 @@ fn main_view_content_width(view: MainView) -> ui_layout::ContentWidth {
         | MainView::LibraryViews
         | MainView::HistoryLogs => ui_layout::ContentWidth::Wide,
         MainView::CheatSources
+        | MainView::CanonicalOrganisation
         | MainView::DatSources
         | MainView::Doctor
         | MainView::Settings
@@ -3566,6 +3573,7 @@ struct ArchiveFsApp {
     /// that starting the GUI never reads the preferences file for a page the
     /// user has not visited.
     cheat_sources_page: Option<cheat_sources_page::CheatSourcesPageState>,
+    rom_organisation_page: Option<rom_organisation_page::RomOrganisationPageState>,
     /// Unsubmitted Cheat Sources text and disclosure state. Held here rather
     /// than in the page state because none of it is policy - see
     /// `CheatSourcesPageUi`.
@@ -3875,6 +3883,7 @@ impl ArchiveFsApp {
             database_state: start_database_load(context.clone(), database_generation, None, false),
             database_generation,
             cheat_sources_page: None,
+            rom_organisation_page: None,
             cheat_sources_ui: cheat_sources_page::CheatSourcesPageUi::default(),
             dat_sources_page: None,
             dat_sources_ui: dat_sources_page::DatSourcesPageUi::default(),
@@ -4792,6 +4801,14 @@ impl ArchiveFsApp {
     /// at. A path that cannot even be resolved (no `HOME`) is reported in
     /// place instead of failing the whole page, since every other part of the
     /// GUI still works without it.
+    /// Draws the Canonical Organisation page, loading its state lazily.
+    fn show_rom_organisation_page(&mut self, ui: &mut egui::Ui) {
+        let page = self
+            .rom_organisation_page
+            .get_or_insert_with(rom_organisation_page::RomOrganisationPageState::load);
+        rom_organisation_page::show_rom_organisation_page(ui, page);
+    }
+
     fn show_cheat_sources_page(&mut self, ui: &mut egui::Ui) {
         if self.cheat_sources_page.is_none() {
             match archivefs_core::patch_manager::default_cheat_sources_config_path() {
@@ -13529,6 +13546,11 @@ impl ArchiveFsApp {
 
                 if self.view == MainView::CheatSources {
                     self.show_cheat_sources_page(ui);
+                    return;
+                }
+
+                if self.view == MainView::CanonicalOrganisation {
+                    self.show_rom_organisation_page(ui);
                     return;
                 }
 
@@ -51004,6 +51026,7 @@ $Instant Growth [Nayr]\n";
             // Left unloaded: these tests never open the Cheat Sources page,
             // and loading it here would read the real per-user preferences.
             cheat_sources_page: None,
+            rom_organisation_page: None,
             cheat_sources_ui: cheat_sources_page::CheatSourcesPageUi::default(),
             dat_sources_page: None,
             dat_sources_ui: dat_sources_page::DatSourcesPageUi::default(),

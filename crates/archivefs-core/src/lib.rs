@@ -1795,7 +1795,8 @@ fn parse_config_fields(contents: &str) -> Result<ConfigFields> {
                 fields.ratarmount_bin = Some(parse_string(value.trim(), line_number)?);
             }
             "master_rom_root" => {
-                fields.master_rom_root = Some(PathBuf::from(parse_string(value.trim(), line_number)?));
+                fields.master_rom_root =
+                    Some(PathBuf::from(parse_string(value.trim(), line_number)?));
             }
             _ => {}
         }
@@ -1900,7 +1901,8 @@ pub fn save_source_folder_configs_to(
             source.path.display()
         )));
     }
-    let contents = render_source_folder_configs(sources, mount_root, ratarmount_bin, master_rom_root);
+    let contents =
+        render_source_folder_configs(sources, mount_root, ratarmount_bin, master_rom_root);
     atomic_write_text(path.as_ref(), &contents)
 }
 
@@ -1928,7 +1930,13 @@ pub fn set_master_rom_root_to(config_path: &Path, path: &Path) -> Result<Option<
         .map(|config| config.ratarmount_bin.clone())
         .unwrap_or_else(|| "ratarmount".to_string());
     let previous = config.and_then(|config| config.master_rom_root);
-    save_source_folder_configs_to(config_path, &sources, &mount_root, &ratarmount_bin, Some(path))?;
+    save_source_folder_configs_to(
+        config_path,
+        &sources,
+        &mount_root,
+        &ratarmount_bin,
+        Some(path),
+    )?;
     Ok(previous)
 }
 
@@ -11685,7 +11693,10 @@ mod tests {
         assert!(set_master_rom_root_to(&config_path, Path::new("relative/roms")).is_err());
         assert!(set_master_rom_root_to(&config_path, Path::new("/")).is_err());
         assert!(
-            Config::load_from(&config_path).unwrap().master_rom_root.is_none(),
+            Config::load_from(&config_path)
+                .unwrap()
+                .master_rom_root
+                .is_none(),
             "a rejected value must not be persisted"
         );
     }
@@ -11772,7 +11783,8 @@ mod tests {
             created_at: Some("2026-01-01T00:00:00Z".to_string()),
         }];
 
-        save_source_folder_configs_to(&config_path, &sources, &mount_root, "ratarmount", None).unwrap();
+        save_source_folder_configs_to(&config_path, &sources, &mount_root, "ratarmount", None)
+            .unwrap();
 
         let loaded = load_source_folder_configs_from(&config_path).unwrap();
         assert_eq!(loaded, sources);

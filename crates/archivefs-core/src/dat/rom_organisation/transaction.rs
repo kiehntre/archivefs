@@ -95,10 +95,9 @@ pub fn build_organisation_transaction(
         if entry.mode != OrganisationMode::RenameInPlace
             && let Some(parent) = entry.destination_path.parent()
             && is_platform_directory_candidate(parent, &plan.master_root)
+            && !created_directories.contains(&parent.to_path_buf())
         {
-            if !created_directories.contains(&parent.to_path_buf()) {
-                created_directories.push(parent.to_path_buf());
-            }
+            created_directories.push(parent.to_path_buf());
         }
     }
     if entries.is_empty() {
@@ -178,10 +177,9 @@ pub fn apply_organisation_transaction(
                     Err(error) => {
                         transaction.created_directories = actually_created;
                         transaction.state = TransactionState::ApplyFailed;
-                        write_journal(journal_dir, transaction)
-                            .map_err(|journal_error| {
-                                ApplyError::Journal(journal_error.to_string())
-                            })?;
+                        write_journal(journal_dir, transaction).map_err(|journal_error| {
+                            ApplyError::Journal(journal_error.to_string())
+                        })?;
                         return Err(ApplyError::Journal(format!(
                             "could not create platform directory {}: {error}",
                             directory.display()
@@ -214,7 +212,8 @@ pub fn apply_organisation_transaction(
     // orphaned mutation. The shared executor re-preflights a moment later for
     // the race window; any directories it would then leave are recorded in
     // the journal and recoverable.
-    let destinations = crate::dat::rename_apply::preflight::batch_destinations(&transaction.entries);
+    let destinations =
+        crate::dat::rename_apply::preflight::batch_destinations(&transaction.entries);
     let preflight_options = crate::dat::rename_apply::preflight::PreflightOptions {
         plan_generation: transaction.plan_generation,
         current_generation: generation,

@@ -2268,7 +2268,7 @@ impl Database {
         Ok(summary)
     }
 
-    fn current_platform_identity_evidence(
+    pub fn current_platform_identity_evidence(
         &self,
         archive_id: i64,
         generation: u64,

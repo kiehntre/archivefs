@@ -992,7 +992,7 @@ fn crash_after_first_of_n_renames_is_recoverable() {
         state: TransactionState::Applying,
         entries: Vec::new(),
         created_directories: Vec::new(),
-            unknown: Default::default(),
+        unknown: Default::default(),
     };
     let mk = |source: &str, state: EntryState| TransactionEntry {
         source_path: PathBuf::from(source),
@@ -1014,7 +1014,7 @@ fn crash_after_first_of_n_renames_is_recoverable() {
         failure_reason: None,
         applied_at_unix: None,
         rolled_back_at_unix: None,
-            unknown: Default::default(),
+        unknown: Default::default(),
     };
     tx.entries.push(mk("/tmp/roms/a.bin", EntryState::Applied));
     tx.entries.push(mk("/tmp/roms/b.bin", EntryState::Planned));
@@ -1045,7 +1045,7 @@ fn recovery_never_auto_resumes() {
         state: TransactionState::Applying,
         entries: Vec::new(),
         created_directories: Vec::new(),
-            unknown: Default::default(),
+        unknown: Default::default(),
     };
     write_journal(&journal, &tx).unwrap();
     let (recovery, _) = find_recovery_transactions(&journal);

@@ -86,6 +86,7 @@ mod platform_artwork;
 mod retroarch_cheat_cache;
 mod retroarch_cheat_setup;
 mod retroarch_cheat_sources;
+mod rom_organise;
 mod romm_identity;
 
 static LOGGER: StderrLogger = StderrLogger;
@@ -396,6 +397,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "cheat-source" => {
             let input_args = args.collect::<Vec<_>>();
             cheat_source::run(input_args)?;
+        }
+        "rom-organise" => {
+            rom_organise::run(args.collect())?;
         }
         "pcsx2-patch-preview" => {
             let mut input_args = args.collect::<Vec<_>>();
