@@ -1754,20 +1754,37 @@ impl DatSourcesPageState {
         if finished {
             self.apply_job = None;
         }
-        // Recovery list may have changed as a result.
-        self.refresh_recovery();
         changed
     }
 
-    /// Re-reads interrupted transactions from the journal directory.
+    /// Re-reads interrupted transactions from the journal directory, reconciling
+    /// any in-flight (`Applying`/`RollingBack`) entries against the filesystem
+    /// so the counts and rollback eligibility reflect what actually happened.
     fn refresh_recovery(&mut self) {
-        let (recovery, _) =
+        let (mut recovery, _) =
             archivefs_core::dat::rename_apply::find_recovery_transactions(&self.transaction_dir);
+        for transaction in &mut recovery {
+            if transaction.entries.iter().any(|entry| {
+                matches!(
+                    entry.state,
+                    archivefs_core::dat::rename_apply::EntryState::Applying
+                        | archivefs_core::dat::rename_apply::EntryState::RollingBack
+                )
+            }) {
+                let _ = archivefs_core::dat::rename_apply::reconcile_recovery(
+                    transaction,
+                    &self.transaction_dir,
+                );
+            }
+        }
         self.recovery_transactions = recovery;
     }
 
     pub(crate) fn poll(&mut self) -> bool {
         let mut changed = self.poll_apply();
+        // Surface (and reconcile) interrupted transactions on every frame so the
+        // recovery banner appears as soon as the page is entered.
+        self.refresh_recovery();
         let Some(job) = self.job.as_mut() else {
             return changed;
         };

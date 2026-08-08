@@ -39,6 +39,7 @@ pub mod journal;
 pub mod model;
 pub mod noclobber;
 pub mod preflight;
+pub mod reconcile;
 pub mod rollback;
 
 pub use executor::{
@@ -57,6 +58,7 @@ pub use model::{
 };
 pub use noclobber::{NoClobberError, rename_noreplace};
 pub use preflight::{PreflightFailure, PreflightOptions, batch_destinations, run_preflight};
+pub use reconcile::{RecoveryIssue, RecoveryIssueKind, reconcile_recovery};
 pub use rollback::{RollbackOutcome, rollback_transaction};
 
 #[cfg(test)]

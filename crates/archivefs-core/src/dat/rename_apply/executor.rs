@@ -269,8 +269,11 @@ pub fn apply_transaction(execution: &mut ApplyExecution<'_>) -> Result<ApplyOutc
     write_journal(&execution.journal_dir, transaction)
         .map_err(|error| ApplyError::Journal(error.to_string()))?;
 
-    // Apply one at a time. Each entry is processed on a clone so the journal
-    // can be written without overlapping mutable and immutable borrows.
+    // Apply one at a time. For each entry the journal is durably checkpointed
+    // to `Applying` BEFORE the rename syscall, so a crash at any point leaves
+    // a recoverable record (the file is either at the source with the entry
+    // Planned/Applying, or at the destination with the entry Applying, and
+    // recovery reconciles either case).
     for index in 0..transaction.entries.len() {
         if cancelled(execution.cancel) {
             transaction.state = TransactionState::ApplyFailed;
@@ -285,12 +288,43 @@ pub fn apply_transaction(execution: &mut ApplyExecution<'_>) -> Result<ApplyOutc
         if transaction.entries[index].state == EntryState::Skipped {
             continue;
         }
-        let mut entry = transaction.entries[index].clone();
-        let outcome = apply_one_entry(&mut entry, &preflight_options);
-        transaction.entries[index] = entry;
-        match outcome {
-            ApplyOne::Applied => {}
-            ApplyOne::Stopped => {
+
+        // Preflight (before entering the mutation window).
+        if let Err(failures) = run_preflight(&transaction.entries[index], &preflight_options) {
+            transaction.entries[index].preflight_passed = false;
+            transaction.entries[index].preflight_failures =
+                failures.iter().map(|f| f.reason()).collect();
+            transaction.entries[index].state = EntryState::ApplyFailed;
+            transaction.entries[index].failure_reason = Some(
+                failures
+                    .iter()
+                    .map(|f| f.reason())
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            );
+            transaction.state = TransactionState::ApplyFailed;
+            write_journal(&execution.journal_dir, transaction)
+                .map_err(|error| ApplyError::Journal(error.to_string()))?;
+            break;
+        }
+        transaction.entries[index].preflight_passed = true;
+
+        // Durable `Applying` checkpoint BEFORE the rename syscall. If this
+        // write fails, no mutation may happen.
+        transaction.entries[index].state = EntryState::Applying;
+        write_journal(&execution.journal_dir, transaction)
+            .map_err(|error| ApplyError::Journal(error.to_string()))?;
+
+        // Mutation window: the rename syscall plus the filesystem
+        // confirmation. Nothing else runs while the file is in flight.
+        match apply_mutation(&transaction.entries[index]) {
+            Ok(()) => {
+                transaction.entries[index].state = EntryState::Applied;
+                transaction.entries[index].applied_at_unix = Some(crate::dat::sources::now_unix());
+            }
+            Err((state, reason)) => {
+                transaction.entries[index].state = state;
+                transaction.entries[index].failure_reason = Some(reason);
                 transaction.state = TransactionState::ApplyFailed;
                 write_journal(&execution.journal_dir, transaction)
                     .map_err(|error| ApplyError::Journal(error.to_string()))?;
@@ -314,62 +348,25 @@ pub fn apply_transaction(execution: &mut ApplyExecution<'_>) -> Result<ApplyOutc
     })
 }
 
-/// The result of applying one entry.
-enum ApplyOne {
-    /// The entry was renamed and confirmed by the filesystem.
-    Applied,
-    /// The entry failed (or the batch must stop); its state and failure
-    /// reason are already recorded on the entry.
-    Stopped,
-}
-
-/// Applies one entry: a fresh preflight immediately before the rename, the
-/// no-clobber rename itself, and a filesystem confirmation before the entry is
-/// marked Applied. On any failure the entry is marked ApplyFailed with an
-/// exact reason and the batch is told to stop.
-fn apply_one_entry(
-    entry: &mut TransactionEntry,
-    preflight_options: &PreflightOptions<'_>,
-) -> ApplyOne {
-    if let Err(failures) = run_preflight(entry, preflight_options) {
-        entry.state = EntryState::ApplyFailed;
-        entry.failure_reason = Some(
-            failures
-                .iter()
-                .map(|f| f.reason())
-                .collect::<Vec<_>>()
-                .join("; "),
-        );
-        return ApplyOne::Stopped;
-    }
-    entry.state = EntryState::Applying;
+/// The mutation window: the no-clobber rename and the filesystem confirmation.
+///
+/// Called only after the entry's `Applying` state has been durably persisted.
+/// On success returns `Ok`; on any failure returns the entry state to record
+/// (`ApplyFailed`) and the exact reason.
+fn apply_mutation(entry: &TransactionEntry) -> Result<(), (EntryState, String)> {
     match rename_noreplace(&entry.source_path, &entry.destination_path) {
         Ok(()) => {
             // The filesystem must confirm the rename before Applied.
             match confirm_rename(entry) {
-                Ok(()) => {
-                    entry.state = EntryState::Applied;
-                    entry.applied_at_unix = Some(crate::dat::sources::now_unix());
-                    ApplyOne::Applied
-                }
-                Err(reason) => {
-                    entry.state = EntryState::ApplyFailed;
-                    entry.failure_reason = Some(reason);
-                    ApplyOne::Stopped
-                }
+                Ok(()) => Ok(()),
+                Err(reason) => Err((EntryState::ApplyFailed, reason)),
             }
         }
-        Err(NoClobberError::DestinationExists) => {
-            entry.state = EntryState::ApplyFailed;
-            entry.failure_reason =
-                Some("the destination appeared during apply and was never overwritten".to_string());
-            ApplyOne::Stopped
-        }
-        Err(error) => {
-            entry.state = EntryState::ApplyFailed;
-            entry.failure_reason = Some(error.to_string());
-            ApplyOne::Stopped
-        }
+        Err(NoClobberError::DestinationExists) => Err((
+            EntryState::ApplyFailed,
+            "the destination appeared during apply and was never overwritten".to_string(),
+        )),
+        Err(error) => Err((EntryState::ApplyFailed, error.to_string())),
     }
 }
 

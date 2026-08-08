@@ -1626,3 +1626,329 @@ fn stress_crash_recovery_fixtures_are_detected() {
         assert_eq!(recovery[0].applied_count(), 1);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Crash-window regression tests
+// ---------------------------------------------------------------------------
+
+use crate::dat::rename_apply::{EntryState as ApplyEntryState, reconcile_recovery};
+
+#[test]
+fn crash_before_the_rename_syscall_is_reconciled_as_not_applied() {
+    // The durable journal says Applying, but the process died before the
+    // syscall: source intact, destination absent. Recovery must conclude the
+    // rename did not happen and mutate nothing.
+    let dir = tempfile::tempdir().unwrap();
+    let roms = dir.path().join("roms");
+    std::fs::create_dir_all(&roms).unwrap();
+    let source = write(&roms, "a.bin");
+    let journal = dir.path().join("journal");
+    std::fs::create_dir_all(&journal).unwrap();
+    let before = snapshot(&roms);
+    let plan = plan(
+        vec![proposal(
+            source.to_str().unwrap(),
+            "a.bin",
+            "b.bin",
+            ProposalState::Suggested,
+        )],
+        1,
+        &roms,
+    );
+    let approved = approved_of(&[&source]);
+    let mut tx = build_transaction(&plan, &approved, 1).unwrap();
+    tx.entries[0].state = ApplyEntryState::Applying;
+    write_journal(&journal, &tx).unwrap();
+
+    let issues = reconcile_recovery(&mut tx, &journal).unwrap();
+    assert_eq!(tx.entries[0].state, ApplyEntryState::Skipped, "not applied");
+    assert_eq!(tx.applied_count(), 0);
+    assert_eq!(
+        issues[0].kind,
+        super::reconcile::RecoveryIssueKind::RenameDidNotHappen
+    );
+    assert_eq!(snapshot(&roms), before, "recovery mutates nothing");
+}
+
+#[test]
+fn crash_after_the_rename_syscall_is_reconciled_as_applied_and_rollback_restores() {
+    // CONFIRMED BUG: the durable journal says Applying, the real production
+    // rename_noreplace already happened, and the process died before the
+    // Applied state was persisted. Without reconciliation the journal would
+    // report applied_count 0 and rollback would leave the file stranded.
+    let dir = tempfile::tempdir().unwrap();
+    let roms = dir.path().join("roms");
+    std::fs::create_dir_all(&roms).unwrap();
+    let source = write(&roms, "a.bin");
+    let journal = dir.path().join("journal");
+    std::fs::create_dir_all(&journal).unwrap();
+    let contents = std::fs::read(&source).unwrap();
+    let plan = plan(
+        vec![proposal(
+            source.to_str().unwrap(),
+            "a.bin",
+            "b.bin",
+            ProposalState::Suggested,
+        )],
+        1,
+        &roms,
+    );
+    let approved = approved_of(&[&source]);
+    let mut tx = build_transaction(&plan, &approved, 1).unwrap();
+    let destination = tx.entries[0].destination_path.clone();
+    tx.entries[0].state = ApplyEntryState::Applying;
+    write_journal(&journal, &tx).unwrap();
+
+    // Real production mutation (the syscall the executor would have made).
+    super::noclobber::rename_noreplace(&source, &destination).unwrap();
+    // No journal write after the syscall: this is the crash.
+
+    // The raw journal is the bug: applied_count 0 while the file is renamed.
+    assert_eq!(
+        tx.applied_count(),
+        0,
+        "the raw journal is the confirmed-bug state"
+    );
+
+    let issues = reconcile_recovery(&mut tx, &journal).unwrap();
+    assert_eq!(
+        tx.applied_count(),
+        1,
+        "recovery recognises the confirmed rename"
+    );
+    assert_eq!(tx.entries[0].state, ApplyEntryState::Applied);
+    assert_eq!(
+        issues[0].kind,
+        super::reconcile::RecoveryIssueKind::RenameConfirmed
+    );
+    assert!(!source.exists());
+    assert!(destination.exists());
+
+    // Rollback must now restore the original path and bytes.
+    let cancel = no_cancel();
+    let outcome = rollback_transaction(&mut tx, &journal, &cancel).unwrap();
+    assert_eq!(outcome.result, RollbackResult::FullyRolledBack);
+    assert!(source.exists());
+    assert!(!destination.exists());
+    assert_eq!(std::fs::read(&source).unwrap(), contents);
+}
+
+#[test]
+fn crash_after_syscall_with_wrong_destination_identity_is_not_classified_as_applied() {
+    let dir = tempfile::tempdir().unwrap();
+    let roms = dir.path().join("roms");
+    std::fs::create_dir_all(&roms).unwrap();
+    let source = write(&roms, "a.bin");
+    let journal = dir.path().join("journal");
+    std::fs::create_dir_all(&journal).unwrap();
+    let plan = plan(
+        vec![proposal(
+            source.to_str().unwrap(),
+            "a.bin",
+            "b.bin",
+            ProposalState::Suggested,
+        )],
+        1,
+        &roms,
+    );
+    let approved = approved_of(&[&source]);
+    let mut tx = build_transaction(&plan, &approved, 1).unwrap();
+    let destination = tx.entries[0].destination_path.clone();
+    tx.entries[0].state = ApplyEntryState::Applying;
+    write_journal(&journal, &tx).unwrap();
+
+    // The rename happened, then the destination was replaced with a different
+    // object before recovery ran.
+    super::noclobber::rename_noreplace(&source, &destination).unwrap();
+    std::fs::remove_file(&destination).unwrap();
+    std::fs::write(&destination, b"replaced").unwrap();
+
+    let issues = reconcile_recovery(&mut tx, &journal).unwrap();
+    assert_eq!(
+        tx.entries[0].state,
+        ApplyEntryState::Applying,
+        "left unresolved"
+    );
+    assert_eq!(tx.applied_count(), 0);
+    assert_eq!(
+        issues[0].kind,
+        super::reconcile::RecoveryIssueKind::DestinationIdentityChanged
+    );
+    // Rollback refuses to guess.
+    let cancel = no_cancel();
+    let outcome = rollback_transaction(&mut tx, &journal, &cancel).unwrap();
+    assert!(matches!(
+        outcome.result,
+        RollbackResult::RollbackFailed { .. }
+    ));
+    assert_eq!(std::fs::read(&destination).unwrap(), b"replaced");
+}
+
+#[test]
+fn applying_with_both_present_is_refused_not_guessed() {
+    let dir = tempfile::tempdir().unwrap();
+    let roms = dir.path().join("roms");
+    std::fs::create_dir_all(&roms).unwrap();
+    let source = write(&roms, "a.bin");
+    let journal = dir.path().join("journal");
+    std::fs::create_dir_all(&journal).unwrap();
+    let plan = plan(
+        vec![proposal(
+            source.to_str().unwrap(),
+            "a.bin",
+            "b.bin",
+            ProposalState::Suggested,
+        )],
+        1,
+        &roms,
+    );
+    let approved = approved_of(&[&source]);
+    let mut tx = build_transaction(&plan, &approved, 1).unwrap();
+    let destination = tx.entries[0].destination_path.clone();
+    tx.entries[0].state = ApplyEntryState::Applying;
+    write_journal(&journal, &tx).unwrap();
+    // The same object appears at both paths (a hard link) - indeterminate.
+    std::fs::hard_link(&source, &destination).unwrap();
+
+    let issues = reconcile_recovery(&mut tx, &journal).unwrap();
+    assert_eq!(
+        tx.entries[0].state,
+        ApplyEntryState::Applying,
+        "left unresolved"
+    );
+    assert_eq!(
+        issues[0].kind,
+        super::reconcile::RecoveryIssueKind::BothSourceAndDestination
+    );
+    assert!(source.exists());
+    assert!(destination.exists());
+}
+
+#[test]
+fn applying_with_both_absent_reports_manual_review() {
+    let dir = tempfile::tempdir().unwrap();
+    let roms = dir.path().join("roms");
+    std::fs::create_dir_all(&roms).unwrap();
+    let source = write(&roms, "a.bin");
+    let journal = dir.path().join("journal");
+    std::fs::create_dir_all(&journal).unwrap();
+    let plan = plan(
+        vec![proposal(
+            source.to_str().unwrap(),
+            "a.bin",
+            "b.bin",
+            ProposalState::Suggested,
+        )],
+        1,
+        &roms,
+    );
+    let approved = approved_of(&[&source]);
+    let mut tx = build_transaction(&plan, &approved, 1).unwrap();
+    tx.entries[0].state = ApplyEntryState::Applying;
+    write_journal(&journal, &tx).unwrap();
+    // Both paths vanished externally.
+    std::fs::remove_file(&source).unwrap();
+
+    let issues = reconcile_recovery(&mut tx, &journal).unwrap();
+    assert_eq!(
+        tx.entries[0].state,
+        ApplyEntryState::Applying,
+        "left unresolved"
+    );
+    assert_eq!(
+        issues[0].kind,
+        super::reconcile::RecoveryIssueKind::BothAbsent
+    );
+}
+
+#[test]
+fn journal_write_failure_before_the_syscall_prevents_any_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let roms = dir.path().join("roms");
+    std::fs::create_dir_all(&roms).unwrap();
+    let source = write(&roms, "a.bin");
+    // The journal "directory" is actually a file, so every write fails.
+    let journal = dir.path().join("journal");
+    std::fs::write(&journal, b"not a directory").unwrap();
+    let before = snapshot(&roms);
+    let plan = plan(
+        vec![proposal(
+            source.to_str().unwrap(),
+            "a.bin",
+            "b.bin",
+            ProposalState::Suggested,
+        )],
+        1,
+        &roms,
+    );
+    let cancel = no_cancel();
+    let error = apply(
+        &plan,
+        approved_of(&[&source]),
+        TrustedRoots::from_paths([&roms]),
+        &journal,
+        HardConflictMode::AbortAll,
+        &cancel,
+    )
+    .unwrap_err();
+    assert!(matches!(error, ApplyError::Journal(_)), "{error:?}");
+    assert_eq!(
+        snapshot(&roms),
+        before,
+        "a journal failure must mean zero mutation"
+    );
+}
+
+#[test]
+fn crash_during_rollback_is_reconciled_honestly() {
+    let dir = tempfile::tempdir().unwrap();
+    let roms = dir.path().join("roms");
+    std::fs::create_dir_all(&roms).unwrap();
+    let source = write(&roms, "a.bin");
+    let journal = dir.path().join("journal");
+    std::fs::create_dir_all(&journal).unwrap();
+    let contents = std::fs::read(&source).unwrap();
+    let plan = plan(
+        vec![proposal(
+            source.to_str().unwrap(),
+            "a.bin",
+            "b.bin",
+            ProposalState::Suggested,
+        )],
+        1,
+        &roms,
+    );
+    let approved = approved_of(&[&source]);
+    let tx = build_transaction(&plan, &approved, 1).unwrap();
+    let destination = tx.entries[0].destination_path.clone();
+    // Apply for real.
+    let cancel = no_cancel();
+    let outcome = apply_exec(
+        tx,
+        approved,
+        TrustedRoots::from_paths(std::slice::from_ref(&roms)),
+        &journal,
+        HardConflictMode::AbortAll,
+        &cancel,
+        1,
+    )
+    .unwrap();
+    let mut tx = outcome.transaction;
+
+    // Simulate a crash during rollback: the durable RollingBack checkpoint was
+    // written, the reverse rename happened, but RolledBack was never persisted.
+    tx.entries[0].state = ApplyEntryState::RollingBack;
+    write_journal(&journal, &tx).unwrap();
+    super::noclobber::rename_noreplace(&destination, &source).unwrap();
+    // No journal write after the reverse rename: the crash.
+
+    let issues = reconcile_recovery(&mut tx, &journal).unwrap();
+    assert_eq!(tx.entries[0].state, ApplyEntryState::RolledBack);
+    assert_eq!(
+        issues[0].kind,
+        super::reconcile::RecoveryIssueKind::RenameDidNotHappen
+    );
+    assert!(source.exists());
+    assert!(!destination.exists());
+    assert_eq!(std::fs::read(&source).unwrap(), contents);
+}

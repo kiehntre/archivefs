@@ -42,6 +42,55 @@ pub fn rollback_transaction(
         });
     }
 
+    // Reconcile any in-flight entries first: a crash can have left an entry
+    // `Applying` (rename may or may not have run) or `RollingBack` (reverse
+    // rename may or may not have run). The filesystem decides which. An entry
+    // that cannot be cleanly classified stays unresolved and blocks the
+    // rollback from claiming completion.
+    let issues = super::reconcile::reconcile_recovery(transaction, journal_dir)
+        .map_err(|error| error.to_string())?;
+    let unresolved = issues
+        .iter()
+        .filter(|issue| {
+            !matches!(
+                issue.kind,
+                super::reconcile::RecoveryIssueKind::RenameDidNotHappen
+                    | super::reconcile::RecoveryIssueKind::RenameConfirmed
+            )
+        })
+        .count();
+    if unresolved > 0 {
+        let detail = issues
+            .iter()
+            .filter(|issue| {
+                matches!(
+                    issue.kind,
+                    super::reconcile::RecoveryIssueKind::BothSourceAndDestination
+                        | super::reconcile::RecoveryIssueKind::BothAbsent
+                        | super::reconcile::RecoveryIssueKind::DestinationIdentityChanged
+                        | super::reconcile::RecoveryIssueKind::SourceIdentityChanged
+                )
+            })
+            .map(|issue| format!("{}: {}", issue.kind.label(), issue.detail))
+            .collect::<Vec<_>>()
+            .join("; ");
+        transaction.state = TransactionState::RollbackFailed;
+        write_journal(journal_dir, transaction).map_err(|error| error.to_string())?;
+        return Ok(RollbackOutcome {
+            result: RollbackResult::RollbackFailed {
+                failed: vec![(
+                    transaction
+                        .entries
+                        .first()
+                        .map(|e| e.source_path.clone())
+                        .unwrap_or_default(),
+                    format!("manual review required: {detail}"),
+                )],
+            },
+            transaction: transaction.clone(),
+        });
+    }
+
     transaction.state = TransactionState::RollingBack;
     write_journal(journal_dir, transaction).map_err(|error| error.to_string())?;
 
@@ -56,8 +105,17 @@ pub fn rollback_transaction(
         if !transaction.entries[index].is_eligible_for_rollback() {
             continue;
         }
-        match rollback_one_entry(&mut transaction.entries[index]) {
+
+        // Durable `RollingBack` checkpoint BEFORE the reverse rename syscall.
+        transaction.entries[index].state = EntryState::RollingBack;
+        write_journal(journal_dir, transaction).map_err(|error| error.to_string())?;
+
+        match rollback_mutation(&transaction.entries[index]) {
             Ok(()) => {
+                transaction.entries[index].state = EntryState::RolledBack;
+                transaction.entries[index].rolled_back_at_unix =
+                    Some(crate::dat::sources::now_unix());
+                transaction.entries[index].failure_reason = None;
                 rolled_back.push(transaction.entries[index].source_path.clone());
             }
             Err(reason) => {
@@ -94,9 +152,11 @@ pub fn rollback_transaction(
     })
 }
 
-/// Reverses one applied entry. Requires the destination to still be the
-/// recorded object and the original source path to be free.
-fn rollback_one_entry(entry: &mut super::model::TransactionEntry) -> Result<(), String> {
+/// The reverse-rename mutation window for one applied entry. Requires the
+/// destination to still be the recorded object and the original source path
+/// to be free. Called only after the entry's `RollingBack` state has been
+/// durably persisted.
+fn rollback_mutation(entry: &super::model::TransactionEntry) -> Result<(), String> {
     // Destination must still exist and still be the recorded object.
     match capture_identity(&entry.destination_path) {
         Err(_) => {
@@ -119,17 +179,11 @@ fn rollback_one_entry(entry: &mut super::model::TransactionEntry) -> Result<(), 
         return Err("rollback refused: the original source path is now occupied".to_string());
     }
 
-    entry.state = EntryState::RollingBack;
     match rename_noreplace(&entry.destination_path, &entry.source_path) {
         Ok(()) => {
             // Confirm the source was restored with the recorded identity.
             match capture_identity(&entry.source_path) {
-                Ok(current) if identity_matches(&entry.identity, &current) => {
-                    entry.state = EntryState::RolledBack;
-                    entry.rolled_back_at_unix = Some(crate::dat::sources::now_unix());
-                    entry.failure_reason = None;
-                    Ok(())
-                }
+                Ok(current) if identity_matches(&entry.identity, &current) => Ok(()),
                 Ok(_) => Err(
                     "rollback renamed but the restored source identity does not match".to_string(),
                 ),
