@@ -74,6 +74,9 @@ use crate::ui::{components as widgets, theme};
 /// reasonably expect a "fix it" button and there is deliberately not one.
 pub(crate) const READ_ONLY_PROMISE: &str = "ArchiveFS never renames, moves, deletes or rewrites your ROMs. An audit reads files and \
      reports what it found; nothing is changed, and nothing is written beside them.";
+/// The short, simple promise shown on the page. Longer detail stays available
+/// as a tooltip (`READ_ONLY_PROMISE`) but never front and centre.
+pub(crate) const SAFE_PROMISE: &str = "Your files won't be renamed unless you approve it.";
 /// The prominent, repeated statement the rename-planning section must show.
 pub(crate) const PLAN_ONLY_PROMISE: &str = "Planning only — ArchiveFS will not rename any files. This section derives suggested names \
      from verified DAT matches and explains them; nothing here changes, moves, deletes or rewrites \
@@ -768,7 +771,7 @@ pub(crate) struct AuditResultView {
     /// Per-file lines, capped for display.
     pub(crate) entries: Vec<AuditEntryView>,
     pub(crate) entries_truncated: usize,
-    pub(crate) unhashed: Vec<String>,
+    pub(crate) unhashed: Vec<(String, String)>,
     pub(crate) unreadable_catalogues: Vec<String>,
     pub(crate) truncated: bool,
     pub(crate) files_scanned: usize,
@@ -888,6 +891,12 @@ pub(crate) enum DatSourcesPageAction {
     RemoveLanguage {
         scope: Option<String>,
         index: usize,
+    },
+    ClearRegion {
+        scope: Option<String>,
+    },
+    ClearLanguage {
+        scope: Option<String>,
     },
     SetRevisionPolicy {
         scope: Option<String>,
@@ -1134,11 +1143,12 @@ fn authored_language_list(config: &DatPolicyConfig, scope: &Option<String>) -> V
     }
 }
 
-/// A preference list rendered as one line for the summary, or the honest
-/// "no preference" wording when it is empty.
+/// A preference list rendered as one line for the summary, or "Any" when the
+/// list is empty (an empty preference list means no preference - all regions
+/// or languages are treated as equal).
 fn render_preference_list(values: Vec<String>) -> String {
     if values.is_empty() {
-        "None (all equal)".to_string()
+        "Any".to_string()
     } else {
         values.join(", ")
     }
@@ -2103,6 +2113,16 @@ impl DatSourcesPageState {
                     if index < list.len() {
                         list.remove(index);
                     }
+                });
+            }
+            DatSourcesPageAction::ClearRegion { scope } => {
+                self.with_policy_targets(&scope, |targets| {
+                    targets.region_list().clear();
+                });
+            }
+            DatSourcesPageAction::ClearLanguage { scope } => {
+                self.with_policy_targets(&scope, |targets| {
+                    targets.language_list().clear();
                 });
             }
             DatSourcesPageAction::SetRevisionPolicy { scope, policy } => {
@@ -3276,7 +3296,7 @@ fn audit_view(outcome: &DatAuditOutcome, elapsed_seconds: Option<u64>) -> AuditR
         unhashed: outcome
             .unhashed
             .iter()
-            .map(|file| format!("{}: {}", file.file_name, file.detail))
+            .map(|file| (file.file_name.clone(), file.detail.clone()))
             .collect(),
         unreadable_catalogues: outcome.unreadable_catalogues.clone(),
         truncated: outcome.truncated,
@@ -3436,10 +3456,11 @@ pub(crate) fn show_dat_sources_page(
 ) -> Option<DatSourcesPageAction> {
     let mut action = None;
 
-    widgets::page_header(
+    widgets::page_header_with_icon(
         ui,
+        crate::ui::icons::DAT_CATALOGUES,
         "DAT sources",
-        "Local DAT catalogues ArchiveFS can check your files against.",
+        "Use DAT catalogues to check and identify your ROMs.",
     );
 
     if let Some(error) = &view.load_error {
@@ -3457,9 +3478,14 @@ pub(crate) fn show_dat_sources_page(
 
     widgets::banner(
         ui,
-        "Read-only",
-        READ_ONLY_PROMISE,
+        "Your files are safe",
+        SAFE_PROMISE,
         widgets::StatusTone::Info,
+    );
+    ui.label(
+        egui::RichText::new(READ_ONLY_PROMISE)
+            .color(theme::muted(ui))
+            .small(),
     );
     ui.add_space(6.0);
     ui.label(
@@ -3492,7 +3518,7 @@ pub(crate) fn show_dat_sources_page(
     if view.is_empty() {
         widgets::empty_state(
             ui,
-            "No DAT sources yet",
+            &crate::ui::icons::with_icon(crate::ui::icons::EMPTY_BOX, "No DAT sources yet"),
             "Add a DAT file, or a folder of them, to check your library against a published \
              catalogue. Nothing is downloaded and nothing is changed.",
             None,
@@ -4713,7 +4739,7 @@ fn show_region_preference_editor(
         ui.label(egui::RichText::new("Preferred regions").strong());
         if view.region_preferences.is_empty() {
             ui.label(
-                egui::RichText::new("none - all regions equal")
+                egui::RichText::new("Any region — no preference")
                     .color(theme::muted(ui))
                     .small(),
             );
@@ -4755,6 +4781,17 @@ fn show_region_preference_editor(
                 });
             }
         }
+        // "Any region" clears the ordering back to no preference.
+        if !view.region_preferences.is_empty()
+            && ui
+                .add(egui::Button::new("Any region").small())
+                .on_hover_text("Clear the region preference so every region is treated as equal.")
+                .clicked()
+        {
+            action = Some(DatSourcesPageAction::ClearRegion {
+                scope: view.scope.clone(),
+            });
+        }
     });
     action
 }
@@ -4768,7 +4805,7 @@ fn show_language_preference_editor(
         ui.label(egui::RichText::new("Preferred languages").strong());
         if view.language_preferences.is_empty() {
             ui.label(
-                egui::RichText::new("none - all languages equal")
+                egui::RichText::new("Any language — no preference")
                     .color(theme::muted(ui))
                     .small(),
             );
@@ -4839,6 +4876,19 @@ fn show_language_preference_editor(
                     }
                 }
             });
+        // "Any language" clears the ordering back to no preference.
+        if !view.language_preferences.is_empty()
+            && ui
+                .add(egui::Button::new("Any language").small())
+                .on_hover_text(
+                    "Clear the language preference so every language is treated as equal.",
+                )
+                .clicked()
+        {
+            action = Some(DatSourcesPageAction::ClearLanguage {
+                scope: view.scope.clone(),
+            });
+        }
     });
     action
 }
@@ -5190,11 +5240,11 @@ fn show_rename_plan_section(
     ui.add_space(10.0);
     widgets::section_header(ui, "Rename planning", None);
 
-    widgets::banner(
-        ui,
-        "Planning only",
-        PLAN_ONLY_PROMISE,
-        widgets::StatusTone::Info,
+    widgets::banner(ui, "Planning only", SAFE_PROMISE, widgets::StatusTone::Info);
+    ui.label(
+        egui::RichText::new(PLAN_ONLY_PROMISE)
+            .color(theme::muted(ui))
+            .small(),
     );
 
     widgets::card(ui, |ui| {
@@ -5496,6 +5546,64 @@ fn show_rename_plan_row(
     });
 }
 
+/// Renders unhashed (name-only) audit files grouped by reason, so a run with
+/// thousands of symlink refusals shows one exact-count summary instead of
+/// thousands of repeated lines. Raw details stay available via "Show all".
+fn show_unhashed_groups(ui: &mut egui::Ui, unhashed: &[(String, String)]) {
+    const EXAMPLES: usize = 10;
+    let mut groups: std::collections::BTreeMap<&str, Vec<&(String, String)>> =
+        std::collections::BTreeMap::new();
+    for file in unhashed.iter() {
+        groups.entry(file.1.as_str()).or_default().push(file);
+    }
+    // Most common reason first.
+    let mut order: Vec<&str> = groups.keys().copied().collect();
+    order.sort_by_key(|detail| std::cmp::Reverse(groups[*detail].len()));
+    for detail in order {
+        let files = &groups[detail];
+        let count = files.len();
+        let heading = if detail.contains("symlink") {
+            format!("{count} symlinks could not be hashed")
+        } else {
+            format!("{count} files could not be hashed")
+        };
+        ui.label(egui::RichText::new(heading).strong());
+        ui.label(egui::RichText::new(detail).color(theme::muted(ui)).small());
+        ui.label(
+            egui::RichText::new(format!(
+                "Example{}: {}",
+                if count == 1 { "" } else { "s" },
+                files
+                    .iter()
+                    .take(EXAMPLES)
+                    .map(|file| file.0.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+            .color(theme::muted(ui))
+            .small(),
+        );
+        if count > EXAMPLES {
+            egui::CollapsingHeader::new(format!("Show all {count}"))
+                .id_salt(("dat-audit-unhashed", detail))
+                .default_open(false)
+                .show(ui, |ui| {
+                    for file in files {
+                        ui.label(egui::RichText::new(&file.0).monospace().small());
+                    }
+                });
+        }
+    }
+    ui.label(
+        egui::RichText::new(
+            "These files were compared by name only, so their matches are not verified by \
+             content.",
+        )
+        .color(theme::muted(ui))
+        .small(),
+    );
+}
+
 fn show_audit_result(ui: &mut egui::Ui, audit: &AuditResultView) {
     widgets::section_header(ui, "Audit result", Some(&audit.headline));
     widgets::card(ui, |ui| {
@@ -5575,9 +5683,7 @@ fn show_audit_result(ui: &mut egui::Ui, audit: &AuditResultView) {
                      name alone.",
                 ),
             );
-            for line in audit.unhashed.iter().take(50) {
-                ui.label(egui::RichText::new(line).small());
-            }
+            show_unhashed_groups(ui, &audit.unhashed);
         }
 
         if let Some(policy) = &audit.policy {

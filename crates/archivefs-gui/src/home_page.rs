@@ -38,6 +38,7 @@ pub(crate) enum HomeCard {
     BrowseGames,
     CheatsAndMods,
     CanonicalOrganisation,
+    CleanUpLibrary,
     CheatSources,
     DatSources,
     RomM,
@@ -91,6 +92,9 @@ impl CardReadiness {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HomeCardView {
     pub(crate) card: HomeCard,
+    /// A leading glyph drawn next to the title. Always accompanied by the
+    /// text title - never the only navigation cue.
+    pub(crate) icon: &'static str,
     pub(crate) title: &'static str,
     pub(crate) explanation: &'static str,
     /// `None` for the one card (Settings) with no single configured/not
@@ -221,6 +225,7 @@ pub(crate) fn build_home_view(inputs: &HomeInputs) -> HomeView {
     let cards = vec![
         HomeCardView {
             card: HomeCard::BuildLibrary,
+            icon: crate::ui::icons::SOURCES,
             title: "Build my library",
             explanation: "ArchiveFS needs one or more source folders before it can scan for archives.",
             readiness: Some(library_readiness),
@@ -229,6 +234,7 @@ pub(crate) fn build_home_view(inputs: &HomeInputs) -> HomeView {
         },
         HomeCardView {
             card: HomeCard::BrowseGames,
+            icon: crate::ui::icons::LIBRARY,
             title: "Browse my games",
             explanation: "See the archives ArchiveFS has found so far, organized and searchable.",
             readiness: Some(browse_readiness),
@@ -237,6 +243,7 @@ pub(crate) fn build_home_view(inputs: &HomeInputs) -> HomeView {
         },
         HomeCardView {
             card: HomeCard::CheatsAndMods,
+            icon: crate::ui::icons::CHEATS,
             title: "Add or manage cheats",
             explanation: "Install trusted cheats and patches for an archive you select. Not every game or every source has cheats available.",
             readiness: Some(cheats_readiness),
@@ -245,14 +252,25 @@ pub(crate) fn build_home_view(inputs: &HomeInputs) -> HomeView {
         },
         HomeCardView {
             card: HomeCard::CanonicalOrganisation,
+            icon: crate::ui::icons::ORGANISE,
             title: "Organise my library",
             explanation: "Plan and, only after your explicit approval, move identified games into canonical platform folders under your master ROM root.",
             readiness: None,
             action_label: "Open Canonical Organisation",
+            secondary: Some((HomeCard::CleanUpLibrary, "Review filename suggestions")),
+        },
+        HomeCardView {
+            card: HomeCard::CleanUpLibrary,
+            icon: crate::ui::icons::CLEAN_UP,
+            title: "Clean up my library",
+            explanation: "Check your files against DAT catalogues and review suggested names and conflicts. Nothing changes until you approve it.",
+            readiness: None,
+            action_label: "Open DAT Sources",
             secondary: None,
         },
         HomeCardView {
             card: HomeCard::DatSources,
+            icon: crate::ui::icons::DAT_CATALOGUES,
             title: "Register DAT files",
             explanation: READ_ONLY_DAT_NOTE,
             readiness: Some(dat_readiness),
@@ -261,6 +279,7 @@ pub(crate) fn build_home_view(inputs: &HomeInputs) -> HomeView {
         },
         HomeCardView {
             card: HomeCard::RomM,
+            icon: crate::ui::icons::ROMM,
             title: "Connect RomM",
             explanation: READ_ONLY_ROMM_NOTE,
             readiness: Some(romm_readiness),
@@ -269,6 +288,7 @@ pub(crate) fn build_home_view(inputs: &HomeInputs) -> HomeView {
         },
         HomeCardView {
             card: HomeCard::CheckSetup,
+            icon: crate::ui::icons::DOCTOR,
             title: "Check my setup",
             explanation: "A summary of ArchiveFS's own configuration and environment checks. Opens Doctor for details - nothing here runs a repair.",
             readiness: Some(setup_readiness),
@@ -277,6 +297,7 @@ pub(crate) fn build_home_view(inputs: &HomeInputs) -> HomeView {
         },
         HomeCardView {
             card: HomeCard::Settings,
+            icon: crate::ui::icons::SETTINGS,
             title: "Settings",
             explanation: "Mount, emulator profile, and other ArchiveFS preferences.",
             readiness: None,
@@ -327,7 +348,12 @@ fn summarize_setup_checks(
 pub(crate) fn show_home_page(ui: &mut egui::Ui, view: &HomeView) -> Option<HomeCard> {
     let mut clicked = None;
 
-    widgets::page_header(ui, "Home", "What would you like to do?");
+    widgets::page_header_with_icon(
+        ui,
+        crate::ui::icons::HOME,
+        "Home",
+        "What would you like to do?",
+    );
 
     match view.banner {
         HomeBanner::FreshInstall => {
@@ -357,6 +383,7 @@ pub(crate) fn show_home_page(ui: &mut egui::Ui, view: &HomeView) -> Option<HomeC
         for card in &view.cards {
             widgets::card(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new(card.icon).size(17.0));
                     ui.label(egui::RichText::new(card.title).size(17.0).strong());
                     if let Some(readiness) = &card.readiness {
                         widgets::status_badge(ui, readiness.label(), readiness.tone());
