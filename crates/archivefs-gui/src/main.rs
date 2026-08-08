@@ -4795,7 +4795,10 @@ impl ArchiveFsApp {
             match archivefs_core::patch_manager::default_cheat_sources_config_path() {
                 Ok(path) => {
                     self.cheat_sources_page =
-                        Some(cheat_sources_page::CheatSourcesPageState::load(path));
+                        Some(cheat_sources_page::CheatSourcesPageState::load(
+                            path,
+                            archivefs_core::patch_manager::default_cheat_source_data_root(),
+                        ));
                 }
                 Err(error) => {
                     widgets::banner(

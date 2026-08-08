@@ -173,9 +173,9 @@ pub use cheat_source_registry::{
     CheatSourceCapabilities, CheatSourceEntry, CheatSourceHealth, CheatSourceRegistry,
     CheatSourceSpec, CheatSourcesConfig, PlatformOverrideEntry, PlatformParticipation,
     ProviderConfigEntry, ProviderPriorityOverride, UnresolvedPreference, UnresolvedPreferenceKind,
-    build_default_registry, default_cheat_sources_config_path, load_cheat_sources_config_default,
-    load_cheat_sources_config_from, save_cheat_sources_config_default,
-    save_cheat_sources_config_to,
+    build_default_registry, default_cheat_source_data_root, default_cheat_sources_config_path,
+    load_cheat_sources_config_default, load_cheat_sources_config_from, probe_cheat_source_health,
+    save_cheat_sources_config_default, save_cheat_sources_config_to,
 };
 pub use cheat_sources::{
     CHEAT_SOURCE_CONCURRENT_OPERATIONS_PER_PROVIDER, CHEAT_SOURCE_CONNECT_TIMEOUT_SECONDS,
