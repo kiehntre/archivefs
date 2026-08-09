@@ -5524,6 +5524,50 @@ mod tests {
     }
 
     #[test]
+    fn legacy_cue_row_reaches_missing_history_after_a_current_successful_scan() {
+        let root = temp_dir("legacy-cue-history");
+        let source = root.join("source");
+        let mount = root.join("mount");
+        let cue_path = write_archive_file(
+            &source,
+            "Disc Game.cue",
+            b"FILE \"Disc Game.bin\" BINARY\n  TRACK 01 MODE1/2352\n",
+        );
+        write_archive_file(&source, "Playable.iso", b"disc image");
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        let folder = database
+            .register_source_folders(&config.source_folders)
+            .unwrap()[0]
+            .clone();
+
+        // Reproduce a pre-fix catalogue row without changing today's scanner:
+        // old versions admitted this path as a direct image.
+        let legacy = Archive {
+            path: cue_path.clone(),
+            kind: ArchiveKind::DirectGameImage,
+            identity: crate::ArchiveIdentity::from_path(
+                &cue_path,
+                &source,
+                fs::metadata(&cue_path).ok().as_ref(),
+            ),
+            health: crate::ArchiveHealth::Pending,
+        };
+        database
+            .upsert_archive(folder.id, &source, &legacy)
+            .unwrap();
+
+        let summary = scan_and_persist(&mut database, &config, "current-successful-scan").unwrap();
+        assert_eq!(summary.counts.archives_missing, 1);
+        let archives = database.load_archives().unwrap();
+        let cue = find_archive(&archives, "Disc Game.cue");
+        assert!(cue.last_verified_missing_at.is_some());
+        assert!(crate::is_known_disc_companion(&cue.absolute_path));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn one_missing_archive_can_be_removed_with_its_related_rows() {
         let root = temp_dir("remove-one-missing");
         let source = root.join("source");
