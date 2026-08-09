@@ -869,7 +869,7 @@ fn the_audit_summary_shows_elapsed_time_and_a_shortened_scan_folder() {
     assert!(audit.elapsed_seconds.is_some());
 
     let mut ui_state = DatSourcesPageUi::default();
-    let output = render(&view, &mut ui_state);
+    let output = render_with_details(&view, &mut ui_state);
     assert!(rendered_text_contains(&output, "Completed in"));
     assert!(
         !rendered_text_contains(&output, &roms.to_string_lossy()),
@@ -1175,8 +1175,8 @@ fn removing_a_source_with_no_job_running_does_not_touch_a_different_jobs_job() {
 fn the_page_states_what_it_supports_and_what_it_will_never_do() {
     // These two sentences are the page's contract with the user, so they are
     // pinned rather than left to drift.
-    assert!(READ_ONLY_PROMISE.contains("never renames"));
-    assert!(READ_ONLY_PROMISE.contains("deletes"));
+    assert!(READ_ONLY_PROMISE.contains(SAFE_PROMISE));
+    assert!(READ_ONLY_PROMISE.contains("delete"));
     assert!(SUPPORTED_FORMATS.contains("Logiqx"));
     assert!(SUPPORTED_FORMATS.contains("ClrMamePro"));
 }
@@ -1281,6 +1281,22 @@ fn render(view: &DatSourcesPageView, ui_state: &mut DatSourcesPageUi) -> egui::F
     })
 }
 
+/// Draws every disclosure body for assertions about information retained in
+/// the technical view. The normal `render` helper deliberately keeps those
+/// bodies closed so beginner-facing tests exercise the real default.
+fn render_with_details(
+    view: &DatSourcesPageView,
+    ui_state: &mut DatSourcesPageUi,
+) -> egui::FullOutput {
+    let context = egui::Context::default();
+    context.memory_mut(|memory| memory.set_everything_is_visible(true));
+    context.run(egui::RawInput::default(), |context| {
+        egui::CentralPanel::default().show(context, |ui| {
+            let _ = show_dat_sources_page(ui, view, ui_state);
+        });
+    })
+}
+
 /// Draws only the running-job card, so the platform line can be asserted
 /// without the source card's own platform control interfering.
 fn render_running_card(running: &RunningJobView) -> egui::FullOutput {
@@ -1340,18 +1356,23 @@ fn warnings_render_count_summary_and_expandable_details() {
 
     let mut ui_state = DatSourcesPageUi::default();
     let collapsed = render(&view, &mut ui_state);
-    assert!(
-        rendered_text_contains(&collapsed, "2 warning types, 2 occurrences"),
-        "the type and occurrence counts must sit on the card"
-    );
-    assert!(
-        rendered_text_contains(&collapsed, "View locations"),
-        "an expandable control must be offered"
-    );
+    assert!(rendered_text_contains(
+        &collapsed,
+        "2 catalogue issues found"
+    ));
+    assert!(rendered_text_contains(
+        &collapsed,
+        "The catalogue still works. Files that could not be used were skipped."
+    ));
+    assert!(rendered_text_contains(&collapsed, "What happened?"));
+    assert!(!rendered_text_contains(
+        &collapsed,
+        "2 warning types, 2 occurrences"
+    ));
     for warning in &warnings {
         assert!(
-            rendered_text_contains(&collapsed, warning),
-            "each group's message is visible without expanding"
+            !rendered_text_contains(&collapsed, warning),
+            "raw parser messages stay out of the beginner-facing summary"
         );
     }
     assert!(
@@ -1362,7 +1383,14 @@ fn warnings_render_count_summary_and_expandable_details() {
     // Expanding one group reveals its locations (unavailable here, since the
     // test diagnostics carry no parser location).
     ui_state.open_diagnostic = Some(row.groups[0].id.clone());
-    let expanded = render(&view, &mut ui_state);
+    let expanded = render_with_details(&view, &mut ui_state);
+    assert!(rendered_text_contains(
+        &expanded,
+        "2 warning types, 2 occurrences"
+    ));
+    for warning in &warnings {
+        assert!(rendered_text_contains(&expanded, warning));
+    }
     assert!(rendered_text_contains(&expanded, "Hide locations"));
     assert!(rendered_text_contains(&expanded, "Location unavailable"));
 }
@@ -1377,7 +1405,7 @@ fn zero_warnings_show_no_warning_details_control() {
     assert!(row.groups.is_empty());
 
     let mut ui_state = DatSourcesPageUi::default();
-    let output = render(&view, &mut ui_state);
+    let output = render_with_details(&view, &mut ui_state);
     assert!(
         !rendered_text_contains(&output, "View locations"),
         "no diagnostics means no details control"
@@ -1407,7 +1435,7 @@ fn warnings_and_parser_notes_render_as_separate_sections() {
     assert_eq!(note_group.message, note_text);
 
     let mut ui_state = DatSourcesPageUi::default();
-    let output = render(&view, &mut ui_state);
+    let output = render_with_details(&view, &mut ui_state);
     assert!(rendered_text_contains(
         &output,
         "1 warning type, 1 occurrence"
@@ -1416,15 +1444,15 @@ fn warnings_and_parser_notes_render_as_separate_sections() {
         &output,
         "1 parser-note type, 1 occurrence"
     ));
-    // The note reassurance is always on the card.
+    // The note reassurance is retained in the explanation disclosure.
     assert!(rendered_text_contains(
         &output,
-        "Parser notes are expected parser behaviour and need no action."
+        "1 additional catalogue note recorded. No action is needed for these."
     ));
 
     // Expanding a note group reveals its (unavailable) location.
     ui_state.open_diagnostic = Some(note_group.id.clone());
-    let expanded = render(&view, &mut ui_state);
+    let expanded = render_with_details(&view, &mut ui_state);
     assert!(rendered_text_contains(&expanded, "Hide locations"));
     assert!(rendered_text_contains(&expanded, note_text));
 }
@@ -1448,7 +1476,7 @@ fn an_error_diagnostic_renders_in_its_own_section_not_as_a_warning() {
     assert_eq!(row.health_state, DatHealthState::Invalid);
 
     let mut ui_state = DatSourcesPageUi::default();
-    let output = render(&view, &mut ui_state);
+    let output = render_with_details(&view, &mut ui_state);
     assert!(rendered_text_contains(
         &output,
         "1 error type, 1 occurrence"
@@ -1480,7 +1508,7 @@ fn mixed_errors_warnings_and_notes_render_as_three_sections() {
     assert_eq!(row.diagnostic_types(DiagnosticSeverity::Note), 1);
 
     let mut ui_state = DatSourcesPageUi::default();
-    let output = render(&view, &mut ui_state);
+    let output = render_with_details(&view, &mut ui_state);
     assert!(rendered_text_contains(&output, "Invalid"));
     assert!(rendered_text_contains(
         &output,
@@ -1538,7 +1566,7 @@ fn repeated_identical_notes_group_into_one_type_with_full_occurrence_count() {
     assert!(note_group.occurrences_truncated);
 
     let mut ui_state = DatSourcesPageUi::default();
-    let output = render(&view, &mut ui_state);
+    let output = render_with_details(&view, &mut ui_state);
     assert!(rendered_text_contains(
         &output,
         "1 parser-note type, 512 occurrences"
@@ -1617,12 +1645,12 @@ fn expanding_one_group_does_not_expand_the_others() {
     assert_eq!(warning_groups.len(), 2);
 
     let mut ui_state = DatSourcesPageUi::default();
-    let collapsed = render(&view, &mut ui_state);
+    let collapsed = render_with_details(&view, &mut ui_state);
     assert_eq!(rendered_text_count(&collapsed, "View locations"), 3);
 
     // Open only the first warning group.
     ui_state.open_diagnostic = Some(warning_groups[0].id.clone());
-    let expanded = render(&view, &mut ui_state);
+    let expanded = render_with_details(&view, &mut ui_state);
     assert_eq!(
         rendered_text_count(&expanded, "Hide locations"),
         1,
@@ -1795,9 +1823,9 @@ fn expanding_a_group_on_one_source_does_not_open_the_same_group_on_another() {
         open_diagnostic: Some(view_a.rows[0].groups[0].id.clone()),
         ..Default::default()
     };
-    let rendered_a = render(&view_a, &mut ui_state);
+    let rendered_a = render_with_details(&view_a, &mut ui_state);
     assert_eq!(rendered_text_count(&rendered_a, "Hide locations"), 1);
-    let rendered_b = render(&view_b, &mut ui_state);
+    let rendered_b = render_with_details(&view_b, &mut ui_state);
     assert_eq!(
         rendered_text_count(&rendered_b, "Hide locations"),
         0,
@@ -1848,7 +1876,7 @@ fn drill_down_shows_parser_location_when_available_and_unavailable_otherwise() {
         open_diagnostic: Some(located.id.clone()),
         ..Default::default()
     };
-    let located_output = render(&view, &mut ui_state);
+    let located_output = render_with_details(&view, &mut ui_state);
     assert!(rendered_text_contains(&located_output, "line 3:12"));
 
     let line_only_group = groups
@@ -1856,7 +1884,7 @@ fn drill_down_shows_parser_location_when_available_and_unavailable_otherwise() {
         .find(|group| group.message == "has a line only")
         .unwrap();
     ui_state.open_diagnostic = Some(line_only_group.id.clone());
-    let line_only_output = render(&view, &mut ui_state);
+    let line_only_output = render_with_details(&view, &mut ui_state);
     assert!(rendered_text_contains(&line_only_output, "line 9"));
     assert!(
         !rendered_text_contains(&line_only_output, "line 9:0"),
@@ -1868,7 +1896,7 @@ fn drill_down_shows_parser_location_when_available_and_unavailable_otherwise() {
         .find(|group| group.message == "no location")
         .unwrap();
     ui_state.open_diagnostic = Some(unlocated.id.clone());
-    let unlocated_output = render(&view, &mut ui_state);
+    let unlocated_output = render_with_details(&view, &mut ui_state);
     assert!(rendered_text_contains(
         &unlocated_output,
         "Location unavailable"
@@ -1919,7 +1947,7 @@ fn an_incomplete_load_is_drawn_prominently_with_its_counts() {
     );
     let view = page.view();
     let mut ui_state = DatSourcesPageUi::default();
-    let output = render(&view, &mut ui_state);
+    let output = render_with_details(&view, &mut ui_state);
     assert!(
         rendered_text_contains(&output, "Incomplete catalogue load"),
         "the incompleteness must be a headline, not body text"
@@ -1998,11 +2026,7 @@ fn the_history_and_logs_reference_is_only_drawn_when_details_are_recorded_there(
 }
 
 #[test]
-fn warnings_are_prominent_on_the_card_not_buried_behind_inspect() {
-    // Regression: the old card showed the "Valid, with warnings" badge, but
-    // the warning text was only reachable by opening Inspect and reading a
-    // nested per-file list. The type/occurrence counts and the expandable
-    // drill-down control now sit on the card itself.
+fn warnings_have_a_plain_summary_with_parser_details_on_demand() {
     let diagnostics = vec![vec![
         warn("A ROM entry has no SHA-1 checksum; only CRC32 was compared"),
         warn("The header declares a version that differs from the filename"),
@@ -2017,14 +2041,21 @@ fn warnings_are_prominent_on_the_card_not_buried_behind_inspect() {
     let mut ui_state = DatSourcesPageUi::default();
     let output = render(&view, &mut ui_state);
     assert!(rendered_text_contains(&output, "Valid, with warnings"));
-    assert!(
-        rendered_text_contains(&output, "2 warning types, 2 occurrences"),
-        "the counts must be visible without any disclosure click"
-    );
-    assert!(
-        rendered_text_contains(&output, "View locations"),
-        "the expandable control must be visible without opening Inspect"
-    );
+    assert!(rendered_text_contains(&output, "2 catalogue issues found"));
+    assert!(rendered_text_contains(
+        &output,
+        "The catalogue still works. Files that could not be used were skipped."
+    ));
+    assert!(!rendered_text_contains(
+        &output,
+        "2 warning types, 2 occurrences"
+    ));
+    let details = render_with_details(&view, &mut ui_state);
+    assert!(rendered_text_contains(
+        &details,
+        "2 warning types, 2 occurrences"
+    ));
+    assert!(rendered_text_contains(&details, "View locations"));
 }
 
 // ---------------------------------------------------------------------------
@@ -2112,7 +2143,7 @@ fn a_doctype_parser_note_shows_valid_with_no_warnings() {
     );
 
     let mut ui_state = DatSourcesPageUi::default();
-    let output = render(&view, &mut ui_state);
+    let output = render_with_details(&view, &mut ui_state);
     assert!(!rendered_text_contains(&output, "with warnings"));
     assert!(
         !rendered_text_contains(&output, "warning type"),
@@ -2145,7 +2176,7 @@ fn a_real_warning_shows_valid_with_warnings() {
     assert_eq!(row.diagnostic_types(DiagnosticSeverity::Note), 0);
 
     let mut ui_state = DatSourcesPageUi::default();
-    let output = render(&view, &mut ui_state);
+    let output = render_with_details(&view, &mut ui_state);
     assert!(rendered_text_contains(&output, "Valid, with warnings"));
     assert!(rendered_text_contains(
         &output,
@@ -2174,7 +2205,7 @@ fn a_real_parser_failure_shows_invalid() {
     assert!(row.groups.is_empty());
 
     let mut ui_state = DatSourcesPageUi::default();
-    let output = render(&view, &mut ui_state);
+    let output = render_with_details(&view, &mut ui_state);
     assert!(rendered_text_contains(&output, "Invalid"));
     assert!(!rendered_text_contains(&output, "View locations"));
 }
@@ -2201,7 +2232,7 @@ fn mixed_warning_and_notes_shows_valid_with_warnings() {
     assert_eq!(row.diagnostic_types(DiagnosticSeverity::Note), 1);
 
     let mut ui_state = DatSourcesPageUi::default();
-    let output = render(&view, &mut ui_state);
+    let output = render_with_details(&view, &mut ui_state);
     assert!(rendered_text_contains(&output, "Valid, with warnings"));
     assert!(rendered_text_contains(
         &output,
@@ -3125,6 +3156,11 @@ fn the_global_scope_is_used_by_default_and_the_scope_selector_is_offered() {
             .any(|option| option.id.as_deref() == Some("NES")),
         "the platform a source covers is offered as a scope"
     );
+    let mut ui_state = DatSourcesPageUi::default();
+    let output = render(&view, &mut ui_state);
+    assert!(rendered_text_contains(&output, "Applies to:"));
+    assert!(rendered_text_contains(&output, "All platforms"));
+    assert!(rendered_text_contains(&output, "Editing: Global defaults"));
 }
 
 #[test]
@@ -3184,7 +3220,7 @@ fn the_policy_section_and_summary_render_at_a_narrow_compact_width() {
     assert!(rendered_text_contains(&output, "Platform: All platforms"));
     assert!(rendered_text_contains(
         &output,
-        "ArchiveFS never renames your files."
+        "Your files won't be renamed unless you approve it."
     ));
 }
 
@@ -4080,6 +4116,6 @@ fn the_empty_state_uses_the_verify_identity_and_short_wording() {
     let output = render(&view, &mut ui_state);
     // With no DAT sources registered the empty state is the friendly, short
     // "No DATs added" with the verify icon - not a long technical block.
-    assert!(rendered_text_contains(&output, "🧾"));
+    assert!(rendered_text_contains(&output, "[V]"));
     assert!(rendered_text_contains(&output, "No DATs added"));
 }

@@ -72,8 +72,8 @@ use crate::ui::{components as widgets, theme};
 
 /// Said once on the page, because a DAT audit is the one place a user might
 /// reasonably expect a "fix it" button and there is deliberately not one.
-pub(crate) const READ_ONLY_PROMISE: &str = "ArchiveFS never renames, moves, deletes or rewrites your ROMs. An audit reads files and \
-     reports what it found; nothing is changed, and nothing is written beside them.";
+pub(crate) const READ_ONLY_PROMISE: &str = "Your files won't be renamed unless you approve it. A DAT audit only reads files and \
+     reports what it found; it does not move, delete or rewrite them.";
 /// The short, simple promise shown on the page. Longer detail stays available
 /// as a tooltip (`READ_ONLY_PROMISE`) but never front and centre.
 pub(crate) const SAFE_PROMISE: &str = "Your files won't be renamed unless you approve it.";
@@ -4085,50 +4085,82 @@ fn show_diagnostics_summary(
     row: &DatSourceRowView,
     ui_state: &mut DatSourcesPageUi,
 ) {
-    for severity in [
-        DiagnosticSeverity::Error,
-        DiagnosticSeverity::Warning,
-        DiagnosticSeverity::Note,
-    ] {
-        let groups = row.groups_of(severity);
-        if groups.is_empty() {
-            continue;
-        }
-        let types = row.diagnostic_types(severity);
-        let occurrences = row.diagnostic_occurrences(severity);
-        let tone = match severity {
-            DiagnosticSeverity::Error => widgets::StatusTone::Blocked,
-            DiagnosticSeverity::Warning => widgets::StatusTone::Warning,
-            DiagnosticSeverity::Note => widgets::StatusTone::Info,
-        };
+    if row.groups.is_empty() {
+        return;
+    }
 
+    // Occurrence lists are deliberately bounded for rendering, so never use
+    // their length for the headline. The stored occurrence totals remain
+    // exact even for very large folders.
+    let attention_issues = row.diagnostic_occurrences(DiagnosticSeverity::Error)
+        + row.diagnostic_occurrences(DiagnosticSeverity::Warning);
+    if attention_issues > 0 {
         ui.add_space(6.0);
         widgets::status_badge(
             ui,
             format!(
-                "{types} {}, {} occurrence{}",
-                severity_type_label(severity, types),
-                occurrences,
-                if occurrences == 1 { "" } else { "s" }
+                "{attention_issues} catalogue issue{} found",
+                if attention_issues == 1 { "" } else { "s" }
             ),
-            tone,
+            widgets::StatusTone::Warning,
         );
-
-        if severity == DiagnosticSeverity::Note {
-            ui.label(
-                egui::RichText::new(
-                    "Parser notes are expected parser behaviour and need no action.",
-                )
-                .color(theme::muted(ui))
-                .small(),
-            );
-        }
-
-        for group in groups {
-            ui.add_space(2.0);
-            show_diagnostic_group(ui, group, ui_state);
-        }
+        ui.label(
+            egui::RichText::new(
+                "The catalogue still works. Files that could not be used were skipped.",
+            )
+            .color(theme::muted(ui))
+            .small(),
+        );
     }
+
+    egui::CollapsingHeader::new("What happened?")
+        .id_salt(("dat-diagnostics-summary", row.id.as_str()))
+        .default_open(false)
+        .show(ui, |ui| {
+            let notes = row.diagnostic_occurrences(DiagnosticSeverity::Note);
+            if notes > 0 {
+                ui.label(format!(
+                    "{notes} additional catalogue note{} recorded. No action is needed for these.",
+                    if notes == 1 { "" } else { "s" }
+                ));
+            }
+            widgets::technical_details(
+                ui,
+                ("dat-parser-technical-details", row.id.as_str()),
+                |ui| {
+                    for severity in [
+                        DiagnosticSeverity::Error,
+                        DiagnosticSeverity::Warning,
+                        DiagnosticSeverity::Note,
+                    ] {
+                        let groups = row.groups_of(severity);
+                        if groups.is_empty() {
+                            continue;
+                        }
+                        let types = row.diagnostic_types(severity);
+                        let occurrences = row.diagnostic_occurrences(severity);
+                        let tone = match severity {
+                            DiagnosticSeverity::Error => widgets::StatusTone::Blocked,
+                            DiagnosticSeverity::Warning => widgets::StatusTone::Warning,
+                            DiagnosticSeverity::Note => widgets::StatusTone::Info,
+                        };
+                        widgets::status_badge(
+                            ui,
+                            format!(
+                                "{types} {}, {occurrences} occurrence{}",
+                                severity_type_label(severity, types),
+                                if occurrences == 1 { "" } else { "s" }
+                            ),
+                            tone,
+                        );
+                        for group in groups {
+                            ui.add_space(2.0);
+                            show_diagnostic_group(ui, group, ui_state);
+                        }
+                    }
+                },
+            );
+        });
 
     if row.history_link_available {
         // Only ever drawn when the full details really are recorded in
@@ -4615,6 +4647,14 @@ fn show_dat_policy_section(
                     }
                 });
         });
+        ui.label(
+            egui::RichText::new(match view.scope {
+                None => "Editing: Global defaults".to_string(),
+                Some(_) => format!("Editing: {} settings", view.scope_label),
+            })
+            .color(theme::muted(ui))
+            .small(),
+        );
         ui.add_space(10.0);
 
         if let Some(policy_action) = show_region_preference_editor(ui, view) {
@@ -4664,7 +4704,7 @@ fn show_dat_policy_section(
         });
         ui.add_space(4.0);
         ui.label(
-            egui::RichText::new("ArchiveFS never renames your files.")
+            egui::RichText::new(SAFE_PROMISE)
                 .color(theme::muted(ui))
                 .small(),
         );
