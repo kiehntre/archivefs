@@ -5509,7 +5509,7 @@ fn print_help() {
     );
     println!("  config-check   Validate ArchiveFS configuration");
     println!(
-        "  cheats source bsfree <status|validate|download|import-local|enable|disable|remove|systems|devices|search|game>  Manage and browse the optional immutable BSFree Archive source; no command installs cheats"
+        "  cheats source bsfree <status|validate|download|import-local|enable|disable|remove|systems|devices|search|game|gamecube-preview|gamecube-apply|gamecube-rollback>  Manage and browse the optional immutable BSFree Archive source. GameCube hex-pair codes are installable via the existing Dolphin adapter (gamecube-preview/gamecube-apply, --confirm to apply, gamecube-rollback to restore); all other platforms and formats are browse-only"
     );
     println!(
         "  platform-artwork <status|import|import-folder|rescan|remove|open-folder>  Manage local canonical platform artwork overrides; import-folder supports --dry-run and no command uses the network"

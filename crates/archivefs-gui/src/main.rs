@@ -45,41 +45,45 @@ use archivefs_core::game_identity::{
     inspect_catalogued_game_identity,
 };
 use archivefs_core::patch_manager::{
-    BsFreeCatalogue, BsFreeCheat, BsFreeDownloadOptions, BsFreeGame, BsFreeGameSearchRequest,
-    BsFreeGameSearchResult, BsFreePaths, BsFreeSourceStatus, CheatCandidate, CheatCandidateArchive,
-    CheatCandidateClassification, CheatCandidateList, CheatCandidateOptions, CheatCatalogueStatus,
-    CheatDestinationRequest, CheatInstallPlanError, CheatInstallPreviewRequest,
-    CheatProviderSourceState, CheatSelection, CheatSourceCancellation, CheatSourceError,
-    CheatSourceFetchOptions, CheatSourceFetchResult, CheatSourceFetchStatus, CheatSourceFreshness,
-    CheatSourceList, CheatSourceListEntry, CheatSourceProgress, CheatSourceProgressPhase,
-    CheatSourceProgressReporter, DeviceFormatCompatibility, DolphinCatalogue,
-    DolphinCatalogueError, DolphinCatalogueErrorKind, DolphinCatalogueFetchOptions,
-    DolphinCatalogueFetchResult, DolphinCatalogueLoad, DolphinCatalogueUpdateCheck,
-    DolphinGameIniInventory, DolphinGeckoLookupResult, DolphinInstallPlanError,
-    DolphinInstallPreviewRequest, DolphinInstallationType, DolphinMatchState, DolphinProfile,
-    DolphinProfileDiscovery, DolphinProfileDiscoveryRoots, DolphinProfileScope,
-    DolphinProviderCodeSelection, DolphinSettingsDirectoryState, EmulatorProfileCandidate,
-    EmulatorProfileSelectReason, EmulatorProfileSelection, GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE,
-    GameCubeCheatSelection, GameCubeCodeFormat, GameCubeGameHackingInstallPreviewRequest,
-    GameCubeGameIdentity, GameCubeInstallPlanError, GameCubeInstallPlanErrorKind,
-    GameHackingErrorKind, GameHackingFetchOptions, GameHackingGame, GameHackingGameCubeCheat,
-    GameHackingGameCubeFetchOptions, GameHackingGameCubeGame, GameHackingGameCubeMatchCandidate,
-    GameHackingGameCubeMatchStatus, GameHackingGameCubeMatchStrength, GameHackingGameCubeProvider,
-    GameHackingMatchCandidate, GameHackingMatchStatus, GameHackingProvider, GameHackingWiiCheat,
-    GameHackingWiiGame, GameHackingWiiMatch, GameHackingWiiMatchCandidate,
-    GameHackingWiiMatchStatus, GameHackingWiiMatchStrength, GameHackingWiiProvider,
-    GeckoProviderFetchOptions, GeckoProviderFetchResult, GeckoProviderFetchStatus,
-    GeckoProviderQuery, HttpsCheatSourceTransport, ImportSourceKind, ImportTrustState,
-    LoadedCandidate, LoadedDolphinDestination, LoadedXeniaDestination, LocalSafetyScanningState,
-    PageRequest, Pcsx2CheatCandidate, Pcsx2CheatSelection, Pcsx2GameIdentity,
-    Pcsx2InstallPlanError, Pcsx2InstallPreviewRequest, Pcsx2InstallationType, Pcsx2MatchState,
-    Pcsx2PatchCategory, Pcsx2PatchDirectoryState, Pcsx2PnachInventory, Pcsx2Profile,
-    Pcsx2ProfileDiscovery, Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope, PreviewAdapter,
-    PreviewDestinationState, PreviewEligibility, PreviewIdentity, PreviewIdentityKind,
-    PreviewIdentityState, PreviewMatchStrength, PreviewSourceItem, PreviewState,
-    ProviderGameMatchConfidence, ReadOnlyCheatCatalogue, RememberedEmulatorProfile,
-    ResolvedCheatDestination, RetroArchCheatLibraryInspection, RetroArchCheatLibraryState,
-    RetroArchCheatSetupDiscovery, RetroArchLocalCheatMatchState, RetroArchMaterializationError,
+    BsFreeCatalogue, BsFreeCheat, BsFreeDedupFinding, BsFreeDedupFindingKind,
+    BsFreeDownloadOptions, BsFreeGame, BsFreeGameCubeCheat, BsFreeGameCubeCheatSelection,
+    BsFreeGameCubeCodeFormat, BsFreeGameCubeError, BsFreeGameCubeErrorKind,
+    BsFreeGameCubeInstallPreviewRequest, BsFreeGameCubeMatch, BsFreeGameCubeSearchOutcome,
+    BsFreeGameCubeSearchStatus, BsFreeGameSearchRequest, BsFreeGameSearchResult, BsFreePaths,
+    BsFreeSourceStatus, CheatCandidate, CheatCandidateArchive, CheatCandidateClassification,
+    CheatCandidateList, CheatCandidateOptions, CheatCatalogueStatus, CheatDestinationRequest,
+    CheatInstallPlanError, CheatInstallPreviewRequest, CheatProviderSourceState, CheatSelection,
+    CheatSourceCancellation, CheatSourceError, CheatSourceFetchOptions, CheatSourceFetchResult,
+    CheatSourceFetchStatus, CheatSourceFreshness, CheatSourceList, CheatSourceListEntry,
+    CheatSourceProgress, CheatSourceProgressPhase, CheatSourceProgressReporter,
+    DeviceFormatCompatibility, DolphinCatalogue, DolphinCatalogueError, DolphinCatalogueErrorKind,
+    DolphinCatalogueFetchOptions, DolphinCatalogueFetchResult, DolphinCatalogueLoad,
+    DolphinCatalogueUpdateCheck, DolphinGameIniInventory, DolphinGeckoLookupResult,
+    DolphinInstallPlanError, DolphinInstallPreviewRequest, DolphinInstallationType,
+    DolphinMatchState, DolphinProfile, DolphinProfileDiscovery, DolphinProfileDiscoveryRoots,
+    DolphinProfileScope, DolphinProviderCodeSelection, DolphinSettingsDirectoryState,
+    EmulatorProfileCandidate, EmulatorProfileSelectReason, EmulatorProfileSelection,
+    GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE, GameCubeCheatSelection, GameCubeCodeFormat,
+    GameCubeGameHackingInstallPreviewRequest, GameCubeGameIdentity, GameCubeInstallPlanError,
+    GameCubeInstallPlanErrorKind, GameHackingErrorKind, GameHackingFetchOptions, GameHackingGame,
+    GameHackingGameCubeCheat, GameHackingGameCubeFetchOptions, GameHackingGameCubeGame,
+    GameHackingGameCubeMatchCandidate, GameHackingGameCubeMatchStatus,
+    GameHackingGameCubeMatchStrength, GameHackingGameCubeProvider, GameHackingMatchCandidate,
+    GameHackingMatchStatus, GameHackingProvider, GameHackingWiiCheat, GameHackingWiiGame,
+    GameHackingWiiMatch, GameHackingWiiMatchCandidate, GameHackingWiiMatchStatus,
+    GameHackingWiiMatchStrength, GameHackingWiiProvider, GeckoProviderFetchOptions,
+    GeckoProviderFetchResult, GeckoProviderFetchStatus, GeckoProviderQuery,
+    HttpsCheatSourceTransport, ImportSourceKind, ImportTrustState, LoadedCandidate,
+    LoadedDolphinDestination, LoadedXeniaDestination, LocalSafetyScanningState, PageRequest,
+    Pcsx2CheatCandidate, Pcsx2CheatSelection, Pcsx2GameIdentity, Pcsx2InstallPlanError,
+    Pcsx2InstallPreviewRequest, Pcsx2InstallationType, Pcsx2MatchState, Pcsx2PatchCategory,
+    Pcsx2PatchDirectoryState, Pcsx2PnachInventory, Pcsx2Profile, Pcsx2ProfileDiscovery,
+    Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope, PreviewAdapter, PreviewDestinationState,
+    PreviewEligibility, PreviewIdentity, PreviewIdentityKind, PreviewIdentityState,
+    PreviewMatchStrength, PreviewSourceItem, PreviewState, ProviderGameMatchConfidence,
+    ReadOnlyCheatCatalogue, RememberedEmulatorProfile, ResolvedCheatDestination,
+    RetroArchCheatLibraryInspection, RetroArchCheatLibraryState, RetroArchCheatSetupDiscovery,
+    RetroArchLocalCheatMatchState, RetroArchMaterializationError,
     RetroArchMaterializationErrorKind, RetroArchMaterializationRequest,
     RetroArchMaterializedPreview, SharedAdapterWriteSupport, SharedApplyConfirmation,
     SharedApplyOptions, SharedApplyResult, SharedApplyStatus, SharedHistoryReport,
@@ -89,13 +93,14 @@ use archivefs_core::patch_manager::{
     StagedXeniaPatchFile, UNKNOWN_CODE_POLICY, WiiCodeFormat, WiiGameIdentity, XeniaCandidate,
     XeniaCandidateCompatibility, XeniaCandidateOutcome, XeniaInstallPlanError,
     XeniaInstallPreviewRequest, XeniaPatchSelection, XeniaProfile, XeniaProfileDiscovery,
-    XeniaProfileDiscoveryRoots, adapter_write_support, build_cheat_candidates,
+    XeniaProfileDiscoveryRoots, adapter_write_support, bsfree_gamecube_load_confirmed,
+    bsfree_gamecube_search, build_bsfree_gamecube_install_preview, build_cheat_candidates,
     build_cheat_install_preview, build_dolphin_install_preview,
     build_gamecube_gamehacking_install_preview, build_pcsx2_cheat_candidates,
     build_pcsx2_install_preview, build_pcsx2_legacy_migration_preview, build_shared_preview,
     build_shared_transaction_plan, build_wii_gamehacking_install_preview, build_xenia_candidates,
     build_xenia_install_preview, check_dolphin_catalogue_update_with_transport,
-    default_bsfree_source_root, default_cheat_source_cache_root,
+    classify_bsfree_gamecube_cheat, default_bsfree_source_root, default_cheat_source_cache_root,
     default_dolphin_catalogue_cache_root, default_gecko_provider_cache_root,
     default_shared_backup_root, default_shared_history_root, discover_dolphin_profiles,
     discover_pcsx2_profiles, discover_retroarch_cheat_setup_profiles,
@@ -113,7 +118,7 @@ use archivefs_core::patch_manager::{
     remove_local_bsfree_source, require_dolphin_managed_gamehacking_verification,
     resolve_cheat_destination, resolve_dolphin_gecko_lookup, select_dolphin_profile,
     select_emulator_profile, selected_pcsx2_managed_cheats, set_bsfree_enabled,
-    stage_dolphin_provider_ini, stage_gamecube_gamehacking_install,
+    stage_bsfree_gamecube_install, stage_dolphin_provider_ini, stage_gamecube_gamehacking_install,
     stage_gamecube_gamehacking_removal, stage_generated_cheat_file, stage_pcsx2_pnach,
     stage_xenia_patch_file, validate_installed_bsfree_source,
 };
@@ -7752,6 +7757,9 @@ impl ArchiveFsApp {
             gamecube_gamehacking_cancellation: None,
             gamecube_gamehacking_generation: 0,
             gamecube_gamehacking_blocked: false,
+            bsfree_gamecube: CheatStepResource::NotLoaded,
+            bsfree_gamecube_cancellation: None,
+            bsfree_gamecube_generation: 0,
             selected_dolphin_profile_id,
             dolphin_explicit_root: String::new(),
             dolphin_inventory_profile_id: None,
@@ -7967,6 +7975,7 @@ impl ArchiveFsApp {
                 xenia_generated: None,
                 pcsx2_generated: None,
                 gamecube_gamehacking_generated: None,
+                bsfree_gamecube_generated: None,
             }));
             context.request_repaint();
         });
@@ -8459,6 +8468,7 @@ impl ArchiveFsApp {
                 xenia_generated: None,
                 pcsx2_generated: None,
                 gamecube_gamehacking_generated: None,
+                bsfree_gamecube_generated: None,
             },
             Err(error) => {
                 self.history.record(HistoryEntry::new(
@@ -8478,6 +8488,7 @@ impl ArchiveFsApp {
                     xenia_generated: None,
                     pcsx2_generated: None,
                     gamecube_gamehacking_generated: None,
+                    bsfree_gamecube_generated: None,
                 }
             }
         };
@@ -8742,6 +8753,7 @@ impl ArchiveFsApp {
                 }),
                 pcsx2_generated: None,
                 gamecube_gamehacking_generated: None,
+                bsfree_gamecube_generated: None,
             },
             Err(error) => {
                 self.history.record(HistoryEntry::new(
@@ -8761,6 +8773,7 @@ impl ArchiveFsApp {
                     xenia_generated: None,
                     pcsx2_generated: None,
                     gamecube_gamehacking_generated: None,
+                    bsfree_gamecube_generated: None,
                 }
             }
         };
@@ -8910,6 +8923,7 @@ impl ArchiveFsApp {
                     xenia_generated: None,
                     pcsx2_generated: None,
                     gamecube_gamehacking_generated: None,
+                    bsfree_gamecube_generated: None,
                 },
                 Err(error) => CheatPreviewResponse {
                     key: worker_key,
@@ -8920,6 +8934,7 @@ impl ArchiveFsApp {
                     xenia_generated: None,
                     pcsx2_generated: None,
                     gamecube_gamehacking_generated: None,
+                    bsfree_gamecube_generated: None,
                 },
             };
             let _ = sender.send(Ok(message));
@@ -9031,6 +9046,12 @@ impl ArchiveFsApp {
             })
             .or_else(|| {
                 response
+                    .bsfree_gamecube_generated
+                    .as_ref()
+                    .map(|generated| generated.staging_root.clone())
+            })
+            .or_else(|| {
+                response
                     .materialized
                     .as_ref()
                     .map(|materialized| materialized.snapshot_root.clone())
@@ -9071,6 +9092,28 @@ impl ArchiveFsApp {
                             ActivityOutcome::Rejected,
                             format!(
                                 "GameCube live-target verification plan blocked: {}",
+                                error.detail
+                            ),
+                        ));
+                        return;
+                    }
+                }
+                if let Some(generated) = &response.bsfree_gamecube_generated {
+                    let expected_managed_names = archivefs_core::patch_manager::managed_names(
+                        &parse_dolphin_ini(&generated.staged.contents),
+                    )
+                    .into_iter()
+                    .collect();
+                    if let Err(error) = require_dolphin_managed_gamehacking_verification(
+                        &mut plan,
+                        expected_managed_names,
+                    ) {
+                        self.history.record(HistoryEntry::new(
+                            ActivityAction::CheatPreview,
+                            Some(workflow.archive_path.clone()),
+                            ActivityOutcome::Rejected,
+                            format!(
+                                "BSFree live-target verification plan blocked: {}",
                                 error.detail
                             ),
                         ));
@@ -10143,6 +10186,7 @@ impl ArchiveFsApp {
                     staged,
                     profile,
                 }),
+                bsfree_gamecube_generated: None,
             },
             Err(error) => {
                 self.history.record(HistoryEntry::new(
@@ -10162,6 +10206,7 @@ impl ArchiveFsApp {
                     xenia_generated: None,
                     pcsx2_generated: None,
                     gamecube_gamehacking_generated: None,
+                    bsfree_gamecube_generated: None,
                 }
             }
         };
@@ -10268,6 +10313,7 @@ impl ArchiveFsApp {
                     staged,
                     profile,
                 }),
+                bsfree_gamecube_generated: None,
             },
             Err(error) => {
                 self.history.record(HistoryEntry::new(
@@ -10287,6 +10333,270 @@ impl ArchiveFsApp {
                     xenia_generated: None,
                     pcsx2_generated: None,
                     gamecube_gamehacking_generated: None,
+                    bsfree_gamecube_generated: None,
+                }
+            }
+        };
+        let Some(workflow) = self.cheat_workflow.as_mut() else {
+            return;
+        };
+        workflow.preview_request = Some(key);
+        workflow.preview = CheatStepResource::Ready(message);
+        workflow.transaction = CheatTransactionState::Idle;
+        workflow.transaction_notice = None;
+        self.review_cheat_apply();
+    }
+
+    /// Searches the optional BSFree Archive SQLite database for the selected
+    /// GameCube game, on a background thread (opening the immutable source
+    /// re-validates its pinned SHA-256, which is too heavy for the UI thread).
+    /// Exactly one match auto-loads its classified cheats; several are shown
+    /// as candidates for explicit confirmation; none yields a search box.
+    fn start_bsfree_gamecube_search(&mut self, context: egui::Context, search_title: String) {
+        let Some((archive_path, game_id, region, platform_ok)) =
+            self.cheat_workflow.as_ref().and_then(|workflow| {
+                let identity = gamecube_identity_for_workflow(workflow)?;
+                Some((
+                    workflow.archive_path.clone(),
+                    identity.dolphin_game_id.clone()?,
+                    identity.region.clone(),
+                    workflow.platform.as_deref() == Some("GameCube"),
+                ))
+            })
+        else {
+            return;
+        };
+        if !platform_ok {
+            return;
+        }
+        let generation = self
+            .cheat_workflow
+            .as_ref()
+            .map(|workflow| workflow.bsfree_gamecube_generation.saturating_add(1))
+            .unwrap_or(1);
+        let (sender, receiver) = mpsc::channel();
+        let Some(workflow) = self.cheat_workflow.as_mut() else {
+            return;
+        };
+        if let Some(previous) = workflow.bsfree_gamecube_cancellation.take() {
+            previous.store(true, Ordering::Relaxed);
+        }
+        workflow.bsfree_gamecube_generation = generation;
+        workflow.bsfree_gamecube_cancellation = Some(Arc::new(AtomicBool::new(false)));
+        workflow.bsfree_gamecube = CheatStepResource::Loading { receiver };
+        self.history.record(HistoryEntry::new(
+            ActivityAction::CheatSourceRetrieval,
+            Some(archive_path),
+            ActivityOutcome::Started,
+            "Searching the local BSFree Archive for this GameCube game.".to_string(),
+        ));
+        thread::spawn(move || {
+            let result = (|| -> Result<BsFreeGameCubeGuiState, String> {
+                let catalogue = open_installed_bsfree_catalogue()?;
+                let outcome =
+                    bsfree_gamecube_search(&catalogue, &search_title, &game_id, region.as_deref())
+                        .map_err(|error| error.to_string())?;
+                Ok(bsfree_gui_state_from_outcome(outcome, search_title))
+            })();
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
+    /// Loads the classified cheats for a BSFree GameCube game the user
+    /// explicitly confirmed from the search candidates.
+    fn start_bsfree_gamecube_confirm(&mut self, context: egui::Context, upstream_uid: i64) {
+        let Some((archive_path, game_id, region, archive_title, platform_ok)) =
+            self.cheat_workflow.as_ref().and_then(|workflow| {
+                let identity = gamecube_identity_for_workflow(workflow)?;
+                Some((
+                    workflow.archive_path.clone(),
+                    identity.dolphin_game_id.clone()?,
+                    identity.region.clone(),
+                    workflow.display_name.clone(),
+                    workflow.platform.as_deref() == Some("GameCube"),
+                ))
+            })
+        else {
+            return;
+        };
+        if !platform_ok {
+            return;
+        }
+        let generation = self
+            .cheat_workflow
+            .as_ref()
+            .map(|workflow| workflow.bsfree_gamecube_generation.saturating_add(1))
+            .unwrap_or(1);
+        let (sender, receiver) = mpsc::channel();
+        let Some(workflow) = self.cheat_workflow.as_mut() else {
+            return;
+        };
+        if let Some(previous) = workflow.bsfree_gamecube_cancellation.take() {
+            previous.store(true, Ordering::Relaxed);
+        }
+        workflow.bsfree_gamecube_generation = generation;
+        workflow.bsfree_gamecube_cancellation = Some(Arc::new(AtomicBool::new(false)));
+        workflow.bsfree_gamecube = CheatStepResource::Loading { receiver };
+        self.history.record(HistoryEntry::new(
+            ActivityAction::CheatSourceRetrieval,
+            Some(archive_path),
+            ActivityOutcome::Started,
+            "Loading the confirmed BSFree GameCube game's cheats.".to_string(),
+        ));
+        thread::spawn(move || {
+            let result = (|| -> Result<BsFreeGameCubeGuiState, String> {
+                let catalogue = open_installed_bsfree_catalogue()?;
+                let outcome = bsfree_gamecube_load_confirmed(
+                    &catalogue,
+                    upstream_uid,
+                    &archive_title,
+                    &game_id,
+                    region.as_deref(),
+                )
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| {
+                    "The confirmed BSFree game is no longer in the catalogue.".to_string()
+                })?;
+                Ok(bsfree_gui_state_from_outcome(outcome, archive_title))
+            })();
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
+    fn update_bsfree_gamecube_cheat_selection(&mut self, index: usize, selected: bool) {
+        let Some(workflow) = self.cheat_workflow.as_mut() else {
+            return;
+        };
+        let CheatStepResource::Ready(state) = &mut workflow.bsfree_gamecube else {
+            return;
+        };
+        if !state.selection.set_selected(index, selected) {
+            return;
+        }
+        workflow.preview = CheatStepResource::NotLoaded;
+        workflow.preview_request = None;
+        workflow.transaction = CheatTransactionState::Idle;
+        workflow.transaction_notice = None;
+    }
+
+    fn update_bsfree_gamecube_cheat_selection_all(&mut self, selected: bool) {
+        let Some(workflow) = self.cheat_workflow.as_mut() else {
+            return;
+        };
+        let CheatStepResource::Ready(state) = &mut workflow.bsfree_gamecube else {
+            return;
+        };
+        if selected {
+            state.selection.select_all();
+        } else {
+            state.selection.clear_all();
+        }
+        workflow.preview = CheatStepResource::NotLoaded;
+        workflow.preview_request = None;
+        workflow.transaction = CheatTransactionState::Idle;
+        workflow.transaction_notice = None;
+    }
+
+    /// BSFree GameCube Stage: stages the selected supported cheats into the
+    /// real Dolphin GameSettings file (preserving every other section
+    /// byte-for-byte) and builds its shared install preview, exactly like the
+    /// GameHacking.org GameCube path. Synchronous - a single small local file.
+    fn start_bsfree_gamecube_install_preview(&mut self) {
+        let Some(staging_root) = default_generated_dolphin_gamehacking_staging_root(false).ok()
+        else {
+            return;
+        };
+        let Some(workflow) = self.cheat_workflow.as_ref() else {
+            return;
+        };
+        let CheatStepResource::Ready(state) = &workflow.bsfree_gamecube else {
+            return;
+        };
+        let Some(game) = state.game.clone() else {
+            return;
+        };
+        let Some(profile) = self.gamecube_gamehacking_profile() else {
+            self.history.record(HistoryEntry::new(
+                ActivityAction::CheatPreview,
+                Some(workflow.archive_path.clone()),
+                ActivityOutcome::Rejected,
+                "BSFree install preview blocked: the selected Dolphin profile is no longer eligible.",
+            ));
+            return;
+        };
+        let game_id = game.archive_game_id.clone();
+        let configuration_path = profile.configuration_path.clone();
+        let cheats = state.cheats.clone();
+        let selection = state.selection.clone();
+        let archive_path = workflow.archive_path.clone();
+        let key = cheat_preview_key(workflow);
+        let response = (|| {
+            let destination =
+                load_dolphin_destination(&configuration_path, &game_id).map_err(|failure| {
+                    BsFreeGameCubeError {
+                        kind: BsFreeGameCubeErrorKind::SelectionInvalid,
+                        cheat_name: None,
+                        detail: failure.to_string(),
+                    }
+                })?;
+            let staged = stage_bsfree_gamecube_install(
+                &staging_root,
+                &format!("{game_id}.ini"),
+                &destination.document,
+                destination.existed,
+                &cheats,
+                &selection,
+            )?;
+            let request = BsFreeGameCubeInstallPreviewRequest {
+                selected_archive: archive_path.clone(),
+                configuration_path: configuration_path.clone(),
+                game_id: game_id.clone(),
+                revision: None,
+                staged: staged.staged.clone(),
+            };
+            let preview = build_bsfree_gamecube_install_preview(&request)?;
+            Ok::<_, BsFreeGameCubeError>((preview, staged))
+        })();
+        let message = match response {
+            Ok((preview, staged)) => CheatPreviewResponse {
+                key: key.clone(),
+                outcome: CheatPreviewOutcome::Ready(preview.report),
+                materialized: None,
+                generated: None,
+                dolphin_generated: None,
+                xenia_generated: None,
+                pcsx2_generated: None,
+                gamecube_gamehacking_generated: None,
+                bsfree_gamecube_generated: Some(GeneratedBsFreeGameCubeInstall {
+                    staging_root,
+                    staged: staged.staged,
+                    profile,
+                    findings: staged.findings,
+                    skipped_duplicates: staged.skipped_duplicates,
+                    skipped_unselectable: staged.skipped_unselectable,
+                }),
+            },
+            Err(error) => {
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::CheatPreview,
+                    Some(archive_path),
+                    ActivityOutcome::Failed,
+                    format!("BSFree install preview failed: {}", error.detail),
+                ));
+                CheatPreviewResponse {
+                    key: key.clone(),
+                    outcome: CheatPreviewOutcome::Failed(
+                        CheatPreviewFailure::BsFreeGameCubeInstallPlan(error),
+                    ),
+                    materialized: None,
+                    generated: None,
+                    dolphin_generated: None,
+                    xenia_generated: None,
+                    pcsx2_generated: None,
+                    gamecube_gamehacking_generated: None,
+                    bsfree_gamecube_generated: None,
                 }
             }
         };
@@ -10430,6 +10740,7 @@ impl ArchiveFsApp {
                         legacy_migration_report,
                     }),
                     gamecube_gamehacking_generated: None,
+                    bsfree_gamecube_generated: None,
                 }
             }
             Err(failure) => {
@@ -10459,6 +10770,7 @@ impl ArchiveFsApp {
                     xenia_generated: None,
                     pcsx2_generated: None,
                     gamecube_gamehacking_generated: None,
+                    bsfree_gamecube_generated: None,
                 }
             }
         };
@@ -10763,6 +11075,61 @@ impl ArchiveFsApp {
                     );
                     workflow.gamecube_gamehacking_blocked = false;
                     workflow.gamecube_gamehacking_cancellation = None;
+                }
+            }
+        }
+        if let CheatStepResource::Loading { receiver } = &workflow.bsfree_gamecube {
+            match receiver.try_recv() {
+                Ok(Ok(mut state)) => {
+                    // Compute the destination-based duplicate/conflict analysis
+                    // once against the real Dolphin GameSettings file so the
+                    // list shows "Already installed"/"Conflict" honestly.
+                    if let Some(configuration_path) = workflow
+                        .selected_dolphin_profile_id
+                        .as_ref()
+                        .and_then(|id| dolphin_profile_paths.get(id))
+                        && let Some(game) = state.game.clone()
+                        && let Ok(destination) =
+                            load_dolphin_destination(configuration_path, &game.archive_game_id)
+                    {
+                        state.analysis =
+                            archivefs_core::patch_manager::analyze_bsfree_gamecube_duplicates(
+                                &state.cheats,
+                                &destination.document,
+                            );
+                        state.selection = BsFreeGameCubeCheatSelection::from_cheats(
+                            &state.cheats,
+                            &destination.document,
+                        );
+                    }
+                    preview_history_entry = Some(HistoryEntry::new(
+                        ActivityAction::CheatSourceRetrieval,
+                        Some(workflow.archive_path.clone()),
+                        ActivityOutcome::Completed,
+                        format!(
+                            "BSFree GameCube search returned {} cheat(s).",
+                            state.cheats.len()
+                        ),
+                    ));
+                    workflow.bsfree_gamecube = CheatStepResource::Ready(state);
+                    workflow.bsfree_gamecube_cancellation = None;
+                }
+                Ok(Err(message)) => {
+                    preview_history_entry = Some(HistoryEntry::new(
+                        ActivityAction::CheatSourceRetrieval,
+                        Some(workflow.archive_path.clone()),
+                        ActivityOutcome::Failed,
+                        format!("BSFree GameCube search failed: {message}"),
+                    ));
+                    workflow.bsfree_gamecube = CheatStepResource::Failed(message);
+                    workflow.bsfree_gamecube_cancellation = None;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    workflow.bsfree_gamecube = CheatStepResource::Failed(
+                        "BSFree Archive worker stopped unexpectedly.".to_string(),
+                    );
+                    workflow.bsfree_gamecube_cancellation = None;
                 }
             }
         }
@@ -13808,6 +14175,27 @@ impl ArchiveFsApp {
                         }
                         Some(CheatWorkflowAction::RemoveSelectedGameCubeGameHacking) => {
                             self.start_gamecube_gamehacking_removal_preview();
+                        }
+                        Some(CheatWorkflowAction::FetchBsFreeGameCube { search_title }) => {
+                            self.start_bsfree_gamecube_search(context.clone(), search_title);
+                        }
+                        Some(CheatWorkflowAction::ConfirmBsFreeGameCubeMatch { upstream_uid }) => {
+                            self.start_bsfree_gamecube_confirm(context.clone(), upstream_uid);
+                        }
+                        Some(CheatWorkflowAction::ToggleBsFreeGameCubeCheatSelected {
+                            index,
+                            selected,
+                        }) => {
+                            self.update_bsfree_gamecube_cheat_selection(index, selected);
+                        }
+                        Some(CheatWorkflowAction::SelectAllBsFreeGameCubeCheats) => {
+                            self.update_bsfree_gamecube_cheat_selection_all(true);
+                        }
+                        Some(CheatWorkflowAction::ClearAllBsFreeGameCubeCheats) => {
+                            self.update_bsfree_gamecube_cheat_selection_all(false);
+                        }
+                        Some(CheatWorkflowAction::InstallSelectedBsFreeGameCube) => {
+                            self.start_bsfree_gamecube_install_preview();
                         }
                         Some(CheatWorkflowAction::RescanDolphinProfiles) => {
                             self.start_dolphin_profile_scan(context.clone());
@@ -19030,9 +19418,13 @@ fn show_bsfree_source_card(
                     widgets::status_badge(ui, "Status unavailable", widgets::StatusTone::Warning)
                 }
             }
-            widgets::status_badge(ui, "Browse only", widgets::StatusTone::Info);
+            widgets::status_badge(
+                ui,
+                "GameCube installable via Dolphin",
+                widgets::StatusTone::Info,
+            );
         });
-        ui.label("ArchiveFS can search this historical cheat database. Installing from BSFree is not supported yet.");
+        ui.label("GameCube cheats can be installed with Dolphin. Other BSFree formats remain browse only.");
         widgets::technical_details(ui, "bsfree-source-provenance", |ui| {
             ui.label("Source: BSFree Archive");
             ui.label("Maintainer: Andrew Mackrodt");
@@ -19245,6 +19637,35 @@ fn bsfree_compatibility_label(compatibility: DeviceFormatCompatibility) -> &'sta
     }
 }
 
+/// Honest, per-code capability statement for a BSFree cheat row. GameCube
+/// hex-pair codes classify as installable through the existing Dolphin
+/// adapter (Gecko-equivalent or native Action Replay); every other platform
+/// and every unsupported format stays reference-only. This never claims
+/// ArchiveFS has verified the BSFree database - it states only which formats
+/// an existing adapter can represent.
+fn bsfree_code_capability(
+    cheat: &BsFreeCheat,
+    platform_id: Option<&str>,
+) -> (&'static str, widgets::StatusTone) {
+    if platform_id == Some("GameCube") {
+        match classify_bsfree_gamecube_cheat(cheat).code_format {
+            BsFreeGameCubeCodeFormat::GeckoEquivalent => {
+                ("Supported by Dolphin (Gecko)", widgets::StatusTone::Success)
+            }
+            BsFreeGameCubeCodeFormat::ActionReplayNative => (
+                "Supported by Dolphin (Action Replay)",
+                widgets::StatusTone::Success,
+            ),
+            BsFreeGameCubeCodeFormat::Unsupported | BsFreeGameCubeCodeFormat::Malformed => (
+                "Unsupported for this emulator",
+                widgets::StatusTone::Pending,
+            ),
+        }
+    } else {
+        ("Reference only", widgets::StatusTone::Pending)
+    }
+}
+
 fn show_bsfree_game_browser(
     ui: &mut egui::Ui,
     manager: &BsFreeManagerState,
@@ -19271,8 +19692,14 @@ fn show_bsfree_game_browser(
     );
     widgets::card(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
-            widgets::status_badge(ui, "Browse only", widgets::StatusTone::Info);
-            ui.label("ArchiveFS can search this historical cheat database. Installing from BSFree is not supported yet.");
+            widgets::status_badge(
+                ui,
+                "GameCube: installable via Dolphin",
+                widgets::StatusTone::Info,
+            );
+            ui.label(
+                "GameCube cheats can be installed with Dolphin. Other BSFree formats remain browse only.",
+            );
         });
         ui.label("Match based on platform and title. Exact game revision is not verified.");
 
@@ -19460,6 +19887,11 @@ fn show_bsfree_game_browser(
                                     bsfree_compatibility_label(cheat.compatibility),
                                     widgets::StatusTone::Pending,
                                 );
+                                let (capability_label, capability_tone) = bsfree_code_capability(
+                                    cheat,
+                                    game.system.archivefs_platform_id.as_deref(),
+                                );
+                                widgets::status_badge(ui, capability_label, capability_tone);
                             });
                             if let Some(section) = &cheat.section {
                                 ui.label(format!("Section: {}", section.name));
@@ -21780,6 +22212,13 @@ struct CheatWorkflowState {
     /// Retry, since retrying immediately cannot help and core-side cooldown
     /// gating already prevents hammering a blocked origin.
     gamecube_gamehacking_blocked: bool,
+    /// BSFree Archive GameCube coverage in Cheats & Mods: an optional local
+    /// SQLite source, matched by platform + title to the selected archive's
+    /// verified Dolphin Game ID. Installable only for the proven hex-pair
+    /// formats; every other BSFree record stays browseable.
+    bsfree_gamecube: CheatStepResource<BsFreeGameCubeGuiState>,
+    bsfree_gamecube_cancellation: Option<Arc<AtomicBool>>,
+    bsfree_gamecube_generation: u64,
     selected_dolphin_profile_id: Option<String>,
     /// An optional additional Dolphin configuration directory to scan,
     /// typed by the user - covers portable/AppImage installs, which have
@@ -21996,6 +22435,20 @@ struct GeneratedGameCubeGameHackingInstall {
     profile: DolphinProfile,
 }
 
+/// The BSFree Archive GameCube equivalent of
+/// `GeneratedGameCubeGameHackingInstall`, additionally carrying the two-pass
+/// duplicate/conflict analysis the BSFree provider computed before staging, so
+/// the review/result UI can list already-installed, skipped, conflict, and
+/// unsupported cheats honestly.
+struct GeneratedBsFreeGameCubeInstall {
+    staging_root: PathBuf,
+    staged: StagedGameCubeIni,
+    profile: DolphinProfile,
+    findings: Vec<BsFreeDedupFinding>,
+    skipped_duplicates: Vec<String>,
+    skipped_unselectable: Vec<String>,
+}
+
 /// The Xenia equivalent of `GeneratedDolphinInstall`: the exact chosen
 /// candidate document, staged as a real merged `.patch.toml`.
 #[derive(Clone)]
@@ -22035,6 +22488,28 @@ fn gamecube_gamehacking_selection_for(
     cheats: &[GameHackingGameCubeCheat],
 ) -> GameCubeCheatSelection {
     GameCubeCheatSelection::from_cheats(cheats, &parse_dolphin_ini(""))
+}
+
+/// BSFree GameCube coverage inside Cheats & Mods: the matched BSFree game,
+/// its classified cheats, and the user's explicit per-cheat selection. Only
+/// the installable formats (`GeckoEquivalent`, `ActionReplayNative`) can be
+/// selected; everything else stays browseable but unselectable. Identity is
+/// the selected archive's verified Dolphin Game ID; the BSFree game itself is
+/// matched by platform + title and always requires review before Apply.
+struct BsFreeGameCubeGuiState {
+    status: BsFreeGameCubeSearchStatus,
+    detail: String,
+    candidates: Vec<BsFreeGameCubeMatch>,
+    game: Option<BsFreeGameCubeMatch>,
+    cheats: Vec<BsFreeGameCubeCheat>,
+    selection: BsFreeGameCubeCheatSelection,
+    /// Destination-based duplicate/conflict analysis computed once per fetch
+    /// against the real Dolphin GameSettings file, so the list can show
+    /// "Already installed"/"Conflict" honestly. Refreshed on every re-search.
+    analysis: Vec<BsFreeDedupFinding>,
+    /// Editable search title, pre-filled with the archive's title. A different
+    /// search re-runs the bounded local BSFree query.
+    search_title: String,
 }
 
 fn dolphin_game_from_wii_game(game: GameHackingWiiGame) -> GameHackingGameCubeGame {
@@ -22200,6 +22675,9 @@ enum CheatPreviewFailure {
     /// Generating, staging, or previewing a GameHacking.org GameCube
     /// cheat install or removal failed.
     GameCubeGameHackingInstallPlan(GameCubeInstallPlanError),
+    /// Generating, staging, or previewing a BSFree Archive GameCube cheat
+    /// install failed.
+    BsFreeGameCubeInstallPlan(BsFreeGameCubeError),
 }
 
 impl std::fmt::Display for CheatPreviewFailure {
@@ -22212,6 +22690,7 @@ impl std::fmt::Display for CheatPreviewFailure {
             Self::XeniaInstallPlan(error) => error.fmt(formatter),
             Self::Pcsx2InstallPlan(error) => error.fmt(formatter),
             Self::GameCubeGameHackingInstallPlan(error) => error.fmt(formatter),
+            Self::BsFreeGameCubeInstallPlan(error) => error.fmt(formatter),
         }
     }
 }
@@ -22231,6 +22710,11 @@ struct CheatPreviewResponse {
     pcsx2_generated: Option<GeneratedPcsx2Install>,
     /// Present only for the GameHacking.org GameCube install/removal path.
     gamecube_gamehacking_generated: Option<GeneratedGameCubeGameHackingInstall>,
+    /// Present only for the BSFree Archive GameCube install path. A staged
+    /// Dolphin GameSettings INI plus the provider's dedup/conflict findings;
+    /// kept distinct so the two sources never cross-talk in the shared
+    /// review/apply/result UI.
+    bsfree_gamecube_generated: Option<GeneratedBsFreeGameCubeInstall>,
 }
 
 enum CheatPreviewWork {
@@ -23193,6 +23677,23 @@ enum CheatWorkflowAction {
     },
     InstallSelectedGameCubeGameHacking,
     RemoveSelectedGameCubeGameHacking,
+    /// BSFree Archive GameCube coverage: search the optional local SQLite
+    /// database for the selected archive's game (bounded, read-only).
+    FetchBsFreeGameCube {
+        search_title: String,
+    },
+    /// Confirm one of several BSFree GameCube search candidates and load its
+    /// classified cheats.
+    ConfirmBsFreeGameCubeMatch {
+        upstream_uid: i64,
+    },
+    ToggleBsFreeGameCubeCheatSelected {
+        index: usize,
+        selected: bool,
+    },
+    SelectAllBsFreeGameCubeCheats,
+    ClearAllBsFreeGameCubeCheats,
+    InstallSelectedBsFreeGameCube,
 }
 
 const MODS_UNAVAILABLE_BODY: &str = "This workspace is reserved for future verified emulator-specific adapters, including patches, texture packs, widescreen fixes, and frame-rate patches. No mod workflow is available yet.";
@@ -24170,6 +24671,9 @@ fn show_dolphin_workflow(
     if matches!(workflow.platform.as_deref(), Some("GameCube" | "Wii")) {
         action = show_gamecube_gamehacking(ui, workflow).or(action);
     }
+    if workflow.platform.as_deref() == Some("GameCube") {
+        action = show_bsfree_gamecube(ui, workflow).or(action);
+    }
     action
 }
 
@@ -24186,18 +24690,20 @@ fn show_dolphin_beginner_summary(
     profiles: &DolphinProfilesState,
 ) -> Option<CheatWorkflowAction> {
     let mut action = None;
-    match &workflow.transaction {
-        CheatTransactionState::Applying { .. } => {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label("Installing…");
-            });
-            return action;
+    if !bsfree_transaction_active(workflow) {
+        match &workflow.transaction {
+            CheatTransactionState::Applying { .. } => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Installing…");
+                });
+                return action;
+            }
+            CheatTransactionState::Result { result, .. } => {
+                return show_beginner_install_result(ui, result);
+            }
+            CheatTransactionState::Idle | CheatTransactionState::Review { .. } => {}
         }
-        CheatTransactionState::Result { result, .. } => {
-            return show_beginner_install_result(ui, result);
-        }
-        CheatTransactionState::Idle | CheatTransactionState::Review { .. } => {}
     }
     let status = dolphin_beginner_status(workflow);
     widgets::status_badge(ui, status.label(), status.tone());
@@ -27095,18 +27601,20 @@ fn show_gamecube_gamehacking(
             },
         );
     }
-    match &workflow.transaction {
-        CheatTransactionState::Applying { .. } => {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label("Installing selected cheats…");
-            });
-            return action;
+    if !bsfree_transaction_active(workflow) {
+        match &workflow.transaction {
+            CheatTransactionState::Applying { .. } => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Installing selected cheats…");
+                });
+                return action;
+            }
+            CheatTransactionState::Result { result, .. } => {
+                return show_beginner_install_result(ui, result);
+            }
+            CheatTransactionState::Idle | CheatTransactionState::Review { .. } => {}
         }
-        CheatTransactionState::Result { result, .. } => {
-            return show_beginner_install_result(ui, result);
-        }
-        CheatTransactionState::Idle | CheatTransactionState::Review { .. } => {}
     }
     match &mut workflow.gamecube_gamehacking {
         CheatStepResource::NotLoaded => {
@@ -27478,6 +27986,554 @@ fn show_gamecube_gamehacking(
     action
 }
 
+/// The BSFree Archive GameCube section inside Cheats & Mods: search the
+/// optional local SQLite database by the selected archive's title, confirm a
+/// candidate when several match, select supported cheats, and install through
+/// the same shared preview/apply/rollback pipeline as every other Dolphin
+/// cheat source. Unsupported and browse-only records stay visible but can
+/// never enter the apply batch.
+fn show_bsfree_gamecube(
+    ui: &mut egui::Ui,
+    workflow: &mut CheatWorkflowState,
+) -> Option<CheatWorkflowAction> {
+    let mut action = None;
+    ui.add_space(theme::SECTION_GAP);
+    widgets::section_header(
+        ui,
+        "BSFree Archive",
+        Some(
+            "An optional historical cheat database. GameCube cheats can be installed with Dolphin. \
+             Other BSFree formats remain browse only.",
+        ),
+    );
+
+    if bsfree_transaction_active(workflow) {
+        match &workflow.transaction {
+            CheatTransactionState::Applying { .. } => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Installing selected cheats…");
+                });
+                return action;
+            }
+            CheatTransactionState::Result { result, .. } => {
+                return show_bsfree_install_result(ui, workflow, result);
+            }
+            CheatTransactionState::Idle | CheatTransactionState::Review { .. } => {}
+        }
+    }
+
+    let identity_ready = gamecube_identity_for_workflow(workflow)
+        .is_some_and(|identity| identity.verified_game_id().is_some());
+    let profile_selected = workflow.selected_dolphin_profile_id.is_some();
+
+    match &mut workflow.bsfree_gamecube {
+        CheatStepResource::NotLoaded => {
+            if identity_ready {
+                // Auto-search once as soon as the archive's verified Game ID is
+                // available, so matching BSFree cheats appear alongside the
+                // other cheat sources without any CLI usage.
+                let search_title = workflow.display_name.clone();
+                action = Some(CheatWorkflowAction::FetchBsFreeGameCube { search_title });
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Searching BSFree Archive for this game…");
+                });
+            } else {
+                widgets::status_badge(ui, "Game identity incomplete", widgets::StatusTone::Blocked);
+                ui.label("ArchiveFS needs a verified Dolphin Game ID before it can search BSFree.");
+            }
+        }
+        CheatStepResource::Loading { .. } => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Reading the local BSFree database…");
+            });
+        }
+        CheatStepResource::Failed(message) => {
+            widgets::banner(
+                ui,
+                "BSFree Archive unavailable",
+                message,
+                widgets::StatusTone::Warning,
+            );
+            if message.contains("not installed")
+                || message.contains("not installed, enabled and validated")
+            {
+                ui.label(
+                    "Download or import the optional historical database from Cheats → Sources, \
+                     then search again.",
+                );
+            }
+            if identity_ready
+                && widgets::action_button(ui, "Try again", widgets::ActionStyle::Secondary, true)
+                    .clicked()
+            {
+                let search_title = workflow.display_name.clone();
+                action = Some(CheatWorkflowAction::FetchBsFreeGameCube { search_title });
+            }
+        }
+        CheatStepResource::Ready(state) => {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Search title:");
+                ui.add(egui::TextEdit::singleline(&mut state.search_title).desired_width(280.0));
+                if ui
+                    .add_enabled(identity_ready, egui::Button::new("Search BSFree"))
+                    .clicked()
+                {
+                    action = Some(CheatWorkflowAction::FetchBsFreeGameCube {
+                        search_title: state.search_title.trim().to_string(),
+                    });
+                }
+            });
+            ui.weak(&state.detail);
+
+            match state.status {
+                BsFreeGameCubeSearchStatus::Candidates => {
+                    for candidate in &state.candidates {
+                        widgets::card(ui, |ui| {
+                            ui.strong(&candidate.matched_bsfree_title);
+                            ui.label(format!(
+                                "Version: {} · BSFree game UID {}",
+                                candidate
+                                    .matched_bsfree_version
+                                    .as_deref()
+                                    .unwrap_or("not supplied"),
+                                candidate.matched_bsfree_game_upstream_uid
+                            ));
+                            ui.weak(&candidate.region_evidence);
+                            if widgets::action_button(
+                                ui,
+                                "Use this game",
+                                widgets::ActionStyle::Primary,
+                                true,
+                            )
+                            .clicked()
+                            {
+                                action = Some(CheatWorkflowAction::ConfirmBsFreeGameCubeMatch {
+                                    upstream_uid: candidate.matched_bsfree_game_upstream_uid,
+                                });
+                            }
+                        });
+                    }
+                }
+                BsFreeGameCubeSearchStatus::NoMatch => {}
+                BsFreeGameCubeSearchStatus::Matched => {
+                    if let Some(game) = &state.game {
+                        widgets::card(ui, |ui| {
+                            ui.strong(&game.matched_bsfree_title);
+                            ui.label(format!(
+                                "Matched for: {} · Game ID {}",
+                                game.archive_title, game.archive_game_id
+                            ));
+                            ui.weak(&game.region_evidence);
+                            ui.weak(
+                                "Matched by platform and title. BSFree carries no verified game \
+                                 revision, so review the cheats before applying.",
+                            );
+                        });
+                    }
+                    for (position, cheat) in state.cheats.iter().enumerate() {
+                        let entry = state
+                            .selection
+                            .entries
+                            .iter()
+                            .find(|entry| entry.index == position)
+                            .cloned();
+                        let (status_label, tone) = bsfree_cheat_status(cheat, &state.analysis);
+                        widgets::card(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                if let Some(entry) = &entry
+                                    && entry.selectable
+                                {
+                                    let mut selected = entry.selected;
+                                    if ui.checkbox(&mut selected, &cheat.name).changed() {
+                                        action = Some(
+                                            CheatWorkflowAction::ToggleBsFreeGameCubeCheatSelected {
+                                                index: entry.index,
+                                                selected,
+                                            },
+                                        );
+                                    }
+                                } else {
+                                    ui.strong(&cheat.name);
+                                }
+                                widgets::status_badge(ui, status_label, tone);
+                            });
+                            if let Some(author) = &cheat.author {
+                                ui.label(format!("Author: {author}"));
+                            }
+                            if let Some(note) = &cheat.note {
+                                ui.label(format!("Notes: {note}"));
+                            }
+                            if entry.is_none_or(|entry| !entry.selectable) {
+                                ui.weak(bsfree_browse_only_reason(cheat.code_format));
+                            }
+                            ui.collapsing("Code", |ui| {
+                                for line in &cheat.code_lines {
+                                    ui.monospace(line);
+                                }
+                            });
+                        });
+                    }
+                    let selected_count = state.selection.selected_count();
+                    ui.horizontal_wrapped(|ui| {
+                        if widgets::action_button(
+                            ui,
+                            "Select all supported",
+                            widgets::ActionStyle::Quiet,
+                            state.selection.selectable_count() > 0,
+                        )
+                        .clicked()
+                        {
+                            action = Some(CheatWorkflowAction::SelectAllBsFreeGameCubeCheats);
+                        }
+                        if widgets::action_button(
+                            ui,
+                            "Clear selection",
+                            widgets::ActionStyle::Quiet,
+                            selected_count > 0,
+                        )
+                        .clicked()
+                        {
+                            action = Some(CheatWorkflowAction::ClearAllBsFreeGameCubeCheats);
+                        }
+                        if matches!(workflow.transaction, CheatTransactionState::Idle)
+                            && widgets::action_button(
+                                ui,
+                                format!("Install {selected_count} cheats"),
+                                widgets::ActionStyle::Primary,
+                                state.selection.can_apply()
+                                    && profile_selected
+                                    && matches!(workflow.transaction, CheatTransactionState::Idle),
+                            )
+                            .clicked()
+                        {
+                            action = Some(CheatWorkflowAction::InstallSelectedBsFreeGameCube);
+                        }
+                    });
+                    if !profile_selected {
+                        ui.weak("Choose an eligible Dolphin profile to enable installation.");
+                    }
+                }
+            }
+        }
+    }
+
+    // The shared review card for a BSFree preview, outside the mutable borrow
+    // of `bsfree_gamecube`.
+    if matches!(workflow.transaction, CheatTransactionState::Review { .. }) {
+        action = show_bsfree_review_card(ui, workflow).or(action);
+    }
+    action
+}
+
+/// Per-cheat status for the BSFree list, using the destination-based analysis
+/// computed when the search completed. Never exposes raw converter terminology
+/// by default.
+fn bsfree_cheat_status(
+    cheat: &BsFreeGameCubeCheat,
+    analysis: &[BsFreeDedupFinding],
+) -> (&'static str, widgets::StatusTone) {
+    if !cheat.code_format.is_installable() {
+        return ("Browse only", widgets::StatusTone::Pending);
+    }
+    let findings = analysis
+        .iter()
+        .filter(|finding| finding.cheat_upstream_id == cheat.upstream_id)
+        .collect::<Vec<_>>();
+    if findings.iter().any(|finding| {
+        matches!(
+            finding.kind,
+            BsFreeDedupFindingKind::AlreadyInstalled
+                | BsFreeDedupFindingKind::AlreadyInstalledDifferentName
+        )
+    }) {
+        return ("Already installed", widgets::StatusTone::Info);
+    }
+    if findings
+        .iter()
+        .any(|finding| finding.kind.blocks_selection())
+    {
+        return ("Conflict", widgets::StatusTone::Blocked);
+    }
+    ("Ready", widgets::StatusTone::Success)
+}
+
+/// Concise browse-only reason for an unsupported/malformed BSFree code.
+fn bsfree_browse_only_reason(code_format: BsFreeGameCubeCodeFormat) -> &'static str {
+    match code_format {
+        BsFreeGameCubeCodeFormat::GeckoEquivalent
+        | BsFreeGameCubeCodeFormat::ActionReplayNative => "Supported by Dolphin.",
+        BsFreeGameCubeCodeFormat::Unsupported => {
+            "Browse only — this code contains an Action Replay command Dolphin refuses to run."
+        }
+        BsFreeGameCubeCodeFormat::Malformed => {
+            "Browse only — this code format cannot be installed yet."
+        }
+    }
+}
+
+/// The BSFree review card: selected game, Dolphin profile, selected cheat
+/// count, files that would change, already-installed items, conflicts, and
+/// the unsupported entries that are excluded. Nothing here mutates anything.
+fn show_bsfree_review_card(
+    ui: &mut egui::Ui,
+    workflow: &mut CheatWorkflowState,
+) -> Option<CheatWorkflowAction> {
+    let mut action = None;
+    let CheatStepResource::Ready(response) = &workflow.preview else {
+        return action;
+    };
+    let Some(generated) = &response.bsfree_gamecube_generated else {
+        return action;
+    };
+    let CheatTransactionState::Review {
+        plan,
+        replacement_approved,
+        ..
+    } = &mut workflow.transaction
+    else {
+        return action;
+    };
+    let matched_title = match &workflow.bsfree_gamecube {
+        CheatStepResource::Ready(state) => state
+            .game
+            .as_ref()
+            .map(|game| game.matched_bsfree_title.clone()),
+        _ => None,
+    };
+    widgets::card(ui, |ui| {
+        let count = generated.staged.affected.len();
+        ui.strong(format!(
+            "Apply {count} cheat{s}?",
+            s = if count == 1 { "" } else { "s" }
+        ));
+        ui.label(
+            "ArchiveFS will write only to the [Gecko]/[ActionReplay] sections of this exact \
+             Dolphin GameSettings file, keep a backup, and make this change undoable.",
+        );
+        if let Some(title) = &matched_title {
+            ui.label(format!("BSFree game: {title}"));
+        }
+        ui.label(format!(
+            "Selected Dolphin executable: {}",
+            generated
+                .profile
+                .resolved
+                .emulator_executable
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "native/system fallback".to_string())
+        ));
+        ui.label(format!(
+            "GameSettings directory: {}",
+            generated.profile.game_settings_path.display()
+        ));
+        ui.label(format!(
+            "Staging artifact (not destination): {}",
+            generated.staged.path.display()
+        ));
+        for entry in &plan.entries {
+            ui.label(format!(
+                "Target file: {}/{}",
+                entry.destination_root.display, entry.destination_relative_path.display
+            ));
+        }
+        for cheat in &generated.staged.affected {
+            ui.label(format!(
+                "{} → [{}]",
+                cheat.name,
+                match cheat.code_format {
+                    GameCubeCodeFormat::ActionReplay => "ActionReplay",
+                    GameCubeCodeFormat::Gecko => "Gecko",
+                    GameCubeCodeFormat::RawUnknown | GameCubeCodeFormat::Unsupported => "n/a",
+                }
+            ));
+        }
+        let installed: Vec<&BsFreeDedupFinding> = generated
+            .findings
+            .iter()
+            .filter(|finding| {
+                matches!(
+                    finding.kind,
+                    BsFreeDedupFindingKind::AlreadyInstalled
+                        | BsFreeDedupFindingKind::AlreadyInstalledDifferentName
+                )
+            })
+            .collect();
+        if !installed.is_empty() {
+            ui.label(format!(
+                "Already installed (not applied again): {}",
+                installed
+                    .iter()
+                    .map(|finding| finding.cheat_name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        let conflicts: Vec<&BsFreeDedupFinding> = generated
+            .findings
+            .iter()
+            .filter(|finding| finding.kind.blocks_selection())
+            .collect();
+        if !conflicts.is_empty() {
+            ui.label(format!(
+                "Conflicts (blocked, not applied): {}",
+                conflicts
+                    .iter()
+                    .map(|finding| finding.cheat_name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if !generated.skipped_unselectable.is_empty() {
+            ui.label(format!(
+                "Unsupported (excluded): {}",
+                generated.skipped_unselectable.join(", ")
+            ));
+        }
+        if !generated.skipped_duplicates.is_empty() {
+            ui.label(format!(
+                "Skipped duplicates: {}",
+                generated.skipped_duplicates.join(", ")
+            ));
+        }
+        let replacement_required = plan.entries.iter().any(|entry| {
+            entry.proposed_action == archivefs_core::patch_manager::PreviewProposedAction::Replace
+        });
+        if replacement_required {
+            ui.checkbox(
+                replacement_approved,
+                "I approve replacing the existing file shown in the preview",
+            );
+        }
+        if widgets::action_button(
+            ui,
+            "Confirm",
+            widgets::ActionStyle::Primary,
+            !replacement_required || *replacement_approved,
+        )
+        .clicked()
+        {
+            action = Some(CheatWorkflowAction::ConfirmApply);
+        }
+        if widgets::action_button(ui, "Cancel", widgets::ActionStyle::Quiet, true).clicked() {
+            action = Some(CheatWorkflowAction::CancelApply);
+        }
+    });
+    action
+}
+
+/// The BSFree install result card: how many cheats were added, the
+/// already-installed/skipped/conflict/unsupported details from the provider's
+/// analysis, and Undo (rollback) through the same shared history flow every
+/// other install uses.
+fn show_bsfree_install_result(
+    ui: &mut egui::Ui,
+    workflow: &CheatWorkflowState,
+    result: &SharedApplyResult,
+) -> Option<CheatWorkflowAction> {
+    let mut action = None;
+    widgets::card(ui, |ui| {
+        let (count, skipped, conflicts, unsupported) = match &workflow.preview {
+            CheatStepResource::Ready(response) => response
+                .bsfree_gamecube_generated
+                .as_ref()
+                .map(|generated| {
+                    (
+                        generated.staged.affected.len(),
+                        generated.skipped_duplicates.clone(),
+                        generated
+                            .findings
+                            .iter()
+                            .filter(|finding| finding.kind.blocks_selection())
+                            .map(|finding| finding.cheat_name.clone())
+                            .collect::<Vec<_>>(),
+                        generated.skipped_unselectable.clone(),
+                    )
+                })
+                .unwrap_or_default(),
+            _ => Default::default(),
+        };
+        match result.journal.status {
+            SharedApplyStatus::Success => {
+                widgets::status_badge(
+                    ui,
+                    format!(
+                        "{count} cheat{s} added",
+                        s = if count == 1 { "" } else { "s" }
+                    ),
+                    widgets::StatusTone::Success,
+                );
+            }
+            SharedApplyStatus::PartialFailure => {
+                widgets::status_badge(
+                    ui,
+                    "Installed with some problems",
+                    widgets::StatusTone::Warning,
+                );
+            }
+            SharedApplyStatus::Failed => {
+                widgets::status_badge(ui, "Install failed", widgets::StatusTone::Blocked);
+            }
+            SharedApplyStatus::DryRun => {
+                widgets::status_badge(ui, "Dry run complete", widgets::StatusTone::Info);
+            }
+        }
+        if !skipped.is_empty() {
+            ui.label(format!(
+                "Already installed or skipped: {}",
+                skipped.join(", ")
+            ));
+        }
+        if !conflicts.is_empty() {
+            ui.label(format!("Conflicts (not applied): {}", conflicts.join(", ")));
+        }
+        if !unsupported.is_empty() {
+            ui.label(format!(
+                "Unsupported (browse only): {}",
+                unsupported.join(", ")
+            ));
+        }
+        for entry in &result.journal.entries {
+            ui.label(format!(
+                "Live target: {}/{}",
+                entry.plan_entry.destination_root.display,
+                entry.plan_entry.destination_relative_path.display
+            ));
+            for failure in &entry.failures {
+                ui.label(format!(
+                    "Failed stage: {:?} · target: {} · {}",
+                    failure.kind,
+                    failure
+                        .path
+                        .as_ref()
+                        .map(|path| path.display.as_str())
+                        .unwrap_or("unknown"),
+                    failure.detail
+                ));
+            }
+        }
+        let rollback_available = result.journal_path.is_some()
+            && matches!(
+                result.journal.status,
+                SharedApplyStatus::Success | SharedApplyStatus::PartialFailure
+            );
+        if widgets::action_button(
+            ui,
+            "Undo installation",
+            widgets::ActionStyle::Destructive,
+            rollback_available,
+        )
+        .clicked()
+        {
+            action = Some(CheatWorkflowAction::RollbackInstall);
+        }
+    });
+    action
+}
+
 fn pcsx2_installation_label(kind: Pcsx2InstallationType) -> &'static str {
     match kind {
         Pcsx2InstallationType::Native => "Native",
@@ -27583,12 +28639,50 @@ fn gamecube_identity_for_workflow(workflow: &CheatWorkflowState) -> Option<GameC
     ))
 }
 
+/// Opens the installed, validated BSFree Archive SQLite catalogue (the pinned
+/// SHA-256 re-validation makes this too heavy for the UI thread, so it only
+/// ever runs on a background thread).
+fn open_installed_bsfree_catalogue() -> Result<BsFreeCatalogue, String> {
+    let paths = BsFreePaths::at(default_bsfree_source_root().map_err(|error| error.to_string())?);
+    BsFreeCatalogue::open_installed(&paths).map_err(|error| error.to_string())
+}
+
+/// Builds the GUI state from a BSFree search/confirm outcome.
+fn bsfree_gui_state_from_outcome(
+    outcome: BsFreeGameCubeSearchOutcome,
+    search_title: String,
+) -> BsFreeGameCubeGuiState {
+    let cheats = outcome.cheats;
+    let selection = BsFreeGameCubeCheatSelection::from_cheats(&cheats, &parse_dolphin_ini(""));
+    BsFreeGameCubeGuiState {
+        status: outcome.status,
+        detail: outcome.detail,
+        candidates: outcome.candidates,
+        game: outcome.game,
+        cheats,
+        selection,
+        analysis: Vec::new(),
+        search_title,
+    }
+}
+
 fn wii_identity_for_workflow(workflow: &CheatWorkflowState) -> Option<WiiGameIdentity> {
     let report = ready_game_identity(workflow)?;
     Some(WiiGameIdentity::from_report(
         workflow.display_name.clone(),
         report,
     ))
+}
+
+/// Whether the current shared transaction/preview belongs to the BSFree
+/// GameCube flow rather than the GameHacking.org flow. The two sources share
+/// one `workflow.transaction`; only the source whose preview artifact is
+/// present renders the applying/result/review states.
+fn bsfree_transaction_active(workflow: &CheatWorkflowState) -> bool {
+    matches!(
+        &workflow.preview,
+        CheatStepResource::Ready(response) if response.bsfree_gamecube_generated.is_some()
+    )
 }
 
 fn cheat_preview_key(workflow: &CheatWorkflowState) -> CheatPreviewRequestKey {
@@ -43301,6 +44395,9 @@ mod tests {
             gamecube_gamehacking_cancellation: None,
             gamecube_gamehacking_generation: 0,
             gamecube_gamehacking_blocked: false,
+            bsfree_gamecube: CheatStepResource::NotLoaded,
+            bsfree_gamecube_cancellation: None,
+            bsfree_gamecube_generation: 0,
             selected_dolphin_profile_id: None,
             dolphin_explicit_root: String::new(),
             dolphin_inventory_profile_id: None,
@@ -46249,6 +47346,7 @@ $Instant Growth [Nayr]\n";
             xenia_generated: None,
             pcsx2_generated: None,
             gamecube_gamehacking_generated: None,
+            bsfree_gamecube_generated: None,
         });
 
         app.update_dolphin_code_selection(|selection| {
@@ -46584,6 +47682,7 @@ $Instant Growth [Nayr]\n";
                 xenia_generated: None,
                 pcsx2_generated: None,
                 gamecube_gamehacking_generated: None,
+                bsfree_gamecube_generated: None,
             }))
             .unwrap();
         app.poll_cheat_workflow(&egui::Context::default());
@@ -47985,6 +49084,7 @@ $Instant Growth [Nayr]\n";
             xenia_generated: None,
             pcsx2_generated: None,
             gamecube_gamehacking_generated: None,
+            bsfree_gamecube_generated: None,
         });
         let ctx = egui::Context::default();
         let mut clipboard = InMemoryClipboard::default();
@@ -48021,6 +49121,7 @@ $Instant Growth [Nayr]\n";
             xenia_generated: None,
             pcsx2_generated: None,
             gamecube_gamehacking_generated: None,
+            bsfree_gamecube_generated: None,
         });
         let ctx = egui::Context::default();
         let mut clipboard = InMemoryClipboard::default();
@@ -49275,6 +50376,9 @@ $Instant Growth [Nayr]\n";
             gamecube_gamehacking_cancellation: None,
             gamecube_gamehacking_generation: 0,
             gamecube_gamehacking_blocked: false,
+            bsfree_gamecube: CheatStepResource::NotLoaded,
+            bsfree_gamecube_cancellation: None,
+            bsfree_gamecube_generation: 0,
             selected_dolphin_profile_id: None,
             dolphin_explicit_root: String::new(),
             dolphin_inventory_profile_id: None,
@@ -65262,6 +66366,9 @@ $Instant Growth [Nayr]\n";
             gamecube_gamehacking_cancellation: None,
             gamecube_gamehacking_generation: 0,
             gamecube_gamehacking_blocked: false,
+            bsfree_gamecube: CheatStepResource::NotLoaded,
+            bsfree_gamecube_cancellation: None,
+            bsfree_gamecube_generation: 0,
             selected_dolphin_profile_id: None,
             dolphin_explicit_root: String::new(),
             dolphin_inventory_profile_id: None,
@@ -65352,7 +66459,7 @@ $Instant Growth [Nayr]\n";
     }
 
     #[test]
-    fn bsfree_stage_one_labels_all_formats_as_browse_only_compatibility() {
+    fn bsfree_stage_one_capability_labels_are_honest() {
         assert_eq!(
             bsfree_compatibility_label(DeviceFormatCompatibility::PotentiallyConvertible),
             "Potentially convertible"
@@ -65369,10 +66476,46 @@ $Instant Growth [Nayr]\n";
             bsfree_match_label(ProviderGameMatchConfidence::Ambiguous),
             "Ambiguous candidates"
         );
+        // A GameCube hex-pair code is honestly reported as installable via
+        // Dolphin; a non-GameCube code is reference-only.
+        let gamecube = archivefs_core::patch_manager::BsFreeCheat {
+            upstream_id: 1,
+            name: "Lives".to_string(),
+            note: None,
+            code: "042318AC 3B8003E7".to_string(),
+            section: None,
+            author: None,
+            device: archivefs_core::patch_manager::BsFreeDeviceSummary {
+                upstream_id: 6,
+                name: "Action Replay".to_string(),
+                compatibility: DeviceFormatCompatibility::PotentiallyConvertible,
+            },
+            compatibility: DeviceFormatCompatibility::PotentiallyConvertible,
+            truncated_fields: Vec::new(),
+        };
+        let (label, _) = bsfree_code_capability(&gamecube, Some("GameCube"));
+        assert!(label.contains("Supported by Dolphin"));
+        let other = archivefs_core::patch_manager::BsFreeCheat {
+            upstream_id: 2,
+            name: "Code".to_string(),
+            note: None,
+            code: "AAAA-BBBB".to_string(),
+            section: None,
+            author: None,
+            device: archivefs_core::patch_manager::BsFreeDeviceSummary {
+                upstream_id: 2,
+                name: "Game Genie".to_string(),
+                compatibility: DeviceFormatCompatibility::PotentiallyConvertible,
+            },
+            compatibility: DeviceFormatCompatibility::PotentiallyConvertible,
+            truncated_fields: Vec::new(),
+        };
+        let (label, _) = bsfree_code_capability(&other, Some("PS2"));
+        assert_eq!(label, "Reference only");
     }
 
     #[test]
-    fn bsfree_gui_is_bounded_browse_only_and_has_no_install_action() {
+    fn bsfree_gui_is_bounded_and_has_no_install_action_in_the_browser() {
         let source = include_str!("main.rs");
         let browser = source
             .split("fn show_bsfree_game_browser(")
@@ -65381,14 +66524,571 @@ $Instant Growth [Nayr]\n";
             .split("/// The Sources page's compact")
             .next()
             .unwrap();
-        assert!(browser.contains("Browse only"));
-        assert!(browser.contains("Installing from BSFree is not supported yet"));
+        assert!(browser.contains("installable via Dolphin"));
+        assert!(browser.contains("Other BSFree formats remain browse only"));
         assert!(browser.contains("PageRequest::games(0)"));
         assert!(browser.contains("Previous 100"));
         assert!(browser.contains("Next 100"));
         assert!(browser.contains("archivefs_platform_display_name"));
         assert!(!browser.contains("Install selected"));
         assert!(!browser.contains("BsFreeOperation::Install"));
+    }
+
+    // ------------------------------------------------------------------
+    // BSFree GameCube Cheats & Mods integration
+    // ------------------------------------------------------------------
+
+    fn bsfree_gui_cheat(
+        id: i64,
+        name: &str,
+        format: BsFreeGameCubeCodeFormat,
+    ) -> BsFreeGameCubeCheat {
+        let code_lines = match format {
+            BsFreeGameCubeCodeFormat::GeckoEquivalent => vec!["042318AC 3B8003E7".to_string()],
+            BsFreeGameCubeCodeFormat::ActionReplayNative => vec!["0224CD50 00003E7F".to_string()],
+            BsFreeGameCubeCodeFormat::Unsupported => vec!["C4129124 0000FF00".to_string()],
+            BsFreeGameCubeCodeFormat::Malformed => vec!["XR7M-X292-DZ418".to_string()],
+        };
+        BsFreeGameCubeCheat {
+            upstream_id: id,
+            name: name.to_string(),
+            author: None,
+            note: None,
+            section: None,
+            code_format: format,
+            code_lines,
+            canonical_digest: format!("digest-{id}"),
+        }
+    }
+
+    fn bsfree_gui_matched_state(cheats: Vec<BsFreeGameCubeCheat>) -> BsFreeGameCubeGuiState {
+        let selection = BsFreeGameCubeCheatSelection::from_cheats(&cheats, &parse_dolphin_ini(""));
+        BsFreeGameCubeGuiState {
+            status: BsFreeGameCubeSearchStatus::Matched,
+            detail:
+                "Matched BSFree GameCube game \"Test Game\"; review the cheats before applying."
+                    .to_string(),
+            candidates: Vec::new(),
+            game: Some(BsFreeGameCubeMatch {
+                archive_title: "Test Game".to_string(),
+                archive_game_id: "GLME01".to_string(),
+                matched_bsfree_game_upstream_uid: 42,
+                matched_bsfree_title: "Test Game".to_string(),
+                matched_bsfree_version: None,
+                region_evidence: "archive region is E".to_string(),
+                requires_review: true,
+                detail: "fixture".to_string(),
+            }),
+            cheats: cheats.clone(),
+            selection,
+            analysis: Vec::new(),
+            search_title: "Test Game".to_string(),
+        }
+    }
+
+    fn render_bsfree_section(
+        workflow: &mut CheatWorkflowState,
+    ) -> (egui::FullOutput, Option<CheatWorkflowAction>) {
+        let ctx = egui::Context::default();
+        let mut action = None;
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                action = show_bsfree_gamecube(ui, workflow);
+            });
+        });
+        (output, action)
+    }
+
+    fn bsfree_test_screen() -> egui::Rect {
+        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0))
+    }
+
+    /// Simulates a real 3-frame click gesture (move, press, release) on the
+    /// BSFree GameCube section, returning the action it produces. egui's
+    /// hit-testing for a frame's pointer events uses widget rects registered
+    /// in the *previous* frame, so a single-frame synthetic click cannot
+    /// register - this mirrors real input.
+    fn bsfree_section_click(
+        workflow: &mut CheatWorkflowState,
+        pos: egui::Pos2,
+    ) -> Option<CheatWorkflowAction> {
+        let ctx = egui::Context::default();
+        let action = std::rc::Rc::new(std::cell::RefCell::new(None));
+        for event in [
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            },
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            },
+        ] {
+            let captured = std::rc::Rc::clone(&action);
+            let _ = ctx.run(
+                egui::RawInput {
+                    events: vec![event],
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        if let Some(inner) = show_bsfree_gamecube(ui, workflow) {
+                            *captured.borrow_mut() = Some(inner);
+                        }
+                    });
+                },
+            );
+        }
+        action.borrow().clone()
+    }
+
+    fn bsfree_generated_fixture(profile: DolphinProfile) -> GeneratedBsFreeGameCubeInstall {
+        GeneratedBsFreeGameCubeInstall {
+            staging_root: PathBuf::from("/staging"),
+            staged: StagedGameCubeIni {
+                staging_root: PathBuf::from("/staging"),
+                path: PathBuf::from("/staging/GLME01.ini"),
+                digest: "a".repeat(64),
+                contents: "[Gecko]\n$Lives [BSFree Archive]\n042318AC 3B8003E7\n".to_string(),
+                destination_existed: true,
+                affected: vec![StagedGameCubeCheat {
+                    name: "Lives".to_string(),
+                    dolphin_name: "Lives [BSFree Archive]".to_string(),
+                    code_format: GameCubeCodeFormat::Gecko,
+                }],
+                skipped_unselectable: vec!["Master".to_string()],
+            },
+            profile,
+            findings: Vec::new(),
+            skipped_duplicates: Vec::new(),
+            skipped_unselectable: vec!["Master".to_string()],
+        }
+    }
+
+    fn bsfree_preview_response(profile: DolphinProfile) -> CheatPreviewResponse {
+        CheatPreviewResponse {
+            key: CheatPreviewRequestKey {
+                archive_path: PathBuf::from("/roms/a.zip"),
+                platform: Some("GameCube".to_string()),
+                adapter: CheatEmulatorAdapter::Dolphin,
+                profile_id: Some("dolphin-native-test".to_string()),
+                source_mode: CheatSourceMode::ArchiveFsTrustedCatalogue,
+                source_id: None,
+                snapshot_id: None,
+            },
+            outcome: CheatPreviewOutcome::Ready(SharedPreviewReport {
+                request_archive: PathBuf::from("/roms/a.zip"),
+                adapter: PreviewAdapter::Dolphin,
+                entries: Vec::new(),
+                conflicts: Vec::new(),
+                warnings: Vec::new(),
+                summary: Default::default(),
+                complete: true,
+            }),
+            materialized: None,
+            generated: None,
+            dolphin_generated: None,
+            xenia_generated: None,
+            pcsx2_generated: None,
+            gamecube_gamehacking_generated: None,
+            bsfree_gamecube_generated: Some(bsfree_generated_fixture(profile)),
+        }
+    }
+
+    #[test]
+    fn bsfree_gui_renders_supported_and_unsupported_cheats_with_honest_status() {
+        let directory = std::env::temp_dir().join(format!(
+            "archivefs-bsfree-gui-render-{}",
+            std::process::id()
+        ));
+        let mut app = dolphin_workflow_with_matched_identity(&directory, "GLME01");
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.bsfree_gamecube = CheatStepResource::Ready(bsfree_gui_matched_state(vec![
+            bsfree_gui_cheat(
+                1,
+                "Infinite lives",
+                BsFreeGameCubeCodeFormat::GeckoEquivalent,
+            ),
+            bsfree_gui_cheat(2, "Max money", BsFreeGameCubeCodeFormat::ActionReplayNative),
+            bsfree_gui_cheat(3, "Master", BsFreeGameCubeCodeFormat::Unsupported),
+            bsfree_gui_cheat(4, "Encrypted", BsFreeGameCubeCodeFormat::Malformed),
+        ]));
+        let (output, action) = render_bsfree_section(workflow);
+        assert!(
+            rendered_text_contains(&output, "Infinite lives"),
+            "supported cheat is visible"
+        );
+        assert!(
+            rendered_text_contains(&output, "Max money"),
+            "supported cheat is visible"
+        );
+        assert!(
+            rendered_text_contains(&output, "Ready"),
+            "installable cheats show Ready"
+        );
+        // Unsupported records stay visible but are marked browse-only.
+        assert!(
+            rendered_text_contains(&output, "Master"),
+            "unsupported cheat stays visible"
+        );
+        assert!(
+            rendered_text_contains(&output, "Encrypted"),
+            "malformed cheat stays visible"
+        );
+        assert!(
+            rendered_text_contains(&output, "Browse only"),
+            "unsupported records say Browse only"
+        );
+        assert!(
+            rendered_text_contains(&output, "this code format cannot be installed yet"),
+            "browse-only reason is shown for the encrypted code"
+        );
+        assert!(
+            action.is_none(),
+            "rendering alone must not mutate or dispatch anything"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn bsfree_gui_unsupported_cheat_cannot_be_selected_for_apply() {
+        let directory = std::env::temp_dir().join(format!(
+            "archivefs-bsfree-gui-select-{}",
+            std::process::id()
+        ));
+        let mut app = dolphin_workflow_with_matched_identity(&directory, "GLME01");
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.bsfree_gamecube = CheatStepResource::Ready(bsfree_gui_matched_state(vec![
+            bsfree_gui_cheat(
+                1,
+                "Infinite lives",
+                BsFreeGameCubeCodeFormat::GeckoEquivalent,
+            ),
+            bsfree_gui_cheat(2, "Master", BsFreeGameCubeCodeFormat::Unsupported),
+        ]));
+        // Clicking the supported cheat's label toggles it.
+        let (discovery_output, _) = render_bsfree_section(workflow);
+        let lives_pos = find_exact_text_center(&discovery_output, "Infinite lives")
+            .expect("supported cheat label renders");
+        let action = bsfree_section_click(workflow, lives_pos);
+        assert!(
+            matches!(
+                action,
+                Some(CheatWorkflowAction::ToggleBsFreeGameCubeCheatSelected {
+                    index: 0,
+                    selected: true
+                })
+            ),
+            "clicking the supported label dispatches a select action"
+        );
+        // Clicking the unsupported cheat's name (which is not a checkbox)
+        // must not dispatch a select action.
+        let (discovery_output, _) = render_bsfree_section(workflow);
+        let master_pos = find_exact_text_center(&discovery_output, "Master")
+            .expect("unsupported cheat label renders");
+        let action = bsfree_section_click(workflow, master_pos);
+        assert!(
+            !matches!(
+                action,
+                Some(CheatWorkflowAction::ToggleBsFreeGameCubeCheatSelected { .. })
+            ),
+            "unsupported cheats can never be selected for Apply"
+        );
+        // Attempting to select the unsupported entry is refused outright.
+        let CheatStepResource::Ready(state) = &workflow.bsfree_gamecube else {
+            panic!("state is Ready");
+        };
+        let mut selection = state.selection.clone();
+        assert!(
+            !selection.set_selected(1, true),
+            "Unsupported can never be selected"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn bsfree_gui_apply_button_shows_selection_count_and_is_disabled_when_empty() {
+        let directory =
+            std::env::temp_dir().join(format!("archivefs-bsfree-gui-count-{}", std::process::id()));
+        let mut app = dolphin_workflow_with_matched_identity(&directory, "GLME01");
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.bsfree_gamecube = CheatStepResource::Ready(bsfree_gui_matched_state(vec![
+            bsfree_gui_cheat(
+                1,
+                "Infinite lives",
+                BsFreeGameCubeCodeFormat::GeckoEquivalent,
+            ),
+            bsfree_gui_cheat(2, "Max money", BsFreeGameCubeCodeFormat::ActionReplayNative),
+            bsfree_gui_cheat(3, "Master", BsFreeGameCubeCodeFormat::Unsupported),
+        ]));
+        let (output, _) = render_bsfree_section(workflow);
+        assert!(
+            rendered_text_contains(&output, "Install 0 cheats"),
+            "the apply button shows the real count and nothing is pre-selected"
+        );
+        // Clicking the disabled apply button must not dispatch an apply.
+        if let Some(pos) = find_exact_text_center(&output, "Install 0 cheats") {
+            let click_output =
+                egui::Context::default().run(click_at(bsfree_test_screen(), pos), |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let _ = show_bsfree_gamecube(ui, workflow);
+                    });
+                });
+            let _ = click_output;
+        }
+        // Select one cheat and the button enables and reports the count.
+        let CheatStepResource::Ready(state) = &mut workflow.bsfree_gamecube else {
+            panic!("state is Ready");
+        };
+        assert!(state.selection.set_selected(0, true));
+        let (output, _) = render_bsfree_section(workflow);
+        assert!(
+            rendered_text_contains(&output, "Install 1 cheat"),
+            "one selection shows 'Install 1 cheat'"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn bsfree_gui_install_button_dispatches_the_shared_preview_apply_action() {
+        let directory =
+            std::env::temp_dir().join(format!("archivefs-bsfree-gui-apply-{}", std::process::id()));
+        let mut app = dolphin_workflow_with_matched_identity(&directory, "GLME01");
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.bsfree_gamecube =
+            CheatStepResource::Ready(bsfree_gui_matched_state(vec![bsfree_gui_cheat(
+                1,
+                "Infinite lives",
+                BsFreeGameCubeCodeFormat::GeckoEquivalent,
+            )]));
+        let CheatStepResource::Ready(state) = &mut workflow.bsfree_gamecube else {
+            panic!("state is Ready");
+        };
+        assert!(state.selection.set_selected(0, true));
+        let (output, _) = render_bsfree_section(workflow);
+        let pos =
+            find_exact_text_center(&output, "Install 1 cheats").expect("the apply button renders");
+        let action = bsfree_section_click(workflow, pos);
+        assert!(
+            matches!(
+                action,
+                Some(CheatWorkflowAction::InstallSelectedBsFreeGameCube)
+            ),
+            "the apply button drives the shared install-preview action"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn bsfree_gui_auto_searches_once_when_identity_is_ready() {
+        let directory =
+            std::env::temp_dir().join(format!("archivefs-bsfree-gui-auto-{}", std::process::id()));
+        let mut app = dolphin_workflow_with_matched_identity(&directory, "GLME01");
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.bsfree_gamecube = CheatStepResource::NotLoaded;
+        let (output, action) = render_bsfree_section(workflow);
+        assert!(
+            rendered_text_contains(&output, "Searching BSFree Archive for this game"),
+            "an auto-search is announced"
+        );
+        assert!(
+            matches!(
+                action,
+                Some(CheatWorkflowAction::FetchBsFreeGameCube { .. })
+            ),
+            "the auto-search action is dispatched, no CLI required"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn bsfree_gui_candidates_require_explicit_confirmation() {
+        let directory = std::env::temp_dir().join(format!(
+            "archivefs-bsfree-gui-candidates-{}",
+            std::process::id()
+        ));
+        let mut app = dolphin_workflow_with_matched_identity(&directory, "GLME01");
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        let cheats = vec![bsfree_gui_cheat(
+            1,
+            "Lives",
+            BsFreeGameCubeCodeFormat::GeckoEquivalent,
+        )];
+        let selection = BsFreeGameCubeCheatSelection::from_cheats(&cheats, &parse_dolphin_ini(""));
+        workflow.bsfree_gamecube = CheatStepResource::Ready(BsFreeGameCubeGuiState {
+            status: BsFreeGameCubeSearchStatus::Candidates,
+            detail: "Several BSFree GameCube games matched; confirm which one to review."
+                .to_string(),
+            candidates: vec![
+                BsFreeGameCubeMatch {
+                    archive_title: "Test Game".to_string(),
+                    archive_game_id: "GLME01".to_string(),
+                    matched_bsfree_game_upstream_uid: 100,
+                    matched_bsfree_title: "Test Game (USA)".to_string(),
+                    matched_bsfree_version: None,
+                    region_evidence: "fixture".to_string(),
+                    requires_review: true,
+                    detail: "fixture".to_string(),
+                },
+                BsFreeGameCubeMatch {
+                    archive_title: "Test Game".to_string(),
+                    archive_game_id: "GLME01".to_string(),
+                    matched_bsfree_game_upstream_uid: 101,
+                    matched_bsfree_title: "Test Game (Europe)".to_string(),
+                    matched_bsfree_version: None,
+                    region_evidence: "fixture".to_string(),
+                    requires_review: true,
+                    detail: "fixture".to_string(),
+                },
+            ],
+            game: None,
+            cheats,
+            selection,
+            analysis: Vec::new(),
+            search_title: "Test Game".to_string(),
+        });
+        let (output, _) = render_bsfree_section(workflow);
+        assert!(
+            rendered_text_contains(&output, "Use this game"),
+            "candidates are shown for explicit confirmation"
+        );
+        assert!(!rendered_text_contains(&output, "Install 0 cheats"));
+        // Clicking a candidate dispatches ConfirmBsFreeGameCubeMatch.
+        let pos =
+            find_exact_text_center(&output, "Use this game").expect("a confirm button renders");
+        let action = bsfree_section_click(workflow, pos);
+        assert!(
+            matches!(
+                action,
+                Some(CheatWorkflowAction::ConfirmBsFreeGameCubeMatch { upstream_uid: 100 })
+            ),
+            "ambiguous identity requires explicit review, never auto-apply"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn bsfree_gui_result_shows_count_and_rollback_after_success() {
+        let directory = std::env::temp_dir().join(format!(
+            "archivefs-bsfree-gui-result-{}",
+            std::process::id()
+        ));
+        let mut app = dolphin_workflow_with_matched_identity(&directory, "GLME01");
+        let profile = match &app.dolphin_profiles {
+            DolphinProfilesState::Ready(discovery) => {
+                discovery.profiles.first().expect("fixture profile").clone()
+            }
+            _ => panic!("fixture has profiles"),
+        };
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        let cheats = vec![bsfree_gui_cheat(
+            1,
+            "Lives",
+            BsFreeGameCubeCodeFormat::GeckoEquivalent,
+        )];
+        workflow.bsfree_gamecube = CheatStepResource::Ready(bsfree_gui_matched_state(cheats));
+        workflow.preview = CheatStepResource::Ready(bsfree_preview_response(profile));
+        let result = successful_shared_apply_result();
+        workflow.transaction = CheatTransactionState::Result {
+            key: cheat_preview_key(workflow),
+            result,
+        };
+        let (output, _) = render_bsfree_section(workflow);
+        assert!(
+            rendered_text_contains(&output, "1 cheat added"),
+            "the beginner-facing result announces the added count"
+        );
+        assert!(
+            rendered_text_contains(&output, "Undo installation"),
+            "rollback is reachable from the result, no CLI required"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn bsfree_gui_apply_and_rollback_reuse_the_shared_backend() {
+        let source = include_str!("main.rs");
+        let dispatch = source
+            .split("Some(CheatWorkflowAction::InstallSelectedBsFreeGameCube) =>")
+            .nth(1)
+            .unwrap();
+        assert!(
+            dispatch.contains("self.start_bsfree_gamecube_install_preview()"),
+            "Install routes through the BSFree install-preview path"
+        );
+        let preview = source
+            .split("fn start_bsfree_gamecube_install_preview")
+            .nth(1)
+            .unwrap()
+            .split("fn update_pcsx2_cheat_selection")
+            .next()
+            .unwrap();
+        assert!(
+            preview.contains("stage_bsfree_gamecube_install("),
+            "staging reuses the existing GameCube adapter"
+        );
+        assert!(
+            preview.contains("build_bsfree_gamecube_install_preview("),
+            "preview reuses the shared preview boundary"
+        );
+        assert!(preview.contains("self.review_cheat_apply()"));
+        // The shared transaction layer performs the actual mutation.
+        assert!(
+            source.contains("fn start_cheat_apply") && source.contains("execute_shared_apply("),
+            "Confirm drives the shared apply/backup/journal machinery"
+        );
+        assert!(
+            source.contains("fn start_cheat_install_rollback")
+                && source.contains("start_shared_rollback_preview"),
+            "Undo drives the shared rollback/history flow"
+        );
+    }
+
+    /// A compact (1280x720) render must still fit the BSFree section without
+    /// panicking and still show the supported cheats and the apply control.
+    #[test]
+    fn bsfree_gui_compact_width_stays_usable() {
+        let directory = std::env::temp_dir().join(format!(
+            "archivefs-bsfree-gui-compact-{}",
+            std::process::id()
+        ));
+        let mut app = dolphin_workflow_with_matched_identity(&directory, "GLME01");
+        let workflow = app.cheat_workflow.as_mut().unwrap();
+        workflow.bsfree_gamecube =
+            CheatStepResource::Ready(bsfree_gui_matched_state(vec![bsfree_gui_cheat(
+                1,
+                "Infinite lives",
+                BsFreeGameCubeCodeFormat::GeckoEquivalent,
+            )]));
+        let ctx = egui::Context::default();
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 720.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = show_bsfree_gamecube(ui, workflow);
+                });
+            },
+        );
+        assert!(
+            rendered_text_contains(&output, "Infinite lives"),
+            "a compact-width Cheats & Mods page still shows the supported cheats"
+        );
+        assert!(
+            rendered_text_contains(&output, "Install 0 cheats"),
+            "the apply control is still usable at compact width"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]

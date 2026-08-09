@@ -65,6 +65,12 @@ pub(crate) const ORDERING_EXPLANATION: &str =
 /// that reads what is already on disk.
 fn provider_kind_label(entry: &CheatSourceEntry) -> &'static str {
     let caps = &entry.spec.capabilities;
+    // BSFree drives installs through the shared Dolphin adapter and only for
+    // verified GameCube hex-pair formats; the generic "Downloads and installs"
+    // would overclaim breadth, so it gets the precise statement.
+    if entry.spec.id == archivefs_core::patch_manager::BSFREE_PROVIDER_ID {
+        return "Downloads and installs (GameCube via Dolphin)";
+    }
     match (caps.remote, caps.download, caps.install) {
         (true, true, true) => "Downloads and installs",
         (true, true, false) => "Downloads (read-only)",
