@@ -152,6 +152,18 @@ pub fn classify_entry(name: &str, is_directory: bool) -> InspectorEntryClassific
     }
 }
 
+/// Whether a path is a known disc-set companion/metadata file rather than an
+/// independently playable game. This deliberately does not attempt BIN/CUE
+/// pairing: it answers only the presentation question that is provable from
+/// the file type, so legacy catalogue rows are not described as missing games.
+pub fn is_known_disc_companion(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("cue") || extension.eq_ignore_ascii_case("m3u")
+        })
+}
+
 /// One archive entry's read-only metadata - never the entry's own data,
 /// which this module never reads.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -824,4 +836,7 @@ fn a_cue_sheet_is_a_companion_file_not_an_independent_missing_game() {
         classify_entry("game.bin", false),
         InspectorEntryClassification::LikelyContent
     );
+    assert!(is_known_disc_companion(Path::new("game.CUE")));
+    assert!(is_known_disc_companion(Path::new("multi-disc.m3u")));
+    assert!(!is_known_disc_companion(Path::new("game.bin")));
 }

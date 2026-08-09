@@ -771,7 +771,7 @@ per-platform rename opt-in.
 
 ### 12.6 Plain-language effect
 
-*"ArchiveFS never renames your files."*
+*"Your files won't be renamed unless you approve it."*
 
 No caveat, no "currently", and no mention of future modes. A user reading this
 setting should come away certain, not wondering what might change.

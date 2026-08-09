@@ -45,3 +45,4 @@ image = { version = "0.25.10", default-features = false, features = ["png"] }
 # and in-process, as required. `pick_folder()` is synchronous and returns
 # `None` on cancel/failure, never panics.
 rfd = "0.17.2"
+time = { version = "0.3.53", features = ["local-offset"] }

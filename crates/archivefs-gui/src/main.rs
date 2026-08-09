@@ -181,10 +181,10 @@ use archivefs_core::{
     check_database_health, classify_archive_health, cleanup_selected_mount_tree,
     create_configured_mount_root_default, create_starter_config_default, default_config_path,
     default_database_path, default_index_path, diagnose_database, edit_library_view_default,
-    format_unix_timestamp_utc, inspect_archive, is_inspectable, latest_schema_version,
-    lazy_unmount_one_archive_path_with_progress, list_source_folder_views_default,
-    load_library_view_configs_default, load_read_only_snapshot_default,
-    load_source_folder_configs_from, mount_one_archive_path,
+    format_unix_timestamp_utc, inspect_archive, is_inspectable, is_known_disc_companion,
+    latest_schema_version, lazy_unmount_one_archive_path_with_progress,
+    list_source_folder_views_default, load_library_view_configs_default,
+    load_read_only_snapshot_default, load_source_folder_configs_from, mount_one_archive_path,
     persisted_archive_has_unknown_platform, plan_stale_mount_directories,
     preview_library_view_default, read_archive_index, remount_one_archive_path,
     remove_library_view_default, remove_source_folder_default, repair_library_view_default,
@@ -8958,7 +8958,7 @@ impl ArchiveFsApp {
                 ActivityAction::CheatInstall,
                 Some(workflow.archive_path.clone()),
                 ActivityOutcome::Rejected,
-                "Rollback unavailable: this install wrote no journal.",
+                "Undo unavailable: this install did not create an undo record.",
             ));
             return;
         };
@@ -16089,9 +16089,7 @@ fn repeated_doctor_group_heading(finding: &Finding, count: usize) -> String {
 /// all" expansion.
 fn repeated_doctor_group_explanation(finding: &Finding) -> Option<&'static str> {
     match finding.id.as_str() {
-        "mounts.not_required" => {
-            Some("These files are used directly and do not need ArchiveFS mounting.")
-        }
+        "mounts.not_required" => Some("These games can be used directly. Nothing needs fixing."),
         "mounts.historical_failure" => Some(
             "These were mount problems in the past. They are shown for reference; nothing is \
              broken right now.",
@@ -16205,39 +16203,49 @@ fn show_repeated_doctor_group(
             )
             .wrap(),
         );
-        for (label, key) in [
-            ("By reason", "reason"),
-            ("By platform", "platform"),
-            ("By media kind", "media_kind"),
-            ("By evidence", "mount_failure_scope"),
-        ] {
-            let counts = repeated_doctor_group_counts(findings, key);
-            if !counts.is_empty() {
-                ui.label(format!("{label}: {counts}"));
-            }
-        }
-        ui.strong(format!(
-            "Examples (first {} of {})",
-            DOCTOR_REPEATED_GROUP_EXAMPLES,
-            findings.len()
-        ));
-        for finding in findings.iter().take(DOCTOR_REPEATED_GROUP_EXAMPLES) {
-            if let Some(affected) = &finding.affected {
-                ui.add(egui::Label::new(format!("• {}", affected.display)).wrap());
-            }
-        }
-        egui::CollapsingHeader::new(format!("Show all {} findings", findings.len()))
-            .id_salt(("doctor-repeated-group", first.id.as_str()))
+        egui::CollapsingHeader::new("Show examples")
+            .id_salt(("doctor-repeated-examples", first.id.as_str()))
             .default_open(false)
             .show(ui, |ui| {
-                for finding in findings {
-                    show_doctor_finding_card(ui, finding, selected, action, ordinals);
-                    ui.add_space(6.0);
+                ui.strong(format!(
+                    "First {} of {}",
+                    DOCTOR_REPEATED_GROUP_EXAMPLES,
+                    findings.len()
+                ));
+                for finding in findings.iter().take(DOCTOR_REPEATED_GROUP_EXAMPLES) {
+                    if let Some(affected) = &finding.affected {
+                        ui.add(egui::Label::new(format!("• {}", affected.display)).wrap());
+                    }
                 }
             });
-        ui.weak(
-            "Copy report exports every underlying finding; grouping changes presentation only.",
-        );
+        egui::CollapsingHeader::new("Show details")
+            .id_salt(("doctor-repeated-details", first.id.as_str()))
+            .default_open(false)
+            .show(ui, |ui| {
+                for (label, key) in [
+                    ("By reason", "reason"),
+                    ("By platform", "platform"),
+                    ("By media kind", "media_kind"),
+                    ("By evidence", "mount_failure_scope"),
+                ] {
+                    let counts = repeated_doctor_group_counts(findings, key);
+                    if !counts.is_empty() {
+                        ui.label(format!("{label}: {counts}"));
+                    }
+                }
+                egui::CollapsingHeader::new(format!("Show all {} findings", findings.len()))
+                    .id_salt(("doctor-repeated-group", first.id.as_str()))
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        for finding in findings {
+                            show_doctor_finding_card(ui, finding, selected, action, ordinals);
+                            ui.add_space(6.0);
+                        }
+                    });
+                ui.weak(
+                    "Copy report exports every underlying finding; grouping changes presentation only.",
+                );
+            });
     });
 }
 
@@ -19024,19 +19032,19 @@ fn show_bsfree_source_card(
             }
             widgets::status_badge(ui, "Browse only", widgets::StatusTone::Info);
         });
-        ui.label("Source: BSFree Archive");
-        ui.label("Maintainer: Andrew Mackrodt");
-        ui.label("Origin: Historical bsfree.org database");
-        ui.label("Distribution status: Optional third-party download");
-        ui.label("Verification: Historical community data, not verified by ArchiveFS");
+        ui.label("ArchiveFS can search this historical cheat database. Installing from BSFree is not supported yet.");
+        widgets::technical_details(ui, "bsfree-source-provenance", |ui| {
+            ui.label("Source: BSFree Archive");
+            ui.label("Maintainer: Andrew Mackrodt");
+            ui.label("Origin: Historical bsfree.org database");
+            ui.label("Distribution status: Optional third-party download");
+            ui.label("Verification: Historical community data, not verified by ArchiveFS");
+        });
         widgets::banner(
             ui,
             "Database-content licence not established",
             "The upstream application code is MIT, but ArchiveFS does not claim that licence covers the historical cheat dataset.",
             widgets::StatusTone::Warning,
-        );
-        ui.label(
-            "No cheats are installed automatically. Stage 1 provides search and browsing only.",
         );
 
         match manager {
@@ -19264,9 +19272,7 @@ fn show_bsfree_game_browser(
     widgets::card(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
             widgets::status_badge(ui, "Browse only", widgets::StatusTone::Info);
-            ui.label(
-                "Installation support will be added only for verified formats in a later stage.",
-            );
+            ui.label("ArchiveFS can search this historical cheat database. Installing from BSFree is not supported yet.");
         });
         ui.label("Match based on platform and title. Exact game revision is not verified.");
 
@@ -21201,7 +21207,7 @@ fn show_shared_rollback_card(
         SharedRollbackState::Applying { .. } => {
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.label("Restoring journal-owned content and verifying the result…");
+                ui.label("Restoring the previous files and checking the result…");
             });
         }
         SharedRollbackState::Result(result) => {
@@ -21233,6 +21239,97 @@ fn show_shared_rollback_card(
     action
 }
 
+fn shared_history_adapter_label(adapter: PreviewAdapter) -> &'static str {
+    match adapter {
+        PreviewAdapter::RetroArch => "RetroArch",
+        PreviewAdapter::Pcsx2 => "PCSX2",
+        PreviewAdapter::Dolphin => "Dolphin",
+        PreviewAdapter::Xenia => "Xenia",
+    }
+}
+
+fn shared_history_status_label(status: SharedApplyStatus) -> &'static str {
+    match status {
+        SharedApplyStatus::DryRun => "Preview",
+        SharedApplyStatus::Success => "Completed",
+        SharedApplyStatus::PartialFailure => "Needs attention",
+        SharedApplyStatus::Failed => "Failed",
+    }
+}
+
+fn shared_history_game_title(
+    journal: &archivefs_core::patch_manager::SharedApplyJournal,
+) -> String {
+    journal
+        .context
+        .selected_archive
+        .to_path_buf()
+        .ok()
+        .and_then(|path| {
+            path.file_stem()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "selected game".to_string())
+}
+
+fn shared_history_title(journal: &archivefs_core::patch_manager::SharedApplyJournal) -> String {
+    let game = shared_history_game_title(journal);
+    match (journal.status, journal.context.adapter) {
+        (SharedApplyStatus::DryRun, _) => format!("Changes previewed for {game}"),
+        (_, PreviewAdapter::Xenia) => format!("Patches added to {game}"),
+        _ => format!("Cheats added to {game}"),
+    }
+}
+
+fn short_month(month: time::Month) -> &'static str {
+    match month {
+        time::Month::January => "Jan",
+        time::Month::February => "Feb",
+        time::Month::March => "Mar",
+        time::Month::April => "Apr",
+        time::Month::May => "May",
+        time::Month::June => "Jun",
+        time::Month::July => "Jul",
+        time::Month::August => "Aug",
+        time::Month::September => "Sep",
+        time::Month::October => "Oct",
+        time::Month::November => "Nov",
+        time::Month::December => "Dec",
+    }
+}
+
+/// Friendly local wall-clock display for a saved change. The raw Unix value
+/// remains under Technical details for audit work.
+fn format_shared_history_time(timestamp: u64, now: SystemTime) -> String {
+    let Ok(timestamp) = i64::try_from(timestamp) else {
+        return "Time unavailable".to_string();
+    };
+    let Ok(utc) = time::OffsetDateTime::from_unix_timestamp(timestamp) else {
+        return "Time unavailable".to_string();
+    };
+    let offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
+    let local = utc.to_offset(offset);
+    let now_seconds = now
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+        .and_then(|seconds| time::OffsetDateTime::from_unix_timestamp(seconds).ok())
+        .map(|value| value.to_offset(offset));
+    if now_seconds.is_some_and(|value| value.date() == local.date()) {
+        format!("Today at {:02}:{:02}", local.hour(), local.minute())
+    } else {
+        format!(
+            "{} {} {} at {:02}:{:02}",
+            local.day(),
+            short_month(local.month()),
+            local.year(),
+            local.hour(),
+            local.minute()
+        )
+    }
+}
+
 fn show_history_logs_page(
     ui: &mut egui::Ui,
     shared_history: &SharedHistoryState,
@@ -21252,21 +21349,19 @@ fn show_history_logs_page(
     widgets::section_header(
         ui,
         "Recovery",
-        Some(
-            "Roll back the most recent set of destructive, journal-tracked operations if something went wrong.",
-        ),
+        Some("Undo the most recent cheat or patch changes if something went wrong."),
     );
     if let Some(rollback_action) = show_shared_rollback_card(ui, rollback) {
         action = Some(rollback_action);
     }
     widgets::section_header(
         ui,
-        "Verified transaction journals",
-        Some("Bounded, read-only projection of shared apply and rollback evidence."),
+        "Changes you can undo",
+        Some("Recent cheat and patch changes, with rollback available when safe."),
     );
     if widgets::action_button(
         ui,
-        "Refresh transaction history",
+        "Refresh change history",
         widgets::ActionStyle::Secondary,
         !matches!(shared_history, SharedHistoryState::Loading { .. }),
     )
@@ -21278,12 +21373,12 @@ fn show_history_logs_page(
         SharedHistoryState::NotLoaded | SharedHistoryState::Loading { .. } => {
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.label("Loading transaction journals off the UI thread…");
+                ui.label("Loading change history…");
             });
         }
         SharedHistoryState::Failed(message) => widgets::banner(
             ui,
-            "Transaction history unavailable",
+            "Change history unavailable",
             message,
             widgets::StatusTone::Warning,
         ),
@@ -21291,16 +21386,16 @@ fn show_history_logs_page(
             if !report.warnings.is_empty() {
                 widgets::banner(
                     ui,
-                    "Some journals could not be read",
+                    "Some history details could not be read",
                     &format!(
-                        "{} malformed or unsupported journal warning(s) were retained; valid operations remain visible.",
+                        "{} saved record(s) could not be opened. Other changes remain available.",
                         report.warnings.len()
                     ),
                     widgets::StatusTone::Warning,
                 );
             }
             if report.journals.is_empty() {
-                ui.label("No shared transaction journals found.");
+                ui.label("No undoable changes found.");
             } else {
                 let mut journals: Vec<_> = report.journals.iter().collect();
                 journals.sort_by(|left, right| {
@@ -21315,7 +21410,7 @@ fn show_history_logs_page(
                         ui.horizontal_wrapped(|ui| {
                             widgets::status_badge(
                                 ui,
-                                format!("{:?}", journal.status),
+                                shared_history_status_label(journal.status),
                                 match journal.status {
                                     SharedApplyStatus::Success => widgets::StatusTone::Success,
                                     SharedApplyStatus::PartialFailure => {
@@ -21325,7 +21420,7 @@ fn show_history_logs_page(
                                     SharedApplyStatus::DryRun => widgets::StatusTone::Info,
                                 },
                             );
-                            ui.strong(&journal.operation_id);
+                            ui.strong(shared_history_title(journal));
                             if selected_operation == Some(journal.operation_id.as_str()) {
                                 widgets::status_badge(
                                     ui,
@@ -21333,19 +21428,20 @@ fn show_history_logs_page(
                                     widgets::StatusTone::Info,
                                 );
                             }
-                            ui.label(format!("{:?}", journal.context.adapter));
                         });
-                        ui.label(format!("Timestamp: {}", journal.timestamp_unix_seconds));
                         ui.label(format!(
-                            "Selected archive: {}",
-                            journal.context.selected_archive.display
+                            "{} · {}",
+                            shared_history_adapter_label(journal.context.adapter),
+                            format_shared_history_time(
+                                journal.timestamp_unix_seconds,
+                                SystemTime::now()
+                            )
                         ));
-                        ui.label(format!("Source mode: {}", journal.context.source_mode));
                         ui.label(format!(
-                            "Destination root: {}",
-                            journal.destination_root.display
+                            "{} change{}",
+                            journal.entries.len(),
+                            if journal.entries.len() == 1 { "" } else { "s" }
                         ));
-                        ui.label(format!("Entries: {}", journal.entries.len()));
                         ui.label(format!(
                             "Rollback: {}",
                             if journal.rollback_operation_id.is_some() {
@@ -21356,14 +21452,42 @@ fn show_history_logs_page(
                                 "unavailable"
                             }
                         ));
-                        if widgets::path_value(ui, "Journal", &PathBuf::from(&path.display)) {
-                            let _ = clipboard.set_text(path.display.clone());
-                        }
                         widgets::technical_details(
                             ui,
                             ("journal_technical_detail", &journal.plan_id),
                             |ui| {
+                                widgets::copyable_value(
+                                    ui,
+                                    "Transaction ID",
+                                    &journal.operation_id,
+                                );
                                 widgets::copyable_value(ui, "Plan ID", &journal.plan_id);
+                                ui.label(format!(
+                                    "Raw timestamp: {}",
+                                    journal.timestamp_unix_seconds
+                                ));
+                                widgets::copyable_value(
+                                    ui,
+                                    "Selected archive",
+                                    &journal.context.selected_archive.display,
+                                );
+                                widgets::copyable_value(
+                                    ui,
+                                    "Source mode",
+                                    &journal.context.source_mode,
+                                );
+                                widgets::copyable_value(
+                                    ui,
+                                    "Destination root",
+                                    &journal.destination_root.display,
+                                );
+                                if widgets::path_value(
+                                    ui,
+                                    "Journal path",
+                                    &PathBuf::from(&path.display),
+                                ) {
+                                    let _ = clipboard.set_text(path.display.clone());
+                                }
                                 for entry in &journal.entries {
                                     ui.label(format!(
                                         "{:?} · {} · verification {} · backup {}",
@@ -22905,8 +23029,8 @@ fn summarise_cheat_warnings(warnings: &[String]) -> Vec<String> {
 /// instead of dumping every entry directly into the page - the Sources
 /// page's original complaint was thousands of malformed/unsupported
 /// cheat-file diagnostics rendered as one banner each, unbounded, right
-/// in the normal workflow. Shows a compact "N verification notes, the
-/// catalogue is still usable" banner plus up to `SAMPLE_LIMIT`
+/// in the normal workflow. Shows a compact "N catalogue issues found, the
+/// catalogue still works" banner, with a bounded explanation
 /// representative entries, with the complete list (plus a "Copy all"
 /// action) always reachable behind `technical_details` - no diagnostic
 /// data is discarded, only its default on-screen footprint is bounded.
@@ -22924,30 +23048,36 @@ fn show_cheat_warnings_summary(
     widgets::banner(
         ui,
         &format!(
-            "{} verification note{}",
+            "{} catalogue issue{} found",
             summarised.len(),
             if summarised.len() == 1 { "" } else { "s" }
         ),
-        "The catalogue remains usable for matching and installation - these entries were excluded, not the whole source.",
+        "The catalogue still works. These files were skipped.",
         widgets::StatusTone::Warning,
     );
-    for warning in summarised.iter().take(SAMPLE_LIMIT) {
-        ui.label(format!("• {warning}"));
-    }
-    if summarised.len() > SAMPLE_LIMIT {
-        ui.weak(format!(
-            "+ {} more - see Technical details below.",
-            summarised.len() - SAMPLE_LIMIT
-        ));
-    }
-    widgets::technical_details(ui, id_salt, |ui| {
-        if widgets::action_button(ui, "Copy all", widgets::ActionStyle::Quiet, true).clicked() {
-            let _ = clipboard.set_text(summarised.join("\n"));
-        }
-        for warning in &summarised {
-            ui.label(format!("• {warning}"));
-        }
-    });
+    egui::CollapsingHeader::new("What happened?")
+        .default_open(false)
+        .show(ui, |ui| {
+            for warning in summarised.iter().take(SAMPLE_LIMIT) {
+                ui.label(format!("• {warning}"));
+            }
+            if summarised.len() > SAMPLE_LIMIT {
+                ui.weak(format!(
+                    "+ {} more - see Technical details below.",
+                    summarised.len() - SAMPLE_LIMIT
+                ));
+            }
+            widgets::technical_details(ui, id_salt, |ui| {
+                if widgets::action_button(ui, "Copy all", widgets::ActionStyle::Quiet, true)
+                    .clicked()
+                {
+                    let _ = clipboard.set_text(warnings.join("\n"));
+                }
+                for warning in warnings {
+                    ui.label(format!("• {warning}"));
+                }
+            });
+        });
 }
 
 /// What the cheat workflow panel asks `update` to do.
@@ -28175,9 +28305,8 @@ fn show_cheat_candidate_stages(
     if stage.list.is_empty() {
         widgets::banner(
             ui,
-            "No matching cheat file",
-            "The trusted catalogue has no cheat file that matches this archive's title, \
-             platform, serial, or content hash. Nothing can be installed.",
+            "No cheats found for this game",
+            "Try another cheat source or check the selected game's platform.",
             widgets::StatusTone::Pending,
         );
         return action;
@@ -28554,8 +28683,8 @@ fn show_shared_cheat_preview(
             {
                 widgets::banner(
                     ui,
-                    "No matching cheat found",
-                    "The active verified catalogue contains no exact or approved strong match for this game. Nothing can be applied.",
+                    "No cheats found for this game",
+                    "Try another cheat source or check the selected game's platform.",
                     widgets::StatusTone::Pending,
                 )
             }
@@ -29021,12 +29150,10 @@ fn show_cheats_mods_page(
     let dolphin_read_only = workflow
         .as_deref()
         .is_some_and(|workflow| workflow.adapter == CheatEmulatorAdapter::Dolphin);
-    let beginner_route = workflow.as_deref().is_some_and(|workflow| {
-        matches!(
-            workflow.adapter,
-            CheatEmulatorAdapter::Dolphin | CheatEmulatorAdapter::Xenia
-        )
-    });
+    // Every selected-game route starts in the gamer-facing presentation.
+    // Adapter state and audit evidence remain available in Workflow
+    // diagnostics instead of determining whether the page is approachable.
+    let beginner_route = workflow.is_some();
     widgets::page_header_with_icon(
         ui,
         crate::ui::icons::CHEATS,
@@ -29047,7 +29174,7 @@ fn show_cheats_mods_page(
 
     if beginner_route && let Some(workflow) = workflow.as_deref() {
         ui.horizontal_wrapped(|ui| {
-            ui.strong(&workflow.display_name);
+            ui.strong(format!("Selected game: {}", workflow.display_name));
             widgets::status_badge(
                 ui,
                 workflow.platform.as_deref().unwrap_or("Unknown platform"),
@@ -29091,9 +29218,9 @@ fn show_cheats_mods_page(
             ui.horizontal_wrapped(|ui| {
                 widgets::status_badge(ui, integration_label, integration_tone);
                 if let Some(workflow) = workflow.as_deref() {
-                    ui.strong(format!("Current archive: {}", workflow.display_name));
+                    ui.strong(format!("Selected game: {}", workflow.display_name));
                 } else {
-                    ui.label("No archive context selected");
+                    ui.label("Choose a game");
                 }
                 if widgets::action_button(
                     ui,
@@ -29110,13 +29237,9 @@ fn show_cheats_mods_page(
                     action = Some(CheatWorkflowAction::ChooseArchive);
                 }
             });
-            let mut readiness_items = vec![(
-                "Trusted catalogue retrieval available",
-                widgets::StatusTone::Success,
-            )];
+            let mut readiness_items = Vec::new();
             if workflow.is_none() {
-                readiness_items.push(("Matching pending", widgets::StatusTone::Pending));
-                readiness_items.push(("Installation gated", widgets::StatusTone::Pending));
+                readiness_items.push(("Waiting for a game", widgets::StatusTone::Pending));
             } else if pcsx2_read_only {
                 readiness_items.push(("Read-only preview", widgets::StatusTone::Info));
                 readiness_items.push(("Preview only", widgets::StatusTone::Pending));
@@ -29237,35 +29360,17 @@ fn show_cheats_mods_page(
                 if beginner_route {
                     ui.add_space(theme::SECTION_GAP);
                     show_mods_section(ui, pcsx2_read_only, dolphin_read_only);
-                    ui.add_space(theme::SECTION_GAP);
-                    show_recent_cheat_activity(ui, history, activity_archive.as_deref());
                 }
             });
     } else {
         widgets::card(ui, |ui| {
             widgets::section_header(
                 ui,
-                "Choose one archive",
-                Some("ArchiveFS never fabricates a default archive context."),
+                "Choose a game",
+                Some("Select a game to see available cheats and patches."),
             );
-            ui.label("Choose an archive here to discover RetroArch profiles and inspect or retrieve a trusted catalogue. Selection alone never mounts, queues, fetches, or changes the archive.");
             ui.horizontal_wrapped(|ui| {
-                widgets::status_badge(
-                    ui,
-                    "Profile discovery available",
-                    widgets::StatusTone::Success,
-                );
-                widgets::status_badge(
-                    ui,
-                    "Trusted retrieval available",
-                    widgets::StatusTone::Success,
-                );
-                widgets::status_badge(ui, "Matching unavailable", widgets::StatusTone::Pending);
-                widgets::status_badge(ui, "Installation unavailable", widgets::StatusTone::Pending);
-                widgets::status_badge(ui, "Mods unavailable", widgets::StatusTone::Pending);
-            });
-            ui.horizontal_wrapped(|ui| {
-                if widgets::action_button(ui, "Choose archive", widgets::ActionStyle::Primary, true)
+                if widgets::action_button(ui, "Choose a game", widgets::ActionStyle::Primary, true)
                     .clicked()
                 {
                     action = Some(CheatWorkflowAction::ChooseArchive);
@@ -29279,9 +29384,7 @@ fn show_cheats_mods_page(
         });
     }
 
-    if !beginner_route {
-        ui.add_space(theme::SECTION_GAP);
-        show_mods_section(ui, pcsx2_read_only, dolphin_read_only);
+    if activity_archive.is_some() {
         ui.add_space(theme::SECTION_GAP);
         show_recent_cheat_activity(ui, history, activity_archive.as_deref());
     }
@@ -29295,26 +29398,24 @@ fn show_cheat_source_modes(
 ) -> Option<CheatWorkflowAction> {
     widgets::section_header(
         ui,
-        "Stage 2 · Cheat source",
-        Some(
-            "Source choice is independent from the archive, emulator profile, destination, and installation state.",
-        ),
+        "Cheat source",
+        Some("Choose where ArchiveFS should look for cheats for this game."),
     );
     let show_existing = |ui: &mut egui::Ui, selected: bool| {
         let mut clicked = false;
         widgets::card(ui, |ui| {
-            clicked = ui.radio(selected, "Existing RetroArch library").clicked();
-            widgets::status_badge(ui, "Existing local content", widgets::StatusTone::Info);
-            ui.label("Read-only bounded inventory of the selected profile's configured cheat directory. No compatibility claim.");
+            clicked = ui.radio(selected, "Existing RetroArch cheats").clicked();
+            widgets::status_badge(ui, "Browse installed cheats", widgets::StatusTone::Info);
+            ui.label("See cheats already stored in the selected RetroArch profile.");
         });
         clicked
     };
     let show_trusted = |ui: &mut egui::Ui, selected: bool| {
         let mut clicked = false;
         widgets::card(ui, |ui| {
-            clicked = ui.radio(selected, "ArchiveFS trusted catalogue").clicked();
-            widgets::status_badge(ui, "Trusted reviewed source", widgets::StatusTone::Success);
-            ui.label("A validated immutable ArchiveFS cache snapshot. It is not the same as RetroArch installed cheats.");
+            clicked = ui.radio(selected, "ArchiveFS cheat catalogue").clicked();
+            widgets::status_badge(ui, "Ready to search", widgets::StatusTone::Success);
+            ui.label("Search the cheat catalogue bundled with ArchiveFS.");
         });
         clicked
     };
@@ -29350,26 +29451,28 @@ fn show_cheat_source_modes(
             ui.label(body);
         });
     };
-    let local_body =
-        "A real bounded local inspection backend is required before selection can be offered.";
-    let remote_body = "User-defined remote sources are a future workflow.";
-    if ui.available_width() >= 760.0 {
-        ui.columns(2, |columns| {
-            show_planned(
-                &mut columns[0],
-                ImportSourceKind::LocalUnverifiedSource,
-                local_body,
-            );
-            show_planned(
-                &mut columns[1],
-                ImportSourceKind::RemoteUnverifiedSource,
-                remote_body,
-            );
-        });
-    } else {
-        show_planned(ui, ImportSourceKind::LocalUnverifiedSource, local_body);
-        show_planned(ui, ImportSourceKind::RemoteUnverifiedSource, remote_body);
-    }
+    widgets::technical_details(ui, "planned-cheat-source-modes", |ui| {
+        let local_body =
+            "A bounded local inspection backend is required before selection can be offered.";
+        let remote_body = "User-defined remote sources are a future workflow.";
+        if ui.available_width() >= 760.0 {
+            ui.columns(2, |columns| {
+                show_planned(
+                    &mut columns[0],
+                    ImportSourceKind::LocalUnverifiedSource,
+                    local_body,
+                );
+                show_planned(
+                    &mut columns[1],
+                    ImportSourceKind::RemoteUnverifiedSource,
+                    remote_body,
+                );
+            });
+        } else {
+            show_planned(ui, ImportSourceKind::LocalUnverifiedSource, local_body);
+            show_planned(ui, ImportSourceKind::RemoteUnverifiedSource, remote_body);
+        }
+    });
     None
 }
 
@@ -29560,24 +29663,24 @@ fn show_cheat_workflow_step2(
     ui.add_space(theme::SECTION_GAP);
     widgets::section_header(
         ui,
-        "Trusted catalogue details",
-        Some("Only reviewed, built-in sources are available. Custom URLs are not accepted."),
+        "Available cheats",
+        Some("ArchiveFS will show the cheats available for the selected game."),
     );
     if workflow.selected_profile_id.is_none() {
         widgets::banner(
             ui,
             "Waiting for profile",
-            "Choose an eligible RetroArch profile in Stage 1 to continue.",
+            "Choose an eligible RetroArch profile to continue.",
             widgets::StatusTone::Pending,
         );
         return None;
     }
     match &workflow.source_list {
         CheatStepResource::NotLoaded => {
-            ui.label("Trusted sources have not been listed yet.");
+            ui.label("Cheat sources have not been checked yet.");
             if widgets::action_button(
                 ui,
-                "List trusted sources",
+                "Check cheat sources",
                 widgets::ActionStyle::Primary,
                 true,
             )
@@ -29589,13 +29692,13 @@ fn show_cheat_workflow_step2(
         CheatStepResource::Loading { .. } => {
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.label("Reading the trusted-source cache...");
+                ui.label("Checking cheat sources...");
             });
         }
         CheatStepResource::Failed(message) => {
             widgets::banner(
                 ui,
-                "Could not list trusted sources",
+                "Cheat sources need attention",
                 message,
                 widgets::StatusTone::Blocked,
             );
@@ -29624,11 +29727,7 @@ fn show_cheat_workflow_step2(
                         if source.experimental {
                             widgets::status_badge(ui, "Experimental", widgets::StatusTone::Warning);
                         } else {
-                            widgets::status_badge(
-                                ui,
-                                "Trusted built-in",
-                                widgets::StatusTone::Success,
-                            );
+                            widgets::status_badge(ui, "Ready", widgets::StatusTone::Success);
                         }
                         widgets::status_badge(
                             ui,
@@ -29637,16 +29736,6 @@ fn show_cheat_workflow_step2(
                         );
                     });
                     if workflow.selected_source_id.as_deref() == Some(&source.source_id) {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(format!("Permitted host: {}", source.permitted_host));
-                            if let Some(fetched_at) = entry.fetched_at_unix_seconds {
-                                ui.label(format!(
-                                    "Last retrieval: {}",
-                                    format_unix_timestamp_utc(fetched_at as i64)
-                                ));
-                            }
-                        });
-                        ui.label(&source.provenance);
                         show_cheat_warnings_summary(
                             ui,
                             &entry.warnings,
@@ -29657,6 +29746,14 @@ fn show_cheat_workflow_step2(
                             ui,
                             ("cheat_source_technical_details", &source.source_id),
                             |ui| {
+                                ui.label(format!("Permitted host: {}", source.permitted_host));
+                                if let Some(fetched_at) = entry.fetched_at_unix_seconds {
+                                    ui.label(format!(
+                                        "Last retrieval: {}",
+                                        format_unix_timestamp_utc(fetched_at as i64)
+                                    ));
+                                }
+                                ui.label(&source.provenance);
                                 widgets::copyable_value(ui, "Source identifier", &source.source_id);
                                 widgets::copyable_value(ui, "Download URL", &source.download_url);
                                 ui.label(format!("Trust status: {}", entry.trust_status));
@@ -29700,7 +29797,7 @@ fn show_cheat_workflow_step2(
                     !busy && !fetching && selected_entry.is_some_and(|entry| entry.source.enabled);
                 if widgets::action_button(
                     ui,
-                    "Manage catalogue in Sources",
+                    "Open Cheat Sources",
                     widgets::ActionStyle::Primary,
                     can_fetch,
                 )
@@ -29712,7 +29809,7 @@ fn show_cheat_workflow_step2(
                     .is_some_and(|entry| entry.freshness != CheatSourceFreshness::Missing);
                 if widgets::action_button(
                     ui,
-                    "Use cached snapshot",
+                    "Use saved catalogue",
                     widgets::ActionStyle::Secondary,
                     !busy && !fetching && cached_available,
                 )
@@ -29752,7 +29849,7 @@ fn show_cheat_workflow_step2(
         CheatStepResource::Failed(message) => {
             widgets::banner(
                 ui,
-                "Catalogue retrieval failed",
+                "Cheat sources need attention",
                 message,
                 widgets::StatusTone::Blocked,
             );
@@ -29981,10 +30078,8 @@ fn show_cheat_workflow_step1(
     let mut action = None;
     widgets::section_header(
         ui,
-        "Stage 1 · Archive and RetroArch profile",
-        Some(
-            "The archive context above is fixed. ArchiveFS selects a profile automatically only when exactly one is eligible.",
-        ),
+        "Choose a RetroArch profile",
+        Some("Choose where ArchiveFS should look for and save cheats for this game."),
     );
     widgets::section_header(ui, "RetroArch profile", None);
     match profiles {
@@ -29998,9 +30093,11 @@ fn show_cheat_workflow_step1(
             });
         }
         RetroArchProfilesState::Error(message) => {
-            ui.colored_label(
-                ui.visuals().error_fg_color,
-                format!("Profile discovery failed: {message}"),
+            widgets::banner(
+                ui,
+                "RetroArch profiles need attention",
+                message,
+                widgets::StatusTone::Warning,
             );
         }
         RetroArchProfilesState::Ready(discovery) => {
@@ -30855,11 +30952,11 @@ fn show_settings_page(
     );
 
     ui.add_space(theme::SECTION_GAP);
-    widgets::section_header(ui, "6. Intentionally unavailable", None);
+    widgets::section_header(ui, "6. More settings coming later", None);
     widgets::banner(
         ui,
-        "Not available yet",
-        "These controls have no supported GUI yet: appearance density, reset controls, cache maintenance, and editing the configuration in-app. Source folders remain managed on the Sources page.",
+        "More settings coming later",
+        "Appearance and maintenance options will be added here in a future update.",
         widgets::StatusTone::Info,
     );
     action
@@ -31708,6 +31805,14 @@ fn build_health_issues(
             continue;
         }
         if unavailable_source_ids.contains(&persisted.source_folder_id) {
+            continue;
+        }
+        // Older builds catalogued .cue/.m3u rows independently. Current scans
+        // correctly skip those companion/metadata files, which makes the
+        // retained legacy row look "missing" even while its disc set is fine.
+        // Do not turn that history artefact into a missing-game warning. This
+        // proves no BIN/CUE pairing and changes no persisted scan evidence.
+        if is_known_disc_companion(&persisted.absolute_path) {
             continue;
         }
         let presence = if persisted.last_verified_missing_at.is_some() {
@@ -44218,12 +44323,9 @@ mod tests {
             });
         });
         for expected in [
-            "Overview",
-            "Selected system workflow",
-            // Workflow-state details ("Emulator profile" and friends) now
-            // live behind the collapsed "Workflow diagnostics" section, so
-            // the primary flow is not interrupted by them - see the
-            // Cheats & Mods workflow simplification.
+            "Selected game: a",
+            "Choose a RetroArch profile",
+            "Cheat source",
             "Workflow diagnostics",
             "Recent related activity",
         ] {
@@ -45200,6 +45302,101 @@ $Instant Growth [Nayr]\n";
             journal,
             journal_path: Some(PathBuf::from("/history/op-beginner-test.json")),
             journal_failure: None,
+        }
+    }
+
+    fn render_shared_history(details_open: bool) -> egui::FullOutput {
+        let mut result = successful_shared_apply_result();
+        result.journal.timestamp_unix_seconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let report = SharedHistoryReport {
+            journals: vec![(
+                SharedTransactionPath::from_path(Path::new("/history/op-beginner-test.json")),
+                result.journal,
+            )],
+            warnings: Vec::new(),
+            complete: true,
+        };
+        let ctx = egui::Context::default();
+        if details_open {
+            ctx.memory_mut(|memory| memory.set_everything_is_visible(true));
+        }
+        let mut rollback = SharedRollbackState::Idle;
+        let shared_history = SharedHistoryState::Ready(report);
+        let mut history = OperationHistory::default();
+        let mut filters = HistoryLogFilters::default();
+        let mut clipboard = InMemoryClipboard::default();
+        ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_history_logs_page(
+                    ui,
+                    &shared_history,
+                    &mut rollback,
+                    None,
+                    &mut history,
+                    &mut filters,
+                    &mut clipboard,
+                );
+            });
+        })
+    }
+
+    #[test]
+    fn transaction_card_defaults_to_a_game_summary_and_human_time() {
+        let output = render_shared_history(false);
+        for expected in [
+            "Completed",
+            "Cheats added to a",
+            "Dolphin · Today at",
+            "1 change",
+            "Preview rollback",
+            "Technical details",
+        ] {
+            assert!(
+                rendered_text_contains(&output, expected),
+                "missing {expected}"
+            );
+        }
+        for technical in [
+            "op-beginner-test",
+            "plan-beginner-test",
+            "/history/op-beginner-test.json",
+            "/dolphin/GameSettings",
+            "/roms/a.zip",
+            "Raw timestamp",
+            "Source mode",
+        ] {
+            assert!(
+                !rendered_text_contains(&output, technical),
+                "technical audit value leaked into the default card: {technical}"
+            );
+        }
+    }
+
+    #[test]
+    fn transaction_details_preserve_the_raw_audit_record() {
+        let output = render_shared_history(true);
+        for expected in [
+            "Transaction ID",
+            "op-beginner-test",
+            "Plan ID",
+            "plan-beginner-test",
+            "Raw timestamp",
+            "Selected archive",
+            "/roms/a.zip",
+            "Source mode",
+            "ArchiveFS trusted catalogue",
+            "Destination root",
+            "/dolphin/GameSettings",
+            "Journal path",
+            "/history/op-beginner-test.json",
+        ] {
+            assert!(
+                rendered_text_contains(&output, expected),
+                "missing {expected}"
+            );
         }
     }
 
@@ -47832,8 +48029,11 @@ $Instant Growth [Nayr]\n";
                 let _ = show_shared_cheat_preview(ui, workflow, &mut clipboard);
             });
         });
-        assert!(rendered_text_contains(&output, "No matching cheat found"));
-        assert!(rendered_text_contains(&output, "Nothing can be applied"));
+        assert!(rendered_text_contains(
+            &output,
+            "No cheats found for this game"
+        ));
+        assert!(rendered_text_contains(&output, "Try another cheat source"));
         for forbidden in ["Install now", "Ready to install", "Apply now"] {
             assert!(
                 !rendered_text_contains(&output, forbidden),
@@ -48578,8 +48778,17 @@ $Instant Growth [Nayr]\n";
                 let _ = show_cheat_source_modes(ui, workflow, &RetroArchProfilesState::NotScanned);
             });
         });
-        assert!(rendered_text_contains(&output, "Local unverified source"));
-        assert!(rendered_text_contains(&output, "Planned"));
+        assert!(rendered_text_contains(&output, "Existing RetroArch cheats"));
+        assert!(!rendered_text_contains(&output, "Local unverified source"));
+        let details_ctx = egui::Context::default();
+        details_ctx.memory_mut(|memory| memory.set_everything_is_visible(true));
+        let details = details_ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_cheat_source_modes(ui, workflow, &RetroArchProfilesState::NotScanned);
+            });
+        });
+        assert!(rendered_text_contains(&details, "Local unverified source"));
+        assert!(rendered_text_contains(&details, "Planned"));
         for fake_action in ["Browse local", "Choose local", "Import local"] {
             assert!(!rendered_text_contains(&output, fake_action));
         }
@@ -48715,15 +48924,20 @@ $Instant Growth [Nayr]\n";
 
         for expected in [
             "Cheats & Mods",
-            "No archive context selected",
-            "Choose one archive",
-            "Choose archive",
+            "Choose a game",
+            "Select a game to see available cheats and patches.",
             "Open Library",
-            "Profile discovery available",
-            "Matching unavailable",
-            "Mods",
         ] {
             assert!(rendered_text_contains(&output, expected));
+        }
+        for internal in [
+            "archive context",
+            "Profile discovery",
+            "Trusted retrieval",
+            "Matching unavailable",
+            "Installation gated",
+        ] {
+            assert!(!rendered_text_contains(&output, internal));
         }
         assert!(!rendered_text_contains(&output, "/roms/"));
     }
@@ -48757,12 +48971,12 @@ $Instant Growth [Nayr]\n";
         });
 
         for expected in [
-            "Stage 1 · Archive and RetroArch profile",
+            "Choose a RetroArch profile",
             "native-user",
-            "Stage 2 · Cheat source",
-            "Trusted catalogue details",
+            "Cheat source",
+            "Available cheats",
             source_name.as_str(),
-            "Trusted built-in",
+            "Ready",
             "Shared preview",
             // "Controlled apply available after eligible preview" now lives
             // behind the collapsed "Workflow diagnostics" section - covered
@@ -49442,17 +49656,14 @@ $Instant Growth [Nayr]\n";
             });
         });
         assert!(
-            rendered_text_contains(&output, "12 verification notes"),
+            rendered_text_contains(&output, "12 catalogue issues found"),
             "the full count must be visible even though only a sample renders directly"
         );
         assert!(
-            rendered_text_contains(&output, "catalogue remains usable"),
+            rendered_text_contains(&output, "The catalogue still works"),
             "must reassure the user the catalogue is still usable despite these exclusions"
         );
-        assert!(rendered_text_contains(
-            &output,
-            "0 catalogue files could not be parsed and were excluded from matching."
-        ));
+        assert!(rendered_text_contains(&output, "What happened?"));
         assert!(
             !rendered_text_contains(
                 &output,
@@ -49460,8 +49671,7 @@ $Instant Growth [Nayr]\n";
             ),
             "only a bounded sample renders directly - the rest stays behind Technical details"
         );
-        assert!(rendered_text_contains(&output, "+ 9 more"));
-        assert!(rendered_text_contains(&output, "Technical details"));
+        assert!(!rendered_text_contains(&output, "verification notes"));
     }
 
     #[test]
@@ -49473,7 +49683,7 @@ $Instant Growth [Nayr]\n";
                 show_cheat_warnings_summary(ui, &[], "empty_warnings_test", &mut clipboard);
             });
         });
-        assert!(!rendered_text_contains(&output, "verification note"));
+        assert!(!rendered_text_contains(&output, "catalogue issue"));
         assert!(!rendered_text_contains(&output, "Technical details"));
     }
 
@@ -49567,12 +49777,12 @@ $Instant Growth [Nayr]\n";
     }
 
     #[test]
-    fn large_historical_mount_group_renders_summary_and_ten_examples_only() {
+    fn large_loose_rom_group_hides_examples_and_technical_breakdown_by_default() {
         let issues: Vec<HealthIssue> = (0..12)
             .map(|index| {
                 doctor_health_issue(
-                    &format!("/roms/history/{index:03}.zip"),
-                    HealthCategory::HistoricalMountFailure,
+                    &format!("/roms/loose/{index:03}.sfc"),
+                    HealthCategory::MountNotRequired,
                 )
             })
             .collect();
@@ -49580,21 +49790,39 @@ $Instant Growth [Nayr]\n";
         let state = doctor_outcome(scan);
         let output = render_doctor_page(&state, &mut None);
 
+        assert!(rendered_text_contains(&output, "12 loose ROMs are healthy"));
         assert!(rendered_text_contains(
             &output,
-            "Historical mount failures: 12"
+            "These games can be used directly. Nothing needs fixing."
         ));
-        assert!(rendered_text_contains(&output, "Examples (first 10 of 12)"));
-        assert!(rendered_text_contains(&output, "/roms/history/009.zip"));
-        assert!(
-            !rendered_text_contains(&output, "/roms/history/010.zip"),
-            "the collapsed full list must not eagerly render hundreds of rows"
-        );
-        assert!(rendered_text_contains(&output, "Show all 12 findings"));
-        assert!(rendered_text_contains(
-            &output,
-            "Copy report exports every underlying finding"
-        ));
+        assert!(rendered_text_contains(&output, "Show examples"));
+        assert!(rendered_text_contains(&output, "Show details"));
+        for hidden in [
+            "By reason",
+            "By platform",
+            "By media kind",
+            "By evidence",
+            "/roms/loose/",
+        ] {
+            assert!(
+                !rendered_text_contains(&output, hidden),
+                "{hidden} leaked into the default card"
+            );
+        }
+
+        let ctx = egui::Context::default();
+        ctx.memory_mut(|memory| memory.set_everything_is_visible(true));
+        let mut clipboard = InMemoryClipboard::default();
+        let details = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_doctor_page(ui, &state, &mut None, None, None, None, &mut clipboard);
+            });
+        });
+        assert!(rendered_text_contains(&details, "By reason"));
+        assert!(rendered_text_contains(&details, "By platform"));
+        assert!(rendered_text_contains(&details, "By media kind"));
+        assert!(rendered_text_contains(&details, "By evidence"));
+        assert!(rendered_text_contains(&details, "/roms/loose/000.sfc"));
     }
 
     #[test]
@@ -59608,6 +59836,18 @@ $Instant Growth [Nayr]\n";
     }
 
     #[test]
+    fn doctor_does_not_turn_a_known_legacy_cue_companion_into_a_missing_game() {
+        let mut cue = persisted_archive(PathBuf::from("/roms/Disc Game.cue"), true);
+        cue.archive_kind = "direct_game_image".to_string();
+        cue.last_seen_at = "2026-08-08T20:00:00Z".to_string();
+        let cached = cached_snapshot(vec![cue]);
+
+        let issues = build_health_issues(&[], &cached, &HashSet::new(), &HashSet::new());
+
+        assert!(issues.is_empty(), "a known companion is not a missing game");
+    }
+
+    #[test]
     fn build_health_issues_never_floods_one_issue_per_archive_for_an_unavailable_source() {
         // 1,242 archives under one offline source must never produce
         // 1,242 `HealthIssue`s - `source_health_issues` (called
@@ -65142,12 +65382,28 @@ $Instant Growth [Nayr]\n";
             .next()
             .unwrap();
         assert!(browser.contains("Browse only"));
+        assert!(browser.contains("Installing from BSFree is not supported yet"));
         assert!(browser.contains("PageRequest::games(0)"));
         assert!(browser.contains("Previous 100"));
         assert!(browser.contains("Next 100"));
         assert!(browser.contains("archivefs_platform_display_name"));
         assert!(!browser.contains("Install selected"));
         assert!(!browser.contains("BsFreeOperation::Install"));
+    }
+
+    #[test]
+    fn settings_uses_user_wording_for_future_options() {
+        let source = include_str!("main.rs");
+        let settings = source
+            .split("fn show_settings_page(")
+            .nth(1)
+            .unwrap()
+            .split("fn history_entry_text(")
+            .next()
+            .unwrap();
+        assert!(settings.contains("More settings coming later"));
+        assert!(!settings.contains("Intentionally unavailable"));
+        assert!(!settings.contains("no supported GUI"));
     }
 
     /// The screen-space position of the first `Shape::Text` *containing*
@@ -69010,7 +69266,7 @@ fn benign_loose_rom_doctor_findings_use_a_friendly_summary() {
     );
     assert_eq!(
         repeated_doctor_group_explanation(&finding),
-        Some("These files are used directly and do not need ArchiveFS mounting.")
+        Some("These games can be used directly. Nothing needs fixing.")
     );
     // A different kind keeps its precise heading (technical detail preserved).
     finding.id = "mounts.historical_failure".to_string();

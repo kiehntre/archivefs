@@ -42,7 +42,7 @@ mod inspector;
 pub use inspector::{
     INSPECTOR_ENTRY_LIMIT, InspectorEntry, InspectorEntryClassification, InspectorEntryKind,
     InspectorError, InspectorReport, classify_entry, inspect_archive, inspect_archive_with_limit,
-    is_inspectable,
+    is_inspectable, is_known_disc_companion,
 };
 
 pub mod game_identity;
