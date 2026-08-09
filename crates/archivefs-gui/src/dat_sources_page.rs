@@ -4092,9 +4092,14 @@ fn show_diagnostics_summary(
     // Occurrence lists are deliberately bounded for rendering, so never use
     // their length for the headline. The stored occurrence totals remain
     // exact even for very large folders.
-    let attention_issues = row.diagnostic_occurrences(DiagnosticSeverity::Error)
-        + row.diagnostic_occurrences(DiagnosticSeverity::Warning);
+    let error_issues = row.diagnostic_occurrences(DiagnosticSeverity::Error);
+    let attention_issues = error_issues + row.diagnostic_occurrences(DiagnosticSeverity::Warning);
     if attention_issues > 0 {
+        // An Error means core marked the source Invalid ("part of what they
+        // asked for is unusable" - see `dat/sources/validation.rs`), which is
+        // not the same claim as "still works, some files were skipped". Say
+        // so truthfully instead of reassuring the user past a real problem.
+        let has_errors = error_issues > 0;
         ui.add_space(6.0);
         widgets::status_badge(
             ui,
@@ -4102,12 +4107,18 @@ fn show_diagnostics_summary(
                 "{attention_issues} catalogue issue{} found",
                 if attention_issues == 1 { "" } else { "s" }
             ),
-            widgets::StatusTone::Warning,
+            if has_errors {
+                widgets::StatusTone::Blocked
+            } else {
+                widgets::StatusTone::Warning
+            },
         );
         ui.label(
-            egui::RichText::new(
-                "The catalogue still works. Files that could not be used were skipped.",
-            )
+            egui::RichText::new(if has_errors {
+                "Some files could not be used and need your attention."
+            } else {
+                "The catalogue still works. Files that could not be used were skipped."
+            })
             .color(theme::muted(ui))
             .small(),
         );

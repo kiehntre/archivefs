@@ -1489,6 +1489,38 @@ fn an_error_diagnostic_renders_in_its_own_section_not_as_a_warning() {
 }
 
 #[test]
+fn an_error_headline_does_not_falsely_reassure_the_catalogue_still_works() {
+    // Error severity means core marked the whole source Invalid ("part of
+    // what they asked for is unusable"), which is a different claim than
+    // "still works, some files were skipped" (the Warning-only wording).
+    // The headline must say so truthfully and match the Blocked badge tone.
+    let error_text = "the catalogue declares an entry the build refuses to index";
+    let (_fixture, page) = page_with_report(
+        vec![vec![error(error_text)]],
+        DatHealthState::Invalid,
+        false,
+        None,
+    );
+    let view = page.view();
+    assert_eq!(view.rows[0].health_state, DatHealthState::Invalid);
+
+    let mut ui_state = DatSourcesPageUi::default();
+    let collapsed = render(&view, &mut ui_state);
+    assert!(rendered_text_contains(
+        &collapsed,
+        "1 catalogue issue found"
+    ));
+    assert!(rendered_text_contains(
+        &collapsed,
+        "Some files could not be used and need your attention."
+    ));
+    assert!(!rendered_text_contains(
+        &collapsed,
+        "The catalogue still works. Files that could not be used were skipped."
+    ));
+}
+
+#[test]
 fn mixed_errors_warnings_and_notes_render_as_three_sections() {
     // All three severities present: each gets its own labelled section, and the
     // badge stays driven by core health (Invalid because an error is present).
