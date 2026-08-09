@@ -1671,6 +1671,6 @@ fn bsfree_is_labeled_browse_only() {
 fn the_page_header_shows_its_icon_alongside_the_title() {
     let view = fresh("icon-header").view();
     let output = render(&view);
-    assert!(rendered_text_contains(&output, "🧩"));
+    assert!(rendered_text_contains(&output, "❤️×99"));
     assert!(rendered_text_contains(&output, "Cheat sources"));
 }

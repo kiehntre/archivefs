@@ -3458,9 +3458,9 @@ pub(crate) fn show_dat_sources_page(
 
     widgets::page_header_with_icon(
         ui,
-        crate::ui::icons::DAT_CATALOGUES,
-        "DAT sources",
-        "Use DAT catalogues to check and identify your ROMs.",
+        crate::ui::icons::VERIFY,
+        "Verify Games",
+        "Use DAT catalogues to identify and check your games.",
     );
 
     if let Some(error) = &view.load_error {
@@ -3518,9 +3518,9 @@ pub(crate) fn show_dat_sources_page(
     if view.is_empty() {
         widgets::empty_state(
             ui,
-            &crate::ui::icons::with_icon(crate::ui::icons::EMPTY_BOX, "No DAT sources yet"),
-            "Add a DAT file, or a folder of them, to check your library against a published \
-             catalogue. Nothing is downloaded and nothing is changed.",
+            &crate::ui::icons::with_icon(crate::ui::icons::VERIFY, "No DATs added"),
+            "Add a DAT catalogue to verify your games. Nothing is downloaded and nothing is \
+             changed.",
             None,
         );
     } else {

@@ -52,13 +52,24 @@ impl StatusTone {
 
 pub(crate) fn status_badge(ui: &mut egui::Ui, label: impl Into<String>, tone: StatusTone) {
     let color = tone.color(ui);
+    // A small consistent status cue by tone, always paired with the word so
+    // status is never carried by the glyph alone.
+    let cue = match tone {
+        StatusTone::Success => "✓",
+        StatusTone::Warning => "!",
+        StatusTone::Blocked => "×",
+        StatusTone::Pending => "?",
+        StatusTone::Active => "▶",
+        StatusTone::Info => "i",
+    };
+    let text = format!("{cue} {}", label.into());
     egui::Frame::new()
         .fill(color.gamma_multiply(0.18))
         .stroke(egui::Stroke::new(1.0_f32, color.gamma_multiply(0.7)))
         .corner_radius(5)
         .inner_margin(egui::Margin::symmetric(8, 3))
         .show(ui, |ui| {
-            ui.label(egui::RichText::new(label.into()).color(color).strong());
+            ui.label(egui::RichText::new(text).color(color).strong());
         });
 }
 
