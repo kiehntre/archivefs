@@ -1657,13 +1657,20 @@ fn an_unreadable_existing_cache_is_drawn_as_invalid_not_not_checked() {
 }
 
 #[test]
-fn bsfree_is_labeled_browse_only() {
+fn bsfree_is_labeled_with_its_honest_gamecube_capability() {
     let registry = archivefs_core::patch_manager::build_default_registry();
     let bsfree = registry.get("bsfree-archive").expect("bsfree entry");
     assert_eq!(
         super::provider_kind_label(bsfree),
-        "Browse only",
-        "BSFree must state it browses only and does not install"
+        "Downloads and installs (GameCube via Dolphin)",
+        "BSFree must state its GameCube install capability without claiming other formats install"
+    );
+    assert!(
+        bsfree
+            .spec
+            .description
+            .contains("GameCube hex-pair codes are installable"),
+        "the row description must carry the same honest capability"
     );
 }
 

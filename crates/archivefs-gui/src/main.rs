@@ -45,41 +45,42 @@ use archivefs_core::game_identity::{
     inspect_catalogued_game_identity,
 };
 use archivefs_core::patch_manager::{
-    BsFreeCatalogue, BsFreeCheat, BsFreeDownloadOptions, BsFreeGame, BsFreeGameSearchRequest,
-    BsFreeGameSearchResult, BsFreePaths, BsFreeSourceStatus, CheatCandidate, CheatCandidateArchive,
-    CheatCandidateClassification, CheatCandidateList, CheatCandidateOptions, CheatCatalogueStatus,
-    CheatDestinationRequest, CheatInstallPlanError, CheatInstallPreviewRequest,
-    CheatProviderSourceState, CheatSelection, CheatSourceCancellation, CheatSourceError,
-    CheatSourceFetchOptions, CheatSourceFetchResult, CheatSourceFetchStatus, CheatSourceFreshness,
-    CheatSourceList, CheatSourceListEntry, CheatSourceProgress, CheatSourceProgressPhase,
-    CheatSourceProgressReporter, DeviceFormatCompatibility, DolphinCatalogue,
-    DolphinCatalogueError, DolphinCatalogueErrorKind, DolphinCatalogueFetchOptions,
-    DolphinCatalogueFetchResult, DolphinCatalogueLoad, DolphinCatalogueUpdateCheck,
-    DolphinGameIniInventory, DolphinGeckoLookupResult, DolphinInstallPlanError,
-    DolphinInstallPreviewRequest, DolphinInstallationType, DolphinMatchState, DolphinProfile,
-    DolphinProfileDiscovery, DolphinProfileDiscoveryRoots, DolphinProfileScope,
-    DolphinProviderCodeSelection, DolphinSettingsDirectoryState, EmulatorProfileCandidate,
-    EmulatorProfileSelectReason, EmulatorProfileSelection, GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE,
-    GameCubeCheatSelection, GameCubeCodeFormat, GameCubeGameHackingInstallPreviewRequest,
-    GameCubeGameIdentity, GameCubeInstallPlanError, GameCubeInstallPlanErrorKind,
-    GameHackingErrorKind, GameHackingFetchOptions, GameHackingGame, GameHackingGameCubeCheat,
-    GameHackingGameCubeFetchOptions, GameHackingGameCubeGame, GameHackingGameCubeMatchCandidate,
-    GameHackingGameCubeMatchStatus, GameHackingGameCubeMatchStrength, GameHackingGameCubeProvider,
-    GameHackingMatchCandidate, GameHackingMatchStatus, GameHackingProvider, GameHackingWiiCheat,
-    GameHackingWiiGame, GameHackingWiiMatch, GameHackingWiiMatchCandidate,
-    GameHackingWiiMatchStatus, GameHackingWiiMatchStrength, GameHackingWiiProvider,
-    GeckoProviderFetchOptions, GeckoProviderFetchResult, GeckoProviderFetchStatus,
-    GeckoProviderQuery, HttpsCheatSourceTransport, ImportSourceKind, ImportTrustState,
-    LoadedCandidate, LoadedDolphinDestination, LoadedXeniaDestination, LocalSafetyScanningState,
-    PageRequest, Pcsx2CheatCandidate, Pcsx2CheatSelection, Pcsx2GameIdentity,
-    Pcsx2InstallPlanError, Pcsx2InstallPreviewRequest, Pcsx2InstallationType, Pcsx2MatchState,
-    Pcsx2PatchCategory, Pcsx2PatchDirectoryState, Pcsx2PnachInventory, Pcsx2Profile,
-    Pcsx2ProfileDiscovery, Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope, PreviewAdapter,
-    PreviewDestinationState, PreviewEligibility, PreviewIdentity, PreviewIdentityKind,
-    PreviewIdentityState, PreviewMatchStrength, PreviewSourceItem, PreviewState,
-    ProviderGameMatchConfidence, ReadOnlyCheatCatalogue, RememberedEmulatorProfile,
-    ResolvedCheatDestination, RetroArchCheatLibraryInspection, RetroArchCheatLibraryState,
-    RetroArchCheatSetupDiscovery, RetroArchLocalCheatMatchState, RetroArchMaterializationError,
+    BsFreeCatalogue, BsFreeCheat, BsFreeDownloadOptions, BsFreeGame, BsFreeGameCubeCodeFormat,
+    BsFreeGameSearchRequest, BsFreeGameSearchResult, BsFreePaths, BsFreeSourceStatus,
+    CheatCandidate, CheatCandidateArchive, CheatCandidateClassification, CheatCandidateList,
+    CheatCandidateOptions, CheatCatalogueStatus, CheatDestinationRequest, CheatInstallPlanError,
+    CheatInstallPreviewRequest, CheatProviderSourceState, CheatSelection, CheatSourceCancellation,
+    CheatSourceError, CheatSourceFetchOptions, CheatSourceFetchResult, CheatSourceFetchStatus,
+    CheatSourceFreshness, CheatSourceList, CheatSourceListEntry, CheatSourceProgress,
+    CheatSourceProgressPhase, CheatSourceProgressReporter, DeviceFormatCompatibility,
+    DolphinCatalogue, DolphinCatalogueError, DolphinCatalogueErrorKind,
+    DolphinCatalogueFetchOptions, DolphinCatalogueFetchResult, DolphinCatalogueLoad,
+    DolphinCatalogueUpdateCheck, DolphinGameIniInventory, DolphinGeckoLookupResult,
+    DolphinInstallPlanError, DolphinInstallPreviewRequest, DolphinInstallationType,
+    DolphinMatchState, DolphinProfile, DolphinProfileDiscovery, DolphinProfileDiscoveryRoots,
+    DolphinProfileScope, DolphinProviderCodeSelection, DolphinSettingsDirectoryState,
+    EmulatorProfileCandidate, EmulatorProfileSelectReason, EmulatorProfileSelection,
+    GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE, GameCubeCheatSelection, GameCubeCodeFormat,
+    GameCubeGameHackingInstallPreviewRequest, GameCubeGameIdentity, GameCubeInstallPlanError,
+    GameCubeInstallPlanErrorKind, GameHackingErrorKind, GameHackingFetchOptions, GameHackingGame,
+    GameHackingGameCubeCheat, GameHackingGameCubeFetchOptions, GameHackingGameCubeGame,
+    GameHackingGameCubeMatchCandidate, GameHackingGameCubeMatchStatus,
+    GameHackingGameCubeMatchStrength, GameHackingGameCubeProvider, GameHackingMatchCandidate,
+    GameHackingMatchStatus, GameHackingProvider, GameHackingWiiCheat, GameHackingWiiGame,
+    GameHackingWiiMatch, GameHackingWiiMatchCandidate, GameHackingWiiMatchStatus,
+    GameHackingWiiMatchStrength, GameHackingWiiProvider, GeckoProviderFetchOptions,
+    GeckoProviderFetchResult, GeckoProviderFetchStatus, GeckoProviderQuery,
+    HttpsCheatSourceTransport, ImportSourceKind, ImportTrustState, LoadedCandidate,
+    LoadedDolphinDestination, LoadedXeniaDestination, LocalSafetyScanningState, PageRequest,
+    Pcsx2CheatCandidate, Pcsx2CheatSelection, Pcsx2GameIdentity, Pcsx2InstallPlanError,
+    Pcsx2InstallPreviewRequest, Pcsx2InstallationType, Pcsx2MatchState, Pcsx2PatchCategory,
+    Pcsx2PatchDirectoryState, Pcsx2PnachInventory, Pcsx2Profile, Pcsx2ProfileDiscovery,
+    Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope, PreviewAdapter, PreviewDestinationState,
+    PreviewEligibility, PreviewIdentity, PreviewIdentityKind, PreviewIdentityState,
+    PreviewMatchStrength, PreviewSourceItem, PreviewState, ProviderGameMatchConfidence,
+    ReadOnlyCheatCatalogue, RememberedEmulatorProfile, ResolvedCheatDestination,
+    RetroArchCheatLibraryInspection, RetroArchCheatLibraryState, RetroArchCheatSetupDiscovery,
+    RetroArchLocalCheatMatchState, RetroArchMaterializationError,
     RetroArchMaterializationErrorKind, RetroArchMaterializationRequest,
     RetroArchMaterializedPreview, SharedAdapterWriteSupport, SharedApplyConfirmation,
     SharedApplyOptions, SharedApplyResult, SharedApplyStatus, SharedHistoryReport,
@@ -95,7 +96,7 @@ use archivefs_core::patch_manager::{
     build_pcsx2_install_preview, build_pcsx2_legacy_migration_preview, build_shared_preview,
     build_shared_transaction_plan, build_wii_gamehacking_install_preview, build_xenia_candidates,
     build_xenia_install_preview, check_dolphin_catalogue_update_with_transport,
-    default_bsfree_source_root, default_cheat_source_cache_root,
+    classify_bsfree_gamecube_cheat, default_bsfree_source_root, default_cheat_source_cache_root,
     default_dolphin_catalogue_cache_root, default_gecko_provider_cache_root,
     default_shared_backup_root, default_shared_history_root, discover_dolphin_profiles,
     discover_pcsx2_profiles, discover_retroarch_cheat_setup_profiles,
@@ -19022,7 +19023,11 @@ fn show_bsfree_source_card(
                     widgets::status_badge(ui, "Status unavailable", widgets::StatusTone::Warning)
                 }
             }
-            widgets::status_badge(ui, "Browse only", widgets::StatusTone::Info);
+            widgets::status_badge(
+                ui,
+                "GameCube installable via Dolphin",
+                widgets::StatusTone::Info,
+            );
         });
         ui.label("Source: BSFree Archive");
         ui.label("Maintainer: Andrew Mackrodt");
@@ -19036,7 +19041,8 @@ fn show_bsfree_source_card(
             widgets::StatusTone::Warning,
         );
         ui.label(
-            "No cheats are installed automatically. Stage 1 provides search and browsing only.",
+            "Search stays read-only. Verified-format GameCube hex-pair codes can be installed via \
+             the existing Dolphin adapter; all other platforms and code formats are reference-only.",
         );
 
         match manager {
@@ -19237,6 +19243,35 @@ fn bsfree_compatibility_label(compatibility: DeviceFormatCompatibility) -> &'sta
     }
 }
 
+/// Honest, per-code capability statement for a BSFree cheat row. GameCube
+/// hex-pair codes classify as installable through the existing Dolphin
+/// adapter (Gecko-equivalent or native Action Replay); every other platform
+/// and every unsupported format stays reference-only. This never claims
+/// ArchiveFS has verified the BSFree database - it states only which formats
+/// an existing adapter can represent.
+fn bsfree_code_capability(
+    cheat: &BsFreeCheat,
+    platform_id: Option<&str>,
+) -> (&'static str, widgets::StatusTone) {
+    if platform_id == Some("GameCube") {
+        match classify_bsfree_gamecube_cheat(cheat).code_format {
+            BsFreeGameCubeCodeFormat::GeckoEquivalent => {
+                ("Supported by Dolphin (Gecko)", widgets::StatusTone::Success)
+            }
+            BsFreeGameCubeCodeFormat::ActionReplayNative => (
+                "Supported by Dolphin (Action Replay)",
+                widgets::StatusTone::Success,
+            ),
+            BsFreeGameCubeCodeFormat::Unsupported | BsFreeGameCubeCodeFormat::Malformed => (
+                "Unsupported for this emulator",
+                widgets::StatusTone::Pending,
+            ),
+        }
+    } else {
+        ("Reference only", widgets::StatusTone::Pending)
+    }
+}
+
 fn show_bsfree_game_browser(
     ui: &mut egui::Ui,
     manager: &BsFreeManagerState,
@@ -19263,9 +19298,14 @@ fn show_bsfree_game_browser(
     );
     widgets::card(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
-            widgets::status_badge(ui, "Browse only", widgets::StatusTone::Info);
+            widgets::status_badge(
+                ui,
+                "GameCube: installable via Dolphin",
+                widgets::StatusTone::Info,
+            );
             ui.label(
-                "Installation support will be added only for verified formats in a later stage.",
+                "Search stays read-only. Verified-format GameCube codes can be installed via the \
+                 existing Dolphin adapter; every other platform and code format is reference-only.",
             );
         });
         ui.label("Match based on platform and title. Exact game revision is not verified.");
@@ -19454,6 +19494,11 @@ fn show_bsfree_game_browser(
                                     bsfree_compatibility_label(cheat.compatibility),
                                     widgets::StatusTone::Pending,
                                 );
+                                let (capability_label, capability_tone) = bsfree_code_capability(
+                                    cheat,
+                                    game.system.archivefs_platform_id.as_deref(),
+                                );
+                                widgets::status_badge(ui, capability_label, capability_tone);
                             });
                             if let Some(section) = &cheat.section {
                                 ui.label(format!("Section: {}", section.name));
@@ -65112,7 +65157,7 @@ $Instant Growth [Nayr]\n";
     }
 
     #[test]
-    fn bsfree_stage_one_labels_all_formats_as_browse_only_compatibility() {
+    fn bsfree_stage_one_capability_labels_are_honest() {
         assert_eq!(
             bsfree_compatibility_label(DeviceFormatCompatibility::PotentiallyConvertible),
             "Potentially convertible"
@@ -65129,10 +65174,46 @@ $Instant Growth [Nayr]\n";
             bsfree_match_label(ProviderGameMatchConfidence::Ambiguous),
             "Ambiguous candidates"
         );
+        // A GameCube hex-pair code is honestly reported as installable via
+        // Dolphin; a non-GameCube code is reference-only.
+        let gamecube = archivefs_core::patch_manager::BsFreeCheat {
+            upstream_id: 1,
+            name: "Lives".to_string(),
+            note: None,
+            code: "042318AC 3B8003E7".to_string(),
+            section: None,
+            author: None,
+            device: archivefs_core::patch_manager::BsFreeDeviceSummary {
+                upstream_id: 6,
+                name: "Action Replay".to_string(),
+                compatibility: DeviceFormatCompatibility::PotentiallyConvertible,
+            },
+            compatibility: DeviceFormatCompatibility::PotentiallyConvertible,
+            truncated_fields: Vec::new(),
+        };
+        let (label, _) = bsfree_code_capability(&gamecube, Some("GameCube"));
+        assert!(label.contains("Supported by Dolphin"));
+        let other = archivefs_core::patch_manager::BsFreeCheat {
+            upstream_id: 2,
+            name: "Code".to_string(),
+            note: None,
+            code: "AAAA-BBBB".to_string(),
+            section: None,
+            author: None,
+            device: archivefs_core::patch_manager::BsFreeDeviceSummary {
+                upstream_id: 2,
+                name: "Game Genie".to_string(),
+                compatibility: DeviceFormatCompatibility::PotentiallyConvertible,
+            },
+            compatibility: DeviceFormatCompatibility::PotentiallyConvertible,
+            truncated_fields: Vec::new(),
+        };
+        let (label, _) = bsfree_code_capability(&other, Some("PS2"));
+        assert_eq!(label, "Reference only");
     }
 
     #[test]
-    fn bsfree_gui_is_bounded_browse_only_and_has_no_install_action() {
+    fn bsfree_gui_is_bounded_and_has_no_install_action_in_the_browser() {
         let source = include_str!("main.rs");
         let browser = source
             .split("fn show_bsfree_game_browser(")
@@ -65141,7 +65222,8 @@ $Instant Growth [Nayr]\n";
             .split("/// The Sources page's compact")
             .next()
             .unwrap();
-        assert!(browser.contains("Browse only"));
+        assert!(browser.contains("installable via Dolphin"));
+        assert!(browser.contains("reference-only"));
         assert!(browser.contains("PageRequest::games(0)"));
         assert!(browser.contains("Previous 100"));
         assert!(browser.contains("Next 100"));

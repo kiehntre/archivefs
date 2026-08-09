@@ -737,11 +737,13 @@ pub fn build_default_registry() -> CheatSourceRegistry {
         display_name: "BSFree Archive".to_string(),
         emulator: "Multi".to_string(),
         platforms: vec![],
-        capabilities: CheatSourceCapabilities::read_only_browse(),
+        capabilities: CheatSourceCapabilities::remote_download_and_install(),
         upstream_project: BSFREE_UPSTREAM_PROJECT.to_string(),
         default_priority: 100,
         description:
-            "Andrew Mackrodt's BSFree Archive: a cross-platform read-only SQLite cheat database"
+            "Andrew Mackrodt's BSFree Archive: an optional immutable SQLite cheat database. \
+             GameCube hex-pair codes are installable via the existing Dolphin adapter; all \
+             other platforms and formats are browse-only"
                 .to_string(),
     }));
 

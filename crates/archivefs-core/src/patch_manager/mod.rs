@@ -18,6 +18,7 @@
 
 mod adapter;
 mod bsfree;
+mod bsfree_gamecube;
 mod cheat_cache_lock;
 mod cheat_cache_maintenance;
 mod cheat_candidates;
@@ -93,6 +94,16 @@ pub use bsfree::{
     default_bsfree_source_root, download_bsfree_database, import_local_bsfree_database,
     inspect_bsfree_source, remove_local_bsfree_source, set_bsfree_enabled,
     validate_bsfree_database, validate_installed_bsfree_source,
+};
+pub use bsfree_gamecube::{
+    BSFREE_GAMECUBE_PROVIDER_LABEL, BsFreeDedupFinding, BsFreeDedupFindingKind,
+    BsFreeGameCubeCheat, BsFreeGameCubeCheatSelection, BsFreeGameCubeCodeFormat,
+    BsFreeGameCubeError, BsFreeGameCubeErrorKind, BsFreeGameCubeInstallPreview,
+    BsFreeGameCubeInstallPreviewRequest, BsFreeGameCubeMatch, BsFreeGameCubeSelectionEntry,
+    BsFreeStagedGameCubeInstall, analyze_bsfree_gamecube_duplicates, bsfree_cheat_as_gamehacking,
+    bsfree_dolphin_code_name, bsfree_gamecube_cheats, bsfree_gamecube_match,
+    build_bsfree_gamecube_install_preview, classify_bsfree_gamecube_cheat,
+    stage_bsfree_gamecube_install,
 };
 pub use cheat_cache_maintenance::{
     CHEAT_CACHE_MAINTENANCE_SCHEMA_VERSION, CachePruneDisposition, CachePruneEntryKind,
