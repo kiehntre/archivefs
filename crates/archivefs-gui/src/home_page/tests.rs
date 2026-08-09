@@ -178,18 +178,15 @@ fn every_primary_card_action_reports_its_own_card() {
     let checks = [passing_check("config file")];
     let view = build_home_view(&established_inputs(&checks));
     let expected = [
-        (HomeCard::BuildLibrary, "Open Sources"),
         (HomeCard::BrowseGames, "Open Library"),
-        (HomeCard::CheatsAndMods, "Open Cheats & Mods"),
-        (
-            HomeCard::CanonicalOrganisation,
-            "Open Canonical Organisation",
-        ),
-        (HomeCard::CleanUpLibrary, "Open DAT Sources"),
-        (HomeCard::DatSources, "Open DAT Sources"),
-        (HomeCard::RomM, "Open Sources"),
+        (HomeCard::CanonicalOrganisation, "Open Organise"),
         (HomeCard::CheckSetup, "Open Doctor"),
+        (HomeCard::CheatsAndMods, "Open Cheats & Mods"),
+        (HomeCard::DatSources, "Open DAT Sources"),
         (HomeCard::Settings, "Open Settings"),
+        (HomeCard::BuildLibrary, "Open Sources"),
+        (HomeCard::CleanUpLibrary, "Open DAT Sources"),
+        (HomeCard::RomM, "Open Sources"),
     ];
     assert_eq!(view.cards.len(), expected.len());
     for (card, (expected_card, expected_label)) in view.cards.iter().zip(expected.iter()) {
@@ -368,7 +365,7 @@ fn rename_and_organise_are_discoverable_from_home() {
         .unwrap();
     // "Organise by platform" is the primary action; "Review filename
     // suggestions" (the DAT rename-planning workflow) is the secondary route.
-    assert_eq!(organise.action_label, "Open Canonical Organisation");
+    assert_eq!(organise.action_label, "Open Organise");
     assert_eq!(
         organise.secondary,
         Some((HomeCard::CleanUpLibrary, "Review filename suggestions"))
@@ -396,16 +393,125 @@ fn every_home_card_shows_its_icon_alongside_its_title() {
         "🗂️",
         "🧹",
         "🎮",
-        "📚",
+        "🧾",
         "🩺",
         "⚙️",
+        "❤️×99",
         "Clean up my library",
-        "Organise my library",
-        "Browse my games",
+        "Organise",
+        "My Games",
     ] {
         assert!(
             rendered_text_contains(&output, expected),
             "expected {expected:?} to be drawn"
+        );
+    }
+}
+
+// --- Beta 1 visual language ---
+
+#[test]
+fn primary_home_cards_carry_their_visual_identity() {
+    let checks = [passing_check("config file")];
+    let view = build_home_view(&established_inputs(&checks));
+    let find = |card: HomeCard| view.cards.iter().find(|c| c.card == card).unwrap();
+    let my_games = find(HomeCard::BrowseGames);
+    assert_eq!(my_games.icon, "🎮");
+    assert_eq!(my_games.title, "My Games");
+    let organise = find(HomeCard::CanonicalOrganisation);
+    assert_eq!(organise.icon, "🗂️");
+    assert_eq!(organise.title, "Organise");
+    let check = find(HomeCard::CheckSetup);
+    assert_eq!(check.icon, "🩺");
+    assert_eq!(check.title, "Check Library");
+    let cheats = find(HomeCard::CheatsAndMods);
+    assert_eq!(cheats.icon, "❤️×99", "the puzzle-piece identity is gone");
+    assert_ne!(cheats.icon, "🧩");
+    let verify = find(HomeCard::DatSources);
+    assert_eq!(verify.icon, "🧾");
+    assert_eq!(verify.title, "Verify Games");
+    let settings = find(HomeCard::Settings);
+    assert_eq!(settings.icon, "⚙️");
+    assert_eq!(settings.title, "Settings");
+}
+
+#[test]
+fn all_destinations_remain_and_six_are_primary() {
+    let checks = [passing_check("config file")];
+    let view = build_home_view(&established_inputs(&checks));
+    let mut all: Vec<HomeCard> = view.cards.iter().map(|c| c.card).collect();
+    all.sort_by_key(|c| format!("{c:?}"));
+    let mut expected: Vec<HomeCard> = vec![
+        HomeCard::BuildLibrary,
+        HomeCard::BrowseGames,
+        HomeCard::CheatsAndMods,
+        HomeCard::CanonicalOrganisation,
+        HomeCard::CleanUpLibrary,
+        HomeCard::DatSources,
+        HomeCard::RomM,
+        HomeCard::CheckSetup,
+        HomeCard::Settings,
+    ];
+    expected.sort_by_key(|c| format!("{c:?}"));
+    assert_eq!(all, expected, "no destination is removed");
+    assert_eq!(
+        view.cards
+            .iter()
+            .filter(|c| c.tier == HomeCardTier::Primary)
+            .count(),
+        6
+    );
+}
+
+#[test]
+fn icons_never_replace_text_labels() {
+    let checks = [passing_check("config file")];
+    let view = build_home_view(&established_inputs(&checks));
+    for card in &view.cards {
+        assert!(!card.icon.is_empty());
+        assert!(
+            !card.title.is_empty(),
+            "an icon-only card would break this rule"
+        );
+        assert!(!card.explanation.is_empty());
+    }
+}
+
+#[test]
+fn home_and_page_headers_share_the_same_concept_icons() {
+    // The page headers reference the very same constants the Home cards use,
+    // so the visual identity cannot drift between Home and a page.
+    assert_eq!(crate::ui::icons::GAMES, "🎮");
+    assert_eq!(crate::ui::icons::ORGANISE, "🗂️");
+    assert_eq!(crate::ui::icons::CHECK, "🩺");
+    assert_eq!(crate::ui::icons::CHEATS, "❤️×99");
+    assert_eq!(crate::ui::icons::VERIFY, "🧾");
+    assert_eq!(crate::ui::icons::SETTINGS, "⚙️");
+    assert_eq!(crate::ui::icons::ARTWORK, "🖼️");
+}
+
+#[test]
+fn the_primary_home_cards_render_at_compact_width() {
+    let checks = [passing_check("config file")];
+    let view = build_home_view(&established_inputs(&checks));
+    let (output, _) = render(&view, 700.0);
+    for expected in [
+        "🎮",
+        "🗂️",
+        "🩺",
+        "❤️×99",
+        "🧾",
+        "⚙️",
+        "My Games",
+        "Organise",
+        "Check Library",
+        "Cheats & Mods",
+        "Verify Games",
+        "Settings",
+    ] {
+        assert!(
+            rendered_text_contains(&output, expected),
+            "expected {expected:?} to render at compact width"
         );
     }
 }

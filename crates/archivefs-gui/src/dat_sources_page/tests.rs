@@ -4070,3 +4070,16 @@ fn repeated_symlink_diagnostics_group_with_an_exact_count_and_bounded_examples()
         "examples must be bounded (found {example_count})"
     );
 }
+
+#[test]
+fn the_empty_state_uses_the_verify_identity_and_short_wording() {
+    let fixture = Fixture::new();
+    let page = fixture.page();
+    let view = page.view();
+    let mut ui_state = DatSourcesPageUi::default();
+    let output = render(&view, &mut ui_state);
+    // With no DAT sources registered the empty state is the friendly, short
+    // "No DATs added" with the verify icon - not a long technical block.
+    assert!(rendered_text_contains(&output, "🧾"));
+    assert!(rendered_text_contains(&output, "No DATs added"));
+}
