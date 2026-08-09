@@ -136,7 +136,7 @@ sources registered) and an **Effective policy** summary:
 - preferred languages: add (via a picker) / move / remove, plus `multi` and
   `original` entries;
 - revision policy and clone policy selectors;
-- a fixed statement "ArchiveFS never renames your files" — no selector for the
+- a fixed statement "Your files won't be renamed unless you approve it." — no selector for the
   future rename modes, per design decision 5;
 - the Effective Policy Summary: current platform, sources consulted in order,
   resolved region/language/revision/clone values, and "where each value comes
