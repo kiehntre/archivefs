@@ -104,6 +104,30 @@ pub(crate) fn card<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui
         .inner
 }
 
+/// A restrained workflow identity for a major navigation card. This colour is
+/// deliberately independent of semantic status colours: readiness remains a
+/// text badge, while the faint tint and top rule identify the destination.
+pub(crate) fn workflow_card<R>(
+    ui: &mut egui::Ui,
+    accent: egui::Color32,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let shown = egui::Frame::new()
+        .fill(accent.gamma_multiply(0.075))
+        .stroke(theme::border(ui))
+        .corner_radius(9)
+        .inner_margin(egui::Margin::same(16))
+        .show(ui, add_contents);
+    ui.painter().line_segment(
+        [
+            shown.response.rect.left_top(),
+            shown.response.rect.right_top(),
+        ],
+        egui::Stroke::new(2.0_f32, accent.gamma_multiply(0.8)),
+    );
+    shown.inner
+}
+
 pub(crate) fn empty_state(
     ui: &mut egui::Ui,
     title: &str,

@@ -97,6 +97,31 @@ pub(crate) enum HomeCardTier {
     Secondary,
 }
 
+/// Concept colour for a primary workflow. It never communicates readiness or
+/// severity; those continue to use semantic status badges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HomeAccent {
+    Games,
+    Organise,
+    Check,
+    Cheats,
+    Verify,
+    Settings,
+}
+
+impl HomeAccent {
+    fn color(self) -> egui::Color32 {
+        match self {
+            Self::Games => egui::Color32::from_rgb(88, 145, 232),
+            Self::Organise => egui::Color32::from_rgb(151, 112, 220),
+            Self::Check => egui::Color32::from_rgb(72, 174, 153),
+            Self::Cheats => egui::Color32::from_rgb(211, 101, 126),
+            Self::Verify => egui::Color32::from_rgb(214, 164, 67),
+            Self::Settings => egui::Color32::from_rgb(132, 151, 174),
+        }
+    }
+}
+
 /// One rendered card: what it is, why it matters, whether it looks ready,
 /// and where it goes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,6 +133,7 @@ pub(crate) struct HomeCardView {
     pub(crate) title: &'static str,
     pub(crate) explanation: &'static str,
     pub(crate) tier: HomeCardTier,
+    pub(crate) accent: Option<HomeAccent>,
     /// `None` for the one card (Settings) with no single configured/not
     /// configured state to report.
     pub(crate) readiness: Option<CardReadiness>,
@@ -240,6 +266,7 @@ pub(crate) fn build_home_view(inputs: &HomeInputs) -> HomeView {
             title: "My Games",
             explanation: "Browse your games. See the library ArchiveFS has found, organised and searchable.",
             tier: HomeCardTier::Primary,
+            accent: Some(HomeAccent::Games),
             readiness: Some(browse_readiness),
             action_label: "Open Library",
             secondary: None,
@@ -250,6 +277,7 @@ pub(crate) fn build_home_view(inputs: &HomeInputs) -> HomeView {
             title: "Organise",
             explanation: "Rename and tidy your library. Preview how your games can be renamed or moved into platform folders; nothing moves until you approve it.",
             tier: HomeCardTier::Primary,
+            accent: Some(HomeAccent::Organise),
             readiness: None,
             action_label: "Open Organise",
             secondary: Some((HomeCard::CleanUpLibrary, "Review filename suggestions")),
@@ -260,6 +288,7 @@ pub(crate) fn build_home_view(inputs: &HomeInputs) -> HomeView {
             title: "Check Library",
             explanation: "Find problems with your ArchiveFS setup and library.",
             tier: HomeCardTier::Primary,
+            accent: Some(HomeAccent::Check),
             readiness: Some(setup_readiness),
             action_label: "Open Doctor",
             secondary: None,
@@ -270,6 +299,7 @@ pub(crate) fn build_home_view(inputs: &HomeInputs) -> HomeView {
             title: "Cheats & Mods",
             explanation: "Find cheats and game enhancements for a selected game.",
             tier: HomeCardTier::Primary,
+            accent: Some(HomeAccent::Cheats),
             readiness: Some(cheats_readiness),
             action_label: "Open Cheats & Mods",
             secondary: Some((HomeCard::CheatSources, "Manage Cheat Sources")),
@@ -280,6 +310,7 @@ pub(crate) fn build_home_view(inputs: &HomeInputs) -> HomeView {
             title: "Verify Games",
             explanation: "Check your games with DATs. Auditing is read-only: nothing is renamed, moved, or rewritten.",
             tier: HomeCardTier::Primary,
+            accent: Some(HomeAccent::Verify),
             readiness: Some(dat_readiness),
             action_label: "Open DAT Sources",
             secondary: None,
@@ -290,6 +321,7 @@ pub(crate) fn build_home_view(inputs: &HomeInputs) -> HomeView {
             title: "Settings",
             explanation: "Set up ArchiveFS: sources, mounts, and preferences.",
             tier: HomeCardTier::Primary,
+            accent: Some(HomeAccent::Settings),
             readiness: None,
             action_label: "Open Settings",
             secondary: None,
@@ -301,6 +333,7 @@ pub(crate) fn build_home_view(inputs: &HomeInputs) -> HomeView {
             title: "Build my library",
             explanation: "ArchiveFS needs one or more source folders before it can scan for archives.",
             tier: HomeCardTier::Secondary,
+            accent: None,
             readiness: Some(library_readiness),
             action_label: "Open Sources",
             secondary: None,
@@ -311,6 +344,7 @@ pub(crate) fn build_home_view(inputs: &HomeInputs) -> HomeView {
             title: "Clean up my library",
             explanation: "Review suggested filenames before renaming, using DAT catalogues.",
             tier: HomeCardTier::Secondary,
+            accent: None,
             readiness: None,
             action_label: "Open DAT Sources",
             secondary: None,
@@ -321,6 +355,7 @@ pub(crate) fn build_home_view(inputs: &HomeInputs) -> HomeView {
             title: "Connect RomM",
             explanation: READ_ONLY_ROMM_NOTE,
             tier: HomeCardTier::Secondary,
+            accent: None,
             readiness: Some(romm_readiness),
             action_label: "Open Sources",
             secondary: None,
@@ -406,9 +441,13 @@ pub(crate) fn show_home_page(ui: &mut egui::Ui, view: &HomeView) -> Option<HomeC
                 HomeCardTier::Primary => (26.0, 18.0),
                 HomeCardTier::Secondary => (16.0, 15.0),
             };
-            widgets::card(ui, |ui| {
+            let draw = |ui: &mut egui::Ui| {
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(egui::RichText::new(card.icon).size(icon_size));
+                    let icon = egui::RichText::new(card.icon).size(icon_size);
+                    ui.label(match card.accent {
+                        Some(accent) => icon.color(accent.color()).strong(),
+                        None => icon.color(theme::muted(ui)),
+                    });
                     ui.label(egui::RichText::new(card.title).size(title_size).strong());
                     if let Some(readiness) = &card.readiness {
                         widgets::status_badge(ui, readiness.label(), readiness.tone());
@@ -447,7 +486,12 @@ pub(crate) fn show_home_page(ui: &mut egui::Ui, view: &HomeView) -> Option<HomeC
                         clicked = Some(secondary_card);
                     }
                 });
-            });
+            };
+            if let Some(accent) = card.accent {
+                widgets::workflow_card(ui, accent.color(), draw);
+            } else {
+                widgets::card(ui, draw);
+            }
             ui.add_space(theme::SECTION_GAP / 2.0);
         }
     });

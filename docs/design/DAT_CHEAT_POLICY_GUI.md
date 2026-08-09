@@ -273,7 +273,7 @@ fields and are resolved by the shared resolver.
 - **Validation:** n/a. A policy document that somehow carries another
   `RenameSafety` value is rejected at load, not honoured.
 - **Scope:** all.
-- **Plain-language effect:** "ArchiveFS never renames your files."
+- **Plain-language effect:** "Your files won't be renamed unless you approve it."
 
 > DECISION (approved) — rename safety is **not** exposed as a selector, and not
 > as a disabled or greyed-out one either. A visible "apply renames" option, even
