@@ -1076,6 +1076,165 @@ pub fn bsfree_gamecube_match(
     Ok(best)
 }
 
+/// How a BSFree GameCube search resolved, mirroring the shape of the
+/// GameHacking.org GameCube match result the existing GUI already renders
+/// (`Matched` / `Candidates` / `NoMatch`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BsFreeGameCubeSearchStatus {
+    /// Exactly one BSFree GameCube game matched the archive title; its
+    /// classified cheats are included.
+    Matched,
+    /// More than one BSFree game matched; the user must confirm one. The
+    /// candidates are returned for review and nothing is applied.
+    Candidates,
+    /// No BSFree GameCube game matched the search title.
+    NoMatch,
+}
+
+/// Result of a BSFree GameCube search for a selected archive. The archive's
+/// verified Dolphin Game ID is carried through for the destination preview;
+/// BSFree itself contributes only platform + title + version/region evidence,
+/// which always requires review before Apply.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BsFreeGameCubeSearchOutcome {
+    pub status: BsFreeGameCubeSearchStatus,
+    pub detail: String,
+    pub candidates: Vec<BsFreeGameCubeMatch>,
+    pub game: Option<BsFreeGameCubeMatch>,
+    pub cheats: Vec<BsFreeGameCubeCheat>,
+}
+
+/// Searches BSFree for the selected archive's GameCube game.
+///
+/// The search probe is the archive title with region/edition markers
+/// ("(USA)", "[Europe]", "(Rev 1)") stripped, so "Luigi's Mansion (USA)"
+/// matches "Luigi's Mansion". The returned rows come from the existing
+/// bounded `search_games` platform+title query. Exactly one result is
+/// auto-matched (its classified cheats are loaded); more than one is returned
+/// as candidates for explicit review - ArchiveFS never applies a BSFree game
+/// that was not explicitly confirmed against the archive.
+pub fn bsfree_gamecube_search(
+    catalogue: &BsFreeCatalogue,
+    archive_title: &str,
+    archive_game_id: &str,
+    archive_region: Option<&str>,
+) -> Result<BsFreeGameCubeSearchOutcome, BsFreeError> {
+    let base_title = strip_region_markers(archive_title);
+    let probe_title = if base_title.trim().is_empty() {
+        archive_title.to_string()
+    } else {
+        base_title
+    };
+    if probe_title.trim().is_empty() {
+        return Ok(BsFreeGameCubeSearchOutcome {
+            status: BsFreeGameCubeSearchStatus::NoMatch,
+            detail: "Enter a title to search the BSFree GameCube catalogue.".to_string(),
+            candidates: Vec::new(),
+            game: None,
+            cheats: Vec::new(),
+        });
+    }
+    let search = catalogue.search_games(&super::BsFreeGameSearchRequest {
+        platform_id: Some("GameCube".to_string()),
+        title: probe_title.clone(),
+        version: None,
+        device_id: None,
+        upstream_game_id: None,
+        page: super::PageRequest::games(0).bounded(),
+    })?;
+    let mut candidates = Vec::new();
+    for game in search.page.rows {
+        let region_evidence = region_evidence(game.version.as_deref(), archive_region);
+        candidates.push(BsFreeGameCubeMatch {
+            archive_title: archive_title.to_string(),
+            archive_game_id: archive_game_id.to_string(),
+            matched_bsfree_game_upstream_uid: game.upstream_uid,
+            matched_bsfree_title: game.name.clone(),
+            matched_bsfree_version: game.version.clone(),
+            region_evidence,
+            requires_review: true,
+            detail: format!(
+                "matched by platform and title {:?}; BSFree carries no emulator-stable identifier, \
+                 so this match always requires review",
+                probe_title
+            ),
+        });
+    }
+    match candidates.len() {
+        0 => Ok(BsFreeGameCubeSearchOutcome {
+            status: BsFreeGameCubeSearchStatus::NoMatch,
+            detail: format!(
+                "No BSFree GameCube game matched {:?}. Try a shorter or different title in the \
+                 search box.",
+                probe_title
+            ),
+            candidates,
+            game: None,
+            cheats: Vec::new(),
+        }),
+        1 => {
+            let game = candidates.remove(0);
+            let cheats = bsfree_gamecube_cheats(catalogue, game.matched_bsfree_game_upstream_uid)?;
+            Ok(BsFreeGameCubeSearchOutcome {
+                status: BsFreeGameCubeSearchStatus::Matched,
+                detail: format!(
+                    "Matched BSFree GameCube game {:?}; review the cheats before applying.",
+                    game.matched_bsfree_title
+                ),
+                candidates,
+                game: Some(game),
+                cheats,
+            })
+        }
+        _ => Ok(BsFreeGameCubeSearchOutcome {
+            status: BsFreeGameCubeSearchStatus::Candidates,
+            detail: "Several BSFree GameCube games matched; confirm which one to review before \
+                     anything can be applied."
+                .to_string(),
+            candidates,
+            game: None,
+            cheats: Vec::new(),
+        }),
+    }
+}
+
+/// Loads the classified cheats for a BSFree GameCube game the user explicitly
+/// confirmed from the search candidates, binding the match to the selected
+/// archive's verified Dolphin Game ID. Returns `Ok(None)` when the confirmed
+/// game is no longer present in the catalogue.
+pub fn bsfree_gamecube_load_confirmed(
+    catalogue: &BsFreeCatalogue,
+    upstream_uid: i64,
+    archive_title: &str,
+    archive_game_id: &str,
+    archive_region: Option<&str>,
+) -> Result<Option<BsFreeGameCubeSearchOutcome>, BsFreeError> {
+    let Some(game_row) = catalogue.game(upstream_uid)? else {
+        return Ok(None);
+    };
+    let game = BsFreeGameCubeMatch {
+        archive_title: archive_title.to_string(),
+        archive_game_id: archive_game_id.to_string(),
+        matched_bsfree_game_upstream_uid: game_row.upstream_uid,
+        matched_bsfree_title: game_row.name.clone(),
+        matched_bsfree_version: game_row.version.clone(),
+        region_evidence: region_evidence(game_row.version.as_deref(), archive_region),
+        requires_review: true,
+        detail: "confirmed by the user from the BSFree search candidates; BSFree carries no \
+                 emulator-stable identifier, so this match still requires review before Apply"
+            .to_string(),
+    };
+    let cheats = bsfree_gamecube_cheats(catalogue, upstream_uid)?;
+    Ok(Some(BsFreeGameCubeSearchOutcome {
+        status: BsFreeGameCubeSearchStatus::Matched,
+        detail: format!("Review the cheats for {:?} before applying.", game_row.name),
+        candidates: Vec::new(),
+        game: Some(game),
+        cheats,
+    }))
+}
+
 fn region_evidence(bsfree_version: Option<&str>, archive_region: Option<&str>) -> String {
     match (bsfree_version, archive_region) {
         (Some(version), Some(region))
@@ -1101,6 +1260,16 @@ fn normalize_title(value: &str) -> String {
     // ("(USA)", "[Europe]", "(Rev 1)") before comparing, so an archive title
     // carrying a region suffix still matches the bare BSFree title without
     // ever weakening an exact normalized-title equality below that.
+    strip_region_markers(value)
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Removes parenthesized/bracketed tokens (region, edition, revision markers)
+/// from a title, preserving everything else.
+fn strip_region_markers(value: &str) -> String {
     let mut without_markers = String::with_capacity(value.len());
     let mut depth = 0u8;
     for character in value.chars() {
@@ -1112,10 +1281,6 @@ fn normalize_title(value: &str) -> String {
         }
     }
     without_markers
-        .chars()
-        .filter(|character| character.is_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect()
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {

@@ -102,6 +102,33 @@ The provider never writes an emulator file. Flow:
    `execute_shared_apply` (backup, atomic write, journal).
 6. `preview_shared_rollback` + `execute_shared_rollback`.
 
+## Cheats & Mods GUI
+
+The proven apply path is fully wired into the existing Cheats & Mods page for a
+GameCube archive with a verified Dolphin Game ID:
+
+- **Search**: a BSFree section appears alongside GameHacking.org. It
+  auto-searches the local catalogue by the archive's title once identity is
+  ready (region/edition markers stripped); the search box is editable. Exactly
+  one match auto-loads its classified cheats; several show "Use this game"
+  candidates that require explicit confirmation; none yields the search box.
+- **Selection**: supported cheats (`GeckoEquivalent`/`ActionReplayNative`)
+  render as checkboxes with a per-cheat status (Ready / Already installed /
+  Conflict / Unsupported / Browse only, computed against the real destination
+  at fetch time). Unsupported and browse-only records stay visible but can
+  never be selected. Nothing is auto-selected.
+- **Apply**: "Install N cheats" stages through `stage_bsfree_gamecube_install`
+  and the shared preview, then the shared review card shows the selected game,
+  Dolphin profile, target file, already-installed items, conflicts, and
+  unsupported entries excluded. Confirm drives `execute_shared_apply`; the
+  result card reports "N cheats added" and lists any already-installed /
+  skipped / conflict / unsupported entries.
+- **Rollback**: "Undo installation" routes through the same shared journal +
+  history rollback flow as every other install; no CLI required.
+- The shared transaction is source-gated: a BSFree preview/apply/result is
+  rendered by the BSFree section, never by the GameHacking section or the
+  beginner summary, and vice versa.
+
 ## Duplicate / conflict analysis (two passes)
 
 - **Source-level** (before any conversion): duplicate records, duplicate bodies

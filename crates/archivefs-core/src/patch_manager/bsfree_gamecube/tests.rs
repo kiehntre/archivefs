@@ -483,3 +483,126 @@ fn author_fallback_uses_bsfree_label_in_dolphin_name() {
         "Lives [BSFree Archive]"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Search / candidate / auto-match
+// ---------------------------------------------------------------------------
+
+fn search_fixture(path: &std::path::Path) {
+    use rusqlite::Connection;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    let connection = Connection::open(path).unwrap();
+    connection
+        .execute_batch("PRAGMA foreign_keys=OFF;")
+        .unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE systems(id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,group_id INTEGER NOT NULL,name TEXT NOT NULL,qty INTEGER NOT NULL DEFAULT 0);\
+             CREATE TABLE devices(id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,qty INTEGER NOT NULL DEFAULT 0);\
+             CREATE TABLE system_devices(system_id INTEGER NOT NULL REFERENCES systems,device_id INTEGER NOT NULL REFERENCES devices,PRIMARY KEY(system_id,device_id));\
+             CREATE TABLE games(id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,game_id INTEGER NOT NULL,name TEXT NOT NULL,version TEXT DEFAULT NULL,system_id INTEGER NOT NULL REFERENCES systems,device_id INTEGER NOT NULL REFERENCES devices,qty INTEGER NOT NULL DEFAULT 0);\
+             CREATE TABLE sections(id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,game_id INTEGER NOT NULL REFERENCES games(game_id),name TEXT NOT NULL,qty INTEGER NOT NULL DEFAULT 0);\
+             CREATE TABLE authors(id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,qty INTEGER NOT NULL DEFAULT 0);\
+             CREATE TABLE codes(id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,code TEXT NOT NULL,note TEXT DEFAULT NULL,game_uid INTEGER NOT NULL REFERENCES games,game_id INTEGER NOT NULL REFERENCES games(game_id),system_id INTEGER NOT NULL REFERENCES systems,device_id INTEGER NOT NULL REFERENCES devices,section_id INTEGER DEFAULT NULL REFERENCES sections,author_id INTEGER DEFAULT NULL REFERENCES authors);",
+        )
+        .unwrap();
+    connection
+        .execute_batch(
+            "INSERT INTO systems(id,group_id,name,qty) VALUES(17,17,'GameCube',10);\
+             INSERT INTO devices(id,name,qty) VALUES(6,'Action Replay',10);\
+             INSERT INTO system_devices VALUES(17,6);\
+             INSERT INTO games(id,game_id,name,version,system_id,device_id,qty) VALUES
+               (1001,1,'Luigi''s Mansion','USA',17,6,2),
+               (1002,2,'The Sims',NULL,17,6,2),
+               (1003,3,'The Sims',NULL,17,6,2),
+               (1004,4,'Pokemon XD',NULL,17,6,2);\
+             INSERT INTO codes(id,name,code,game_uid,game_id,system_id,device_id) VALUES
+               (1,'Lives','042318AC 3B8003E7',1001,1,17,6),
+               (2,'Money','042318B0 3B8003E8',1001,1,17,6),
+               (3,'Lives','042318AC 3B8003E7',1002,2,17,6),
+               (4,'Lives','042318AC 3B8003E7',1003,3,17,6),
+               (5,'Max','042318AC 3B8003E7',1004,4,17,6);",
+        )
+        .unwrap();
+}
+
+fn search_catalogue(path: &std::path::Path) -> BsFreeCatalogue {
+    BsFreeCatalogue::open_with_expected_hash(path, None).unwrap()
+}
+
+#[test]
+fn search_auto_matches_a_unique_title_and_loads_cheats() {
+    let root =
+        std::env::temp_dir().join(format!("archivefs-bsfree-gc-search-{}", std::process::id()));
+    let db = root.join("search.db");
+    search_fixture(&db);
+    let catalogue = search_catalogue(&db);
+    let outcome =
+        bsfree_gamecube_search(&catalogue, "Luigi's Mansion (USA)", "GLME01", Some("E")).unwrap();
+    assert_eq!(outcome.status, BsFreeGameCubeSearchStatus::Matched);
+    let game = outcome.game.expect("a single match auto-selects");
+    assert_eq!(game.matched_bsfree_title, "Luigi's Mansion");
+    assert!(game.requires_review);
+    assert_eq!(outcome.cheats.len(), 2, "classified cheats are loaded");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn search_returns_candidates_when_titles_tie() {
+    let root = std::env::temp_dir().join(format!(
+        "archivefs-bsfree-gc-search-tie-{}",
+        std::process::id()
+    ));
+    let db = root.join("search.db");
+    search_fixture(&db);
+    let catalogue = search_catalogue(&db);
+    let outcome = bsfree_gamecube_search(&catalogue, "The Sims", "GLME01", Some("E")).unwrap();
+    assert_eq!(outcome.status, BsFreeGameCubeSearchStatus::Candidates);
+    assert_eq!(outcome.candidates.len(), 2);
+    assert!(
+        outcome.cheats.is_empty(),
+        "no cheats auto-load while ambiguous"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn search_returns_no_match_and_empty_search_is_harmless() {
+    let root = std::env::temp_dir().join(format!(
+        "archivefs-bsfree-gc-search-none-{}",
+        std::process::id()
+    ));
+    let db = root.join("search.db");
+    search_fixture(&db);
+    let catalogue = search_catalogue(&db);
+    let outcome =
+        bsfree_gamecube_search(&catalogue, "Super Mario Sunshine", "GLME01", None).unwrap();
+    assert_eq!(outcome.status, BsFreeGameCubeSearchStatus::NoMatch);
+    assert!(outcome.candidates.is_empty());
+    let outcome = bsfree_gamecube_search(&catalogue, "   ", "GLME01", None).unwrap();
+    assert_eq!(outcome.status, BsFreeGameCubeSearchStatus::NoMatch);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn load_confirmed_binds_the_match_and_loads_cheats() {
+    let root = std::env::temp_dir().join(format!(
+        "archivefs-bsfree-gc-confirm-{}",
+        std::process::id()
+    ));
+    let db = root.join("search.db");
+    search_fixture(&db);
+    let catalogue = search_catalogue(&db);
+    let outcome =
+        bsfree_gamecube_load_confirmed(&catalogue, 1002, "Archive Title", "GLME01", Some("E"))
+            .unwrap()
+            .expect("the confirmed game exists");
+    assert_eq!(outcome.status, BsFreeGameCubeSearchStatus::Matched);
+    assert_eq!(outcome.game.unwrap().matched_bsfree_title, "The Sims");
+    assert_eq!(outcome.cheats.len(), 1);
+    let missing = bsfree_gamecube_load_confirmed(&catalogue, 9999, "x", "GLME01", None).unwrap();
+    assert!(missing.is_none());
+    let _ = std::fs::remove_dir_all(&root);
+}

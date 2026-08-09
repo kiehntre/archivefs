@@ -678,7 +678,10 @@ impl BsFreeCatalogue {
         Self::open_with_expected_hash(path, Some(BSFREE_EXPECTED_SHA256))
     }
 
-    fn open_with_expected_hash(
+    /// Opens a catalogue against an optional expected SHA-256. Public only
+    /// within the crate so sibling adapter tests (e.g. the BSFree GameCube
+    /// bridge) can exercise the search/confirm path with a synthetic fixture.
+    pub(crate) fn open_with_expected_hash(
         path: &Path,
         expected_hash: Option<&str>,
     ) -> Result<Self, BsFreeError> {

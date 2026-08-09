@@ -99,10 +99,11 @@ pub use bsfree_gamecube::{
     BSFREE_GAMECUBE_PROVIDER_LABEL, BsFreeDedupFinding, BsFreeDedupFindingKind,
     BsFreeGameCubeCheat, BsFreeGameCubeCheatSelection, BsFreeGameCubeCodeFormat,
     BsFreeGameCubeError, BsFreeGameCubeErrorKind, BsFreeGameCubeInstallPreview,
-    BsFreeGameCubeInstallPreviewRequest, BsFreeGameCubeMatch, BsFreeGameCubeSelectionEntry,
-    BsFreeStagedGameCubeInstall, analyze_bsfree_gamecube_duplicates, bsfree_cheat_as_gamehacking,
-    bsfree_dolphin_code_name, bsfree_gamecube_cheats, bsfree_gamecube_match,
-    build_bsfree_gamecube_install_preview, classify_bsfree_gamecube_cheat,
+    BsFreeGameCubeInstallPreviewRequest, BsFreeGameCubeMatch, BsFreeGameCubeSearchOutcome,
+    BsFreeGameCubeSearchStatus, BsFreeGameCubeSelectionEntry, BsFreeStagedGameCubeInstall,
+    analyze_bsfree_gamecube_duplicates, bsfree_cheat_as_gamehacking, bsfree_dolphin_code_name,
+    bsfree_gamecube_cheats, bsfree_gamecube_load_confirmed, bsfree_gamecube_match,
+    bsfree_gamecube_search, build_bsfree_gamecube_install_preview, classify_bsfree_gamecube_cheat,
     stage_bsfree_gamecube_install,
 };
 pub use cheat_cache_maintenance::{
