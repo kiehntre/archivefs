@@ -3033,9 +3033,9 @@ fn library_tab_label(tab: LibraryTab) -> &'static str {
 fn show_library_shell_header(ui: &mut egui::Ui, current_tab: LibraryTab) -> Option<LibraryTab> {
     widgets::page_header_with_icon(
         ui,
-        crate::ui::icons::LIBRARY,
-        "Library",
-        "Archives, health, duplicates, and saved views for your library.",
+        crate::ui::icons::GAMES,
+        "My Games",
+        "Browse and manage your game library.",
     );
     let tab_options: [(LibraryTab, &str); 4] = [
         (
@@ -14158,9 +14158,9 @@ impl ArchiveFsApp {
                 if self.view == MainView::Doctor {
                     widgets::page_header_with_icon(
                         ui,
-                        crate::ui::icons::DOCTOR,
-                        "Doctor",
-                        "Check your ArchiveFS setup and find problems. Running it changes nothing.",
+                        crate::ui::icons::CHECK,
+                        "Check Library",
+                        "Find problems with your ArchiveFS setup and library. Running it changes nothing.",
                     );
                     let action = show_doctor_page(
                         ui,
@@ -29034,9 +29034,16 @@ fn show_cheats_mods_page(
         if beginner_route {
             "Choose compatible enhancements for the selected game."
         } else {
-            "Inspect emulator-managed cheats and patches or retrieve trusted catalogues for one exact archive."
+            "Find cheats, patches and game enhancements for a selected game."
         },
     );
+    // One restrained retro cheat-code motif - decoration, never the label.
+    ui.label(
+        egui::RichText::new(crate::ui::icons::CHEAT_CODE)
+            .color(theme::muted(ui))
+            .size(13.0),
+    );
+    ui.add_space(theme::SECTION_GAP / 2.0);
 
     if beginner_route && let Some(workflow) = workflow.as_deref() {
         ui.horizontal_wrapped(|ui| {
@@ -30573,7 +30580,7 @@ fn show_settings_page(
         ui,
         crate::ui::icons::SETTINGS,
         "Settings",
-        "Review ArchiveFS locations, configuration health, and supported integrations.",
+        "Set up ArchiveFS: locations, configuration, and integrations.",
     );
 
     let database_path = database_state_path(database_state).map(|path| path.display().to_string());
@@ -30832,7 +30839,7 @@ fn show_settings_page(
     ui.add_space(theme::SECTION_GAP);
     widgets::section_header(
         ui,
-        "5. Platform artwork",
+        &crate::ui::icons::with_icon(crate::ui::icons::ARTWORK, "5. Platform artwork"),
         Some(
             "Manage local, upgrade-stable artwork overrides. ArchiveFS never identifies a machine \
              from its picture: choose the canonical platform explicitly. Imports are normalised \
@@ -33614,7 +33621,7 @@ fn show_loaded_data(
         Some(LibraryTableMessage::EmptyLibrary) => {
             widgets::empty_state(
                 ui,
-                &crate::ui::icons::with_icon(crate::ui::icons::EMPTY_BOX, "Library is empty"),
+                &crate::ui::icons::with_icon(crate::ui::icons::GAMES, "No games yet"),
                 EMPTY_LIBRARY_MESSAGE,
                 None,
             );
@@ -34653,8 +34660,7 @@ fn show_selection_controls_row(
     });
 }
 
-const EMPTY_LIBRARY_MESSAGE: &str =
-    "No archives in the library yet. Scan a source folder to add archives.";
+const EMPTY_LIBRARY_MESSAGE: &str = "Add a source or scan your library to find games.";
 const ZERO_FILTER_RESULTS_MESSAGE: &str = "No archives match the current search and filters.";
 
 /// Requirement 4: distinguishes "the library itself has no archives at
@@ -39330,7 +39336,7 @@ mod tests {
                 let _ = show_library_shell_header(ui, LibraryTab::Archives);
             });
         });
-        for expected in ["Library", "Archives", "Health", "Duplicates", "Views"] {
+        for expected in ["My Games", "Archives", "Health", "Duplicates", "Views"] {
             assert!(
                 rendered_text_contains(&output, expected),
                 "the Library shell header did not render {expected:?}"
@@ -60647,9 +60653,9 @@ $Instant Growth [Nayr]\n";
             });
         });
         assert_eq!(
-            count_exact_text_occurrences(&shell_output, "Library"),
+            count_exact_text_occurrences(&shell_output, "My Games"),
             1,
-            "the unified Library shell must render exactly one 'Library' heading"
+            "the unified Library shell must render exactly one 'My Games' heading"
         );
 
         let data = empty_loaded_data("/mnt/library");

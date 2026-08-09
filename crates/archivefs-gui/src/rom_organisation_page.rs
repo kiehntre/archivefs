@@ -441,8 +441,8 @@ pub(crate) fn show_rom_organisation_page(ui: &mut egui::Ui, state: &mut RomOrgan
     widgets::page_header_with_icon(
         ui,
         crate::ui::icons::ORGANISE,
-        "Canonical organisation",
-        "Preview where your games would go. Nothing moves until you approve it.",
+        "Organise",
+        "Preview how your games can be renamed or organised. Nothing moves until you approve it.",
     );
 
     widgets::card(ui, |ui| {
