@@ -1408,6 +1408,76 @@ fn to_gamecube_cheat(cheat: &GameHackingWiiCheat) -> GameHackingGameCubeCheat {
     }
 }
 
+/// The `"Name [Author]"` Dolphin display name for a GameHacking Wii cheat,
+/// matching the GameCube adapter's convention.
+fn wii_dolphin_name(cheat: &GameHackingWiiCheat) -> String {
+    match cheat.author.as_deref().map(str::trim) {
+        Some(author) if !author.is_empty() => format!("{} [{author}]", cheat.name),
+        _ => format!("{} [GameHacking.org]", cheat.name),
+    }
+}
+
+/// The normalized Dolphin view of a GameHacking Wii cheat, so the shared
+/// duplicate/conflict analyser can compare GameHacking and BSFree Wii records
+/// on equal footing. A cheat is installable exactly when the Wii provider's
+/// own safety gate says so.
+impl super::dolphin_dedup::DolphinCheat for GameHackingWiiCheat {
+    fn upstream_id(&self) -> i64 {
+        // Stable FNV-1a over the provider id: deterministic, collision-free
+        // enough for provenance matching within one catalogue, and independent
+        // of provider vocabulary.
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in self.id.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash as i64
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn dolphin_name(&self) -> String {
+        wii_dolphin_name(self)
+    }
+
+    fn code_lines(&self) -> &[String] {
+        &self.code_lines
+    }
+
+    fn target_gecko(&self) -> bool {
+        self.code_format == WiiCodeFormat::Gecko
+    }
+
+    fn output_digest(&self) -> String {
+        use sha2::Digest;
+        let mut hasher = Sha256::new();
+        hasher.update(if self.target_gecko() {
+            &b"gecko\n"[..]
+        } else {
+            &b"actionreplay\n"[..]
+        });
+        for line in &self.code_lines {
+            hasher.update(line.as_bytes());
+            hasher.update(b"\n");
+        }
+        super::dolphin_code::hex_sha256(&hasher.finalize())
+    }
+
+    fn installable(&self) -> bool {
+        self.safety.installable()
+            && matches!(
+                self.code_format,
+                WiiCodeFormat::Gecko | WiiCodeFormat::ActionReplay
+            )
+    }
+
+    fn memory_operations(&self) -> Vec<super::dolphin_code::MemoryOperation> {
+        super::dolphin_code::derive_memory_operations(&self.code_lines)
+    }
+}
+
 pub fn stage_wii_gamehacking_install(
     staging_root: &Path,
     file_name: &str,

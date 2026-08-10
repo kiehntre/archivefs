@@ -1045,6 +1045,10 @@ pub fn bsfree_platform_mapping(upstream_id: i64, name: &str) -> ProviderPlatform
             Some(("Nintendo DS", PlatformMappingStatus::Alias))
         }
         "3D0" => Some(("3DO", PlatformMappingStatus::Alias)),
+        // BSFree contains no Wii rows in the shipped snapshot, but the mapping
+        // is name-based so any future database row whose system name is "Wii"
+        // is recognised as the Wii platform rather than as unknown.
+        "Wii" => Some(("Wii", PlatformMappingStatus::Exact)),
         _ => None,
     };
     let (archivefs_platform_id, archivefs_platform_display_name, status, explanation) = match mapped
