@@ -231,7 +231,7 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             "Review the structured installer entries and journal before retrying; refused writes were left unapplied.",
             outcome.journal_path.as_deref().map(|journal| {
                 vec![
-                    "archivefs".into(),
+                    "emuwiz-cli".into(),
                     "retroarch-cheat-inspect".into(),
                     journal.display().to_string(),
                 ]
@@ -699,7 +699,7 @@ fn result_from_plan(
 }
 
 fn preview_apply_command(options: &SetupCliOptions, plan: &RetroArchCheatSetupPlan) -> Vec<String> {
-    let mut command = vec!["archivefs".into(), "retroarch-cheat-setup".into()];
+    let mut command = vec!["emuwiz-cli".into(), "retroarch-cheat-setup".into()];
     if let Some(source_id) = &options.source_id {
         command.push("--source".into());
         command.push(source_id.clone());
@@ -761,14 +761,14 @@ fn next_steps(journal_path: &Path, destination_root: &Path) -> Vec<RetroArchChea
             6,
             "view_history",
             "Review EmuWiz cheat installation history.",
-            Some(vec!["archivefs".into(), "retroarch-cheat-history".into()]),
+            Some(vec!["emuwiz-cli".into(), "retroarch-cheat-history".into()]),
         ),
         step(
             7,
             "inspect_journal",
             "Inspect the installed destinations before rollback.",
             Some(vec![
-                "archivefs".into(),
+                "emuwiz-cli".into(),
                 "retroarch-cheat-inspect".into(),
                 journal_path.display().to_string(),
             ]),
@@ -778,7 +778,7 @@ fn next_steps(journal_path: &Path, destination_root: &Path) -> Vec<RetroArchChea
             "preview_rollback",
             "Preview a safe rollback with the selected cheat root.",
             Some(vec![
-                "archivefs".into(),
+                "emuwiz-cli".into(),
                 "retroarch-cheat-rollback".into(),
                 journal_path.display().to_string(),
                 "--cheat-destination-root".into(),
@@ -879,6 +879,35 @@ mod tests {
             }),
             blockers: Vec::new(),
             diagnostics: Vec::<Diagnostic>::new(),
+        }
+    }
+
+    #[test]
+    fn next_step_commands_use_the_emuwiz_binary_name() {
+        let journal_path =
+            Path::new("/home/user/.local/share/emuwiz/retroarch-cheat-journals/x.json");
+        let destination_root = Path::new("/home/user/.config/retroarch/cheats");
+        let steps = next_steps(journal_path, destination_root);
+
+        let commands: Vec<&Vec<String>> = steps
+            .iter()
+            .filter_map(|step| step.command.as_ref())
+            .collect();
+        assert_eq!(
+            commands.len(),
+            3,
+            "history, inspect and rollback steps must each carry a command"
+        );
+        for command in &commands {
+            assert_eq!(
+                command.first().map(String::as_str),
+                Some("emuwiz-cli"),
+                "{command:?}"
+            );
+            assert!(
+                !command.iter().any(|arg| arg == "archivefs"),
+                "no next-step command hint may name the legacy bare \"archivefs\" token: {command:?}"
+            );
         }
     }
 

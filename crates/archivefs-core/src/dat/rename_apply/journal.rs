@@ -205,6 +205,64 @@ mod tests {
             primary.join(RENAME_TRANSACTIONS_DIRECTORY)
         );
     }
+
+    /// Simulates upgrading an existing ArchiveFS install (only the legacy
+    /// data directory exists) that has an interrupted rename transaction on
+    /// disk at the moment EmuWiz starts: the journal must still be found,
+    /// through the exact resolution path production code uses, and nothing
+    /// about resolving it may create a second EmuWiz-named journal directory
+    /// or leave a second copy of the journal anywhere.
+    #[test]
+    fn a_legacy_in_flight_journal_is_discovered_after_upgrade_without_stranding_or_duplication() {
+        let home = tempfile::tempdir().unwrap();
+        let legacy_dir = home
+            .path()
+            .join(".local/share/archivefs/rename-transactions");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+
+        let mut tx = transaction(TransactionState::Applying);
+        tx.transaction_id = "legacy-in-flight".to_string();
+        write_journal(&legacy_dir, &tx).unwrap();
+
+        // Resolve the same way `default_rename_transaction_dir` does for a
+        // real upgrade: same underlying helper, injected home instead of the
+        // process environment.
+        let resolved_dir =
+            rename_transaction_dir_in(Some(home.path().as_os_str().to_os_string())).unwrap();
+        assert_eq!(
+            resolved_dir, legacy_dir,
+            "an upgrade must resolve to the legacy directory the journal already lives in"
+        );
+
+        let (recovery, problems) = find_recovery_transactions(&resolved_dir);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(
+            recovery.len(),
+            1,
+            "the in-flight legacy transaction must be discovered exactly once"
+        );
+        assert_eq!(recovery[0].transaction_id, "legacy-in-flight");
+
+        // Not stranded: resolution never created a second, EmuWiz-named
+        // journal directory alongside the legacy one.
+        let emuwiz_dir = home.path().join(".local/share/emuwiz/rename-transactions");
+        assert!(
+            !emuwiz_dir.exists(),
+            "resolution must not create or write a second, EmuWiz-named journal directory"
+        );
+
+        // Not duplicated: exactly one journal file exists anywhere under the
+        // legacy directory - discovery read it, it did not get copied.
+        let journal_files: Vec<_> = std::fs::read_dir(&legacy_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(
+            journal_files.len(),
+            1,
+            "exactly one journal file must exist, not a duplicate in a second location"
+        );
+    }
     use crate::dat::rename_apply::model::{ObjectIdentity, ObjectKind, TransactionEntry};
     use std::path::PathBuf;
 
