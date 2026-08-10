@@ -203,7 +203,7 @@ impl Workflow {
         let plan = build_shared_transaction_plan(
             report,
             "test-profile",
-            "ArchiveFS cached catalogue",
+            "EmuWiz cached catalogue",
             &self.staging_root,
         )
         .expect("plan builds");
@@ -371,7 +371,7 @@ fn an_explicitly_chosen_ambiguous_candidate_still_installs() {
     let plan = build_shared_transaction_plan(
         &preview.report,
         "test-profile",
-        "ArchiveFS cached catalogue",
+        "EmuWiz cached catalogue",
         &staging_root,
     )
     .expect("plan builds");

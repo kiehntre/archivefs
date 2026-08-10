@@ -3,7 +3,7 @@
 //! Doctor already knows which profiles exist: `discover_dolphin_profiles`,
 //! `discover_pcsx2_profiles` and `discover_xenia_profiles` do that, and each
 //! already reports its own blockers. This module answers the one question none
-//! of them answers: **could ArchiveFS write an install into that profile?**
+//! of them answers: **could EmuWiz write an install into that profile?**
 //!
 //! It answers it from metadata only. Nothing here creates a directory, a
 //! `GameSettings` file, a `.pnach`, a `.patch.toml`, a config file or a probe
@@ -13,7 +13,7 @@
 //!
 //! ## Scope
 //!
-//! Only the three adapters ArchiveFS already supports, through their existing
+//! Only the three adapters EmuWiz already supports, through their existing
 //! discovery abstractions. No emulator gains support here. Flatpak profiles
 //! are assessed exactly like native ones, which is honest but incomplete: a
 //! portal can still refuse a write that the bits allow, so the narrowed
@@ -45,7 +45,7 @@ use crate::patch_manager::{
 /// bury every other result.
 pub const MAX_INDIVIDUAL_PROFILE_FINDINGS: usize = 12;
 
-/// Which emulator a profile belongs to. Only adapters ArchiveFS already
+/// Which emulator a profile belongs to. Only adapters EmuWiz already
 /// supports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -101,7 +101,7 @@ pub struct ProfileAssessment {
     /// The adapter's own blockers, if any.
     pub blockers: Vec<String>,
     pub root_path: EncodedPath,
-    /// The one directory ArchiveFS would write into for this adapter.
+    /// The one directory EmuWiz would write into for this adapter.
     pub destination_path: EncodedPath,
     pub destination_exists: bool,
     pub destination_is_directory: bool,
@@ -109,7 +109,7 @@ pub struct ProfileAssessment {
     pub mount_mode: MountMode,
     pub permissions: Option<PathPermissions>,
     pub writability: WritabilityAssessment,
-    /// Set when ArchiveFS already knows this is the selected/remembered
+    /// Set when EmuWiz already knows this is the selected/remembered
     /// profile for this adapter.
     pub preferred: Option<bool>,
 }
@@ -130,7 +130,7 @@ impl ProfileAssessment {
         match self.writability {
             // Nothing to report: this is the ordinary healthy case.
             WritabilityAssessment::AppearsWritable => None,
-            // ArchiveFS creates the destination during install, so its absence
+            // EmuWiz creates the destination during install, so its absence
             // is informational, not a fault.
             WritabilityAssessment::MissingDestination => Some(DoctorSeverity::Info),
             // An install into this profile would fail.
@@ -204,7 +204,7 @@ pub struct ProfileDiscoveries<'a> {
     pub pcsx2_error: Option<String>,
     pub xenia: Option<&'a XeniaProfileDiscovery>,
     pub xenia_error: Option<String>,
-    /// The profile ids ArchiveFS currently prefers, when known.
+    /// The profile ids EmuWiz currently prefers, when known.
     pub preferred_dolphin: Option<&'a str>,
     pub preferred_pcsx2: Option<&'a str>,
     pub preferred_xenia: Option<&'a str>,
@@ -239,7 +239,7 @@ pub fn assess_emulator_profiles(
                     .map(|blocker| format!("{:?}: {}", blocker.kind, blocker.detail))
                     .collect(),
                 &profile.configuration_path,
-                // The one directory ArchiveFS writes into for Dolphin.
+                // The one directory EmuWiz writes into for Dolphin.
                 &profile.game_settings_path,
                 discoveries.preferred_dolphin,
                 mount_table,
@@ -464,11 +464,11 @@ pub fn findings_from_emulator_profiles(report: &ProfileAssessmentReport) -> Vec<
                         WritabilityAssessment::PermissionDenied =>
                             "Installing a cheat or patch into this profile would fail with a permission error.",
                         WritabilityAssessment::MissingDestination =>
-                            "ArchiveFS creates this directory during an install, so this is only worth knowing about in advance.",
+                            "EmuWiz creates this directory during an install, so this is only worth knowing about in advance.",
                         WritabilityAssessment::UnsafeDestination =>
-                            "ArchiveFS refuses to write through a symlink or into a non-directory, so this profile cannot be used as-is.",
+                            "EmuWiz refuses to write through a symlink or into a non-directory, so this profile cannot be used as-is.",
                         WritabilityAssessment::NotProven | WritabilityAssessment::AppearsWritable =>
-                            "ArchiveFS cannot confirm from metadata alone whether a write here would succeed, and will not write a test file to find out.",
+                            "EmuWiz cannot confirm from metadata alone whether a write here would succeed, and will not write a test file to find out.",
                     },
                     match profile.writability {
                         WritabilityAssessment::ReadOnlyFilesystem =>
@@ -476,9 +476,9 @@ pub fn findings_from_emulator_profiles(report: &ProfileAssessmentReport) -> Vec<
                         WritabilityAssessment::PermissionDenied =>
                             "Give the current user write access to that directory, or pick a different profile.",
                         WritabilityAssessment::MissingDestination =>
-                            "Nothing to do now. Launch the emulator once, or let ArchiveFS create it during an install.",
+                            "Nothing to do now. Launch the emulator once, or let EmuWiz create it during an install.",
                         WritabilityAssessment::UnsafeDestination =>
-                            "Replace the symlink with a real directory, or point ArchiveFS at a different profile.",
+                            "Replace the symlink with a real directory, or point EmuWiz at a different profile.",
                         WritabilityAssessment::NotProven | WritabilityAssessment::AppearsWritable =>
                             "No action needed. An install will report the real outcome.",
                     },
@@ -518,7 +518,7 @@ pub fn findings_from_emulator_profiles(report: &ProfileAssessmentReport) -> Vec<
                     .unwrap_or(DoctorSeverity::Info),
                 "Several emulator profiles need attention",
                 format!(
-                    "{} discovered emulator profiles have a destination ArchiveFS could not confirm it can write to.",
+                    "{} discovered emulator profiles have a destination EmuWiz could not confirm it can write to.",
                     notable.len()
                 ),
             )
@@ -565,7 +565,7 @@ pub fn findings_from_emulator_profiles(report: &ProfileAssessmentReport) -> Vec<
                     DoctorSeverity::Info,
                     format!("More than one {} profile could be used", emulator.label()),
                     format!(
-                        "{} usable {} profiles were found and none is selected, so ArchiveFS will ask before installing.",
+                        "{} usable {} profiles were found and none is selected, so EmuWiz will ask before installing.",
                         candidates.len(),
                         emulator.label()
                     ),
@@ -584,7 +584,7 @@ pub fn findings_from_emulator_profiles(report: &ProfileAssessmentReport) -> Vec<
                         .collect::<Vec<_>>(),
                 )
                 .with_guidance(
-                    "This is not a fault. ArchiveFS never picks an emulator profile for you when there is real ambiguity.",
+                    "This is not a fault. EmuWiz never picks an emulator profile for you when there is real ambiguity.",
                     "Choose a profile in the Cheats and Mods workflow to have it remembered.",
                 ),
             );
@@ -625,7 +625,7 @@ pub fn not_checked_from_emulator_profiles(
     }) {
         items.push(NotCheckedCheck {
             name: "Flatpak sandbox write permission".to_string(),
-            reason: "A Flatpak profile's real writability depends on portal and sandbox permissions, which cannot be read from file metadata. ArchiveFS reports what the permissions and mount state say, and no more.".to_string(),
+            reason: "A Flatpak profile's real writability depends on portal and sandbox permissions, which cannot be read from file metadata. EmuWiz reports what the permissions and mount state say, and no more.".to_string(),
             next_step: "No action needed. An install will report the real outcome.".to_string(),
         });
     }
@@ -677,7 +677,7 @@ pub struct DiscoveredProfiles {
     pub preferred_dolphin: Option<String>,
     pub pcsx2: Result<Pcsx2ProfileDiscovery, String>,
     /// Xenia has no documented native configuration path, so it is only ever
-    /// discovered from roots the user has already pointed ArchiveFS at. With
+    /// discovered from roots the user has already pointed EmuWiz at. With
     /// none supplied there is nothing to assess - not a failure.
     pub xenia: Option<XeniaProfileDiscovery>,
 }
@@ -763,7 +763,7 @@ pub fn profile_destination_directories(report: &ProfileAssessmentReport) -> Vec<
 
 /// The managed-file scan targets implied by discovered profiles.
 ///
-/// Only formats with an in-file ArchiveFS marker are worth returning: PCSX2
+/// Only formats with an in-file EmuWiz marker are worth returning: PCSX2
 /// managed blocks and Dolphin's `[ArchiveFS_Managed_GameHacking]` section.
 /// Other formats carry no ownership proof, so walking them would read user
 /// files for no diagnostic gain.
@@ -872,7 +872,7 @@ mod tests {
         assert_eq!(
             assessed.severity(),
             None,
-            "a profile ArchiveFS can write to must produce no finding at all"
+            "a profile EmuWiz can write to must produce no finding at all"
         );
         assert!(findings_from_emulator_profiles(&report(vec![assessed])).is_empty());
     }

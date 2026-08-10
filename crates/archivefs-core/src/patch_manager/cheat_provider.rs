@@ -90,7 +90,7 @@ pub struct ProviderPlatformMapping {
     pub upstream_id: i64,
     pub upstream_name: String,
     pub archivefs_platform_id: Option<String>,
-    /// Human-facing name resolved from ArchiveFS's one canonical registry.
+    /// Human-facing name resolved from EmuWiz's one canonical registry.
     /// Providers never maintain a second display-name table.
     pub archivefs_platform_display_name: Option<String>,
     pub status: PlatformMappingStatus,

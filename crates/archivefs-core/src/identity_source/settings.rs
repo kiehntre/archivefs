@@ -24,7 +24,12 @@ pub const CONFIG_FILE_NAME: &str = "config.json";
 
 /// The suggested place for a token. Never created automatically - a credential
 /// appearing without the person putting it there would be a surprise.
-pub const SUGGESTED_TOKEN_PATH: &str = "~/.config/archivefs/romm-token";
+/// The suggested place for a RomM read-only token, shown in help text and
+/// the configuration UI. A suggestion only: the token is never created or
+/// read at this path automatically, and the configured path always wins.
+/// EmuWiz's own directory is suggested; a legacy ArchiveFS user may keep
+/// the token under `~/.config/archivefs/` without issue.
+pub const SUGGESTED_TOKEN_PATH: &str = "~/.config/emuwiz/romm-token";
 
 /// The largest page size a person may configure. Above the client's own clamp
 /// there is nothing to gain, and this makes the refusal explicit rather than
@@ -353,7 +358,7 @@ pub fn load_token_file(path: Option<&Path>) -> Result<RommToken, TokenFileRefusa
 }
 
 /// The default identity root: `<data dir>/identity`, beside the library
-/// database and the other ArchiveFS-owned caches.
+/// database and the other EmuWiz-owned caches.
 pub fn default_identity_root() -> Result<PathBuf, String> {
     let database = crate::database::default_database_path().map_err(|error| error.to_string())?;
     Ok(database

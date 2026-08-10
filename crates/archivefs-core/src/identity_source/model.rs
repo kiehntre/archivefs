@@ -7,7 +7,7 @@
 //!
 //! # Evidence, not truth
 //!
-//! An external record says what someone else concluded. ArchiveFS keeps that
+//! An external record says what someone else concluded. EmuWiz keeps that
 //! separate from what it verified itself, compares the two, and reports the
 //! comparison. [`ExternalVerification`] is the outcome of that comparison, and
 //! [`IdentityConflict`] is what is retained when the two disagree - both are
@@ -41,7 +41,7 @@ impl IdentityProvider {
 /// A hash an external source published, with the algorithm it used.
 ///
 /// The algorithm is carried rather than implied, because an external source may
-/// offer several and ArchiveFS must only ever compare like with like.
+/// offer several and EmuWiz must only ever compare like with like.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExternalHash {
     pub algorithm: HashAlgorithm,
@@ -98,7 +98,7 @@ impl ExternalHash {
 
 /// A metadata-provider identifier the external source had already resolved.
 ///
-/// Kept as provenance only. ArchiveFS makes no network request to any of these
+/// Kept as provenance only. EmuWiz makes no network request to any of these
 /// in Stage 1; they are recorded so a later stage, or a person, can follow them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetadataProviderId {
@@ -109,7 +109,7 @@ pub struct MetadataProviderId {
 /// A reference to artwork the external source owns.
 ///
 /// A reference, never the bytes: the source remains the owner of full-size
-/// artwork, and ArchiveFS stores only enough to fetch a thumbnail lazily.
+/// artwork, and EmuWiz stores only enough to fetch a thumbnail lazily.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtworkReference {
     /// A path relative to the provider's own base, or an absolute URL the
@@ -119,7 +119,7 @@ pub struct ArtworkReference {
     pub small_reference: Option<String>,
 }
 
-/// How well an external record agrees with what ArchiveFS can see locally.
+/// How well an external record agrees with what EmuWiz can see locally.
 ///
 /// The ordering is meaningful: a stronger variant is a stronger claim, and
 /// [`ExternalVerification::outranks`] is what stops a weaker external record
@@ -127,12 +127,12 @@ pub struct ArtworkReference {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExternalVerification {
-    /// No safe local path match at all - the record describes a file ArchiveFS
+    /// No safe local path match at all - the record describes a file EmuWiz
     /// does not have.
     Unmatched,
     /// The matched file is gone, or has materially changed since import.
     Stale,
-    /// The external record contradicts something ArchiveFS established locally.
+    /// The external record contradicts something EmuWiz established locally.
     /// No side wins; the conflict is retained.
     Ambiguous,
     /// Path, title and platform agree, but nothing was hash-verified.
@@ -163,7 +163,7 @@ impl ExternalVerification {
                 "the file this record described is missing or has changed since it was imported"
             }
             Self::Ambiguous => {
-                "the external record disagrees with what ArchiveFS determined locally, so neither \
+                "the external record disagrees with what EmuWiz determined locally, so neither \
                  is treated as settled"
             }
             Self::ProbableExternal => {
@@ -188,7 +188,7 @@ impl ExternalVerification {
     /// Whether this external level may be presented ahead of local evidence of
     /// the given strength.
     ///
-    /// External evidence never displaces a local *verified* identity: ArchiveFS
+    /// External evidence never displaces a local *verified* identity: EmuWiz
     /// reading a game's own header beats someone else's database saying
     /// otherwise, and where they differ the answer is a conflict, not a swap.
     pub fn outranks(self, local: LocalEvidenceStrength) -> bool {
@@ -204,7 +204,7 @@ impl ExternalVerification {
     }
 }
 
-/// How strong ArchiveFS's own evidence is for the same file.
+/// How strong EmuWiz's own evidence is for the same file.
 ///
 /// Kept deliberately coarse: this is only ever used to decide whether an
 /// external record may lead, and a finer scale would invite pretending to a
@@ -212,13 +212,13 @@ impl ExternalVerification {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LocalEvidenceStrength {
-    /// ArchiveFS has no identity of its own for this file. The default, so a
+    /// EmuWiz has no identity of its own for this file. The default, so a
     /// caller that has not looked cannot accidentally claim it has.
     #[default]
     None,
     /// A folder alias, an extension, or another non-conclusive signal.
     Weak,
-    /// A signature, header or hash ArchiveFS computed itself.
+    /// A signature, header or hash EmuWiz computed itself.
     Verified,
 }
 
@@ -228,7 +228,7 @@ pub struct IdentityConflict {
     pub field: ConflictField,
     /// What the external source says.
     pub external: String,
-    /// What ArchiveFS determined locally.
+    /// What EmuWiz determined locally.
     pub local: String,
     /// Why it matters, in a person's words.
     pub detail: String,
@@ -258,7 +258,7 @@ impl ConflictField {
 
 /// One imported identity record.
 ///
-/// Every field the provider published that ArchiveFS can use, plus the
+/// Every field the provider published that EmuWiz can use, plus the
 /// provenance needed to explain where it came from and when. Nothing here is
 /// derived at display time: the comparison happens once, at import, and its
 /// outcome is stored.
@@ -276,11 +276,11 @@ pub struct ExternalIdentityRecord {
     pub provider_file_id: Option<String>,
     /// The path as the provider knows it, kept verbatim for provenance.
     pub provider_path: String,
-    /// The path in ArchiveFS's own terms, after mapping. `None` when no mapping
+    /// The path in EmuWiz's own terms, after mapping. `None` when no mapping
     /// applied, which is what [`ExternalVerification::Unmatched`] describes.
     pub archivefs_path: Option<PathBuf>,
     pub title: Option<String>,
-    /// The canonical ArchiveFS platform this record suggests, when the
+    /// The canonical EmuWiz platform this record suggests, when the
     /// provider's platform could be mapped to one.
     pub platform_candidate: Option<String>,
     /// The provider's own platform name, kept even when it could not be mapped.
@@ -296,7 +296,7 @@ pub struct ExternalIdentityRecord {
     pub related_files: Vec<String>,
     /// Sibling records the provider links to this one.
     pub sibling_game_ids: Vec<String>,
-    /// When ArchiveFS imported it, as a Unix timestamp.
+    /// When EmuWiz imported it, as a Unix timestamp.
     pub imported_at_unix_seconds: i64,
     /// When the provider last changed it, where the provider says.
     pub provider_updated_at: Option<String>,

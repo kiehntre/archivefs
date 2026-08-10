@@ -1,6 +1,6 @@
 # Duplicate Detector Plugin Architecture
 
-This document describes the intended architecture for richer, hash- and metadata-assisted duplicate detection in ArchiveFS. Most of it remains a design document, not yet implemented.
+This document describes the intended architecture for richer, hash- and metadata-assisted duplicate detection in EmuWiz. Most of it remains a design document, not yet implemented.
 
 **Current status:** a first, narrower tier already exists today:
 `FilenameDuplicateDetector` groups catalogue entries by normalized filename
@@ -18,7 +18,7 @@ The duplicate detector should help users identify archives that may represent th
 
 Goals:
 
-- Detect likely duplicate archives using reusable ArchiveFS models.
+- Detect likely duplicate archives using reusable EmuWiz models.
 - Avoid filename-only decisions where better identity data is available.
 - Produce clear reports that explain why archives were grouped together.
 - Support different confidence levels instead of a single duplicate/not-duplicate answer.

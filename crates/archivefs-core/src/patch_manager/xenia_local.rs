@@ -38,7 +38,7 @@ const XENIA_CONFIG_MARKER: &str = "xenia-canary.config.toml";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum XeniaInstallationType {
-    /// A caller-supplied directory - the only kind ArchiveFS currently
+    /// A caller-supplied directory - the only kind EmuWiz currently
     /// discovers, since Xenia Canary has no single documented native path.
     Explicit,
 }
@@ -96,7 +96,7 @@ pub struct XeniaProfile {
     pub provenance: &'static str,
     pub eligible: bool,
     pub blockers: Vec<XeniaProfileBlocker>,
-    /// `configuration_path/patches` - the only directory ArchiveFS ever
+    /// `configuration_path/patches` - the only directory EmuWiz ever
     /// manages for this adapter.
     pub patches_path: PathBuf,
     pub patches_state: XeniaPatchesDirectoryState,

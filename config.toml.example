@@ -1,42 +1,43 @@
-# Example ArchiveFS configuration.
+# Example EmuWiz configuration.
 #
-# Copy this file to ~/.config/archivefs/config.toml and edit mount_root
-# below for your system - source folders do not need to be edited here at
-# all (see below).
+# Copy this file to ~/.config/emuwiz/config.toml and edit mount_root below
+# for your system. An existing ~/.config/archivefs/config.toml is still read
+# and honoured from before the EmuWiz rename. Source folders do not need to
+# be edited here at all (see below).
 
-# Folders ArchiveFS scans recursively for supported archives (.zip, .7z,
-# .rar). ArchiveFS supports any number of independent source folders, and
+# Folders EmuWiz scans recursively for supported archives (.zip, .7z,
+# .rar). EmuWiz supports any number of independent source folders, and
 # a config with zero sources loads and runs fine - this is not a required
 # key.
 #
 # You do not need to hand-edit this array: add, enable/disable, scan, and
 # remove source folders from the Sources page in the GUI, or from the
 # command line, e.g.:
-#   archivefs-cli source add /data/archives
-#   archivefs-cli source add /data/more-archives
-#   archivefs-cli sources
+#   emuwiz-cli source add /data/archives
+#   emuwiz-cli source add /data/more-archives
+#   emuwiz-cli sources
 # Both ways write to this same config atomically, and both are safe to
 # use interchangeably at any time - nothing here needs reinstalling.
 #
 # If you do prefer to pre-seed this file by hand, either the legacy plain
 # array below or one `[[source]]` block per folder (path/enabled fields)
-# is understood; ArchiveFS uses a small hand-written parser, not a full
+# is understood; EmuWiz uses a small hand-written parser, not a full
 # TOML implementation.
 source_folders = []
 
-# Directory where ArchiveFS creates mount points for the archives it opens.
-# ArchiveFS creates this directory if it does not already exist, and never
+# Directory where EmuWiz creates mount points for the archives it opens.
+# EmuWiz creates this directory if it does not already exist, and never
 # writes anywhere under source_folders. Required.
 mount_root = "/mnt/archivefs"
 
-# Name or path of the ratarmount binary ArchiveFS uses to mount archives
+# Name or path of the ratarmount binary EmuWiz uses to mount archives
 # read-only. ratarmount is a separate tool - install it yourself and make
 # sure it is reachable. Optional: defaults to "ratarmount" (resolved from
 # PATH) if this line is omitted. Set an absolute path here instead if
 # ratarmount is not on PATH.
 ratarmount_bin = "ratarmount"
 
-# Optional canonical ROM root. When set, ArchiveFS can *plan* - and, only
+# Optional canonical ROM root. When set, EmuWiz can *plan* - and, only
 # after explicit approval, apply - moving identified games into canonical
 # RomM-compatible platform directories beneath this root (for example
 # /mnt/games/roms/psp/Game (Europe).iso). Setting this line never moves
@@ -45,6 +46,6 @@ ratarmount_bin = "ratarmount"
 # slug mapping, never from display text. Omit the line when you do not want
 # organisation.
 #
-#   archivefs-cli rom-organise set-master-root /mnt/games/roms
+#   emuwiz-cli rom-organise set-master-root /mnt/games/roms
 #
 # master_rom_root = "/mnt/games/roms"

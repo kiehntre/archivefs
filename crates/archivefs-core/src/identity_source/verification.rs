@@ -165,7 +165,7 @@ impl VerificationStore {
             TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
         let write = || -> std::io::Result<()> {
-            // Owner-only, like the rest of ArchiveFS's identity data. Nothing here is
+            // Owner-only, like the rest of EmuWiz's identity data. Nothing here is
             // a secret, but it does list where the library's files are, which is not
             // something to publish to every account on the machine.
             let mut options = OpenOptions::new();

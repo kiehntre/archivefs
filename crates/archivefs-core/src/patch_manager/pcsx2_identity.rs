@@ -62,14 +62,14 @@ impl Pcsx2GameIdentity {
         };
         let plain_failure_reason = match state {
             Pcsx2IdentityState::Verified => None,
-            Pcsx2IdentityState::MissingCrc => Some(
-                "ArchiveFS could not prove the game CRC required for PCSX2 cheats.".to_string(),
-            ),
+            Pcsx2IdentityState::MissingCrc => {
+                Some("EmuWiz could not prove the game CRC required for PCSX2 cheats.".to_string())
+            }
             Pcsx2IdentityState::Deferred => {
                 Some("Game identification is not available for this image format yet.".to_string())
             }
             Pcsx2IdentityState::Ambiguous => Some(
-                "ArchiveFS found ambiguous game identity evidence and will not guess.".to_string(),
+                "EmuWiz found ambiguous game identity evidence and will not guess.".to_string(),
             ),
             Pcsx2IdentityState::Unsupported => {
                 Some("This selection is not a supported PlayStation 2 game image.".to_string())

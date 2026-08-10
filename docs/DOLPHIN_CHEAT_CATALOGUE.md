@@ -87,7 +87,7 @@ entries are all rejected), but only entries matching the exact
 `<repo>-<commit>/Data/Sys/GameSettings/<GAMEID>.ini` shape are ever
 decompressed - everything else is skipped without being read.
 
-The download uses an identifiable ArchiveFS User-Agent, a bounded overall
+The download uses an identifiable EmuWiz User-Agent, a bounded overall
 timeout, a bounded maximum download size, a manual redirect limit (only the
 approved hosts are ever followed), retry with backoff on transient network
 errors, and SHA-256 verification of the downloaded archive. The parsed
@@ -97,8 +97,8 @@ catalogue exactly as usable as it was before the attempt.
 
 ## Cache location
 
-The catalogue lives entirely under ArchiveFS's own cache
-(`<ArchiveFS data directory>/dolphin-cheat-catalogue/`), separate from:
+The catalogue lives entirely under EmuWiz's own cache
+(`<EmuWiz data directory>/dolphin-cheat-catalogue/`), separate from:
 
 - Dolphin's `User/GameSettings` directory
 - transaction journals and backups
@@ -129,27 +129,27 @@ The first download always requires an explicit click. After a catalogue
 exists:
 
 - it is used immediately, offline, on every game selection
-- ArchiveFS quietly checks upstream for a newer commit at most once per
+- EmuWiz quietly checks upstream for a newer commit at most once per
   session, recording only the check timestamp and whether an update is
   available - this check never downloads the archive itself
 - an available update is surfaced as an "Update available" state; the large
   download itself always still requires an explicit "Update catalogue" click
 - "Check for updates" is also available manually at any time
 - "Rebuild local index" re-parses the archive already pinned to the active
-  commit (useful after an ArchiveFS parser improvement) without checking
+  commit (useful after an EmuWiz parser improvement) without checking
   upstream for a newer commit
 
 ## Offline use
 
 Once downloaded, the catalogue answers every lookup without any network
 access. If neither the catalogue nor a previously cached single-game result
-has an entry for a selected game, ArchiveFS does not automatically retry the
+has an entry for a selected game, EmuWiz does not automatically retry the
 network - an explicit fetch remains available under Details.
 
 ## Removal
 
 "Remove downloaded catalogue" requires confirmation and removes only
-ArchiveFS's own catalogue cache files. It never removes installed Dolphin
+EmuWiz's own catalogue cache files. It never removes installed Dolphin
 codes, never alters `User/GameSettings`, and leaves existing transaction
 history untouched.
 

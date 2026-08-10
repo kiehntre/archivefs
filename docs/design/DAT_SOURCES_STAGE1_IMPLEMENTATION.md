@@ -136,7 +136,7 @@ understand has nothing to misinterpret.
 ### 3.2 Schema
 
 ```toml
-# ArchiveFS DAT source registry
+# EmuWiz DAT source registry
 
 [[sources]]
 id = "no-intro-nes"

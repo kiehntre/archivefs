@@ -1,6 +1,6 @@
-# ArchiveFS Database Diagnosis and Recovery
+# EmuWiz Database Diagnosis and Recovery
 
-ArchiveFS stores its local catalogue at
+EmuWiz stores its local catalogue at
 `~/.local/share/archivefs/library.sqlite3`. The path is resolved from `HOME`
 (or `USERPROFILE` when `HOME` is unavailable) plus
 `.local/share/archivefs/library.sqlite3`; it is not currently configurable and
@@ -32,7 +32,7 @@ header with a final-component no-follow open. `hot_candidate` means SQLite's
 rollback-journal magic is present; SQLite remains authoritative because locks
 and the rest of the header also affect recovery. `zeroed_non_hot` and
 `truncated_non_hot` are explicit non-hot states. `malformed` means an
-unrecognised non-zero header, while `unreadable` means ArchiveFS could not
+unrecognised non-zero header, while `unreadable` means EmuWiz could not
 safely read it. Neither state is silently called database corruption. SQLite's
 extended `SQLITE_READONLY_ROLLBACK` result is reported as
 `rollback_recovery_required`, with preservation and copy-first guidance.
@@ -45,7 +45,7 @@ lsof ~/.local/share/archivefs/*
 fuser ~/.local/share/archivefs/*
 ```
 
-Close an active ArchiveFS process cleanly through its normal UI or shell before
+Close an active EmuWiz process cleanly through its normal UI or shell before
 copying database files. Do not kill it merely to make a lock disappear.
 
 ## What sidecars mean
@@ -62,7 +62,7 @@ database and every sidecar as one preservation set.
 
 ## Interrupted scans
 
-ArchiveFS scans write the catalogue in short, durable SQLite transactions.
+EmuWiz scans write the catalogue in short, durable SQLite transactions.
 `library-scan`, per-source scans, Scan All, and the GUI's Scan Library action
 are the production paths that update the `archives` table. If the process is
 forcibly terminated while SQLite is committing one of those transactions,
@@ -80,7 +80,7 @@ shutdown. `SIGKILL`, process abort, host failure, and power loss can still
 interrupt SQLite; the rollback journal is precisely the durability mechanism
 for those cases.
 
-Do not kill ArchiveFS during a scan. If a hot journal appears, first establish
+Do not kill EmuWiz during a scan. If a hot journal appears, first establish
 that no writer remains, preserve the complete file set, and rehearse SQLite's
 normal rollback on a copy. Read-only commands never recover a genuinely hot
 journal because recovery itself must write.
@@ -92,7 +92,7 @@ close it cleanly, recheck, and rerun read-only diagnostics. With no active user,
 create a timestamped directory such as:
 
 ```text
-~/Backups/ArchiveFS/database-recovery-YYYYMMDD-HHMMSS/
+~/Backups/EmuWiz/database-recovery-YYYYMMDD-HHMMSS/
 ```
 
 Copy the main file and every related `-journal`, `-wal`, `-shm`, temporary,
@@ -136,12 +136,12 @@ validate them; never overwrite the original during diagnosis.
 ### E. Permissions or ownership mismatch
 
 Compare the directory, main file, and sidecar owner/group/mode with the user
-running ArchiveFS. Propose the narrowest specific correction. Do not recursively
+running EmuWiz. Propose the narrowest specific correction. Do not recursively
 `chmod` or `chown`, and do not apply any permission change during diagnosis.
 
 ### F. Migration failure
 
-Record `PRAGMA user_version`, the ArchiveFS build, and the named failing
+Record `PRAGMA user_version`, the EmuWiz build, and the named failing
 migration. Reproduce the migration against a complete copy, fix and test the
 code, and only then plan a live retry. A read-only diagnostic never migrates.
 
@@ -154,7 +154,7 @@ do not infer that every `SQLITE_CANTOPEN` result is a permission problem.
 
 ## Non-goals
 
-`database-check` is not a repair command. ArchiveFS provides no `--fix` or
+`database-check` is not a repair command. EmuWiz provides no `--fix` or
 `--repair`, does not delete journals, does not checkpoint WAL, does not vacuum
 or reindex, does not change ownership or permissions, does not kill processes,
 and does not automatically retry a live migration. Recovery is a deliberate,

@@ -1,4 +1,4 @@
--- Migration 0001: initial schema foundation for the ArchiveFS persistent
+-- Migration 0001: initial schema foundation for the EmuWiz persistent
 -- library catalogue.
 --
 -- See docs/DATABASE_DESIGN.md for the full design and the rationale behind

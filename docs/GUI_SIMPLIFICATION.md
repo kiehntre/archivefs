@@ -1557,7 +1557,7 @@ above. In particular: Active Mounts' internal `ScrollArea` for the
 mounted-archive list was confirmed not nested inside an outer page-level
 scroll (`MainView::ActiveMounts` is absent from
 `main_view_uses_page_scroll`) - no double-scroll issue exists there.
-Settings' numbered section headings ("1. ArchiveFS locations" through
+Settings' numbered section headings ("1. EmuWiz locations" through
 "5. Intentionally unavailable") are unique to that page but were judged
 to serve its checklist-like structure well enough not to remove for
 consistency alone. About's compact version/system-information layout,

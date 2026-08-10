@@ -13,7 +13,7 @@
 //! GameHacking.org's system slug for GameCube is confirmed to be `ngc`,
 //! not `gamecube` - the catalogue lives at
 //! `https://gamehacking.org/system/ngc/all` (see `GAMECUBE_INDEX_URL`).
-//! ArchiveFS's own user-facing platform name stays "GameCube"
+//! EmuWiz's own user-facing platform name stays "GameCube"
 //! everywhere else (CLI command name, cache file names, the catalogue's
 //! `system` field, GUI labels) - only the GameHacking URL path and
 //! robots.txt check use the `ngc` slug.
@@ -144,14 +144,14 @@ impl GameCubeGameIdentity {
         let plain_failure_reason = match state {
             GameCubeIdentityState::Verified => None,
             GameCubeIdentityState::MissingGameId => Some(
-                "ArchiveFS could not prove the GameCube Game ID required for GameHacking.org matching."
+                "EmuWiz could not prove the GameCube Game ID required for GameHacking.org matching."
                     .to_string(),
             ),
             GameCubeIdentityState::Deferred => Some(
                 "Game identification is not available for this image format yet.".to_string(),
             ),
             GameCubeIdentityState::Ambiguous => Some(
-                "ArchiveFS found ambiguous game identity evidence and will not guess.".to_string(),
+                "EmuWiz found ambiguous game identity evidence and will not guess.".to_string(),
             ),
             GameCubeIdentityState::Unsupported => {
                 Some("This selection is not a supported GameCube game image.".to_string())
@@ -288,7 +288,7 @@ pub struct GameCubeSysIdDiagnostics {
 /// A returned cheat's identified raw code format. Never inferred from the
 /// hex shape alone - only an explicit label in the exported text (an
 /// `Encryption:`/`Format:` field) promotes a cheat to `ActionReplay` or
-/// `Gecko`; ArchiveFS never speculatively converts between the two.
+/// `Gecko`; EmuWiz never speculatively converts between the two.
 ///
 /// ## Why the hex shape alone can never decide this (code-format audit)
 ///

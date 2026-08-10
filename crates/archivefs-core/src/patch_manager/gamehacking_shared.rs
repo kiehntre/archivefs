@@ -16,7 +16,7 @@ pub(crate) const BASE_URL: &str = "https://gamehacking.org";
 pub(crate) const EXPORT_URL: &str = "https://gamehacking.org/inc/sub.exportCodes.php";
 pub(crate) const ROBOTS_URL: &str = "https://gamehacking.org/robots.txt";
 const USER_AGENT: &str = concat!(
-    "ArchiveFS/",
+    "EmuWiz/",
     env!("CARGO_PKG_VERSION"),
     " (+https://github.com/davedap/archivefs; one-game-at-a-time cheat provider)"
 );
@@ -237,7 +237,7 @@ impl UreqGameHackingTransport {
             GameHackingHttpClassification::RateLimited => {
                 return Err(provider_error(
                     GameHackingErrorKind::RateLimited,
-                    "GameHacking.org asked ArchiveFS to slow down (HTTP 429)",
+                    "GameHacking.org asked EmuWiz to slow down (HTTP 429)",
                 ));
             }
             GameHackingHttpClassification::ServerError => {

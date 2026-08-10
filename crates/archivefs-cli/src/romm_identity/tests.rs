@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 // --- Fixtures -------------------------------------------------------------
 
 /// A temporary tree: a library to stand in for a source folder, an identity root
-/// for ArchiveFS's own files, and a place for token files.
+/// for EmuWiz's own files, and a place for token files.
 struct Tree {
     root: PathBuf,
 }
@@ -72,7 +72,7 @@ impl Tree {
         self.identity().join("romm").join("identity-cache.json")
     }
 
-    /// Everything ArchiveFS wrote under the identity root, concatenated, so a
+    /// Everything EmuWiz wrote under the identity root, concatenated, so a
     /// test can assert a secret appears in none of it.
     fn all_written_text(&self) -> String {
         let mut text = String::new();
@@ -798,7 +798,7 @@ fn the_token_is_written_nowhere_and_printed_nowhere() {
     let written = tree.all_written_text();
     assert!(
         !written.contains(STUB_TOKEN),
-        "the token was written into ArchiveFS's own files"
+        "the token was written into EmuWiz's own files"
     );
     assert!(
         !written.contains("Bearer"),

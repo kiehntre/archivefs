@@ -620,7 +620,7 @@ fn distinct_faults_are_never_merged_merely_because_the_wording_is_similar() {
         "Mount root is writable",
         SetupDiagnosticStatus::Error,
         "Writable directory required: /mnt/archivefs",
-        "ArchiveFS must create mount-point directories below mount_root.",
+        "EmuWiz must create mount-point directories below mount_root.",
         "Grant the current user write access or choose another mount_root.",
     )]);
     let mut inputs = DoctorScanInputs::none_loaded();
@@ -653,7 +653,7 @@ fn merging_keeps_the_highest_severity_the_guidance_and_the_canonical_subsystem()
         "Writable directory required",
     );
     rich.affected = Some(EncodedPath::from_path(Path::new("/mnt/archivefs")));
-    rich.why_it_matters = Some("ArchiveFS must create mount-point directories.".to_string());
+    rich.why_it_matters = Some("EmuWiz must create mount-point directories.".to_string());
     rich.next_step = Some("Grant write access.".to_string());
     rich.recovery = Some(KnownRecovery::new(
         None,
@@ -671,7 +671,7 @@ fn merging_keeps_the_highest_severity_the_guidance_and_the_canonical_subsystem()
     // Guidance and recovery are adopted from the richer report.
     assert_eq!(
         finding.why_it_matters.as_deref(),
-        Some("ArchiveFS must create mount-point directories.")
+        Some("EmuWiz must create mount-point directories.")
     );
     assert_eq!(finding.next_step.as_deref(), Some("Grant write access."));
     assert!(finding.repair_may_exist());
@@ -831,7 +831,7 @@ fn database_diagnostics_map_to_stable_ids_and_are_escalated_conservatively() {
             "{:?}",
             findings[0].evidence
         );
-        // Database repair is never automatic in ArchiveFS, so nothing is
+        // Database repair is never automatic in EmuWiz, so nothing is
         // offered here at all.
         assert!(!findings[0].repair_may_exist(), "{code:?}");
     }
@@ -925,7 +925,7 @@ fn health_issues_map_their_category_severity_and_known_recovery() {
             .as_ref()
             .expect("recovery")
             .notice()
-            .starts_with("A repair action already exists elsewhere in ArchiveFS")
+            .starts_with("A repair action already exists elsewhere in EmuWiz")
     );
 
     assert_eq!(findings[1].severity, DoctorSeverity::Error);
@@ -1007,7 +1007,7 @@ fn setup_diagnostics_carry_their_guidance_verbatim() {
             "ratarmount is available",
             SetupDiagnosticStatus::Error,
             "ratarmount was not found.",
-            "ArchiveFS uses ratarmount to expose archive contents as read-only folders.",
+            "EmuWiz uses ratarmount to expose archive contents as read-only folders.",
             "Install ratarmount and ensure it is available on PATH, then refresh diagnostics.",
         ),
         setup_check(
@@ -1024,7 +1024,7 @@ fn setup_diagnostics_carry_their_guidance_verbatim() {
     assert_eq!(findings[0].severity, DoctorSeverity::Error);
     assert_eq!(
         findings[0].why_it_matters.as_deref(),
-        Some("ArchiveFS uses ratarmount to expose archive contents as read-only folders.")
+        Some("EmuWiz uses ratarmount to expose archive contents as read-only folders.")
     );
     assert_eq!(
         findings[0].next_step.as_deref(),
@@ -1051,7 +1051,7 @@ fn not_configured_setup_checks_become_info_severity_findings_not_errors() {
         "Config file exists",
         SetupDiagnosticStatus::NotConfigured,
         "Configuration file is missing: ~/.config/archivefs/config.toml",
-        "ArchiveFS needs this file to locate archives and mounts.",
+        "EmuWiz needs this file to locate archives and mounts.",
         "Create a starter config or create this file manually.",
     )]);
     setup.config_missing = true;
@@ -1608,7 +1608,7 @@ fn doctor_reuses_the_existing_retryability_rules() {
     );
 }
 
-/// Every path-based gatherer, run together against a complete fake ArchiveFS
+/// Every path-based gatherer, run together against a complete fake EmuWiz
 /// data directory: config file, catalogue database, mount root with real user
 /// content, and an install journal. Nothing in the tree may change.
 ///
@@ -2114,7 +2114,7 @@ fn the_deferred_list_no_longer_claims_the_new_families_are_missing() {
         "Free disk space",
         "Read-only filesystem detection",
         "Emulator profile writability",
-        "Orphaned ArchiveFS-managed cheat entries",
+        "Orphaned EmuWiz-managed cheat entries",
     ] {
         assert!(
             !DEFERRED_CHECKS

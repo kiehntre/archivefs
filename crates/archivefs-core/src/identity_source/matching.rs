@@ -1,4 +1,4 @@
-//! Comparing an imported record against the file ArchiveFS can actually see.
+//! Comparing an imported record against the file EmuWiz can actually see.
 //!
 //! Import produces claims. This module turns each claim into a verdict by looking
 //! at the local file, and the verdict is the honest weakest thing the evidence
@@ -41,7 +41,7 @@ use super::model::{
     LocalEvidenceStrength,
 };
 
-/// What ArchiveFS already knows about one local file, supplied by the caller.
+/// What EmuWiz already knows about one local file, supplied by the caller.
 ///
 /// Deliberately data rather than a lookup: matching stays pure and testable, and
 /// the caller decides how much it is willing to spend establishing local facts.
@@ -56,7 +56,7 @@ pub struct LocalFileFacts {
     /// exist". For a folder-based game - a ScummVM directory, a PS4 game folder,
     /// Shenmue's three discs in a directory - that was simply untrue.
     pub presence: LocalPresence,
-    /// The platform ArchiveFS itself determined, if any.
+    /// The platform EmuWiz itself determined, if any.
     pub local_platform: Option<String>,
     /// How strong that determination is.
     pub local_strength: LocalEvidenceStrength,
@@ -147,7 +147,7 @@ pub fn match_record(
     let mut conflicts = Vec::new();
 
     // No mapping means nothing to compare. Not a fault: a RomM library may hold
-    // platforms this ArchiveFS has no source folder for.
+    // platforms this EmuWiz has no source folder for.
     let Some(path) = &record.archivefs_path else {
         evidence.push(
             "no configured path mapping covers this record, so no local file was compared"
@@ -242,18 +242,18 @@ pub fn match_record(
                 external: external.clone(),
                 local: local.clone(),
                 detail: format!(
-                    "RomM says {external} but ArchiveFS determined {local} from the file itself"
+                    "RomM says {external} but EmuWiz determined {local} from the file itself"
                 ),
             });
         }
         (Some(external), None) => {
             evidence.push(format!(
-                "RomM says {external}; ArchiveFS has no platform of its own for this file"
+                "RomM says {external}; EmuWiz has no platform of its own for this file"
             ));
         }
         (None, _) => {
             evidence.push(
-                "RomM's platform could not be mapped to a canonical ArchiveFS platform".to_string(),
+                "RomM's platform could not be mapped to a canonical EmuWiz platform".to_string(),
             );
         }
     }
@@ -312,10 +312,10 @@ pub fn match_record(
     if platform_agrees == Some(false) {
         let verified = facts.local_strength == LocalEvidenceStrength::Verified;
         evidence.push(if verified {
-            "ArchiveFS verified a different platform from the file itself, so the two disagree"
+            "EmuWiz verified a different platform from the file itself, so the two disagree"
                 .to_string()
         } else {
-            "RomM and ArchiveFS suggest different platforms".to_string()
+            "RomM and EmuWiz suggest different platforms".to_string()
         });
         return MatchOutcome {
             verification: ExternalVerification::Ambiguous,
@@ -352,7 +352,7 @@ pub fn match_record(
     // a caller presenting this cannot mistake it for permission to overwrite.
     if candidate.is_usable() && !candidate.outranks(facts.local_strength) {
         evidence.push(format!(
-            "ArchiveFS's own identity is {} and is not displaced by this record",
+            "EmuWiz's own identity is {} and is not displaced by this record",
             match facts.local_strength {
                 LocalEvidenceStrength::Verified => "verified",
                 LocalEvidenceStrength::Weak => "weaker but still local",
@@ -557,7 +557,7 @@ impl LocalPresence {
                  collection may not be on this machine at all"
             ),
             Self::Directory => format!(
-                "{path} exists but is a directory. The game is present as a folder; ArchiveFS \
+                "{path} exists but is a directory. The game is present as a folder; EmuWiz \
                  identifies files, so there was no single file to compare against what RomM \
                  published"
             ),

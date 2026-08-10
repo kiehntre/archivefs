@@ -48,7 +48,7 @@ the additional fields this model defines. Today it holds
 `platform_defaults`, and the per-source matching fields (§7–§13).
 
 - One policy document exists per user (it is not per-library or per-worktree).
-- It is stored outside the ArchiveFS library database, next to the existing
+- It is stored outside the EmuWiz library database, next to the existing
   config, and is written **durably and atomically**: temp file, `sync_all`,
   `rename`, then parent-directory sync where the platform supports it
   (migration §3.3).
@@ -141,7 +141,7 @@ registration; cheat sources keep their compiled-in ID.
 
 ### 2.5 Plain-language effect
 
-Shown to the user as: *"The stable name ArchiveFS uses to remember this source.
+Shown to the user as: *"The stable name EmuWiz uses to remember this source.
 It won't change if the download location changes."*
 
 ---
@@ -157,9 +157,9 @@ the existing three-state model from `docs/CHEATS_MODS_USER_POLICY.md`
 from *source* trust (a structurally unsafe file does not change a source's trust
 level; see §7 of the audit).
 
-**DECISION (approved): shipping a provider does not mean ArchiveFS has reviewed
+**DECISION (approved): shipping a provider does not mean EmuWiz has reviewed
 or endorsed the upstream content.** Trust is a statement about the *pipe*, never
-about what flows through it. ArchiveFS reviewed the URL policy, the host, the
+about what flows through it. EmuWiz reviewed the URL policy, the host, the
 transport, the parser, and the resource ceilings for a built-in source. It has
 not reviewed, curated, or endorsed the cheats, patches, or catalogue entries the
 upstream publishes, and it makes no claim that they are correct, safe to apply,
@@ -167,24 +167,24 @@ or lawfully redistributable.
 
 This distinction is load-bearing for the scraper-backed entries
 (`gamehacking.org-*`, `bsfree-archive`, the Dolphin and Xenia upstreams): those
-carry community-submitted content that no ArchiveFS maintainer has read.
+carry community-submitted content that no EmuWiz maintainer has read.
 
 ### 3.2 Values
 
 | Value | Meaning — always about the integration, never the content | Today's equivalent |
 | --- | --- | --- |
-| `BuiltInReviewed` | ArchiveFS maintainers reviewed this source's origin, endpoints, format, and limits, and ship it. **No claim is made about the upstream's content.** | `trust_status = "built_in_reviewed"`, reported by `list_retroarch_cheat_sources()` for the one retrieval source only. |
+| `BuiltInReviewed` | EmuWiz maintainers reviewed this source's origin, endpoints, format, and limits, and ship it. **No claim is made about the upstream's content.** | `trust_status = "built_in_reviewed"`, reported by `list_retroarch_cheat_sources()` for the one retrieval source only. |
 | `UserTrusted` | A user explicitly reviewed and elevated this source's origin. | None yet (future user-added sources). |
 | `Untrusted` | The integration has not been reviewed. Community content, friend-shared files, local files. | The planned `LocalUnverifiedSource`/`RemoteUnverifiedSource` GUI cards. |
 
 **This is a new field, not a mapping.** `CheatSourceSpec` has no trust field
 today, so the other eight registry entries have no trust level to migrate. All
 nine compiled-in entries adopt `BuiltInReviewed` when the field is introduced —
-under the scoped meaning above, this is simply the true statement that ArchiveFS
+under the scoped meaning above, this is simply the true statement that EmuWiz
 reviewed and ships the integration.
 
 **Naming consequence.** Because `BuiltInReviewed` is easy to misread as
-"ArchiveFS vouches for these cheats", the label must never be rendered bare. The
+"EmuWiz vouches for these cheats", the label must never be rendered bare. The
 GUI and CLI render it with its scope attached — "Built-in integration; upstream
 content not reviewed" — and never as an unqualified "Reviewed" or "Trusted"
 badge (GUI §3.5).
@@ -219,12 +219,12 @@ compiled-in cheat sources, under the integration-only meaning defined in §3.1.
 Shown as: *"Built-in integration"* / *"You reviewed this source"* / *"Not
 reviewed yet"*, each with its scope attached. The user is told:
 
-*"ArchiveFS reviewed how this source is fetched and parsed — the address, the
+*"EmuWiz reviewed how this source is fetched and parsed — the address, the
 transport, and the limits. It has not reviewed the cheats or patches the source
 publishes, and does not endorse them. Codes come from the upstream community;
 check anything you apply."*
 
-And for unreviewed sources: *"Not reviewed means ArchiveFS's developers haven't
+And for unreviewed sources: *"Not reviewed means EmuWiz's developers haven't
 checked this source's setup. It isn't a judgement that the source is bad."*
 
 ---
@@ -623,7 +623,7 @@ relationships when producing verdicts.
 
 ### 9.5 Plain-language effect
 
-*"How ArchiveFS treats clone entries (a different region or revision of a game
+*"How EmuWiz treats clone entries (a different region or revision of a game
 that lists another entry as its parent)."*
 
 ---
@@ -715,7 +715,7 @@ default). Stronger options can prefer one source or refuse the match."*
 
 ### 12.1 Definition
 
-`RenameSafety` - names the question of whether ArchiveFS may ever *suggest or
+`RenameSafety` - names the question of whether EmuWiz may ever *suggest or
 perform a rename* of a local file to match a source's canonical name (a
 normalisation used by some DAT tooling).
 
@@ -744,7 +744,7 @@ ever implemented, that is a separate approved feature with its own migration.
 
 ### 12.3 Rules
 
-- **ArchiveFS never renames a source archive.** The audit (§1, §7) and the
+- **EmuWiz never renames a source archive.** The audit (§1, §7) and the
   project principle "never modify user archives" make `NeverSuggest` the only
   value until a separately approved feature allows otherwise.
 - **No GUI control offers the other values.** Rename safety is rendered as a
@@ -861,7 +861,7 @@ Provenance is always recorded; there is no opt-out.
 
 ### 14.5 Plain-language effect
 
-*"ArchiveFS records where every catalogue entry came from and what evidence
+*"EmuWiz records where every catalogue entry came from and what evidence
 backed each match, so you can see exactly why a result was reached."*
 
 ---

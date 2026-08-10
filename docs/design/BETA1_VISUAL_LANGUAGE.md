@@ -19,7 +19,7 @@ title, one short explanation, and a consistent glyph:
 | Check Library | 🩺 | "Check Library — Find problems" | 🩺 Check Library |
 | Cheats & Mods | ❤️×99 | "Cheats & Mods — Find cheats and game enhancements" | ❤️×99 Cheats & Mods |
 | Verify Games | 🧾 | "Verify Games — Check your games with DATs" | 🧾 Verify Games |
-| Settings | ⚙️ | "Settings — Set up ArchiveFS" | ⚙️ Settings |
+| Settings | ⚙️ | "Settings — Set up EmuWiz" | ⚙️ Settings |
 
 Secondary/admin destinations (Sources, Clean up my library, RomM, History &
 Logs, Artwork, Mounts, About) stay available but render quieter and after the

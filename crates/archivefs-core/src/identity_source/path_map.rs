@@ -1,6 +1,6 @@
-//! Translating a provider's paths into ArchiveFS's own.
+//! Translating a provider's paths into EmuWiz's own.
 //!
-//! A RomM instance describes its files in its own terms; ArchiveFS sees the same
+//! A RomM instance describes its files in its own terms; EmuWiz sees the same
 //! files somewhere else. Import is therefore useless without a mapping, and
 //! dangerous with a careless one - a mapping is a rule for turning text a remote
 //! server sent into a local filesystem path.
@@ -124,7 +124,7 @@ pub struct PathMapping {
     /// The path as the provider reports it: `roms` when the instance is
     /// relative, `/romm/library` when it is absolute.
     pub provider_prefix: String,
-    /// Where those files are for ArchiveFS, e.g. `/mnt/games/roms`.
+    /// Where those files are for EmuWiz, e.g. `/mnt/games/roms`.
     pub archivefs_prefix: PathBuf,
 }
 
@@ -133,7 +133,7 @@ pub struct PathMapping {
 #[serde(rename_all = "snake_case", tag = "reason")]
 pub enum MappingRefusal {
     EmptyPrefix,
-    /// An ArchiveFS destination that is not absolute. A local path has to be.
+    /// An EmuWiz destination that is not absolute. A local path has to be.
     NotAbsolute {
         side: &'static str,
         value: String,
@@ -220,9 +220,7 @@ pub enum MappingRefusal {
 impl MappingRefusal {
     pub fn detail(&self) -> String {
         match self {
-            Self::EmptyPrefix => {
-                "a mapping needs both a RomM path and an ArchiveFS path".to_string()
-            }
+            Self::EmptyPrefix => "a mapping needs both a RomM path and an EmuWiz path".to_string(),
             Self::NotAbsolute { side, value } => {
                 format!("the {side} path `{value}` must be absolute")
             }
@@ -276,7 +274,7 @@ impl MappingRefusal {
             }
             Self::OutsideTrustedRoots { value } => format!(
                 "`{value}` is not inside any configured source folder; an imported identity must \
-                 point at a library ArchiveFS already knows about"
+                 point at a library EmuWiz already knows about"
             ),
             Self::DuplicateDestination { value } => format!(
                 "two mappings both translate to `{value}`, which would make the result depend on \
@@ -355,7 +353,7 @@ impl PathMappings {
             }
             if !destination.is_absolute() {
                 return Err(MappingRefusal::NotAbsolute {
-                    side: "ArchiveFS",
+                    side: "EmuWiz",
                     value: destination.display().to_string(),
                 });
             }
@@ -364,7 +362,7 @@ impl PathMappings {
                 .any(|component| !matches!(component, Component::RootDir | Component::Normal(_)))
             {
                 return Err(MappingRefusal::NonNormalComponent {
-                    side: "ArchiveFS",
+                    side: "EmuWiz",
                     value: destination.display().to_string(),
                 });
             }
@@ -514,7 +512,7 @@ pub enum PathTranslation {
         trusted_root: Option<PathBuf>,
     },
     /// No mapping covers this path. Not an error: a RomM library may legitimately
-    /// contain platforms ArchiveFS does not have.
+    /// contain platforms EmuWiz does not have.
     Unmatched {
         provider_path: String,
         normalised_path: String,

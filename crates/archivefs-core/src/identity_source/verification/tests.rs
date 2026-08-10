@@ -360,7 +360,7 @@ fn a_stored_hash_promotes_a_matching_record_to_confirmed() {
 
     // Without a stored hash nothing local has been compared, so the verdict rests on
     // the record alone. (It is Probable rather than Strong here only because a bare
-    // fixture file gives ArchiveFS no platform of its own to agree with.)
+    // fixture file gives EmuWiz no platform of its own to agree with.)
     let facts = LocalFileFacts::observe(&file);
     let claims = PathClaims::of(std::slice::from_ref(&record));
     let before = match_record(&record, &facts, &claims, &LocalHashCache::new());

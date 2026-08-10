@@ -1307,7 +1307,7 @@ pub fn match_pcsx2_inventory(
             state: Pcsx2MatchState::NoVerifiedGameCrcAvailable,
             verified_crc: None,
             matching_files: Vec::new(),
-            reason: "ArchiveFS has no verified PCSX2 executable CRC for this archive".into(),
+            reason: "EmuWiz has no verified PCSX2 executable CRC for this archive".into(),
         }
     }
 }

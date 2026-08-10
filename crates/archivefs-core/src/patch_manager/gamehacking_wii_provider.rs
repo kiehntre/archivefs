@@ -127,15 +127,15 @@ impl WiiGameIdentity {
         let plain_failure_reason = match state {
             WiiIdentityState::Verified => None,
             WiiIdentityState::MissingGameId => Some(
-                "ArchiveFS could not prove the six-character Wii Game ID required for matching."
+                "EmuWiz could not prove the six-character Wii Game ID required for matching."
                     .to_string(),
             ),
             WiiIdentityState::Deferred => {
                 Some("Wii identity is not available for this image format yet.".to_string())
             }
-            WiiIdentityState::Ambiguous => Some(
-                "ArchiveFS found ambiguous Wii identity evidence and will not guess.".to_string(),
-            ),
+            WiiIdentityState::Ambiguous => {
+                Some("EmuWiz found ambiguous Wii identity evidence and will not guess.".to_string())
+            }
             WiiIdentityState::Unsupported => {
                 Some("This selection is not a supported Wii disc image.".to_string())
             }
@@ -1330,7 +1330,7 @@ fn classify_wii_cheat_safety(
     if lower_name.contains("master code") || lower_name.contains("enable code") {
         return (
             WiiCheatSafety::UnsupportedMasterCodeRequirement,
-            vec!["ArchiveFS cannot prove master/enable-code dependencies from this page.".into()],
+            vec!["EmuWiz cannot prove master/enable-code dependencies from this page.".into()],
         );
     }
     if lines.iter().any(|line| contains_placeholder(line)) {
@@ -1357,7 +1357,7 @@ fn classify_wii_cheat_safety(
         || lower_name.contains("joker")
     {
         warnings.push(
-            "Button activator is controller-specific; ArchiveFS preserves it without rewriting the mask."
+            "Button activator is controller-specific; EmuWiz preserves it without rewriting the mask."
                 .into(),
         );
     }

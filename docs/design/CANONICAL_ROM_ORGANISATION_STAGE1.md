@@ -2,7 +2,7 @@
 
 Status: implemented in `crates/archivefs-core/src/dat/rom_organisation/`.
 
-ArchiveFS can organise identified games into a user-configured **master ROM
+EmuWiz can organise identified games into a user-configured **master ROM
 root** under canonical, RomM-compatible platform directories — only after an
 explicit read-only plan and explicit approval. Nothing moves merely because a
 root is configured.

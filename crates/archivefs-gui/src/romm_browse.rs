@@ -736,7 +736,7 @@ pub(crate) struct ConflictRowView {
     pub(crate) conflicts: Vec<ConflictLineView>,
     /// Every evidence line, so nothing is dropped from display.
     pub(crate) evidence: Vec<String>,
-    /// Set when ArchiveFS's own identity was kept in preference to RomM's.
+    /// Set when EmuWiz's own identity was kept in preference to RomM's.
     pub(crate) local_evidence_retained: Option<String>,
     pub(crate) competing_records: Vec<String>,
     pub(crate) provenance: String,
@@ -1630,9 +1630,7 @@ fn show_record_artwork(
         "RomM-hosted path_cover_small: not recorded"
     });
     if detail.has_public_artwork_reference {
-        ui.label(
-            "Public artwork reference recorded, but ArchiveFS does not fetch from public hosts.",
-        );
+        ui.label("Public artwork reference recorded, but EmuWiz does not fetch from public hosts.");
     }
 
     let displayed = if detail.artwork == ArtworkAvailability::Fetchable {
@@ -1740,7 +1738,7 @@ fn show_conflicts(ui: &mut egui::Ui, state: &mut BrowseState, busy: bool) -> Opt
         }
     });
     ui.label(
-        "Nothing here is resolved automatically. Where ArchiveFS had stronger local evidence, it \
+        "Nothing here is resolved automatically. Where EmuWiz had stronger local evidence, it \
          was kept and RomM's claim recorded beside it.",
     );
 
@@ -1780,7 +1778,7 @@ fn show_conflicts(ui: &mut egui::Ui, state: &mut BrowseState, busy: bool) -> Opt
             if let Some(retained) = &row.local_evidence_retained {
                 widgets::banner(
                     ui,
-                    "ArchiveFS's own identity was kept",
+                    "EmuWiz's own identity was kept",
                     retained,
                     widgets::StatusTone::Success,
                 );

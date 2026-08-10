@@ -65,12 +65,12 @@ inputs:
 1. The already-discovered `RetroArchEnvironmentReport` (profiles, each
    profile's resolved `Cheats` path, and its installed cores' `.info`
    metadata - `supported_extensions` in particular).
-2. The read-only ArchiveFS catalogue (every **present** archive - rows
+2. The read-only EmuWiz catalogue (every **present** archive - rows
    already marked missing are excluded, matching PCSX2's own treatment).
 
 The one genuine ambiguity this preview resolves is **core selection**:
 which installed core, if any, would load this archive. That is decided
-by comparing the archive's own file extension (ArchiveFS tracks Zip/
+by comparing the archive's own file extension (EmuWiz tracks Zip/
 SevenZip/Rar archives; this is the archive's own container extension,
 not an inner compressed entry's extension - see "Non-goals" below)
 against every installed core's declared `supported_extensions`,
@@ -111,7 +111,7 @@ A later milestone added a genuinely different second source of evidence:
 RetroArch's own `.lpl` playlists, which *do* record a resolved content
 path, core association, and (for scanned collections) a database name
 for content the user has already loaded. That evidence is read-only,
-never invents anything ArchiveFS doesn't already know, and is documented
+never invents anything EmuWiz doesn't already know, and is documented
 separately in [`RETROARCH_PLAYLISTS.md`](RETROARCH_PLAYLISTS.md) rather
 than here, since it introduces its own confidence vocabulary
 (`exact`/`strong`/`weak`/`ambiguous`/`unsupported`) distinct from the
@@ -179,7 +179,7 @@ not guessed or taken from forum posts:
   `file_archive_compressed_read` - the sibling name is still derived from
   the archive's own path, not an inner entry name
   (`content_file_load_into_memory`, `runloop_path_set_basename`'s
-  `HAVE_COMPRESSION` branch) - which is exactly why an ArchiveFS-managed
+  `HAVE_COMPRESSION` branch) - which is exactly why an EmuWiz-managed
   archive's own path is a correct, direct basis for this destination.
 - **Soft-patch precedence** (verified): when no per-content core option
   overrides it, RetroArch tries IPS, then BPS, then UPS, then Xdelta,
@@ -318,14 +318,14 @@ unset).
   `supported_extensions` - not any extension an archive's *inner*
   compressed content might have. A core that only declares an
   uncompressed extension (e.g. `sfc`, not `zip`) will never match an
-  ArchiveFS-managed `.zip` archive directly through this preview, even if
-  RetroArch could load the ROM after ArchiveFS mounts it.
-- Exact identity evidence (a per-archive checksum ArchiveFS itself holds)
+  EmuWiz-managed `.zip` archive directly through this preview, even if
+  RetroArch could load the ROM after EmuWiz mounts it.
+- Exact identity evidence (a per-archive checksum EmuWiz itself holds)
   is never used - see "Why this is not an `EmulatorAdapter`" and the
   honesty note above. RetroArch's own playlists are now read as a
   *different* kind of evidence (see [`RETROARCH_PLAYLISTS.md`](RETROARCH_PLAYLISTS.md)),
-  but a playlist's CRC is never compared against anything ArchiveFS has,
-  since it may describe an inner archive member ArchiveFS does not track.
+  but a playlist's CRC is never compared against anything EmuWiz has,
+  since it may describe an inner archive member EmuWiz does not track.
 - The binary `.rdb` content database is still not parsed.
 
 ## Core-specific caveats
@@ -350,5 +350,5 @@ content database (`.lpl` playlists are now *read*, as evidence - see
 [`RETROARCH_PLAYLISTS.md`](RETROARCH_PLAYLISTS.md) - but never written);
 modeling indexed (chained) patch destinations beyond the first; launching
 RetroArch or any core; and any network call. This command only previews
-destinations for content ArchiveFS already knows about, using data
+destinations for content EmuWiz already knows about, using data
 already on disk.

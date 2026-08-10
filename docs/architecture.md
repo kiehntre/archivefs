@@ -1,11 +1,11 @@
 # Overview
 
-ArchiveFS is a Linux-first tool for exposing archive files as read-only directory trees, and for browsing, organizing, and previewing archived collections without extracting them permanently. The implementation focuses on conservative filesystem behavior, reusable core types, and CLI/GUI commands built on shared library code in `archivefs-core`.
+EmuWiz is a Linux-first tool for exposing archive files as read-only directory trees, and for browsing, organizing, and previewing archived collections without extracting them permanently. The implementation focuses on conservative filesystem behavior, reusable core types, and CLI/GUI commands built on shared library code in `archivefs-core`.
 
 Core project principles:
 
 - Linux-first: current mount and watcher behavior assumes Linux facilities such as `/proc/self/mountinfo`, FUSE-style mount tools, and `notify` with Linux-friendly event handling.
-- Read-only archive mounting: archives are mounted as folder views through `ratarmount`; ArchiveFS does not provide writable archive editing.
+- Read-only archive mounting: archives are mounted as folder views through `ratarmount`; EmuWiz does not provide writable archive editing.
 - Never modify user archives: scanner, status, stats, info, watcher, catalogue, library-view, and patch-preview operations read archive metadata and filesystem state but do not rewrite source archive files.
 - Build reusable components before features: commands are thin wrappers over `archivefs-core` types such as `ArchiveScanner`, `ArchiveRecord`, `Database`, `LibraryViewConfig`, and the patch-manager types.
 - Extension points before hardcoding, but never forced: metadata/health provider traits and the `EmulatorAdapter` trait exist so new sources of information and new emulators can be added without redesigning shared orchestration - but only when a trait genuinely fits. The current built-in providers are filename metadata and filesystem health; PCSX2's read-only patch preview is the current (and only) `EmulatorAdapter` implementation. RetroArch's read-only patch/cheat preview is a second, independent preview built the same way PCSX2's was reviewed - by checking the existing trait against real requirements first - and shipped as its own narrowly-scoped type once that trait genuinely did not fit, rather than weakening the trait to force a fit.
@@ -108,7 +108,7 @@ those plans. Unrelated and nested mounts under the same root are refused or pres
 
 `unmount-one <archive-path-or-name>` scans and plans mounts, selects one archive with shared selection logic, and unmounts only that archive's mount path.
 
-`clean` removes only empty directories derived from current ArchiveFS mount plans, while preserving
+`clean` removes only empty directories derived from current EmuWiz mount plans, while preserving
 the mount root, unrelated directories, mounted paths, and non-empty directories.
 
 `watch` observes configured source folders and rebuilds the JSON index after debounced archive-related changes. It does not mount or unmount.
@@ -201,7 +201,7 @@ Command output remains on stdout; logs go to stderr.
 
 # Testing
 
-ArchiveFS tests favor small, focused unit tests around core behavior. The current suite exercises archive extension detection, split archive skipping, platform detection, safe mount naming, duplicate mount path generation, selection errors, archive stats, archive info, index JSON, index freshness, config checks, doctor reports, cleanup behavior, watcher filtering/debouncing, and command argument parsing.
+EmuWiz tests favor small, focused unit tests around core behavior. The current suite exercises archive extension detection, split archive skipping, platform detection, safe mount naming, duplicate mount path generation, selection errors, archive stats, archive info, index JSON, index freshness, config checks, doctor reports, cleanup behavior, watcher filtering/debouncing, and command argument parsing.
 
 The testing philosophy is to keep dangerous behavior behind abstractions and use lightweight fakes where possible. For example, mount and unmount command tests use a recording backend rather than invoking real system mount tools. Watcher behavior is tested at the filtering and debounce layers rather than requiring OS event integration for every case.
 

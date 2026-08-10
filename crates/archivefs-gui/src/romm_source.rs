@@ -95,7 +95,7 @@ pub(crate) enum RommOperation {
 }
 
 impl RommOperation {
-    /// Whether this changes anything ArchiveFS owns.
+    /// Whether this changes anything EmuWiz owns.
     ///
     /// A status load does not, which is what makes it safe to run while a mutating
     /// operation is in flight.
@@ -774,7 +774,7 @@ fn state_tone(state: &ProviderState) -> widgets::StatusTone {
 fn state_detail(state: &ProviderState) -> Option<String> {
     match state {
         ProviderState::NotConfigured => Some(
-            "Point ArchiveFS at your RomM instance and a read-only token file to get started."
+            "Point EmuWiz at your RomM instance and a read-only token file to get started."
                 .to_string(),
         ),
         ProviderState::NeverImported => Some(
@@ -924,7 +924,7 @@ pub(crate) fn build_result_view(
             headline: "Configuration saved".to_string(),
             rows: crate::romm_config::describe_saved(settings),
             notes: vec![
-                "Written atomically to ArchiveFS's own configuration. Nothing was contacted, and \
+                "Written atomically to EmuWiz's own configuration. Nothing was contacted, and \
                  no import ran - use Test connection or Refresh when you are ready."
                     .to_string(),
             ],
@@ -978,7 +978,7 @@ pub(crate) fn build_result_view(
             notes: Vec::new(),
             informational: false,
         },
-        // A verification *is* a card result: it changed ArchiveFS-owned state, so it
+        // A verification *is* a card result: it changed EmuWiz-owned state, so it
         // is worth a line even though the panel shows the detail.
         Ok(RommOperationOutcome::Verified(outcome)) => RommResultView {
             succeeded: outcome.all_agree && !outcome.comparisons.is_empty(),
@@ -1495,7 +1495,7 @@ pub(crate) fn show_romm_source_card(
             widgets::banner(
                 ui,
                 "Clear cached cover thumbnails?",
-                "Only ArchiveFS's own thumbnails are removed. Your imported identity, RomM's own \
+                "Only EmuWiz's own thumbnails are removed. Your imported identity, RomM's own \
                  artwork and your ROM files are untouched, and covers are refetched when they are \
                  next shown.",
                 widgets::StatusTone::Warning,

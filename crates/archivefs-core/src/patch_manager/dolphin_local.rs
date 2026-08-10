@@ -1410,7 +1410,7 @@ pub fn match_dolphin_inventory(
             verified_game_id: None,
             verified_revision,
             matching_files: Vec::new(),
-            reason: "ArchiveFS has no separately verified Dolphin game ID for this archive".into(),
+            reason: "EmuWiz has no separately verified Dolphin game ID for this archive".into(),
         };
     };
     let Some(game_id) = normalize_verified_game_id(value) else {

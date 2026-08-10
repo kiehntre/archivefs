@@ -1,6 +1,6 @@
 # Cheats & Mods trust, safety, and privacy
 
-ArchiveFS treats users as capable adults while enforcing concrete technical
+EmuWiz treats users as capable adults while enforcing concrete technical
 safety boundaries. The product rule is: **Block dangerous behaviour, not
 personal choice.** It inspects, explains, warns, and records where a working
 adapter supports those actions; it never secretly executes content or silently
@@ -11,7 +11,7 @@ changes an original source.
 - **Trusted** means a built-in reviewed source adapter with known provenance,
   format, remote host where relevant, enforced retrieval limits, and available
   integrity information.
-- **Unverified** means ArchiveFS has not reviewed the source. Community content,
+- **Unverified** means EmuWiz has not reviewed the source. Community content,
   local files, personal collections, and content from a friend belong here.
   Unverified does not mean malicious. A future import workflow may use
   structurally valid unverified content after a clear warning and explicit
@@ -65,14 +65,14 @@ model, while the GUI currently reports source unavailable until the trusted
 catalogue can materialize a per-game source item. See
 [`SHARED_CHEAT_PREVIEW.md`](SHARED_CHEAT_PREVIEW.md).
 
-The archive picker searches the already loaded ArchiveFS library by displayed
+The archive picker searches the already loaded EmuWiz library by displayed
 name, platform, source, mount state, and path. Its tentative selection is
 separate from Library focus and mount queues. Applying a choice changes only the
 Cheats & Mods context; it never mounts, fetches, installs, or modifies the
 archive. Changing away from a context with catalogue retrieval state requires
 confirmation.
 
-The existing RetroArch library and ArchiveFS cached catalogue are separate
+The existing RetroArch library and EmuWiz cached catalogue are separate
 source modes. Existing-library inspection validates the configured destination
 root, refuses symlinked or unsafe paths, and examines at most 10,000 directory
 entries to a depth of 16. It counts regular `.cht`-named files without opening
@@ -92,7 +92,7 @@ content policies, resource limits, an immutable inspection report, and an
 explicit consent hand-off. Disabling it will require confirmation, keep a
 visible warning, and never mark uninspected content safe:
 
-> Turning this off does not make unsafe files safe. It only stops ArchiveFS
+> Turning this off does not make unsafe files safe. It only stops EmuWiz
 > checking them.
 
 The confirmation must explain that structural checks stop, protection is
@@ -101,7 +101,7 @@ action.
 
 ## Unknown code and original files
 
-> ArchiveFS may inspect imported content, but it never executes unknown code
+> EmuWiz may inspect imported content, but it never executes unknown code
 > automatically.
 
 Executables, scripts, installers, macros, and other active content are never
@@ -110,16 +110,16 @@ rollback, or cleanup. Adapter policy remains format-specific: an executable is
 incompatible with a RetroArch cheat catalogue; a Cheat Engine `.ct` document
 could be a valid candidate for a future adapter but embedded scripts would
 require inspection and would never run automatically; and a Windows mod
-installer could be exposed as inspectable high-risk content, but ArchiveFS
+installer could be exposed as inspectable high-risk content, but EmuWiz
 would not run it.
 
-ArchiveFS never silently deletes, rewrites, or sanitizes the user's original
+EmuWiz never silently deletes, rewrites, or sanitizes the user's original
 source. If sanitized import is implemented, it must create a separate cleaned
 copy and an inspectable report listing every excluded item and reason.
 
 ## Local privacy
 
-When an implemented adapter performs safety inspection, ArchiveFS scans the
+When an implemented adapter performs safety inspection, EmuWiz scans the
 supported imported files locally on your device to help identify unsafe paths,
 unexpected executables or scripts, unsupported formats, archive bombs, and
 other structural risks. Today this applies to the trusted RetroArch catalogue
@@ -127,16 +127,16 @@ retrieval pipeline and bounded read-only inspection of an already managed
 PCSX2 or Dolphin profile; it does not describe a general local-import scanner.
 
 Scan results, filenames, file contents, hashes, and metadata are not sent to the
-ArchiveFS developers or any third party. ArchiveFS has no telemetry, remote file
+EmuWiz developers or any third party. EmuWiz has no telemetry, remote file
 submission, cloud malware scanning, developer upload, or third-party analysis
 path. This inspection exists solely for the user's protection. Network access
 by the trusted catalogue retriever downloads only the reviewed catalogue; it
 does not upload local content.
 
-ArchiveFS is not an antivirus scanner. A future unverified-source confirmation
+EmuWiz is not an antivirus scanner. A future unverified-source confirmation
 must show the trust and inspection states, detected adapter and formats,
 expected/documentation/unexpected files, active and blocked content, warnings,
-resource limits, remaining risk, and exactly what ArchiveFS will and will not
+resource limits, remaining risk, and exactly what EmuWiz will and will not
 do.
 
 ## Duplicate and destination safety
@@ -149,7 +149,7 @@ preview, confirmation, backup, journal, verification, and rollback rules.
 
 ## Responsible use
 
-ArchiveFS is intended for preservation, accessibility, personal customization,
+EmuWiz is intended for preservation, accessibility, personal customization,
 and legitimate interoperability. It must not be used to bypass copy protection,
 licensing systems, access controls, or other technical protections.
 
@@ -159,6 +159,6 @@ helps make future games, updates, and preservation efforts possible.
 
 You are responsible for ensuring that you have the right to use, modify,
 import, and distribute any cheats, patches, mods, textures, or related files.
-ArchiveFS does not verify ownership or licensing, does not decide the legality
+EmuWiz does not verify ownership or licensing, does not decide the legality
 of individual files, and does not block structurally safe content solely
 because licensing information is absent or uncertain.

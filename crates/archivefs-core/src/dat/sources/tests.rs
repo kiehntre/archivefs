@@ -1271,17 +1271,36 @@ fn a_save_leaves_no_temporary_file_behind() {
 #[test]
 fn the_registry_path_is_the_documented_one_and_needs_a_home() {
     // Injected through the seam so this never depends on, or disturbs, the real
-    // HOME - other tests in this crate read it concurrently.
+    // HOME - other tests in this crate read it concurrently. A fresh home
+    // resolves to the EmuWiz path; an existing legacy ArchiveFS home is reused.
     let path = dat_sources_config_path_in(Some(std::ffi::OsString::from("/home/example")))
         .expect("a home resolves");
     assert_eq!(
         path,
-        PathBuf::from("/home/example/.config/archivefs/dat_sources.toml")
+        PathBuf::from("/home/example/.config/emuwiz/dat_sources.toml")
     );
     assert!(
         dat_sources_config_path_in(None).is_err(),
         "an absent HOME must not resolve to a relative path"
     );
+}
+
+#[test]
+fn a_legacy_archivefs_home_is_reused_for_the_dat_registry() {
+    let root = std::env::temp_dir().join(format!(
+        "archivefs-dat-registry-legacy-home-{}",
+        std::process::id()
+    ));
+    let legacy = root.join(".config/archivefs");
+    std::fs::create_dir_all(&legacy).unwrap();
+    let path =
+        dat_sources_config_path_in(Some(root.clone().into_os_string())).expect("a home resolves");
+    assert_eq!(
+        path,
+        legacy.join("dat_sources.toml"),
+        "an existing legacy ArchiveFS config dir is reused transparently"
+    );
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]

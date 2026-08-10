@@ -1,4 +1,4 @@
-# ArchiveFS Roadmap
+# EmuWiz Roadmap
 
 This roadmap is reconstructed from the current codebase, its test suite, and
 its commit/tag history - not from a fixed release schedule. It contains no
@@ -45,8 +45,8 @@ These are implemented, tested, and in current use today:
   and a GUI duplicate review workflow.
 - Managed library views: named, symlink-based organized views of the
   catalogue with plan/preview/apply/repair/remove semantics and a manifest
-  that records exactly which symlinks ArchiveFS created, so repair and
-  removal only ever touch paths ArchiveFS manages.
+  that records exactly which symlinks EmuWiz created, so repair and
+  removal only ever touch paths EmuWiz manages.
 - A read-only archive content inspector used to improve mount-readiness
   checks without extracting archives.
 - A read-only PCSX2 patch-preview foundation: fetches official PCSX2 patch
@@ -255,7 +255,7 @@ scheduled:
   `ArchiveIdentity` already reserves (`content_hash`, `archive_hash`,
   `internal_listing_hash`).
 - Launch-preparation workflows once an adapter can safely describe what a
-  launch would require, without ArchiveFS becoming a launcher itself.
+  launch would require, without EmuWiz becoming a launcher itself.
 - Additional JSON output for more commands, and automation/scripting/CLI
   integration built on the existing JSON stability guarantees in
   [`docs/json-api.md`](docs/json-api.md).
@@ -277,18 +277,18 @@ or currently implemented in any form:
   the ZIP/7z/RAR archives already supported) - guidance and detection only,
   not conversion tooling, unless a future design explicitly proposes that.
 - Interop with existing frontends such as ES-DE, RetroDECK, or LaunchBox,
-  where that is practical without ArchiveFS taking over their role.
+  where that is practical without EmuWiz taking over their role.
 - Remote-play workflow documentation (for example Sunshine/Moonlight) for
-  users who already use ArchiveFS-managed libraries with those tools.
+  users who already use EmuWiz-managed libraries with those tools.
 
 ## Explicitly out of scope for now
 
-ArchiveFS is not, and these are not planned:
+EmuWiz is not, and these are not planned:
 
 - A ROM, BIOS, firmware, or game download service.
 - A storefront or marketplace for any kind of software or media.
 - A DRM system, license-enforcement layer, or content-restriction system.
-- A mandatory cloud account or cloud-dependent service - ArchiveFS is
+- A mandatory cloud account or cloud-dependent service - EmuWiz is
   local-first and must keep working offline.
 - A telemetry or usage-analytics platform.
 - A surveillance system, or any component that reports on user files to a

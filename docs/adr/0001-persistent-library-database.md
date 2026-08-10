@@ -8,7 +8,7 @@ integration design this record summarizes.
 
 ## Context
 
-ArchiveFS currently has no persistent memory of anything it has scanned.
+EmuWiz currently has no persistent memory of anything it has scanned.
 `ArchiveScanner::scan_archives` walks every configured source folder from scratch on
 every single command invocation - `index-build`, `duplicates`, `info`, `mount-one`,
 and the GUI's `load_read_only_snapshot` on every launch and every Refresh click. The
@@ -16,7 +16,7 @@ closest thing to persistence is `~/.local/share/archivefs/index.json`, which is 
 just a full-rebuild snapshot written by the most recent `index-build`, with no memory
 of what changed between one build and the next.
 
-The long-term direction for ArchiveFS includes a persistent library (metadata,
+The long-term direction for EmuWiz includes a persistent library (metadata,
 artwork, emulator associations, launch history, favourites, duplicate detection,
 library health, mounted-state history, direct launching). All of that needs somewhere
 durable to live. Building it directly on top of the JSON index is not workable: JSON
@@ -41,7 +41,7 @@ immediate-mode UI), with no async runtime anywhere. `sqlx` is async-first and wo
 require adopting `tokio` or `async-std` as a new architectural layer purely to run
 local SQLite queries - a much larger and unrelated change than "add persistence". The
 `bundled` feature statically links SQLite's C source, so no `libsqlite3` system
-dependency is needed to build or run ArchiveFS, preserving the same "no extra system
+dependency is needed to build or run EmuWiz, preserving the same "no extra system
 packages required" property already verified for this project's release build (the
 release workflow was specifically checked to need zero additional Ubuntu packages,
 because `archivefs-gui`'s windowing libraries resolve via runtime `dlopen`, not
@@ -57,7 +57,7 @@ it does today. The database is additive: a cache and an observation log over wha
 `ArchiveScanner` would discover on its own, always safe to delete and rebuild from the
 filesystem. This is treated as an architectural boundary, not a convention -
 mount/unmount code is not to import from the new `catalogue` module at all, so the
-database being missing, empty, or corrupt cannot affect whether ArchiveFS can safely
+database being missing, empty, or corrupt cannot affect whether EmuWiz can safely
 mount or unmount an archive.
 
 ## Consequences
@@ -73,7 +73,7 @@ mount or unmount an archive.
   project's existing fast, filesystem-light test style.
 - Because mount safety never depends on the database, every stage of the delivery
   plan in the design document can ship independently without risking the one thing
-  ArchiveFS cannot regress: safe mounting and unmounting.
+  EmuWiz cannot regress: safe mounting and unmounting.
 
 **Negative / accepted trade-offs:**
 

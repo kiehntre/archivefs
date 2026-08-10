@@ -181,7 +181,7 @@ selected-state panel.
 `NotMountable` as a literal status label is an internal state name
 leaking into a beginner-facing surface, and it reads as an error for
 items that are not broken — a direct GameCube RVZ/ISO/GCZ/CISO image
-never needed mounting in the first place; ArchiveFS's mount step exists
+never needed mounting in the first place; EmuWiz's mount step exists
 for *archive* formats (ZIP/7z/RAR), not for direct images. Gamer View's
 primary-action slot resolves to exactly one of three states, never a raw
 backend enum name:
@@ -582,7 +582,7 @@ changed relative to §2.1's original sketch:
   directory. Missing, malformed, oversized, symlinked, or unsupported SVG
   files retain the built-in vector glyph. The existing resolved `image`
   crate is now a direct dependency with only PNG decoding enabled; its
-  `MIT OR Apache-2.0` licence is compatible with ArchiveFS.
+  `MIT OR Apache-2.0` licence is compatible with EmuWiz.
 
 ### Platform Artwork Pack v1 follow-up
 

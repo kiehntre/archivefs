@@ -1,13 +1,13 @@
-# ArchiveFS Watcher
+# EmuWiz Watcher
 
-This document designs the ArchiveFS filesystem watcher.
+This document designs the EmuWiz filesystem watcher.
 
 The watcher observes configured source folders, refreshes `ArchiveRecord` data,
 and updates the JSON index. It must not mount or unmount archives.
 
 ## Goals
 
-- Keep ArchiveFS aware of archive files as they are added, removed, renamed, or
+- Keep EmuWiz aware of archive files as they are added, removed, renamed, or
   modified.
 - Update `ArchiveRecord` values and the JSON index without requiring manual
   `index-build` runs.
@@ -32,7 +32,7 @@ Linux behavior:
   archive additions or updates.
 - Treat `IN_DELETE` and `IN_MOVED_FROM` as possible archive removals.
 - Treat queue overflow as a signal to perform a safe broader rescan.
-- Normalize raw `notify` events into ArchiveFS-level changes before processing.
+- Normalize raw `notify` events into EmuWiz-level changes before processing.
 
 Normalized events should include:
 
@@ -126,7 +126,7 @@ Fallback to a full source rescan when:
   expensive than a full rescan.
 
 Safe rescans should rebuild records using the same provider pipeline as other
-ArchiveFS entry points. The watcher should not have separate metadata or health
+EmuWiz entry points. The watcher should not have separate metadata or health
 logic.
 
 ## Index Update Strategy
@@ -147,7 +147,7 @@ Index update rules:
 The index writer should tolerate the index being missing. In that case, the
 watcher may create it from current records.
 
-If another ArchiveFS process updates the index concurrently, the watcher should
+If another EmuWiz process updates the index concurrently, the watcher should
 avoid corrupting the file. A future lock file or advisory lock should coordinate
 writers.
 

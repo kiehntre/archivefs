@@ -274,7 +274,7 @@ pub fn import_platform_artwork(
     let height = ((input_height as f64 * scale).round() as u32).max(1);
     if input_width.max(input_height) < NORMALIZED_CONTENT_SIZE {
         warnings.push(format!(
-            "Small source retained at {}x{}; ArchiveFS did not upscale it",
+            "Small source retained at {}x{}; EmuWiz did not upscale it",
             input_width, input_height
         ));
     }

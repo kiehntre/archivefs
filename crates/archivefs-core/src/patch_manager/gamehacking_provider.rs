@@ -276,13 +276,13 @@ pub fn gamehacking_cache_root() -> Result<PathBuf, GameHackingError> {
     let database = crate::default_database_path().map_err(|failure| {
         error(
             GameHackingErrorKind::CacheUnavailable,
-            format!("ArchiveFS data directory is unavailable: {failure}"),
+            format!("EmuWiz data directory is unavailable: {failure}"),
         )
     })?;
     let parent = database.parent().ok_or_else(|| {
         error(
             GameHackingErrorKind::CacheUnavailable,
-            "ArchiveFS database path has no parent directory",
+            "EmuWiz database path has no parent directory",
         )
     })?;
     Ok(parent.join("cache/gamehacking"))

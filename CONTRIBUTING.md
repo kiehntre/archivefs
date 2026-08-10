@@ -1,11 +1,11 @@
-# Contributing to ArchiveFS
+# Contributing to EmuWiz
 
-ArchiveFS is alpha-stage software. Thank you for considering contributing -
+EmuWiz is alpha-stage software. Thank you for considering contributing -
 this document covers how to build, validate, and submit changes.
 
 ## Getting the pinned toolchain
 
-ArchiveFS pins an exact Rust toolchain in [`rust-toolchain.toml`](rust-toolchain.toml)
+EmuWiz pins an exact Rust toolchain in [`rust-toolchain.toml`](rust-toolchain.toml)
 so that local development, CI, and release builds all use the same compiler.
 If you have `rustup` installed, running any `cargo`/`rustc` command inside
 the repository automatically installs and uses the pinned version - you do
@@ -42,7 +42,7 @@ in `Cargo.lock`, matching what CI and the release workflow use.
 ## Rust toolchain policy
 
 - `rust-toolchain.toml` is the single source of truth for which Rust
-  version ArchiveFS is developed and tested against. As of this writing
+  version EmuWiz is developed and tested against. As of this writing
   that is Rust `1.97.1`, with the `rustfmt` and `clippy` components.
 - `.github/workflows/ci.yml` and `.github/workflows/release.yml` both
   install that exact version explicitly (via `dtolnay/rust-toolchain` with
@@ -83,7 +83,7 @@ in `Cargo.lock`, matching what CI and the release workflow use.
 - Document user-facing changes in [`CHANGELOG.md`](CHANGELOG.md) under
   `Unreleased`, and update [`ROADMAP.md`](ROADMAP.md) if the change
   completes or changes the scope of a roadmap item.
-- ArchiveFS never modifies a user's source archive files. Any change that
+- EmuWiz never modifies a user's source archive files. Any change that
   would make this untrue needs a very good reason and explicit discussion
   first.
 

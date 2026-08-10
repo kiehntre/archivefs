@@ -153,7 +153,7 @@ Every claim below is confirmed against the official RetroArch source
   but **unresolved**. Confirmed from source that RetroArch itself does
   *not* anchor such a value to the config file's directory or to any XDG
   base at config-read time (`fill_pathname_expand_special` returns it
-  unchanged); ArchiveFS does not invent a resolution base RetroArch itself
+  unchanged); EmuWiz does not invent a resolution base RetroArch itself
   doesn't use.
 - **Empty value** (`""`): a real, distinct configured state - "runtime
   default unknown," never "not configured."
@@ -162,7 +162,7 @@ Every claim below is confirmed against the official RetroArch source
   cases, which this milestone does not attempt to reproduce. Several of
   the needed defaults (System, Cores, CoreInfo, Database, Shaders,
   JoypadAutoconfig) are gated behind compile-time/package-specific values
-  ArchiveFS cannot observe from outside the RetroArch binary, so no
+  EmuWiz cannot observe from outside the RetroArch binary, so no
   default is guessed for *any* purpose, keeping the policy uniform and
   honest rather than confidently wrong for some users.
 

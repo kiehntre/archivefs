@@ -35,7 +35,7 @@ pub const XENIA_UPSTREAM_REPOSITORY: &str = "xenia-canary/game-patches";
 pub const XENIA_UPSTREAM_ATTRIBUTION: &str =
     "Patch definitions from the xenia-canary/game-patches upstream dataset.";
 /// The repository publishes no LICENSE file (confirmed via the GitHub API
-/// license field, which is `null`) - ArchiveFS records this honestly
+/// license field, which is `null`) - EmuWiz records this honestly
 /// rather than asserting terms upstream never declared.
 pub const XENIA_UPSTREAM_LICENSE: &str = "No LICENSE file is published by xenia-canary/game-patches at the time of writing; contents remain the property of their individual authors pending upstream clarification.";
 

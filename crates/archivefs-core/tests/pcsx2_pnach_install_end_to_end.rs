@@ -531,11 +531,11 @@ fn unwritable_profile_fails_without_touching_rom_or_creating_pnach() {
 }
 
 /// A real-world upgrade scenario: a game was previously installed by an
-/// ArchiveFS build that only knew the legacy `<CRC>.pnach` naming. This
+/// EmuWiz build that only knew the legacy `<CRC>.pnach` naming. This
 /// PCSX2 build only reads `<SERIAL>_<CRC>.pnach`, so the next "Install
 /// selected" must detect the legacy file, migrate its managed cheat into
 /// the serial+CRC file the running PCSX2 actually opens, and leave the
-/// legacy file stripped of ArchiveFS content (but otherwise untouched) -
+/// legacy file stripped of EmuWiz content (but otherwise untouched) -
 /// never silently leaving two active copies of the same cheat. Migration
 /// cleanup of the legacy file is its own chained operation (its own
 /// journal, its own independent undo), so both steps are driven and
@@ -645,7 +645,7 @@ fn legacy_crc_only_file_is_detected_migrated_and_independently_undoable() {
     assert_eq!(legacy_result.journal.status, SharedApplyStatus::Success);
 
     // The legacy file keeps its unrelated content but no longer carries any
-    // ArchiveFS-managed block - it is not left as a silently duplicated
+    // EmuWiz-managed block - it is not left as a silently duplicated
     // active copy of the same cheat.
     let legacy_now = fs::read_to_string(fixture.legacy_crc_only_destination()).unwrap();
     assert!(legacy_now.contains("pre-existing user note"));

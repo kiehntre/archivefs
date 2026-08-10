@@ -1675,7 +1675,7 @@ fn sanitize_path_component(value: &str) -> Option<String> {
 /// RetroArch environment's own cheat root - "the canonical RetroArch
 /// platform-directory convention already used by the discovered
 /// installation" from `docs/RETROARCH_CHEAT_CATALOGUE.md`. The platform
-/// component is *only* ArchiveFS's own canonical platform name (the same
+/// component is *only* EmuWiz's own canonical platform name (the same
 /// alias table used for matching, e.g. `"Atari - 2600"` -> `"Atari2600"`) -
 /// an unknown, ambiguous, or unsafe hint is never used as-is, sanitized or
 /// not: an unrecognized platform is `source_platform_unresolved`, exactly

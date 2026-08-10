@@ -3507,7 +3507,7 @@ fn the_planning_only_warning_is_prominent() {
     let output = render(&view, &mut ui_state);
     assert!(rendered_text_contains(&output, "Planning only"));
     assert!(
-        rendered_text_contains(&output, "ArchiveFS will not rename any files"),
+        rendered_text_contains(&output, "EmuWiz will not rename any files"),
         "the read-only promise must be stated plainly"
     );
 }

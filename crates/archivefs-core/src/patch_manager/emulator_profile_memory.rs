@@ -11,7 +11,7 @@
 //! dropping remembered profiles on the next source edit. A dedicated file
 //! avoids that coupling while still living in the same config directory
 //! and reusing the same atomic-rename write primitive
-//! (`crate::atomic_write_text`) as the rest of ArchiveFS's configuration.
+//! (`crate::atomic_write_text`) as the rest of EmuWiz's configuration.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -30,13 +30,7 @@ pub struct RememberedEmulatorProfile {
 }
 
 pub fn default_emulator_profile_memory_path() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .ok_or_else(|| ArchiveFsError::Config("HOME is not set".to_string()))?;
-    Ok(PathBuf::from(home)
-        .join(".config")
-        .join("archivefs")
-        .join("emulator_profiles.toml"))
+    crate::app_dirs::config_path("emulator_profiles.toml")
 }
 
 pub fn load_remembered_emulator_profiles_default() -> Result<Vec<RememberedEmulatorProfile>> {
@@ -205,7 +199,7 @@ fn unquote(value: &str, line_number: usize) -> Result<String> {
 }
 
 fn render_remembered_profiles(profiles: &[RememberedEmulatorProfile]) -> String {
-    let mut out = String::from("# ArchiveFS remembered emulator profiles\n");
+    let mut out = String::from("# EmuWiz remembered emulator profiles\n");
     for profile in profiles {
         out.push('\n');
         out.push_str("[[emulator_profile]]\n");
@@ -231,7 +225,7 @@ pub struct EmulatorProfileCandidate {
     pub profile_id: String,
     pub root: PathBuf,
     pub eligible: bool,
-    /// True for a profile ArchiveFS knows is a portable install (e.g. a
+    /// True for a profile EmuWiz knows is a portable install (e.g. a
     /// caller-supplied explicit root distinct from the OS-standard
     /// configuration directory) - used only to break a tie between
     /// multiple valid profiles when nothing has been remembered or

@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-  <!-- Original ArchiveFS artwork: generic cartridge system silhouette. -->
+  <!-- Original EmuWiz artwork: generic cartridge system silhouette. -->
   <path d="M16 12 H36 V20 H44 V52 H16 Z" fill="none" stroke="#4a4a4a" stroke-width="3"/>
   <rect x="22" y="26" width="16" height="4" fill="#4a4a4a"/>
 </svg>

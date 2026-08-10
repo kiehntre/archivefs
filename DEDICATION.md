@@ -1,6 +1,6 @@
 # Dedication
 
-ArchiveFS is dedicated to my dad.
+EmuWiz is dedicated to my dad.
 
 My father, mentor, best friend, and an artist.
 

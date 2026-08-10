@@ -210,7 +210,7 @@ pub struct RenameTransaction {
     /// (for example canonical platform folders under a master ROM root).
     ///
     /// Recorded durably before they are created so crash recovery and rollback
-    /// know exactly which directories belong to ArchiveFS. Rollback removes
+    /// know exactly which directories belong to EmuWiz. Rollback removes
     /// only these, in reverse order, and only while they are still empty;
     /// a pre-existing user directory is never recorded here and never removed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

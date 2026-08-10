@@ -219,7 +219,7 @@ impl RetroArchCheatSetupResult {
             ),
             "database_unavailable" | "database_has_no_usable_records" => (
                 "scan_archivefs_library",
-                "Create or update the ArchiveFS library with the normal source/library scan workflow.",
+                "Create or update the EmuWiz library with the normal source/library scan workflow.",
             ),
             _ => (
                 "review_error",
@@ -361,7 +361,7 @@ pub fn build_retroarch_cheat_setup_plan(
     if usable_game_records == 0 {
         return Err(RetroArchCheatSetupError::new(
             "database_has_no_usable_records",
-            "the ArchiveFS database contains no game records; run an ArchiveFS library scan first",
+            "the EmuWiz database contains no game records; run an EmuWiz library scan first",
         ));
     }
     let archives = load_retroarch_catalogue_archives_read_only(database_path)?;

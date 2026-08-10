@@ -1,6 +1,6 @@
 # Security Policy
 
-ArchiveFS is alpha-stage software. This document describes its current
+EmuWiz is alpha-stage software. This document describes its current
 safety boundaries and how to report a vulnerability - it is not a security
 guarantee or a certification.
 
@@ -24,11 +24,11 @@ confirmed, fixed and noted in `CHANGELOG.md` under a `Security` entry.
 
 ## Current safety boundaries
 
-These are the security-relevant properties ArchiveFS's design and tests
+These are the security-relevant properties EmuWiz's design and tests
 currently rely on. See [`docs/security.md`](docs/security.md) for the full
 detail behind each of these.
 
-- **Local-first, no telemetry.** ArchiveFS does not send usage data,
+- **Local-first, no telemetry.** EmuWiz does not send usage data,
   crash reports, or file information anywhere. The only network access in
   the codebase today is the PCSX2 patch-metadata fetch
   (`pcsx2-patch-preview`), which is an explicit, user-invoked, read-only
@@ -72,7 +72,7 @@ call out the safety implications explicitly in your pull request:
 
 ## Out of scope
 
-ArchiveFS does not currently implement, and reports about the *absence* of
+EmuWiz does not currently implement, and reports about the *absence* of
 these are expected rather than actionable bugs:
 
 - Malware/virus scanning of archive contents.

@@ -990,7 +990,7 @@ fn a_duplicate_provider_claim_names_the_competing_records() {
 fn stronger_local_evidence_is_shown_as_retained() {
     let mut row = conflicting("1", ConflictField::Platform, "gb", "Game Boy Color");
     row.evidence
-        .push("ArchiveFS's own verified identity was stronger and was not displaced".to_string());
+        .push("EmuWiz's own verified identity was stronger and was not displaced".to_string());
     let cache = cache(vec![row]);
     let page = build_conflict_page(&cache, 0, 10);
     assert!(
@@ -1524,7 +1524,7 @@ fn detail_artwork_is_typed_and_public_urls_never_enter_the_view_model() {
     let output = render(&mut state);
     assert!(rendered_text_contains(
         &output,
-        "Public artwork reference recorded, but ArchiveFS does not fetch from public hosts."
+        "Public artwork reference recorded, but EmuWiz does not fetch from public hosts."
     ));
     assert!(!rendered_text_contains(&output, "retroachievements.org"));
 }

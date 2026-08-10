@@ -41,7 +41,7 @@
 //! - `Malformed` – anything that is not a well-formed hex-pair line
 //!   (placeholders such as `XXXX`/`?`/`N/A`, the base-31 encrypted
 //!   `XXXX-XXXX-XXXXX` AR codes, free text). The encrypted dash-format codes
-//!   are real Action Replay content that Dolphin could decrypt, but ArchiveFS
+//!   are real Action Replay content that Dolphin could decrypt, but EmuWiz
 //!   has no verified decryptor and therefore cannot inspect what they decode
 //!   to; they remain browse-only.
 //!
@@ -302,7 +302,7 @@ pub fn classify_bsfree_gamecube_cheat(cheat: &BsFreeCheat) -> BsFreeGameCubeChea
     cheat
 }
 
-/// The stable Dolphin display name ArchiveFS uses for a BSFree-installed
+/// The stable Dolphin display name EmuWiz uses for a BSFree-installed
 /// code, matching the `"Display Name [Author]"` convention Dolphin itself
 /// uses and the GameCube GameHacking adapter reproduces.
 #[must_use]
@@ -432,7 +432,7 @@ pub struct BsFreeDedupFinding {
 ///
 /// Pass B (output-level) runs over the *final output form* produced by any
 /// classification: two records converting to identical Gecko/AR output, a
-/// converted result colliding with an already-installed user/ArchiveFS cheat
+/// converted result colliding with an already-installed user/EmuWiz cheat
 /// in the same or the other section, and same-name-different-body collisions
 /// with installed content.
 pub fn analyze_bsfree_gamecube_duplicates<'a>(
@@ -597,7 +597,7 @@ pub fn analyze_bsfree_gamecube_duplicates<'a>(
                 relates_to: Some(dolphin_name.clone()),
                 detail: format!(
                     "a code named {:?} is already installed (in {} the {}) with a different body; \
-                     ArchiveFS will not overwrite it",
+                     EmuWiz will not overwrite it",
                     dolphin_name,
                     if same_section_has_name {
                         "same"
@@ -1112,7 +1112,7 @@ pub struct BsFreeGameCubeSearchOutcome {
 /// matches "Luigi's Mansion". The returned rows come from the existing
 /// bounded `search_games` platform+title query. Exactly one result is
 /// auto-matched (its classified cheats are loaded); more than one is returned
-/// as candidates for explicit review - ArchiveFS never applies a BSFree game
+/// as candidates for explicit review - EmuWiz never applies a BSFree game
 /// that was not explicitly confirmed against the archive.
 pub fn bsfree_gamecube_search(
     catalogue: &BsFreeCatalogue,

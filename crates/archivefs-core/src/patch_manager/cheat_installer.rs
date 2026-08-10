@@ -84,10 +84,10 @@ use super::destination_safety::{
     DestinationSafetyFailureReason, DestinationState, assess_destination,
 };
 
-/// Directory name (beneath the ArchiveFS XDG data directory) that holds one
+/// Directory name (beneath the EmuWiz XDG data directory) that holds one
 /// journal file per real apply run.
 pub const CHEAT_INSTALL_RUNS_DIRECTORY_NAME: &str = "cheat-install-runs";
-/// Directory name (beneath the ArchiveFS XDG data directory) that holds
+/// Directory name (beneath the EmuWiz XDG data directory) that holds
 /// pre-replacement backups.
 pub const CHEAT_INSTALL_BACKUPS_DIRECTORY_NAME: &str = "cheat-install-backups";
 
@@ -134,7 +134,7 @@ fn should_inject(_point: FaultPoint) -> bool {
 /// so the pure/impure boundary is explicit: everything here is supplied by
 /// the caller (the CLI in production; a test fixture in tests) - this
 /// module never resolves a default path, reads `$HOME`, or opens the live
-/// ArchiveFS database itself.
+/// EmuWiz database itself.
 pub struct CheatInstallOptions {
     pub destination_root: PathBuf,
     pub allow_replace_different: bool,

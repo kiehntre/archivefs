@@ -1,4 +1,4 @@
-# ArchiveFS Architecture
+# EmuWiz Architecture
 
 This is a short, top-level overview. The full, current architecture
 reference - core components, providers, the persistent catalogue, managed
@@ -7,7 +7,7 @@ lives in [`docs/architecture.md`](docs/architecture.md).
 
 ## Crates
 
-ArchiveFS is a Rust workspace with three crates:
+EmuWiz is a Rust workspace with three crates:
 
 - `archivefs-core`: configuration, scanning, mount planning and execution,
   the persistent SQLite catalogue, managed library views, the archive
@@ -27,7 +27,7 @@ never mounts or unmounts anything on its own.
 Archive mounting is implemented through the `MountBackend` trait
 (see [`docs/domain-model.md`](docs/domain-model.md)). The only current
 implementation, `RatarmountBackend`, shells out to `ratarmount`. Mounts are
-always read-only; ArchiveFS never modifies a source archive.
+always read-only; EmuWiz never modifies a source archive.
 
 ## Archive health states
 

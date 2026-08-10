@@ -1,6 +1,6 @@
 # RetroArch streaming catalogue download
 
-The Libretro catalogue ZIP is downloaded through ArchiveFS's HTTPS client; no
+The Libretro catalogue ZIP is downloaded through EmuWiz's HTTPS client; no
 `curl`, `wget`, shell, or external process is used. Network access begins only
 after the user confirms Download or Update in Sources.
 
@@ -104,5 +104,5 @@ individual file.
 10. Cancel during download and confirm partial files are removed.
 11. Confirm the old snapshot remains usable after cancellation.
 12. Confirm Alien 3 matching remains available throughout failed updates.
-13. Restart ArchiveFS and confirm no incomplete snapshot is active.
+13. Restart EmuWiz and confirm no incomplete snapshot is active.
 14. Confirm no curl, wget, or external process is launched.

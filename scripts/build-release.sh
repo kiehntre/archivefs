@@ -9,7 +9,7 @@ usage() {
     cat <<'EOF'
 Usage: scripts/build-release.sh [--output-dir DIR] [--target-dir DIR]
 
-Build and verify the canonical ArchiveFS Linux release archive.
+Build and verify the canonical EmuWiz Linux release archive.
 
 Options:
   --output-dir DIR  Destination for the archive and .sha256 file.
@@ -113,11 +113,13 @@ fi
 RUST_REMAP="${RUST_REMAP# }"
 export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }$RUST_REMAP"
 
-release_note "building ArchiveFS v$VERSION with cargo --release --locked"
+release_note "building EmuWiz v$VERSION with cargo --release --locked"
 (cd "$REPO_ROOT" && cargo "${BUILD_ARGS[@]}")
 BUILD_ROOT="${CARGO_TARGET_DIR:-$REPO_ROOT/target}/release"
 
-for binary in archivefs-cli archivefs-gui; do
+# Package the primary EmuWiz binaries. install.sh creates the legacy
+# `archivefs-cli`/`archivefs-gui` aliases at install time.
+for binary in emuwiz-cli emuwiz; do
     [[ -f "$BUILD_ROOT/$binary" && -x "$BUILD_ROOT/$binary" ]] ||
         release_die "release binary missing or not executable: $BUILD_ROOT/$binary"
     install -m 0755 "$BUILD_ROOT/$binary" "$STAGE_ROOT/$binary"
@@ -148,6 +150,6 @@ chmod 0644 "$ARTIFACT" "$CHECKSUM"
 release_note "inspecting and testing the finished archive"
 "$SCRIPT_DIR/verify-release-artifact.sh" --checksum "$CHECKSUM" "$ARTIFACT"
 
-printf '\nArchiveFS release artifact created successfully.\n'
+printf '\nEmuWiz release artifact created successfully.\n'
 printf 'Artifact: %s\n' "$ARTIFACT"
 printf 'Checksum: %s\n' "$CHECKSUM"

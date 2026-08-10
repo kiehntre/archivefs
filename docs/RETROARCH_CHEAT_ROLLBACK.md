@@ -31,13 +31,13 @@ writes one immutable journal below
 `~/.local/share/archivefs/...`).
 
 Entries recorded as `installed_new` are removed only when the destination is
-still a safe regular file whose hash equals the hash installed by ArchiveFS.
+still a safe regular file whose hash equals the hash installed by EmuWiz.
 Missing files are `already_restored`; changed files are preserved and reported
 as `failed_destination_changed`.
 
 For `replaced_with_backup`, rollback verifies the destination replacement hash,
 the backup's previous-content hash, and that the backup is beneath the
-ArchiveFS backup root with no symlink components. The verified bytes are
+EmuWiz backup root with no symlink components. The verified bytes are
 written through a same-directory temporary file, fsynced, hash-checked, and
 atomically renamed into place. Backups remain available after success. A
 destination already matching the backup is `already_restored`; missing or

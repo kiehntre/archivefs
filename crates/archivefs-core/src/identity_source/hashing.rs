@@ -2,7 +2,7 @@
 //!
 //! RomM publishes CRC32, MD5 and SHA-1. To reach
 //! [`ExternalVerification::ConfirmedExternal`](super::model::ExternalVerification::ConfirmedExternal)
-//! ArchiveFS has to compute the same thing over the same bytes and find it
+//! EmuWiz has to compute the same thing over the same bytes and find it
 //! agrees. That is the only reason this module exists, and it shapes every
 //! decision in it.
 //!
@@ -106,7 +106,7 @@ impl HashRefusal {
 
 /// The identity of a file's contents, for cache invalidation.
 ///
-/// Path, size and modification time - the same triple the rest of ArchiveFS
+/// Path, size and modification time - the same triple the rest of EmuWiz
 /// already uses to decide whether a file it saw before is still the same file. Not
 /// a guarantee (a change within one timestamp tick is possible), so it is used
 /// only to *invalidate*: a hash is discarded when any of these differs, never

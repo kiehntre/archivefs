@@ -1,6 +1,6 @@
 //! One shared, read-only diagnostic finding model for Doctor.
 //!
-//! ArchiveFS already contains a large diagnostic engine, but every
+//! EmuWiz already contains a large diagnostic engine, but every
 //! subsystem grew its own finding type, its own severity scale, and its own
 //! UI surface. This module adds exactly one thing:
 //! a shared [`Finding`] plus thin adapters that translate the *existing*
@@ -36,7 +36,7 @@
 //!
 //! - Not a repair dispatcher. [`KnownRecovery`] is *informational metadata*
 //!   describing a repair the user can already perform somewhere else in
-//!   ArchiveFS today. It carries no callable, no closure, and no path to
+//!   EmuWiz today. It carries no callable, no closure, and no path to
 //!   execute against.
 //! - Not a replacement for `DoctorReport`, `SetupDiagnostics`,
 //!   `HealthIssue`, `DatabaseHealthReport`, or
@@ -151,7 +151,7 @@ impl fmt::Display for DoctorSeverity {
 #[serde(rename_all = "snake_case")]
 pub enum DoctorCategory {
     Configuration,
-    /// Free space on the filesystems ArchiveFS depends on.
+    /// Free space on the filesystems EmuWiz depends on.
     Storage,
     /// How those filesystems are mounted.
     Filesystems,
@@ -161,9 +161,9 @@ pub enum DoctorCategory {
     Library,
     Database,
     Emulators,
-    /// Discovered emulator profiles and whether ArchiveFS could write to them.
+    /// Discovered emulator profiles and whether EmuWiz could write to them.
     EmulatorProfiles,
-    /// ArchiveFS-managed cheat and patch entries.
+    /// EmuWiz-managed cheat and patch entries.
     ManagedEntries,
     Transactions,
     /// Doctor reporting on itself - an adapter that could not run.
@@ -253,7 +253,7 @@ pub enum DoctorSubsystem {
     /// `discover_dolphin_profiles` / `discover_pcsx2_profiles` /
     /// `discover_xenia_profiles`
     EmulatorProfiles,
-    /// ArchiveFS-managed cheat and patch entries, anchored on install
+    /// EmuWiz-managed cheat and patch entries, anchored on install
     /// journals and on each adapter's own ownership marker.
     ManagedEntries,
     /// The Doctor runner itself.
@@ -312,7 +312,7 @@ impl fmt::Display for DoctorSubsystem {
 
 // --- Known recovery (informational only) ---------------------------------
 
-/// A repair ArchiveFS **already** implements for this fault, recorded so
+/// A repair EmuWiz **already** implements for this fault, recorded so
 /// Doctor can honestly say one exists - and nothing more.
 ///
 /// This is deliberately inert. It holds no callable, no closure, and no
@@ -328,7 +328,7 @@ pub struct KnownRecovery {
     /// `RecoveryAction` variants (for example removing missing catalogue
     /// rows, which lives on the Library page).
     pub action: Option<RecoveryAction>,
-    /// Where the person can already do this today, in ArchiveFS's own
+    /// Where the person can already do this today, in EmuWiz's own
     /// navigation terms.
     pub available_at: &'static str,
 }
@@ -344,7 +344,7 @@ impl KnownRecovery {
     /// The exact wording Doctor shows. Never a button label.
     pub fn notice(&self) -> String {
         format!(
-            "A repair action already exists elsewhere in ArchiveFS: {}.",
+            "A repair action already exists elsewhere in EmuWiz: {}.",
             self.available_at
         )
     }
@@ -384,7 +384,7 @@ pub struct Finding {
     /// `lossy`, instead of being silently mangled.
     pub affected: Option<EncodedPath>,
     /// Informational only - see [`KnownRecovery`]. Present when a repair
-    /// exists somewhere else in ArchiveFS but Doctor does not offer it.
+    /// exists somewhere else in EmuWiz but Doctor does not offer it.
     pub recovery: Option<KnownRecovery>,
     /// The repair Doctor itself offers for this finding, if any. Fieldless,
     /// so a finding can never smuggle a path or a command into a repair -
@@ -523,7 +523,7 @@ impl Finding {
         self
     }
 
-    /// Whether a repair for this fault exists somewhere in ArchiveFS,
+    /// Whether a repair for this fault exists somewhere in EmuWiz,
     /// whether or not Doctor offers it here.
     pub fn repair_may_exist(&self) -> bool {
         self.recovery.is_some() || self.repair.is_some()
@@ -592,7 +592,7 @@ impl SubsystemCoverage {
 }
 
 /// An individual check that was available but did not run in this scan, and
-/// why. Distinct from [`DeferredCheck`] (which ArchiveFS cannot do at all)
+/// why. Distinct from [`DeferredCheck`] (which EmuWiz cannot do at all)
 /// and from [`CoverageStatus::Unavailable`] (which is whole-subsystem):
 /// this is a single check inside a subsystem that *was* consulted.
 ///
@@ -606,7 +606,7 @@ pub struct NotCheckedCheck {
     pub next_step: String,
 }
 
-/// A check ArchiveFS does not perform yet. Shown in the product so a clean
+/// A check EmuWiz does not perform yet. Shown in the product so a clean
 /// Doctor result is never mistaken for complete coverage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct DeferredCheck {
@@ -623,11 +623,11 @@ pub const DEFERRED_CHECKS: &[DeferredCheck] = &[
     },
     DeferredCheck {
         name: "Write access inside a sandbox",
-        reason: "Read-only mounts and permissions are now assessed from metadata. A Flatpak or Snap portal can still refuse a write that permissions appear to allow, and proving that would need a write probe ArchiveFS deliberately does not perform.",
+        reason: "Read-only mounts and permissions are now assessed from metadata. A Flatpak or Snap portal can still refuse a write that permissions appear to allow, and proving that would need a write probe EmuWiz deliberately does not perform.",
     },
     DeferredCheck {
         name: "Managed entries with no install record",
-        reason: "Managed entries are matched against ArchiveFS's install history. PCSX2 .pnach files and GameHacking-managed Dolphin INIs additionally carry in-file ArchiveFS ownership markers. Xenia and RetroArch files carry no marker, so an entry whose install record was deleted cannot be recognised - and ArchiveFS will not guess, because your own entries look identical.",
+        reason: "Managed entries are matched against EmuWiz's install history. PCSX2 .pnach files and GameHacking-managed Dolphin INIs additionally carry in-file EmuWiz ownership markers. Xenia and RetroArch files carry no marker, so an entry whose install record was deleted cannot be recognised - and EmuWiz will not guess, because your own entries look identical.",
     },
     DeferredCheck {
         name: "Dolphin, PCSX2 and Xenia diagnostic reports",
@@ -1220,7 +1220,7 @@ mod database_adapter {
     /// Adapts `diagnose_database`'s output. That function is documented to
     /// perform no recovery, no migration and no pragma change, which is
     /// exactly why it is safe here. No repair is offered: database repair is
-    /// never automatic in ArchiveFS.
+    /// never automatic in EmuWiz.
     pub fn findings_from_database_report(report: &DatabaseHealthReport) -> Vec<Finding> {
         let path = EncodedPath {
             display: report.database_path.display.clone(),
@@ -1286,7 +1286,7 @@ mod database_adapter {
                         .with_evidence(outcome.messages.clone())
                         .with_recovery(KnownRecovery::new(
                             None,
-                            "Tools → Database Status shows the full report; ArchiveFS never repairs the catalogue automatically",
+                            "Tools → Database Status shows the full report; EmuWiz never repairs the catalogue automatically",
                         )),
                     );
                 }
@@ -1327,7 +1327,7 @@ fn destination_reason_id(reason: DestinationSafetyFailureReason) -> &'static str
 /// `SetupDiagnostics` already report that, and repeating it would be the
 /// third copy of one fact. Only genuine path-safety failures - a symlinked
 /// root, a non-directory component, a traversal - are reported, because
-/// nothing else in ArchiveFS surfaces them for the mount root today.
+/// nothing else in EmuWiz surfaces them for the mount root today.
 pub fn findings_from_mount_root_safety(safety: &MountRootSafety) -> Vec<Finding> {
     match &safety.outcome {
         Ok(_) => Vec::new(),
@@ -1361,7 +1361,7 @@ pub fn findings_from_mount_root_safety(safety: &MountRootSafety) -> Vec<Finding>
                 .with_affected_path(&safety.root)
                 .with_evidence(evidence)
                 .with_guidance(
-                    "ArchiveFS refuses to mount beneath a symlinked or otherwise unsafe root, because doing so could place mounts outside the directory you configured.",
+                    "EmuWiz refuses to mount beneath a symlinked or otherwise unsafe root, because doing so could place mounts outside the directory you configured.",
                     "Point mount_root at a real directory you own, with no symlinked parent components.",
                 ),
             ]
@@ -1506,7 +1506,7 @@ pub fn findings_from_transaction_history(report: &SharedHistoryReport) -> Vec<Fi
                 DoctorSubsystem::SharedTransactions,
                 DoctorSeverity::Warning,
                 "An install journal could not be read",
-                "ArchiveFS found a journal file it could not parse. Rollback is unavailable for that operation.",
+                "EmuWiz found a journal file it could not parse. Rollback is unavailable for that operation.",
             )
             .with_affected(EncodedPath {
                 display: warning.path.display.clone(),
@@ -1523,7 +1523,7 @@ pub fn findings_from_transaction_history(report: &SharedHistoryReport) -> Vec<Fi
                 DoctorSubsystem::SharedTransactions,
                 DoctorSeverity::Info,
                 "Install history was truncated",
-                "There are more install journals than ArchiveFS lists at once, so this history is incomplete.",
+                "There are more install journals than EmuWiz lists at once, so this history is incomplete.",
             )
             .with_evidence(vec![format!(
                 "Journals listed: {}",

@@ -253,7 +253,7 @@ fn an_arbitrary_action_string_is_rejected() {
 // --- 6. Arbitrary path injection ----------------------------------------
 
 /// A repair target never comes from the request. Even a finding fabricated to
-/// name a path outside ArchiveFS's boundary is refused.
+/// name a path outside EmuWiz's boundary is refused.
 #[test]
 fn a_finding_naming_a_path_outside_the_mount_root_is_refused() {
     let fixture = Fixture::new("path-injection");

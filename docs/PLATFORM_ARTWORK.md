@@ -12,7 +12,7 @@ and prompts for missing images live in
 
 Artwork resolution is deterministic and strictly ordered:
 
-1. A valid ArchiveFS-managed custom PNG named for the canonical platform ID.
+1. A valid EmuWiz-managed custom PNG named for the canonical platform ID.
 2. The exact Platform Artwork Pack v1 PNG compiled into the GUI executable.
 3. A valid managed custom category PNG, when present.
 4. The existing category fallback native glyph: console, handheld, computer,
@@ -104,7 +104,7 @@ altered during integration.
 
 ## Provenance and endorsement
 
-The PNGs were supplied for this milestone as original/generated ArchiveFS
+The PNGs were supplied for this milestone as original/generated EmuWiz
 project artwork. The repository does not record a third-party source,
 photographer, or external artwork pack for them. No manufacturer wordmarks,
 manufacturer logos, or copied photographs were intentionally used. The
@@ -118,7 +118,7 @@ record says otherwise.
 ## User-managed artwork
 
 Advanced View → Settings → “5. Platform artwork” manages upgrade-stable user
-artwork under `~/.local/share/archivefs/platform-artwork/`. ArchiveFS never
+artwork under `~/.local/share/archivefs/platform-artwork/`. EmuWiz never
 writes overrides into its installation or source tree. The manager supports
 search/filter, one explicit platform at a time, confirmed removal, folder
 preview/import, and a read-only rescan. Custom PNGs remain higher priority
@@ -150,7 +150,7 @@ placed in the managed folder and validated by Rescan.
 
 The same operations are available through `archivefs-cli platform-artwork`.
 No artwork command uses the network, database, ROM library, or emulator
-profiles. Removing or restoring default artwork removes only ArchiveFS's
+profiles. Removing or restoring default artwork removes only EmuWiz's
 normalised managed copy, never the source selected during import.
 
 ## SVG/category fallbacks

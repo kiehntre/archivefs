@@ -6,7 +6,7 @@ the DAT audit and the PR #13 matching policy.
 
 ## 1. Purpose and hard rule
 
-ArchiveFS can verify a local ROM against a DAT catalogue and, with the
+EmuWiz can verify a local ROM against a DAT catalogue and, with the
 user's matching policy, say *which* catalogue entry a file is. This stage turns
 that into a **proposal**: a suggested canonical filename, why it was chosen,
 and anything that blocks it.
@@ -74,7 +74,7 @@ status, sanitisation notes, object kind, and `actionable`.
 2. reject any `/`, `\` or NUL (Blocked - never sanitised into a traversal);
 3. compare extensions case-insensitively: equal or both-absent ⇒
    `Preserved`; different ⇒ `Unsupported` (container/member rename not
-   supported; no such mapping exists in ArchiveFS today);
+   supported; no such mapping exists in EmuWiz today);
 4. replace filesystem-invalid characters (control characters everywhere;
    the Windows-reserved set on Windows) with `_`, recording each replacement;
 5. re-check the result is a non-empty single component.
@@ -143,7 +143,7 @@ separately-approved step.
 
 A "Rename planning" section on the DAT Sources page, shown after an audit:
 
-- prominent **"Planning only — ArchiveFS will not rename any files"** banner;
+- prominent **"Planning only — EmuWiz will not rename any files"** banner;
 - counts by state and filters (All / Suggested / Already canonical / Ambiguous
   / Conflicts / Unsupported / Blocked);
 - per-proposal rows with current → proposed names, platform, source, match

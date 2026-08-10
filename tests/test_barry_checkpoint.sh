@@ -2,7 +2,7 @@
 # Shell-level tests for scripts/barry-checkpoint.sh.
 #
 # Exercises barry-checkpoint.sh entirely inside disposable, temporary fake
-# ArchiveFS repositories (their own `git init`, their own Cargo.toml /
+# EmuWiz repositories (their own `git init`, their own Cargo.toml /
 # Cargo.lock, their own copy of the script under scripts/) - it never
 # touches this real repository's working tree, git history, or
 # .barry-cache/. Run it directly:
@@ -85,7 +85,7 @@ assert_equal() {
     if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (expected [$3], got [$2])"; fi
 }
 
-# make_fake_repo DIR - builds a minimal but genuine ArchiveFS-shaped
+# make_fake_repo DIR - builds a minimal but genuine EmuWiz-shaped
 # repository under DIR: a workspace Cargo.toml naming archivefs-core, an
 # empty crates/archivefs-core directory, a matching Cargo.lock, its own
 # git history (one commit), and its own copy of barry-checkpoint.sh under
@@ -299,7 +299,7 @@ assert_contains "error message mentions git repository" "$(cat "$errfile")" "git
 rm -f -- "$errfile"
 rm -rf -- "$work" "$plain_dir"
 
-echo "=== test: fails clearly inside a git repo that is not ArchiveFS ==="
+echo "=== test: fails clearly inside a git repo that is not EmuWiz ==="
 work=$(mktemp -d)
 other_repo="$work/other-repo"
 mkdir -p -- "$other_repo/scripts"
@@ -311,11 +311,11 @@ printf '[package]\nname = "unrelated"\n' >"$other_repo/Cargo.toml"
   cd "$other_repo" && git commit --quiet -m "unrelated repo" )
 errfile=$(mktemp)
 if "$other_repo/scripts/barry-checkpoint.sh" >/dev/null 2>"$errfile"; then
-    bad "exits non-zero inside a non-ArchiveFS git repository"
+    bad "exits non-zero inside a non-EmuWiz git repository"
 else
-    ok "exits non-zero inside a non-ArchiveFS git repository"
+    ok "exits non-zero inside a non-EmuWiz git repository"
 fi
-assert_contains "error message names the reason" "$(cat "$errfile")" "ArchiveFS repository"
+assert_contains "error message names the reason" "$(cat "$errfile")" "EmuWiz repository"
 rm -f -- "$errfile"
 rm -rf -- "$work"
 

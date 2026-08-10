@@ -162,7 +162,7 @@ impl std::error::Error for DuplicateSourceId {}
 /// A preferences entry this build cannot act on, kept exactly as written.
 ///
 /// Not an error and not a warning about the file being wrong: the usual cause
-/// is a provider a different ArchiveFS build knows about, or a typo the user
+/// is a provider a different EmuWiz build knows about, or a typo the user
 /// can fix. Either way the entry is inert - it never affects resolution - and
 /// it is never rewritten or dropped.
 #[derive(Debug, Clone, PartialEq, Eq)]

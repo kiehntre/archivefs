@@ -26,7 +26,7 @@
 //! serial/CRC to a catalogue row: **the catalogue game itself is the only
 //! input**, and every entry below is produced only from data already on
 //! local disk (the RetroArch installation environment already discovered
-//! by `emulator_environment::retroarch`, and the read-only ArchiveFS
+//! by `emulator_environment::retroarch`, and the read-only EmuWiz
 //! catalogue). See `docs/RETROARCH_PATCH_PREVIEW.md` for the full design
 //! record, including the primary RetroArch source citations the cheat/
 //! patch destination conventions below are based on.
@@ -37,7 +37,7 @@
 //! that PCSX2 does not is **core selection**: RetroArch's own per-game
 //! cheat file path is scoped by which core loaded the content
 //! (`cheat_manager_get_game_specific_filename`'s `core_name` component),
-//! and ArchiveFS has no reliable way to know which installed core a user
+//! and EmuWiz has no reliable way to know which installed core a user
 //! would actually pick. This module resolves that only when it is
 //! genuinely unambiguous - exactly one installed core's own `.info`
 //! metadata (already inventoried by `emulator_environment::retroarch`,
@@ -317,7 +317,7 @@ pub struct RetroArchAdvisoryEntry {
     /// Lowercase file extension of the catalogue archive's own file (e.g.
     /// `"zip"`), or `None` if the archive has no extension or its
     /// extension is not valid UTF-8. This is the *archive's own* container
-    /// extension (ArchiveFS tracks Zip/SevenZip/Rar archives only) - not an
+    /// extension (EmuWiz tracks Zip/SevenZip/Rar archives only) - not an
     /// inner compressed entry's extension; see
     /// `docs/RETROARCH_PATCH_PREVIEW.md`'s "Non-goals" for why inner-entry
     /// inspection is out of scope here.
@@ -933,9 +933,9 @@ fn normalize_for_label_match(value: &str) -> String {
 
 /// Matches one playlist entry against every present catalogue archive,
 /// strongest evidence first - see `docs/RETROARCH_PLAYLISTS.md` for the
-/// full tier record. Never invents evidence ArchiveFS does not have: tier
+/// full tier record. Never invents evidence EmuWiz does not have: tier
 /// 2 ("archive path plus exact inner member identity") from the design
-/// review can never reach `Exact` here, because ArchiveFS has no inner-
+/// review can never reach `Exact` here, because EmuWiz has no inner-
 /// member identity to verify against - an archive-member path's outer
 /// archive match tops out at `Strong`, explicitly incomplete.
 fn match_entry_to_archives(
@@ -2366,7 +2366,7 @@ mod tests {
         let plan = build_retroarch_advisory_plan(&filesystem, report, vec![game]);
 
         let evidence = &plan.entries[0].profile_outcomes[0].playlist_evidence[0];
-        // Explicitly *not* Exact: ArchiveFS never has the inner member's
+        // Explicitly *not* Exact: EmuWiz never has the inner member's
         // own identity to verify against, so this evidence is incomplete
         // even though the outer archive path matched exactly.
         assert_eq!(evidence.confidence, PlaylistMatchConfidence::Strong);
@@ -2671,7 +2671,7 @@ mod tests {
             )],
         );
         // The `archive()` fixture derives `normalized_name` by simply
-        // lowercasing `relative` - unlike the real ArchiveFS scanner's own
+        // lowercasing `relative` - unlike the real EmuWiz scanner's own
         // normalization, it does not strip spaces/punctuation. Using a
         // single-word name here keeps this test isolated to the
         // label-matching *tier* itself rather than exercising two
@@ -2733,10 +2733,10 @@ mod tests {
 
     #[test]
     fn inner_crc_is_never_compared_to_outer_archive_identity() {
-        // ArchiveFS has no per-archive checksum field at all
+        // EmuWiz has no per-archive checksum field at all
         // (`PersistedArchive` carries none), so a playlist entry's CRC -
         // which may describe an *inner* file inside an archive - can
-        // never be compared against anything ArchiveFS has for the outer
+        // never be compared against anything EmuWiz has for the outer
         // archive. This test locks in that the verified-CRC tier
         // structurally cannot fire: matching never even inspects `crc`,
         // only `content_path`/`label`.

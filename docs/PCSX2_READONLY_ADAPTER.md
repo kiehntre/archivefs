@@ -1,6 +1,6 @@
 # Read-only PCSX2 Cheats & Mods adapter
 
-ArchiveFS can discover local PCSX2 profiles and inspect their existing PNACH
+EmuWiz can discover local PCSX2 profiles and inspect their existing PNACH
 files from the Cheats & Mods workspace. This adapter is observational only. It
 does not start PCSX2, evaluate patch directives, download a patch collection,
 or create, copy, modify, enable, disable, rename, delete, sanitize, or generate
@@ -16,14 +16,14 @@ The default Linux discovery checks only documented locations:
 - Flatpak user and system installation markers, used only to describe scope. A
   system Flatpak still has a per-user configuration;
 - portable/AppImage roots only when another trusted component supplies an
-  exact, already-known configuration root. ArchiveFS does not search arbitrary
+  exact, already-known configuration root. EmuWiz does not search arbitrary
   locations or infer portable roots from filenames.
 
 A profile must use an absolute, non-root path; every existing path component
 must be a real directory rather than a symlink; and the configuration must
 contain a no-follow `inis` directory or `PCSX2.ini` marker. Existing unsafe or
 unproven candidates remain visible as blocked. Missing standard candidates are
-ignored and missing explicit portable roots are reported as blocked. ArchiveFS
+ignored and missing explicit portable roots are reported as blocked. EmuWiz
 never creates a missing profile or patch directory. On Unix, device/inode
 identity is captured during discovery and checked again before inventory.
 

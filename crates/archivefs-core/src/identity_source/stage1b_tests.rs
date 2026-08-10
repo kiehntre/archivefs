@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 // --- Fixtures -------------------------------------------------------------
 
-/// A temporary tree with a library root and an ArchiveFS-owned identity root.
+/// A temporary tree with a library root and an EmuWiz-owned identity root.
 struct Tree {
     root: PathBuf,
 }
@@ -1865,7 +1865,7 @@ fn a_platform_disagreement_with_verified_local_evidence_is_ambiguous() {
     let tree = Tree::new("match-platform-conflict");
     let contents = b"1234567890";
     let path = tree.file("nes/game.zip", contents);
-    // RomM says NES; ArchiveFS verified Atari ST from the file itself.
+    // RomM says NES; EmuWiz verified Atari ST from the file itself.
     let record = matchable(path.clone(), Some(10), Vec::new(), Some("NES"));
     let outcome = match_record(
         &record,

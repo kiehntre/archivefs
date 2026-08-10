@@ -3,6 +3,22 @@ name = "archivefs-gui"
 version.workspace = true
 edition.workspace = true
 
+# Binary naming during the EmuWiz rename (staged): `emuwiz` and
+# `emuwiz-gui` are the primary names; `archivefs-gui` remains as a legacy
+# compatibility alias so existing launchers keep working. All three run the
+# exact same code.
+[[bin]]
+name = "emuwiz"
+path = "src/main.rs"
+
+[[bin]]
+name = "emuwiz-gui"
+path = "src/main.rs"
+
+[[bin]]
+name = "archivefs-gui"
+path = "src/main.rs"
+
 [dependencies]
 archivefs-core = { path = "../archivefs-core" }
 log = "0.4"

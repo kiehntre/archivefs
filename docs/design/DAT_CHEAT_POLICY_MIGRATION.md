@@ -200,7 +200,7 @@ Required sequence, and it cannot be reordered:
 2. **Only then start writing `format_version = 1`** plus any new field.
 3. A user who downgrades to a binary older than step 1 will find the file
    unreadable. The failure must be a clear "this preferences file was written by
-   a newer ArchiveFS" message with the path, and the binary must **fall back to
+   a newer EmuWiz" message with the path, and the binary must **fall back to
    built-in defaults rather than deleting or rewriting the file**.
 
 > REVIEW FIX — the original §3 described versioning a document that was assumed
@@ -236,7 +236,7 @@ The new policy version is separate from the existing counters it coexists with:
 - `CHEAT_SOURCE_LEGACY_SCHEMA_VERSION` — remains the floor for reading old
   manifests.
 - Library DB `schema_version` — untouched; the policy document is not stored in
-  the ArchiveFS library database (model §1.1).
+  the EmuWiz library database (model §1.1).
 - `cheat_sources.toml` — **currently unversioned**; gains `format_version` only
   via the two-release sequence above.
 
@@ -344,7 +344,7 @@ Two distinct rollback cases:
 
 ### 5.3 Downgrade (binary) rollback
 
-If a user reinstalls an older ArchiveFS binary:
+If a user reinstalls an older EmuWiz binary:
 
 - The older binary reads the library/cache as before; the policy document is
   simply a file it does not read. This is safe **only if** the newer binary
@@ -546,7 +546,7 @@ section listed; this table is the index.
 | --- | --- | --- |
 | 1 | **DAT and cheat sources use separate priority spaces.** They answer different questions and are never compared. | model §5.2; GUI §1.6, §3.11 |
 | 2 | **DAT priorities are ordered only against other DAT sources relevant to the same platform.** Ordering is computed per platform over the relevant subset; sources covering disjoint platforms never compare. Default `100`. | model §5.2, §5.5; §15.3 |
-| 3 | **Shipping a scraper or provider does not mean ArchiveFS reviewed or endorsed the upstream content.** Trust describes the integration only, and the label always carries that scope. | model §3.1, §3.2, §3.5; GUI §3.5 |
+| 3 | **Shipping a scraper or provider does not mean EmuWiz reviewed or endorsed the upstream content.** Trust describes the integration only, and the label always carries that scope. | model §3.1, §3.2, §3.5; GUI §3.5 |
 | 4 | **The shipped lower-number-wins cheat priority rule is preserved** for compatibility, and not inverted. The GUI renders resolved position rather than the bare number. | model §5.1; GUI §3.11 |
 | 5 | **Rename safety remains `NeverSuggest` for the first implementation.** The other modes are future design only and must not appear as active GUI controls — not even disabled ones. | model §12; GUI §2.6, §5.3 |
 | 6 | **Preference writes gain durable atomic-write semantics**: file `sync_all`, then rename, then parent-directory sync where the platform supports it. | migration §3.3 |

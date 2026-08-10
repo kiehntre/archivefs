@@ -30,7 +30,7 @@ trap 'printf "\nFailed near line %s\n" "$LINENO" >&2' ERR
     "Set NOBARA_HOST, for example: NOBARA_HOST=davedap@192.168.1.50 $0"
 
 [[ -d "$PROJECT_DIR/.git" ]] || die \
-    "ArchiveFS repository not found at $PROJECT_DIR"
+    "EmuWiz repository not found at $PROJECT_DIR"
 
 cd "$PROJECT_DIR"
 
@@ -66,8 +66,8 @@ fi
 log "Building release binaries"
 cargo build --workspace --release --locked
 
-CLI="$PROJECT_DIR/target/release/archivefs-cli"
-GUI="$PROJECT_DIR/target/release/archivefs-gui"
+CLI="$PROJECT_DIR/target/release/emuwiz-cli"
+GUI="$PROJECT_DIR/target/release/emuwiz"
 
 [[ -x "$CLI" ]] || die "Missing release CLI: $CLI"
 [[ -x "$GUI" ]] || die "Missing release GUI: $GUI"
@@ -79,8 +79,8 @@ cleanup_local
 mkdir -p "$BUNDLE_NAME"
 
 log "Assembling temporary test bundle"
-install -m755 "$CLI" "$BUNDLE_NAME/archivefs-cli"
-install -m755 "$GUI" "$BUNDLE_NAME/archivefs-gui"
+install -m755 "$CLI" "$BUNDLE_NAME/emuwiz-cli"
+install -m755 "$GUI" "$BUNDLE_NAME/emuwiz"
 install -m755 install.sh "$BUNDLE_NAME/install.sh"
 
 for file in README.md CHANGELOG.md; do
@@ -105,17 +105,17 @@ done
 shopt -u nullglob
 
 log "Verifying copied binaries"
-cmp --silent "$CLI" "$BUNDLE_NAME/archivefs-cli" ||
-    die "Bundled CLI differs from target/release/archivefs-cli"
+cmp --silent "$CLI" "$BUNDLE_NAME/emuwiz-cli" ||
+    die "Bundled CLI differs from target/release/emuwiz-cli"
 
-cmp --silent "$GUI" "$BUNDLE_NAME/archivefs-gui" ||
-    die "Bundled GUI differs from target/release/archivefs-gui"
+cmp --silent "$GUI" "$BUNDLE_NAME/emuwiz" ||
+    die "Bundled GUI differs from target/release/emuwiz"
 
-"$BUNDLE_NAME/archivefs-cli" --version
+"$BUNDLE_NAME/emuwiz-cli" --version
 
 if [[ -n "$EXPECTED_COMMAND_PATTERN" ]]; then
     log "Checking expected CLI commands"
-    if ! "$BUNDLE_NAME/archivefs-cli" --help |
+    if ! "$BUNDLE_NAME/emuwiz-cli" --help |
         grep -E "$EXPECTED_COMMAND_PATTERN"
     then
         die "Expected CLI command pattern not found: $EXPECTED_COMMAND_PATTERN"
@@ -131,10 +131,10 @@ trap 'rm -rf "$TEST_DIR"; cleanup_local' EXIT
 
 tar -xzf "${BUNDLE_NAME}.tar.gz" -C "$TEST_DIR"
 
-"$TEST_DIR/$BUNDLE_NAME/archivefs-cli" --version
+"$TEST_DIR/$BUNDLE_NAME/emuwiz-cli" --version
 
 if [[ -n "$EXPECTED_COMMAND_PATTERN" ]]; then
-    "$TEST_DIR/$BUNDLE_NAME/archivefs-cli" --help |
+    "$TEST_DIR/$BUNDLE_NAME/emuwiz-cli" --help |
         grep -E "$EXPECTED_COMMAND_PATTERN" >/dev/null ||
         die "Expected commands missing from extracted tarball"
 fi
@@ -166,11 +166,11 @@ tar -xzf "${BUNDLE_NAME}.tar.gz"
 cd "$BUNDLE_NAME"
 
 printf '\n==> Bundle version before installation\n'
-./archivefs-cli --version
+./emuwiz-cli --version
 
 if [[ -n "$EXPECTED_COMMAND_PATTERN" ]]; then
     printf '\n==> Checking expected commands before installation\n'
-    ./archivefs-cli --help |
+    ./emuwiz-cli --help |
         grep -E "$EXPECTED_COMMAND_PATTERN"
 fi
 
@@ -181,7 +181,7 @@ if [[ -f "$DB" ]]; then
     printf '\n==> Backing up database to %s\n' "$BACKUP"
     cp --preserve=mode,timestamps "$DB" "$BACKUP"
 else
-    printf '\n==> No existing ArchiveFS database to back up\n'
+    printf '\n==> No existing EmuWiz database to back up\n'
 fi
 
 printf '\n==> Installing test build\n'
@@ -190,26 +190,26 @@ chmod +x install.sh
 hash -r
 
 printf '\n==> Installed binary paths\n'
-command -v archivefs-cli
-command -v archivefs-gui
+command -v emuwiz-cli
+command -v emuwiz
 
 printf '\n==> Installed version\n'
-archivefs-cli --version
+emuwiz-cli --version
 
 if [[ -n "$EXPECTED_COMMAND_PATTERN" ]]; then
     printf '\n==> Checking expected installed commands\n'
-    archivefs-cli --help |
+    emuwiz-cli --help |
         grep -E "$EXPECTED_COMMAND_PATTERN"
 fi
 
 printf '\n==> Running doctor\n'
-archivefs-cli doctor
+emuwiz-cli doctor
 
 printf '\n==> Checking configuration\n'
-archivefs-cli config-check
+emuwiz-cli config-check
 
 printf '\n==> Checking persistent library\n'
-archivefs-cli library-status
+emuwiz-cli library-status
 
 printf '\n==> CLI deployment smoke test passed\n'
 REMOTE_SCRIPT
@@ -217,7 +217,7 @@ REMOTE_SCRIPT
 log "Deployment completed successfully"
 
 printf '\nManual GUI test still required on Nobara:\n'
-printf '  archivefs-gui\n'
+printf '  emuwiz\n'
 printf '\nTest the new controls, asynchronous refresh, selection behaviour,\n'
 printf 'unknown filtering, and confirm mount state does not change.\n'
 

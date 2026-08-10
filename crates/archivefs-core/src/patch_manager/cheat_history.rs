@@ -820,13 +820,13 @@ fn reconstruct_direct_child(root: &Path, encoded: &CheatInstallPath) -> Result<P
     let path = PathBuf::from(&encoded.display);
     let relative = path
         .strip_prefix(root)
-        .map_err(|_| "path is outside the expected ArchiveFS root".to_string())?;
+        .map_err(|_| "path is outside the expected EmuWiz root".to_string())?;
     if relative.components().count() != 1
         || !matches!(relative.components().next(), Some(Component::Normal(_)))
         || root.join(relative) != path
     {
         return Err(
-            "path is not a direct, traversal-free child of the expected ArchiveFS root".into(),
+            "path is not a direct, traversal-free child of the expected EmuWiz root".into(),
         );
     }
     Ok(path)

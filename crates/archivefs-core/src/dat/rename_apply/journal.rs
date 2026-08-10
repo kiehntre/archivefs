@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::ArchiveFsError;
 use crate::dat::rename_apply::model::{EntryState, RenameTransaction, TransactionState};
 
-/// The journal directory's name under the ArchiveFS data directory.
+/// The journal directory's name under the EmuWiz data directory.
 pub const RENAME_TRANSACTIONS_DIRECTORY: &str = "rename-transactions";
 
 /// How long a journal filename may grow before it is unusable.
@@ -31,20 +31,17 @@ const MAX_JOURNAL_NAME_BYTES: usize = 128;
 /// Monotonic per-process sequence for transaction ids and journal names.
 static TRANSACTION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// The default journal directory: `~/.local/share/archivefs/rename-transactions`.
+/// The default journal directory: `rename-transactions/` under the effective
+/// data directory (EmuWiz's or the legacy ArchiveFS one).
 pub fn default_rename_transaction_dir() -> Result<PathBuf, ArchiveFsError> {
-    rename_transaction_dir_in(std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")))
+    Ok(crate::app_dirs::data_dir()?.join(RENAME_TRANSACTIONS_DIRECTORY))
 }
 
 /// The logic behind [`default_rename_transaction_dir`], with the home injected
 /// so tests can exercise the no-home case without racing on the environment.
 pub fn rename_transaction_dir_in(home: Option<OsString>) -> Result<PathBuf, ArchiveFsError> {
     let home = home.ok_or_else(|| ArchiveFsError::Config("HOME is not set".to_string()))?;
-    Ok(PathBuf::from(home)
-        .join(".local")
-        .join("share")
-        .join("archivefs")
-        .join(RENAME_TRANSACTIONS_DIRECTORY))
+    Ok(crate::app_dirs::data_dir_in(Path::new(&home)).join(RENAME_TRANSACTIONS_DIRECTORY))
 }
 
 /// A stable, unique transaction id: `<unix_seconds>-<sequence>`.
@@ -179,6 +176,93 @@ pub fn terminal_state_after_apply(transaction: &RenameTransaction) -> Transactio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn journal_directory_uses_emuwiz_for_a_fresh_home() {
+        let home = tempfile::tempdir().unwrap();
+        let path = rename_transaction_dir_in(Some(home.path().as_os_str().to_os_string())).unwrap();
+        assert_eq!(
+            path,
+            home.path().join(".local/share/emuwiz/rename-transactions")
+        );
+    }
+
+    #[test]
+    fn journal_directory_reuses_legacy_and_prefers_emuwiz() {
+        let home = tempfile::tempdir().unwrap();
+        let legacy = home.path().join(".local/share/archivefs");
+        std::fs::create_dir_all(&legacy).unwrap();
+        let home_arg = Some(home.path().as_os_str().to_os_string());
+        assert_eq!(
+            rename_transaction_dir_in(home_arg.clone()).unwrap(),
+            legacy.join(RENAME_TRANSACTIONS_DIRECTORY)
+        );
+
+        let primary = home.path().join(".local/share/emuwiz");
+        std::fs::create_dir_all(&primary).unwrap();
+        assert_eq!(
+            rename_transaction_dir_in(home_arg).unwrap(),
+            primary.join(RENAME_TRANSACTIONS_DIRECTORY)
+        );
+    }
+
+    /// Simulates upgrading an existing ArchiveFS install (only the legacy
+    /// data directory exists) that has an interrupted rename transaction on
+    /// disk at the moment EmuWiz starts: the journal must still be found,
+    /// through the exact resolution path production code uses, and nothing
+    /// about resolving it may create a second EmuWiz-named journal directory
+    /// or leave a second copy of the journal anywhere.
+    #[test]
+    fn a_legacy_in_flight_journal_is_discovered_after_upgrade_without_stranding_or_duplication() {
+        let home = tempfile::tempdir().unwrap();
+        let legacy_dir = home
+            .path()
+            .join(".local/share/archivefs/rename-transactions");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+
+        let mut tx = transaction(TransactionState::Applying);
+        tx.transaction_id = "legacy-in-flight".to_string();
+        write_journal(&legacy_dir, &tx).unwrap();
+
+        // Resolve the same way `default_rename_transaction_dir` does for a
+        // real upgrade: same underlying helper, injected home instead of the
+        // process environment.
+        let resolved_dir =
+            rename_transaction_dir_in(Some(home.path().as_os_str().to_os_string())).unwrap();
+        assert_eq!(
+            resolved_dir, legacy_dir,
+            "an upgrade must resolve to the legacy directory the journal already lives in"
+        );
+
+        let (recovery, problems) = find_recovery_transactions(&resolved_dir);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(
+            recovery.len(),
+            1,
+            "the in-flight legacy transaction must be discovered exactly once"
+        );
+        assert_eq!(recovery[0].transaction_id, "legacy-in-flight");
+
+        // Not stranded: resolution never created a second, EmuWiz-named
+        // journal directory alongside the legacy one.
+        let emuwiz_dir = home.path().join(".local/share/emuwiz/rename-transactions");
+        assert!(
+            !emuwiz_dir.exists(),
+            "resolution must not create or write a second, EmuWiz-named journal directory"
+        );
+
+        // Not duplicated: exactly one journal file exists anywhere under the
+        // legacy directory - discovery read it, it did not get copied.
+        let journal_files: Vec<_> = std::fs::read_dir(&legacy_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(
+            journal_files.len(),
+            1,
+            "exactly one journal file must exist, not a duplicate in a second location"
+        );
+    }
     use crate::dat::rename_apply::model::{ObjectIdentity, ObjectKind, TransactionEntry};
     use std::path::PathBuf;
 

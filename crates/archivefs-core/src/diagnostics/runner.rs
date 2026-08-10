@@ -122,7 +122,7 @@ pub struct DoctorScanInputs<'a> {
     /// was computed for.
     pub index_freshness: Gathered<(&'a ArchiveIndexFreshness, &'a std::path::Path)>,
     /// From `environment::assess_storage` - free space and mount mode for
-    /// every filesystem ArchiveFS depends on.
+    /// every filesystem EmuWiz depends on.
     pub storage: Gathered<&'a StorageAssessment>,
     /// From `profiles::assess_emulator_profiles`.
     pub emulator_profiles: Gathered<&'a ProfileAssessmentReport>,
@@ -159,7 +159,7 @@ impl<'a> DoctorScanInputs<'a> {
                 "Emulator profiles have not been discovered in this session.",
             ),
             managed_entries: Gathered::NotLoaded(
-                "ArchiveFS-managed cheat entries have not been scanned yet.",
+                "EmuWiz-managed cheat entries have not been scanned yet.",
             ),
             free_space_policy: FreeSpacePolicy::default(),
         }
@@ -203,7 +203,7 @@ pub struct DoctorScan {
     pub findings: Vec<Finding>,
     /// Which subsystems were actually checked, and why any were not.
     pub coverage: Vec<SubsystemCoverage>,
-    /// Checks ArchiveFS does not perform yet. Always the full list, so a
+    /// Checks EmuWiz does not perform yet. Always the full list, so a
     /// clean result cannot be read as complete coverage.
     pub deferred: &'static [DeferredCheck],
     /// How many duplicate findings were merged away. Surfaced so the

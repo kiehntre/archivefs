@@ -62,7 +62,7 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             if json {
                 println!("{{\n  \"removed\": true,\n  \"provider\": \"bsfree-archive\"\n}}");
             } else {
-                println!("Removed ArchiveFS's local BSFree source copy only.");
+                println!("Removed EmuWiz's local BSFree source copy only.");
             }
         }
         "systems" => {
@@ -146,7 +146,7 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
                          unsupported formats remain browse-only"
                             .to_string()
                     } else {
-                        "No ArchiveFS adapter can install codes for this platform; browse-only"
+                        "No EmuWiz adapter can install codes for this platform; browse-only"
                             .to_string()
                     },
                     installable_cheat_count: installable_count,
@@ -206,7 +206,7 @@ fn cheat_capability(
         Some(BsFreeGameCubeCodeFormat::Malformed) => {
             "browse-only: not a well-formed hex-pair code".to_string()
         }
-        None => "reference only: no ArchiveFS adapter for this platform/format".to_string(),
+        None => "reference only: no EmuWiz adapter for this platform/format".to_string(),
     };
     CheatCapability {
         upstream_id: cheat.upstream_id,
@@ -686,7 +686,7 @@ mod tests {
         assert!(!capability.installable);
         assert_eq!(
             capability.capability,
-            "reference only: no ArchiveFS adapter for this platform/format"
+            "reference only: no EmuWiz adapter for this platform/format"
         );
     }
 

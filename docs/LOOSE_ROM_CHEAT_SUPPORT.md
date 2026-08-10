@@ -1,6 +1,6 @@
 # Loose-ROM RetroArch cheat support
 
-ArchiveFS treats supported loose cartridge ROMs as selectable library content,
+EmuWiz treats supported loose cartridge ROMs as selectable library content,
 not archive-mount inputs. This foundation is deliberately limited to Mega
 Drive/Genesis files already accepted by the scanner: `.md`, `.gen`, `.smd`, and
 contextual `.bin`. Shared identity can also inspect `.sfc` and `.smc` with an
@@ -21,7 +21,7 @@ remain the identity for non-UTF-8 paths.
 
 The digest verifies that preview refers to stable local bytes. It does not say
 that the ROM is a known-good dump, authentic, safe, legally owned, or compatible
-with any emulator. `.smd` is hashed exactly as stored; ArchiveFS does not strip
+with any emulator. `.smd` is hashed exactly as stored; EmuWiz does not strip
 headers, deinterleave, normalize, rewrite, or calculate a canonical ROM hash.
 
 Trusted-catalogue materialization continues to require exact or already-
@@ -41,7 +41,7 @@ loose entry remains visible and removable but is skipped before a mount attempt;
 valid archive entries in the same queue still proceed. Direct core mount
 validation independently rejects loose ROMs.
 
-The GUI uses the wording `Loose ROM · no ArchiveFS mount required` and retains
+The GUI uses the wording `Loose ROM · no EmuWiz mount required` and retains
 selection, inspection, copy-path, platform, Recently Found, and Cheats & Mods
 actions.
 
@@ -58,7 +58,7 @@ file, and 16 MiB total matching bytes read. Symlinks and unsafe roots are
 refused. Results distinguish Not found, normalized filename Candidate, Exact
 local filename, Ambiguous, Unsafe, Unavailable, and Limit reached. These labels
 describe path evidence only; local cheat compatibility and trust remain
-unverified. Trusted ArchiveFS snapshot matching is a separate pipeline.
+unverified. Trusted EmuWiz snapshot matching is a separate pipeline.
 
 ## Catalogue retrieval bounds
 

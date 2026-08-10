@@ -42,7 +42,7 @@ use crate::ui::{components as widgets, theme};
 
 /// How a built-in source is described, everywhere it is described.
 ///
-/// ArchiveFS reviewed the address, the transport, the parser and the limits
+/// EmuWiz reviewed the address, the transport, the parser and the limits
 /// for these sources. It has not read the cheats they publish, and six of
 /// the nine carry community-submitted content. A bare "Reviewed" or
 /// "Trusted" badge would assert something untrue, so the scope travels with
@@ -51,7 +51,7 @@ pub(crate) const BUILT_IN_INTEGRATION_LABEL: &str =
     "Built-in integration — upstream content not reviewed";
 
 /// The sentence shown once per page, under the built-in label.
-pub(crate) const UPSTREAM_CONTENT_CAVEAT: &str = "ArchiveFS checked how each source is fetched and parsed. It has not reviewed the cheats or \
+pub(crate) const UPSTREAM_CONTENT_CAVEAT: &str = "EmuWiz checked how each source is fetched and parsed. It has not reviewed the cheats or \
      patches they publish, and does not endorse them. Codes come from the upstream community.";
 
 /// Priority reads backwards to most people, so it is never shown bare.
@@ -719,7 +719,7 @@ pub(crate) fn show_cheat_sources_page(
         ui,
         crate::ui::icons::CHEATS,
         "Cheat sources",
-        "Choose where ArchiveFS looks for cheats and patches.",
+        "Choose where EmuWiz looks for cheats and patches.",
     );
 
     if let Some(error) = &view.load_error {

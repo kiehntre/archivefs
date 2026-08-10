@@ -1,4 +1,4 @@
-//! `archivefs-cli identity source romm <command>`.
+//! `emuwiz-cli identity source romm <command>`.
 //!
 //! Follows the conventions the rest of this binary already uses: a flat
 //! sub-command match, the shared `--json` flag, the `take_*` argument helpers,
@@ -202,7 +202,7 @@ struct Context<'a> {
     /// roots and therefore leave this absent, so fixtures can never touch a
     /// user's catalogue.
     database_path: Option<PathBuf>,
-    /// Where ArchiveFS keeps its own identity data, including the artwork cache.
+    /// Where EmuWiz keeps its own identity data, including the artwork cache.
     identity_root: PathBuf,
     settings: SettingsLocation,
     api: IdentitySourceApi,
@@ -1811,12 +1811,12 @@ fn report_progress(context: &Context, progress: ImportProgress) {
     ));
 }
 
-/// Local facts for one record: metadata only, and a platform ArchiveFS itself
+/// Local facts for one record: metadata only, and a platform EmuWiz itself
 /// determined where the registry can say so from the path.
 fn facts_for(record: &ExternalIdentityRecord, _trusted: &TrustedRoots) -> LocalFileFacts {
     match record.archivefs_path.as_deref() {
         Some(path) => {
-            // The platform ArchiveFS would derive from the path alone. Folder
+            // The platform EmuWiz would derive from the path alone. Folder
             // evidence is not conclusive, so it is reported as weak - which is
             // what stops it from being treated as a verified local identity.
             let local = archivefs_core::platform::detect::platform_for_folder_name(
@@ -2080,7 +2080,7 @@ fn conflicts(context: &Context, mut args: Vec<String>) -> Result<(), Box<dyn std
                 .any(|item| item.contains("not displaced"))
             {
                 lines.push(
-                    "    ArchiveFS's own identity is stronger and was not replaced.".to_string(),
+                    "    EmuWiz's own identity is stronger and was not replaced.".to_string(),
                 );
             }
         }
@@ -2492,7 +2492,7 @@ fn remove(context: &Context, mut args: Vec<String>) -> Result<(), Box<dyn std::e
     let result = RemovalResult {
         cache_removed,
         config_removed,
-        // The token belongs to the person, not to ArchiveFS.
+        // The token belongs to the person, not to EmuWiz.
         token_file_kept: settings.source.token_path.clone(),
         romm_modified: false,
         roms_modified: false,
@@ -2561,7 +2561,7 @@ fn confine_to_roots(
         .map(|parent| parent.join(path.file_name().unwrap_or_default()));
     if !lexical.as_deref().is_some_and(&inside) {
         return Err(format!(
-            "{} is not inside a configured source folder, so ArchiveFS will not read it",
+            "{} is not inside a configured source folder, so EmuWiz will not read it",
             path.display()
         )
         .into());
@@ -2579,7 +2579,7 @@ fn confine_to_roots(
     })?;
     if !inside(&resolved) {
         return Err(format!(
-            "{} leads out of your configured source folders, to {}; ArchiveFS will not follow it",
+            "{} leads out of your configured source folders, to {}; EmuWiz will not follow it",
             path.display(),
             resolved.display()
         )
@@ -3115,7 +3115,7 @@ fn artwork(context: &Context, mut args: Vec<String>) -> Result<(), Box<dyn std::
             "What the catalogue offers".to_string(),
             format!(
                 "  {} record(s) have a cover on your RomM instance, which is the only place \
-                 ArchiveFS fetches from",
+                 EmuWiz fetches from",
                 report.fetchable_records
             ),
             format!(

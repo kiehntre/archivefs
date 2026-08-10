@@ -59,7 +59,7 @@ pub const MAX_CHEAT_CANDIDATE_EVIDENCE: usize = 12;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CheatCandidateArchive {
     pub display_name: String,
-    /// Canonical ArchiveFS platform name, or a recognizable alias.
+    /// Canonical EmuWiz platform name, or a recognizable alias.
     pub platform: Option<String>,
     pub region: Option<String>,
     /// Serial / product code (`SLUS-12345`), when identity resolved one.

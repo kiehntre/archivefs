@@ -26,7 +26,7 @@ installed core only through the archive's own outer file extension
 most:
 
 - **Compressed content**: a core that only declares an uncompressed
-  extension (e.g. `sfc`) never matches an ArchiveFS-managed `.zip`
+  extension (e.g. `sfc`) never matches an EmuWiz-managed `.zip`
   archive directly, even when RetroArch itself would happily load it.
 - **Shared extensions**: several installed cores (e.g. multiple arcade
   cores, or several consoles that all read `.zip`) commonly share the
@@ -53,7 +53,7 @@ intentional crossing of the "sibling, not part of" boundary between
 
 Playlist-to-catalogue **matching and core association** lives in
 `archivefs-core::patch_manager::retroarch`, since it needs the read-only
-ArchiveFS catalogue, which `emulator_environment` never touches.
+EmuWiz catalogue, which `emulator_environment` never touches.
 
 ## Verified playlist format
 
@@ -198,9 +198,9 @@ digits are canonicalized to uppercase (a lossless case fold, never a
 guess). `Placeholder` is the literal `"00000000|crc"`. Anything else
 non-empty is `Malformed` and is reported, never coerced into looking
 valid. **The CRC is never used as matching evidence** in this milestone:
-ArchiveFS has no per-archive checksum field at all (`PersistedArchive`
+EmuWiz has no per-archive checksum field at all (`PersistedArchive`
 carries none), and a playlist's CRC may describe an *inner* file inside
-an archive rather than the outer archive ArchiveFS actually tracks -
+an archive rather than the outer archive EmuWiz actually tracks -
 comparing the two would silently conflate different logical objects. The
 CRC is exposed only as informational evidence alongside whatever
 `content_path`/`label` matching actually found.
@@ -224,7 +224,7 @@ existing PCSX2/RetroArch precedent), strongest evidence first:
    catalogue archive's real path exactly, byte-for-byte.
 2. **Strong** - an archive-member path's *outer* archive portion matches
    a catalogue archive's path exactly (the inner member is never
-   verified - ArchiveFS has no inner-member identity to check against,
+   verified - EmuWiz has no inner-member identity to check against,
    so this deliberately never reaches `Exact`); or a normalized basename
    matches and the catalogue archive has a known platform (the only
    honestly available "corroborating evidence" without a `db_name`-to-

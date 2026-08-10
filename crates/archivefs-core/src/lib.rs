@@ -16,6 +16,10 @@ use serde::ser::{SerializeMap, SerializeStruct};
 use serde::{Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
+/// App-directory resolution with legacy ArchiveFS compatibility. See the
+/// module for the reuse-not-migrate strategy that keeps existing user data
+/// reachable during the EmuWiz rename.
+pub mod app_dirs;
 mod database;
 /// Read-only Doctor diagnostics: one shared finding model plus adapters
 /// over the existing per-subsystem reports. See the module documentation
@@ -842,9 +846,9 @@ fn run_setup_diagnostics_default_with_path(config_path: Result<PathBuf>) -> Setu
                 name: "Config path".to_string(),
                 status: SetupDiagnosticStatus::Error,
                 detail: format!(
-                    "ArchiveFS could not determine the user configuration directory: {error}"
+                    "EmuWiz could not determine the user configuration directory: {error}"
                 ),
-                why_it_matters: "ArchiveFS needs a known configuration location.".to_string(),
+                why_it_matters: "EmuWiz needs a known configuration location.".to_string(),
                 next_step: "Set HOME and refresh diagnostics.".to_string(),
             }],
         },
@@ -860,7 +864,7 @@ fn run_setup_diagnostics_default_with_path(config_path: Result<PathBuf>) -> Setu
 /// root, which changes that directory's modification time - unacceptable
 /// for a strictly read-only diagnostic.
 ///
-/// `ready_for_actions` is therefore always `false` here: ArchiveFS cannot
+/// `ready_for_actions` is therefore always `false` here: EmuWiz cannot
 /// honestly assert that mount and unmount actions are usable without having
 /// established writability.
 pub fn run_setup_diagnostics_read_only(config_path: impl AsRef<Path>) -> SetupDiagnostics {
@@ -992,7 +996,7 @@ fn run_setup_diagnostics_with_checks(
     // source_folders` directly. Reading that raw legacy field here used to
     // mean a config using only the newer `[[source]]` block format
     // reported zero source folders to diagnostics while the rest of the
-    // app correctly saw every structured, enabled source - "ArchiveFS is
+    // app correctly saw every structured, enabled source - "EmuWiz is
     // ready for scanning"/"...for mount/unmount actions" could then be
     // permanently false even with a fully valid, populated config. Enabled
     // filtering here mirrors `parse_config`'s own `Config.source_folders`
@@ -1046,7 +1050,7 @@ fn run_setup_diagnostics_with_checks(
     let ratarmount_ready = command_check(ratarmount_name);
     let unmount_ready = command_check("fusermount3") || command_check("umount");
     let ready_for_scanning = config_valid && sources_ready;
-    // An unprobed mount root can never make actions "ready": ArchiveFS has
+    // An unprobed mount root can never make actions "ready": EmuWiz has
     // not established that it can create mount points there.
     let ready_for_actions = ready_for_scanning
         && mount_root_ready
@@ -1059,7 +1063,7 @@ fn run_setup_diagnostics_with_checks(
         "Config file exists",
         config_read_ok,
         config_read_detail,
-        "ArchiveFS needs this file to locate archives and mounts.",
+        "EmuWiz needs this file to locate archives and mounts.",
         "Create a starter config or create this file manually.",
     );
     setup_check(
@@ -1067,7 +1071,7 @@ fn run_setup_diagnostics_with_checks(
         "Config parses successfully",
         fields.is_some(),
         parse_detail,
-        "Invalid TOML prevents ArchiveFS from reading any settings.",
+        "Invalid TOML prevents EmuWiz from reading any settings.",
         "Open the config and correct the reported fields or syntax.",
     );
     setup_check(
@@ -1080,7 +1084,7 @@ fn run_setup_diagnostics_with_checks(
             || "No usable source folder is configured.".to_string(),
             |sources| format!("{} source folder(s) configured.", sources.len()),
         ),
-        "Source folders contain the archives ArchiveFS scans.",
+        "Source folders contain the archives EmuWiz scans.",
         "Add at least one existing, enabled source folder (Sources page or source_folders).",
     );
     for (source, state) in &source_states {
@@ -1109,7 +1113,7 @@ fn run_setup_diagnostics_with_checks(
             || "No mount_root setting is available.".to_string(),
             |root| format!("Mount root: {}", root.display()),
         ),
-        "ArchiveFS places read-only archive mounts below this directory.",
+        "EmuWiz places read-only archive mounts below this directory.",
         "Set mount_root to a dedicated directory.",
     );
     setup_check_with_warning(
@@ -1144,7 +1148,7 @@ fn run_setup_diagnostics_with_checks(
                 || "No mount root is available to test.".to_string(),
                 |root| format!("Writable directory required: {}", root.display()),
             ),
-            "ArchiveFS must create mount-point directories below mount_root.",
+            "EmuWiz must create mount-point directories below mount_root.",
             "Grant the current user write access or choose another mount_root.",
         ),
         // Deliberately not probed - see `run_setup_diagnostics_read_only`.
@@ -1162,7 +1166,7 @@ fn run_setup_diagnostics_with_checks(
                 },
             ),
             why_it_matters:
-                "ArchiveFS must create mount-point directories below mount_root before it can mount anything."
+                "EmuWiz must create mount-point directories below mount_root before it can mount anything."
                     .to_string(),
             next_step:
                 "Run `archivefs config-check`, or use Settings -> Validate configuration, to test write access."
@@ -1178,7 +1182,7 @@ fn run_setup_diagnostics_with_checks(
         } else {
             format!("{ratarmount_name} was not found.")
         },
-        "ArchiveFS uses ratarmount to expose archive contents as read-only folders.",
+        "EmuWiz uses ratarmount to expose archive contents as read-only folders.",
         "Install ratarmount and ensure it is available on PATH, then refresh diagnostics.",
     );
     setup_check(
@@ -1190,12 +1194,12 @@ fn run_setup_diagnostics_with_checks(
         } else {
             "Neither fusermount3 nor umount was found.".to_string()
         },
-        "Without either tool, ArchiveFS cannot detach mounted archives.",
+        "Without either tool, EmuWiz cannot detach mounted archives.",
         "Install fusermount3 or provide umount on PATH, then refresh diagnostics.",
     );
     setup_check(
         &mut checks,
-        "ArchiveFS is ready for scanning",
+        "EmuWiz is ready for scanning",
         ready_for_scanning,
         "Scanning requires a valid config and all configured source folders.".to_string(),
         "Archive scanning populates the library shown in the GUI.",
@@ -1203,7 +1207,7 @@ fn run_setup_diagnostics_with_checks(
     );
     setup_check(
         &mut checks,
-        "ArchiveFS is ready for mount/unmount actions",
+        "EmuWiz is ready for mount/unmount actions",
         ready_for_actions,
         "Actions additionally require a writable mount root and system tools.".to_string(),
         "Mount and unmount controls are unsafe or unusable until these checks pass.",
@@ -1318,7 +1322,7 @@ pub fn create_starter_config(path: &Path) -> Result<()> {
         .map_err(|source| ArchiveFsError::io(path.to_path_buf(), source))?;
     use std::io::Write;
     file.write_all(
-        b"# ArchiveFS starter configuration\n\
+        b"# EmuWiz starter configuration\n\
           # No source folders are configured yet - that is fine, a fresh\n\
           # install with zero sources loads normally. Add your first one\n\
           # from the Sources page in the GUI, or from the command line:\n\
@@ -1626,13 +1630,7 @@ fn run_config_check_with_mount_root_creation(
 }
 
 pub fn default_config_path() -> Result<PathBuf> {
-    let home = env::var_os("HOME")
-        .or_else(|| env::var_os("USERPROFILE"))
-        .ok_or_else(|| ArchiveFsError::Config("HOME is not set".to_string()))?;
-    Ok(PathBuf::from(home)
-        .join(".config")
-        .join("archivefs")
-        .join("config.toml"))
+    app_dirs::config_path("config.toml")
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1986,7 +1984,7 @@ fn validate_master_rom_root(path: &Path) -> Result<()> {
 /// add/enable/disable/remove), the config no longer contains a plain
 /// `source_folders = [...]` line at all.
 ///
-/// Downgrade note: a pre-multi-source ArchiveFS build's parser only
+/// Downgrade note: a pre-multi-source EmuWiz build's parser only
 /// understands `key = value` / `key = [...]` lines (see
 /// `config.toml.example`'s own note on this), not `[[source]]` tables. If
 /// you downgrade to such a build after using any source-management
@@ -2004,7 +2002,7 @@ fn render_source_folder_configs(
     ratarmount_bin: &str,
     master_rom_root: Option<&Path>,
 ) -> String {
-    let mut out = String::from("# ArchiveFS configuration\n\n");
+    let mut out = String::from("# EmuWiz configuration\n\n");
     out.push_str(&format!(
         "mount_root = {}\n",
         quote_config_string(&mount_root.display().to_string())
@@ -2684,7 +2682,7 @@ pub struct RemoveSourceFolderOutcome {
     pub catalogue_rows_removed: Option<usize>,
 }
 
-/// Removes `target` from ArchiveFS configuration only - never the
+/// Removes `target` from EmuWiz configuration only - never the
 /// directory or any file inside it; this function never touches the
 /// filesystem the source folder points to at all. Defaults
 /// (`keep_catalogue = true`) to preserving every archive row the source
@@ -3037,7 +3035,7 @@ pub enum ArchiveKind {
     SevenZip,
     Rar,
     /// A loose Mega Drive/Genesis ROM. It is catalogued but deliberately
-    /// marked unsupported for ArchiveFS's archive-mount backend.
+    /// marked unsupported for EmuWiz's archive-mount backend.
     MegaDriveRom,
     /// A supported game image that is catalogued directly rather than
     /// requiring an archive wrapper. Scanning never mounts or modifies it.
@@ -3045,7 +3043,7 @@ pub enum ArchiveKind {
 }
 
 impl ArchiveKind {
-    /// Whether this library entry is an ArchiveFS archive-mount input.
+    /// Whether this library entry is an EmuWiz archive-mount input.
     /// Loose cartridge ROMs remain selectable library content but never
     /// become queue or mount candidates.
     pub fn is_mount_input(self) -> bool {
@@ -3687,7 +3685,7 @@ pub fn catalogue_filename_duplicates(archives: &[PersistedArchive]) -> Catalogue
 
 /// A single archive's overall health category - see `classify_archive_health`
 /// for the truthful, non-invented rules deriving this (v0.4.3-alpha, Health
-/// and Recovery Dashboard). Every variant here is backed by state ArchiveFS
+/// and Recovery Dashboard). Every variant here is backed by state EmuWiz
 /// can already observe reliably; nothing here is inferred or guessed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum HealthCategory {
@@ -5334,14 +5332,7 @@ impl ArchiveIndexFreshness {
 }
 
 pub fn default_index_path() -> Result<PathBuf> {
-    let home = env::var_os("HOME")
-        .or_else(|| env::var_os("USERPROFILE"))
-        .ok_or_else(|| ArchiveFsError::Index("HOME is not set".to_string()))?;
-    Ok(PathBuf::from(home)
-        .join(".local")
-        .join("share")
-        .join("archivefs")
-        .join("index.json"))
+    app_dirs::data_path("index.json")
 }
 
 pub fn build_archive_index(config: &Config) -> Result<ArchiveIndex> {
@@ -6943,7 +6934,7 @@ fn empty_unmounted_dir_is_removable(
 /// that [`cleanup_selected_mount_tree`] would remove - **without removing
 /// anything**.
 ///
-/// Read-only by construction: it walks only ArchiveFS's own mount root (not
+/// Read-only by construction: it walks only EmuWiz's own mount root (not
 /// the library, and never an archive), applies exactly the same predicate the
 /// remover applies via [`empty_unmounted_dir_is_removable`], refuses to
 /// follow symlinks, and never descends into an active mount point. The walk
@@ -11460,7 +11451,7 @@ mod tests {
     /// *exists* (so the old "mount root" check alone reported Pass, and
     /// `DoctorReport::is_ready()` - what the Library page's "Doctor: Ready"
     /// summary reads - agreed) but is not writable by the user actually
-    /// running ArchiveFS, while `run_setup_diagnostics_with_checks` (the
+    /// running EmuWiz, while `run_setup_diagnostics_with_checks` (the
     /// separate check that actually gates Mount/Unmount via
     /// `SetupDiagnostics.ready_for_actions`) already correctly failed on
     /// the same directory. Before the new "mount root writable" check
@@ -11614,7 +11605,7 @@ mod tests {
         });
 
         let config = parse_config(&contents).expect(
-            "config.toml.example must parse with the real ArchiveFS config parser - \
+            "config.toml.example must parse with the real EmuWiz config parser - \
              if you changed the parser or the example, keep both in sync",
         );
 
@@ -12403,7 +12394,7 @@ mod tests {
                 && check.status == SetupDiagnosticStatus::NotConfigured
         }));
         assert!(report.checks.iter().any(|check| {
-            check.name == "ArchiveFS is ready for scanning"
+            check.name == "EmuWiz is ready for scanning"
                 && check.status == SetupDiagnosticStatus::NotConfigured
         }));
     }
@@ -13069,8 +13060,8 @@ mod tests {
             "Mount root is writable",
             "ratarmount is available",
             "fusermount3 or umount is available",
-            "ArchiveFS is ready for scanning",
-            "ArchiveFS is ready for mount/unmount actions",
+            "EmuWiz is ready for scanning",
+            "EmuWiz is ready for mount/unmount actions",
         ] {
             assert!(
                 report

@@ -41,7 +41,7 @@ encoding_rs = "0.8"
 # the thumbnail cache be tested without a window.
 #
 # Keep the codec surface deliberately limited; the GUI only ever reads
-# ArchiveFS-owned PNG output. `jpeg` is here because an imported artwork file
+# EmuWiz-owned PNG output. `jpeg` is here because an imported artwork file
 # may be one. WebP is magic-detected and refused until its optional decoder can
 # be supplied by the build.
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }

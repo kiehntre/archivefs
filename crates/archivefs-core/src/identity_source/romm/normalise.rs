@@ -1,6 +1,6 @@
 //! Turning a RomM record into an [`ExternalIdentityRecord`].
 //!
-//! This is the adapter's whole job: everything above it speaks ArchiveFS's own
+//! This is the adapter's whole job: everything above it speaks EmuWiz's own
 //! identity model and knows nothing about RomM's field names. Every field name
 //! read here was taken from a real RomM 5.1.0's `/openapi.json`, and every one is
 //! optional at the JSON level - a record missing a field is normalised without
@@ -10,7 +10,7 @@
 //! # Platforms go through the existing registry
 //!
 //! RomM's platform slugs are resolved with [`crate::platform::platform_for_alias`],
-//! the same registry the rest of ArchiveFS uses. There is deliberately no second
+//! the same registry the rest of EmuWiz uses. There is deliberately no second
 //! table of platform names here: a slug the registry does not recognise stays
 //! visible as unknown, with RomM's own name and id preserved, rather than being
 //! guessed at with substring matching.
@@ -295,7 +295,7 @@ pub struct NormalisedPlatform {
     pub provider_platform_id: Option<String>,
     pub provider_slug: String,
     pub provider_name: Option<String>,
-    /// The canonical ArchiveFS platform, when the registry recognises the slug.
+    /// The canonical EmuWiz platform, when the registry recognises the slug.
     ///
     /// Owned rather than `&'static str` because this is persisted: a cache written
     /// by one build must be readable by the next, and a borrowed registry name
@@ -321,7 +321,7 @@ pub fn normalise_platform(value: &Value) -> Option<NormalisedPlatform> {
     })
 }
 
-/// Resolves a RomM platform slug to a canonical ArchiveFS platform.
+/// Resolves a RomM platform slug to a canonical EmuWiz platform.
 ///
 /// Delegates to the one platform registry. Exact, normalised matching only -
 /// `platform_for_alias` compares whole normalised aliases, never substrings, so

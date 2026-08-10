@@ -1,14 +1,14 @@
 # Dependency security
 
 This note records the dependency-advisory remediation performed for the
-ArchiveFS v0.7 alpha candidate on 2026-07-29. It covers the resolved Cargo
+EmuWiz v0.7 alpha candidate on 2026-07-29. It covers the resolved Cargo
 graph; it does not claim that all future dependency versions are safe.
 
 ## Findings and exposure
 
-| Advisory | Before | Exposure in ArchiveFS | Resolution |
+| Advisory | Before | Exposure in EmuWiz | Resolution |
 | --- | --- | --- | --- |
-| RUSTSEC-2026-0195 | `quick-xml 0.39.4` | Build-time only, through the `wayland-scanner` procedural macro. ArchiveFS does not use this parser on game or catalogue data at runtime. | Updated to `quick-xml 0.41.0` through `wayland-scanner 0.31.11`. |
+| RUSTSEC-2026-0195 | `quick-xml 0.39.4` | Build-time only, through the `wayland-scanner` procedural macro. EmuWiz does not use this parser on game or catalogue data at runtime. | Updated to `quick-xml 0.41.0` through `wayland-scanner 0.31.11`. |
 | RUSTSEC-2026-0194 | `quick-xml 0.39.4` | Build-time only, through the same Wayland protocol-generation path. | Updated to `quick-xml 0.41.0` through `wayland-scanner 0.31.11`. |
 | RUSTSEC-2026-0192 | `ttf-parser 0.25.1` | Runtime GUI font parsing and rendering through `owned_ttf_parser`, `ab_glyph`, `epaint`, and `egui`. The finding is an unmaintained-crate warning rather than a known vulnerability. | Removed by updating the coordinated `eframe`/`egui` family from 0.32.3 to 0.34.3. The replacement font path uses `font-types 0.11.3`, `read-fonts 0.37.0`, and `skrifa 0.40.0`. |
 
@@ -48,7 +48,7 @@ font-types 0.11.3 / read-fonts 0.37.0 / skrifa 0.40.0
 The quick-xml findings were fixed with a compatible Wayland scanner patch-line
 lockfile update. The font warning could not be removed by a lockfile-only
 update: the current `ab_glyph 0.2` line constrains `owned_ttf_parser` to the
-unmaintained 0.25 line. ArchiveFS therefore uses the smallest coordinated GUI
+unmaintained 0.25 line. EmuWiz therefore uses the smallest coordinated GUI
 dependency update that removes that chain without changing application
 features or redesigning the interface.
 
@@ -76,7 +76,7 @@ graph; the pre-existing duplicate families for `calloop`, `getrandom`,
 dependency was added solely to suppress an advisory.
 
 The lockfile contains optional backend packages published with the updated GUI
-family, but ArchiveFS still selects the Glow renderer. `cargo tree -p
+family, but EmuWiz still selects the Glow renderer. `cargo tree -p
 archivefs-gui -e normal` confirms that WGPU and Naga are not in the active
 normal dependency graph.
 

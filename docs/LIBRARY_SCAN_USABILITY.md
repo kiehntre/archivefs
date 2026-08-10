@@ -2,7 +2,7 @@
 
 ## Mega Drive and Genesis loose ROMs
 
-ArchiveFS uses the existing canonical platform name `MegaDrive`; Genesis is a
+EmuWiz uses the existing canonical platform name `MegaDrive`; Genesis is a
 folder alias, not a second platform.
 
 Loose `.gen` and `.smd` files are recognised case-insensitively because those
@@ -16,7 +16,7 @@ provides folder evidence, and ordinary `README.md` files outside that context
 remain ignored.
 
 Loose ROMs are catalogued and searchable with exact path bytes preserved, but
-are marked unsupported for ArchiveFS's archive-mount backend. Existing manual
+are marked unsupported for EmuWiz's archive-mount backend. Existing manual
 platform assignments continue to outrank automatic detection.
 
 Scanner ZIP handling is unchanged. A ZIP is catalogued as a ZIP container;

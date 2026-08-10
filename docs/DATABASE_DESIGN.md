@@ -1,4 +1,4 @@
-# ArchiveFS Persistent Library Database: Design
+# EmuWiz Persistent Library Database: Design
 
 Status: implemented foundation. This document records the small, additive
 SQLite-backed catalogue that sits alongside the existing filesystem-scanning
@@ -119,7 +119,7 @@ following existing types and behaviors constrain and inform every choice below:
 - Emulator launching or emulator configuration of any kind.
 - Cloud sync, remote backup, or any network-facing behavior for the database itself.
 - Multi-user support - one database file for one local user, matching every other
-  piece of ArchiveFS state (`~/.config/archivefs/config.toml`,
+  piece of EmuWiz state (`~/.config/archivefs/config.toml`,
   `~/.local/share/archivefs/index.json`) being single-user and local already.
 
 None of the long-term items in the task description (artwork, emulator associations,
@@ -663,7 +663,7 @@ The task's four candidate identity signals, and how this design uses them:
   column/table, the database file should be copied to a timestamped
   `library.db.bak-<version>-<timestamp>` sibling first (a plain file copy is safe for
   SQLite when nothing else has the file open, which is guaranteed here since
-  ArchiveFS is not a daemon).
+  EmuWiz is not a daemon).
 - **Recovery from corruption.** `PRAGMA integrity_check` on open. If it fails, the
   database is never the source of truth for anything (see
   [section 1](#1-goals-and-non-goals)), so the correct recovery is exactly the same as

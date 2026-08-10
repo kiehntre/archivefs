@@ -3,7 +3,7 @@
 //! Every checksum in a DAT file is normalised to lowercase hexadecimal of the
 //! correct length for its algorithm. Malformed or truncated values are dropped.
 //!
-//! SHA-256 is included here because Redump publishes it; ArchiveFS's own hashing
+//! SHA-256 is included here because Redump publishes it; EmuWiz's own hashing
 //! infrastructure in `identity_source` only needs CRC32/MD5/SHA-1 (what RomM
 //! publishes), but DAT files carry a fourth algorithm, and a future stage will
 //! need it.

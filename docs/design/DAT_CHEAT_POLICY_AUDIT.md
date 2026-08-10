@@ -1,7 +1,7 @@
 # DAT & Cheat-Source Policy Audit
 
 This document is a design-time audit of the current DAT catalogue and cheat-source
-subsystems in ArchiveFS. It is intended to identify where the two systems already
+subsystems in EmuWiz. It is intended to identify where the two systems already
 share concerns, where each has its own policy, and where a future shared policy
 layer could be introduced without disturbing existing behaviour.
 
@@ -499,7 +499,7 @@ policy can be applied.
   user-typed (see `parsers/mod.rs`).
 - Cheat source uses `validate_cache_path_for_read`, `safe_regular_or_directory`,
   `reject_symlink`, and `validate_cache_root_identity` for cache paths.
-- ArchiveFS already has `safe_read`/`TrustedRoots` for source-folder reads.
+- EmuWiz already has `safe_read`/`TrustedRoots` for source-folder reads.
 
 **Recommendation:** When DATs move from user-typed paths to configured or
 stored paths, they must use `TrustedRoots` like everything else. The cheat

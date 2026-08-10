@@ -266,7 +266,7 @@ impl IdentitySourceApi {
         cache.page(offset, limit).to_vec()
     }
 
-    /// Matches one ArchiveFS path against the cache, for a details view.
+    /// Matches one EmuWiz path against the cache, for a details view.
     ///
     /// Uses only a cached hash, never computing one, so opening a game's details
     /// cannot start reading a four-gigabyte file.

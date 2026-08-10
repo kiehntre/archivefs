@@ -18,7 +18,7 @@
 //!    other hash), both are kept. The audit reports the collision rather than
 //!    silently picking one.
 //! 4. **Read-only audit.** The audit takes hashes _already known_ to
-//!    ArchiveFS as input; it never hashes local files. Every verdict
+//!    EmuWiz as input; it never hashes local files. Every verdict
 //!    distinguishes between exact, probable, filename-only, ambiguous, and
 //!    no-evidence outcomes.
 //!

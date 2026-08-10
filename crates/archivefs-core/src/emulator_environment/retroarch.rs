@@ -307,7 +307,7 @@ pub struct ConfigFileFinding {
 #[serde(rename_all = "snake_case")]
 pub enum ResolutionState {
     ConfiguredResolved,
-    /// A non-empty value was configured but ArchiveFS declines to
+    /// A non-empty value was configured but EmuWiz declines to
     /// resolve it (a `:`-application-directory alias, or a plain
     /// relative value) - see the `colon_alias_unresolved`/
     /// `relative_path_unresolved` diagnostics for why.
@@ -1307,7 +1307,7 @@ fn parse_config(text: &str, recognized_keys: &[&'static str]) -> ParsedConfig {
 }
 
 /// Resolves a non-empty configured value to a real path, or `None` if
-/// ArchiveFS declines to resolve it (colon alias, or a plain relative
+/// EmuWiz declines to resolve it (colon alias, or a plain relative
 /// value with no config-relative anchor RetroArch itself would use -
 /// confirmed via `fill_pathname_expand_special` in the primary source).
 fn resolve_configured_value(raw: &str, tilde_home: &Path) -> Option<PathBuf> {

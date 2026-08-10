@@ -78,13 +78,13 @@ assert_contains() {
 }
 
 # make_bundle DIR - populates DIR with a fake extracted release bundle:
-# install.sh, stub archivefs-cli/archivefs-gui, config.toml.example.
+# install.sh, stub emuwiz-cli/emuwiz, config.toml.example.
 make_bundle() {
     mkdir -p -- "$1"
     cp -- "$install_sh" "$1/install.sh"
-    printf '#!/bin/sh\necho fake-cli\n' >"$1/archivefs-cli"
-    printf '#!/bin/sh\necho fake-gui\n' >"$1/archivefs-gui"
-    chmod +x -- "$1/archivefs-cli" "$1/archivefs-gui"
+    printf '#!/bin/sh\necho fake-cli\n' >"$1/emuwiz-cli"
+    printf '#!/bin/sh\necho fake-gui\n' >"$1/emuwiz"
+    chmod +x -- "$1/emuwiz-cli" "$1/emuwiz"
     cp -- "$config_example" "$1/config.toml.example"
 }
 
@@ -94,9 +94,9 @@ make_bundle() {
 make_workspace() {
     mkdir -p -- "$1/target/release"
     cp -- "$install_sh" "$1/install.sh"
-    printf '#!/bin/sh\necho ws-cli\n' >"$1/target/release/archivefs-cli"
-    printf '#!/bin/sh\necho ws-gui\n' >"$1/target/release/archivefs-gui"
-    chmod +x -- "$1/target/release/archivefs-cli" "$1/target/release/archivefs-gui"
+    printf '#!/bin/sh\necho ws-cli\n' >"$1/target/release/emuwiz-cli"
+    printf '#!/bin/sh\necho ws-gui\n' >"$1/target/release/emuwiz"
+    chmod +x -- "$1/target/release/emuwiz-cli" "$1/target/release/emuwiz"
     cp -- "$config_example" "$1/config.toml.example"
 }
 
@@ -114,13 +114,53 @@ bin_dir="$work/bin"
 
 assert_success "install from bundle succeeds" \
     env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir"
-assert_executable "archivefs-cli installed and executable" "$bin_dir/archivefs-cli"
-assert_executable "archivefs-gui installed and executable" "$bin_dir/archivefs-gui"
-assert_file_exists "config.toml created" "$home/.config/archivefs/config.toml"
+assert_executable "emuwiz-cli installed and executable" "$bin_dir/emuwiz-cli"
+assert_executable "archivefs-cli legacy alias installed" "$bin_dir/archivefs-cli"
+assert_executable "emuwiz installed and executable" "$bin_dir/emuwiz"
+assert_executable "emuwiz-gui alias installed" "$bin_dir/emuwiz-gui"
+assert_executable "archivefs-gui legacy alias installed" "$bin_dir/archivefs-gui"
+
+assert_file_exists "config.toml created" "$home/.config/emuwiz/config.toml"
 assert_files_equal "config.toml matches config.toml.example" \
-    "$config_example" "$home/.config/archivefs/config.toml"
-cli_out=$("$bin_dir/archivefs-cli")
-assert_contains "installed archivefs-cli runs (bundle stub)" "$cli_out" "fake-cli"
+    "$config_example" "$home/.config/emuwiz/config.toml"
+cli_out=$("$bin_dir/emuwiz-cli")
+assert_contains "installed emuwiz-cli runs (bundle stub)" "$cli_out" "fake-cli"
+rm -rf -- "$work"
+
+echo "=== test: an existing legacy config directory is reused ==="
+work=$(mktemp -d)
+make_bundle "$work/bundle"
+home="$work/home"
+mkdir -p -- "$home/.config/archivefs"
+marker="LEGACY CONFIG - KEEP USING"
+printf '%s\n' "$marker" >"$home/.config/archivefs/config.toml"
+bin_dir="$work/bin"
+
+assert_success "install with only a legacy config succeeds" \
+    env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir"
+kept=$(cat "$home/.config/archivefs/config.toml")
+assert_contains "legacy config content is preserved" "$kept" "$marker"
+assert_no_such_path "no EmuWiz config is created beside a legacy profile" \
+    "$home/.config/emuwiz/config.toml"
+rm -rf -- "$work"
+
+echo "=== test: EmuWiz config takes precedence when both directories exist ==="
+work=$(mktemp -d)
+make_bundle "$work/bundle"
+home="$work/home"
+mkdir -p -- "$home/.config/emuwiz" "$home/.config/archivefs"
+primary_marker="PRIMARY CONFIG - KEEP USING"
+legacy_marker="LEGACY CONFIG - DO NOT SELECT"
+printf '%s\n' "$primary_marker" >"$home/.config/emuwiz/config.toml"
+printf '%s\n' "$legacy_marker" >"$home/.config/archivefs/config.toml"
+bin_dir="$work/bin"
+
+assert_success "install with both config directories succeeds" \
+    env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir"
+kept=$(cat "$home/.config/emuwiz/config.toml")
+assert_contains "EmuWiz config wins and is preserved" "$kept" "$primary_marker"
+legacy_kept=$(cat "$home/.config/archivefs/config.toml")
+assert_contains "unselected legacy config is untouched" "$legacy_kept" "$legacy_marker"
 rm -rf -- "$work"
 
 echo "=== test: install from a workspace checkout (target/release) ==="
@@ -132,8 +172,8 @@ bin_dir="$work/bin"
 
 assert_success "install from workspace succeeds" \
     env HOME="$home" sh "$work/workspace/install.sh" --prefix "$bin_dir"
-cli_out=$("$bin_dir/archivefs-cli")
-assert_contains "installed archivefs-cli runs (workspace stub)" "$cli_out" "ws-cli"
+cli_out=$("$bin_dir/emuwiz-cli")
+assert_contains "installed emuwiz-cli runs (workspace stub)" "$cli_out" "ws-cli"
 rm -rf -- "$work"
 
 echo "=== test: an existing config is never overwritten ==="
@@ -145,11 +185,11 @@ bin_dir="$work/bin"
 
 env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" >/dev/null
 marker="USER EDITED - DO NOT CLOBBER"
-printf '%s\n' "$marker" >"$home/.config/archivefs/config.toml"
+printf '%s\n' "$marker" >"$home/.config/emuwiz/config.toml"
 
 assert_success "reinstall over an existing config succeeds" \
     env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir"
-kept=$(cat "$home/.config/archivefs/config.toml")
+kept=$(cat "$home/.config/emuwiz/config.toml")
 assert_contains "existing config content is preserved" "$kept" "$marker"
 rm -rf -- "$work"
 
@@ -166,10 +206,13 @@ printf 'unrelated\n' >"$bin_dir/some-other-tool"
 
 assert_success "uninstall succeeds" \
     env HOME="$home" sh "$work/bundle/install.sh" --uninstall --prefix "$bin_dir"
+assert_no_such_path "emuwiz-cli removed" "$bin_dir/emuwiz-cli"
 assert_no_such_path "archivefs-cli removed" "$bin_dir/archivefs-cli"
-assert_no_such_path "archivefs-gui removed" "$bin_dir/archivefs-gui"
+assert_no_such_path "emuwiz removed" "$bin_dir/emuwiz"
+assert_no_such_path "emuwiz-gui alias removed" "$bin_dir/emuwiz-gui"
+assert_no_such_path "archivefs-gui alias removed" "$bin_dir/archivefs-gui"
 assert_file_exists "unrelated file in bin dir is untouched" "$bin_dir/some-other-tool"
-assert_file_exists "config.toml survives uninstall" "$home/.config/archivefs/config.toml"
+assert_file_exists "config.toml survives uninstall" "$home/.config/emuwiz/config.toml"
 assert_success "uninstalling again is a no-op, not an error" \
     env HOME="$home" sh "$work/bundle/install.sh" --uninstall --prefix "$bin_dir"
 rm -rf -- "$work"
@@ -189,7 +232,7 @@ else
     ok "install fails when no binaries are present"
 fi
 missing_err=$(cat "$errfile")
-assert_contains "failure message names the missing binaries" "$missing_err" "archivefs-cli"
+assert_contains "failure message names the missing binaries" "$missing_err" "emuwiz-cli"
 rm -f -- "$errfile"
 rm -rf -- "$work"
 

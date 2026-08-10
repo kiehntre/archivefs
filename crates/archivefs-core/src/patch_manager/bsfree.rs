@@ -1,6 +1,6 @@
 //! Optional read-only adapter for Andrew Mackrodt's BSFree Archive.
 //!
-//! The upstream database remains an immutable third-party artifact. ArchiveFS
+//! The upstream database remains an immutable third-party artifact. EmuWiz
 //! never migrates it, never opens it writable, and Stage 1 deliberately has no
 //! installation or conversion API.
 
@@ -317,7 +317,7 @@ pub fn bsfree_provenance() -> CheatProviderProvenance {
         maintainer: "Andrew Mackrodt".to_string(),
         origin: "Historical bsfree.org database".to_string(),
         distribution_status: "Optional third-party download".to_string(),
-        verification: "Historical community data, not verified by ArchiveFS".to_string(),
+        verification: "Historical community data, not verified by EmuWiz".to_string(),
     }
 }
 
@@ -758,8 +758,7 @@ impl BsFreeCatalogue {
             return Ok(BsFreeGameSearchResult {
                 confidence: ProviderGameMatchConfidence::NoMatch,
                 exact_revision_verified: false,
-                explanation: "No BSFree system maps to the requested ArchiveFS platform"
-                    .to_string(),
+                explanation: "No BSFree system maps to the requested EmuWiz platform".to_string(),
                 page: ProviderPage {
                     offset: page.offset,
                     limit: page.limit,
@@ -1056,7 +1055,7 @@ pub fn bsfree_platform_mapping(upstream_id: i64, name: &str) -> ProviderPlatform
                 Some(platform.display_name.to_string()),
                 status,
                 format!(
-                    "Explicit BSFree mapping from {name} to ArchiveFS {} ({})",
+                    "Explicit BSFree mapping from {name} to EmuWiz {} ({})",
                     platform.id, platform.display_name
                 ),
             ),
@@ -1073,7 +1072,7 @@ pub fn bsfree_platform_mapping(upstream_id: i64, name: &str) -> ProviderPlatform
             None,
             None,
             PlatformMappingStatus::Unknown,
-            "No explicit BSFree-to-ArchiveFS platform mapping exists".to_string(),
+            "No explicit BSFree-to-EmuWiz platform mapping exists".to_string(),
         ),
     };
     ProviderPlatformMapping {
@@ -1095,7 +1094,7 @@ pub fn bsfree_device_mapping(upstream_id: i64, name: &str) -> ProviderDeviceMapp
         ),
         "Game Busters" | "Red Dragon" | "GameGuru" => (
             DeviceFormatCompatibility::ReferenceOnly,
-            "Historical device is browse-only; ArchiveFS has no verified parser or installer for this exact format",
+            "Historical device is browse-only; EmuWiz has no verified parser or installer for this exact format",
         ),
         _ => (
             DeviceFormatCompatibility::Unknown,

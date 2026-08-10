@@ -1,6 +1,6 @@
 //! The local-only endpoint policy for external identity sources.
 //!
-//! An identity source is a URL a person types in, and ArchiveFS then connects to
+//! An identity source is a URL a person types in, and EmuWiz then connects to
 //! it with a bearer token attached. That combination is exactly the shape of a
 //! server-side request forgery, so this module exists to make the dangerous
 //! cases unreachable rather than unlikely.

@@ -53,11 +53,11 @@ grep -Fq "v$VERSION" "$REPO_ROOT/README.md" ||
     release_die "README.md does not mention current release v$VERSION"
 
 if [[ -n "$BINARY_DIR" ]]; then
-    [[ -x "$BINARY_DIR/archivefs-cli" ]] || release_die "CLI binary missing in $BINARY_DIR"
-    [[ -x "$BINARY_DIR/archivefs-gui" ]] || release_die "GUI binary missing in $BINARY_DIR"
-    [[ "$($BINARY_DIR/archivefs-cli --version)" == "archivefs-cli $VERSION" ]] ||
+    [[ -x "$BINARY_DIR/emuwiz-cli" ]] || release_die "CLI binary missing in $BINARY_DIR"
+    [[ -x "$BINARY_DIR/emuwiz" ]] || release_die "GUI binary missing in $BINARY_DIR"
+    [[ "$($BINARY_DIR/emuwiz-cli --version)" == "emuwiz-cli $VERSION" ]] ||
         release_die "CLI --version disagrees with workspace version"
-    [[ "$($BINARY_DIR/archivefs-gui --version)" == "archivefs-gui $VERSION" ]] ||
+    [[ "$($BINARY_DIR/emuwiz --version)" == "emuwiz $VERSION" ]] ||
         release_die "GUI --version disagrees with workspace version"
 fi
 

@@ -1,11 +1,11 @@
-# ArchiveFS Patch & Cheat Manager Design
+# EmuWiz Patch & Cheat Manager Design
 
 > Historical Phase 1 design record. Its implementation-status statements are
 > preserved for provenance and do not describe the current v0.7 workspace.
 
 ## Status and Scope
 
-This document defines the future architecture and records the current Phase 1 implementation boundary. It does not authorize a database migration or any change to ArchiveFS mount behavior.
+This document defines the future architecture and records the current Phase 1 implementation boundary. It does not authorize a database migration or any change to EmuWiz mount behavior.
 
 The current uncommitted implementation contains the first adapter slice: a read-only PCSX2 metadata preview. It fetches one compiled-in metadata endpoint into bounded memory, reports native and Flatpak standard-path **installation candidates**, reads the existing catalogue through an enforced read-only connection, and produces a non-executable advisory plan. A candidate means only that a documented standard directory exists; Phase 1 does not prove that an emulator binary is installed, identify its version, validate a complete layout, inspect destination contents, or establish mutation authority.
 
@@ -15,7 +15,7 @@ Exact catalogue matching is currently blocked in production because the approved
 
 The Patch & Cheat Manager is a managed system for discovering, previewing, downloading, installing, updating, auditing, and rolling back emulator cheats and patches. Candidate content includes cheat databases, widescreen and 60 FPS patches, translation patches, emulator compatibility patches, controller fixes, and small community patch formats such as IPS, BPS, and xdelta metadata. Users may configure additional source URLs.
 
-The manager must never request, accept into its trusted cache, install, or distribute complete copyrighted ROMs, ISOs, disc images, or games. It requests only reviewed metadata and narrowly allowlisted patch content types, applies strict byte limits, stops a mismatched stream as soon as it can identify it, and deletes the untrusted partial payload while retaining only a bounded rejection record. No client can prevent a malicious server from sending mislabeled game bytes after a legitimate patch request, so the honest enforceable boundary is that such bytes are bounded, never accepted as a patch, never installed, never redistributed, and never retained as content. Phase 1 avoids this exposure entirely by requesting metadata only. The manager does not patch an ArchiveFS source archive in place. Binary patch application to a user-supplied game, if ever supported, is a separately reviewed future capability and must produce a new derived file rather than alter the original archive.
+The manager must never request, accept into its trusted cache, install, or distribute complete copyrighted ROMs, ISOs, disc images, or games. It requests only reviewed metadata and narrowly allowlisted patch content types, applies strict byte limits, stops a mismatched stream as soon as it can identify it, and deletes the untrusted partial payload while retaining only a bounded rejection record. No client can prevent a malicious server from sending mislabeled game bytes after a legitimate patch request, so the honest enforceable boundary is that such bytes are bounded, never accepted as a patch, never installed, never redistributed, and never retained as content. Phase 1 avoids this exposure entirely by requesting metadata only. The manager does not patch an EmuWiz source archive in place. Binary patch application to a user-supplied game, if ever supported, is a separately reviewed future capability and must produce a new derived file rather than alter the original archive.
 
 The overall first release may eventually fetch and inspect small non-executable artifacts and manage emulator-owned cheat or patch files. The **implemented gate is narrower than that release**: Phase 1 is only an in-memory fetch and read-only PCSX2 metadata preview. It does not persist source configuration or cache data, download artifact payloads, create installation plans that can be executed, write audit records, install files, create backups, or expose rollback. No production implementation beyond that Phase 1 boundary may begin without a new design approval. Mount and unmount execution remains independent in every phase.
 
@@ -140,7 +140,7 @@ Secrets are never stored in plain-text source configuration, manifests, logs, GU
 
 Built-in sources are not intrinsically safe: they begin with reviewed defaults and may pin verification material, but their responses remain untrusted. Every user-added URL starts as `Untrusted`, has unattended updates disabled, uses conservative limits, and requires the user to review its host, formats, requested adapter, verification status, and every initial plan. Trust may be raised only by explicit local action; prior success does not automatically raise it.
 
-Source state may live in manager-owned files beginning in a later approved phase, not in the ArchiveFS catalogue schema. Phase 1 uses one compiled-in source definition and does not write source state. User-added sources, source editing, update scheduling, and persistence are explicitly outside Phase 1. Configuration parsing integration and the persistence format require a separate implementation design review.
+Source state may live in manager-owned files beginning in a later approved phase, not in the EmuWiz catalogue schema. Phase 1 uses one compiled-in source definition and does not write source state. User-added sources, source editing, update scheduling, and persistence are explicitly outside Phase 1. Configuration parsing integration and the persistence format require a separate implementation design review.
 
 ## Retrieval and Verification
 
@@ -299,7 +299,7 @@ An otherwise exact record that resolves to multiple local games or installations
 
 Only `Exact` matches may be eligible for unattended updates, and only when source trust, verification, manifest ownership, unchanged destination hashes, and local unattended policy also permit it. `Probable` and `Uncertain` always require explicit review. Phase 1 has no unattended or execution capability regardless of confidence. The interface displays the evidence, namespace, provenance, required identifiers, and contradictions, not only a score. It must never silently install an uncertain game match.
 
-The ArchiveFS catalogue can contribute platform, normalized title, region, serial/title ID, and hash metadata already known for an archive. The matcher reads a consistent catalogue snapshot; it does not hold catalogue locks while performing network work. A future explicit hash operation may read game bytes and store results outside the game archive, but that operation is not part of preview and is outside Phase 1. The matcher does not rename, rewrite, repack, extract into, mount, or otherwise alter the game archive. A catalogue record is supporting evidence, not proof unless it carries an exact identifier appropriate to that emulator, patch format, region, and revision.
+The EmuWiz catalogue can contribute platform, normalized title, region, serial/title ID, and hash metadata already known for an archive. The matcher reads a consistent catalogue snapshot; it does not hold catalogue locks while performing network work. A future explicit hash operation may read game bytes and store results outside the game archive, but that operation is not part of preview and is outside Phase 1. The matcher does not rename, rewrite, repack, extract into, mount, or otherwise alter the game archive. A catalogue record is supporting evidence, not proof unless it carries an exact identifier appropriate to that emulator, patch format, region, and revision.
 
 ## Preview and Planning
 
@@ -416,7 +416,7 @@ Recovery is conservative and runs under the installation lock:
 
 Rollback uses the same rules with old and new generations reversed. Recovery never downloads data, chooses a different source version, regenerates a plan, overwrites a locally modified file, or performs a “best effort” mixture. Doctor reports incomplete/corrupt journals, missing or corrupt backups, manifest/file hash drift, ownership conflicts, orphaned staging objects, inaccessible or replaced targets, unsupported durability, and unsupported manifest versions.
 
-Destination paths are stored as validated relative components bound to an adapter installation identity and approved root, not accepted later as arbitrary strings. An advisory lock coordinates ArchiveFS processes but does not protect against external attackers. For mutation, the transaction layer opens the approved root without following links, records its filesystem identity, walks/creates children relative to held directory handles with no-follow/beneath constraints, permits only regular-file leaves, and renames relative to those handles. It compares the opened objects—not a later canonicalized string—with planned identities immediately before backup and rename. Unsupported platforms/filesystems remain preview-only until equivalent race-resistant primitives are designed and tested.
+Destination paths are stored as validated relative components bound to an adapter installation identity and approved root, not accepted later as arbitrary strings. An advisory lock coordinates EmuWiz processes but does not protect against external attackers. For mutation, the transaction layer opens the approved root without following links, records its filesystem identity, walks/creates children relative to held directory handles with no-follow/beneath constraints, permits only regular-file leaves, and renames relative to those handles. It compares the opened objects—not a later canonicalized string—with planned identities immediately before backup and rename. Unsupported platforms/filesystems remain preview-only until equivalent race-resistant primitives are designed and tested.
 
 ## Dependency Policy and Doctor
 
@@ -498,7 +498,7 @@ The GUI should use a feature-local state/update/view boundary when implementatio
 | Patch matched to wrong game | Evidence-based confidence, contradiction detection, exact-only unattended eligibility, and mandatory review for probable/uncertain matches. |
 | SSRF, malicious redirects, and DNS rebinding | Validate scheme and every resolved/redirect target; block local/private/special networks by default; bind credentials to approved origins; recheck the connected peer. |
 | Malicious catalogue or local metadata | Treat catalogue strings and identifiers as untrusted; use the same bounded normalization; never convert catalogue paths into destinations or commands. |
-| Concurrent ArchiveFS process | Take one installation-namespace lock before revalidation and hold it through journal commit; reject a second operation. |
+| Concurrent EmuWiz process | Take one installation-namespace lock before revalidation and hold it through journal commit; reject a second operation. |
 | Concurrent emulator or benign editor | Detect when reliable, warn/block according to the adapter profile, use atomic exchange/no-replace operations, verify the displaced object, and recover conservatively on drift. |
 | Malicious same-user process | Not fully preventable: same-UID code can mutate accessible files and manager state around operations. Restrictive permissions, held directory handles, atomic exchange, hashes, and journals reduce races but do not form a sandbox boundary. |
 | Disk full, I/O error, or lost durability | Check capabilities, treat every write/sync as fallible, publish journal states durably, and follow only the recovery table. |
@@ -518,14 +518,14 @@ Acceptance criteria:
 
 - Metadata snapshots, PCSX2 installation candidates, identity evidence, match results, and advisory entries are representable without GUI/CLI types.
 - Advisory plans distinguish hypothetical actions, blocking dispositions, and match evidence, and have no execution/confirmation API.
-- The parser contract is version-labelled and rejects incompatible Git-tree shapes. The upstream response does not carry an independent ArchiveFS schema-version field.
+- The parser contract is version-labelled and rejects incompatible Git-tree shapes. The upstream response does not carry an independent EmuWiz schema-version field.
 - The patch-manager module has no dependency on mount backends, process execution, manifest/backup code, or mutable catalogue APIs.
 
 Tests: built-in source validation; URL/error redaction; trust defaults; advisory plan determinism; incompatible metadata-version rejection; property tests for hypothetical relative-path and PCSX2 identifier normalization; compile-time/API checks that no executor accepts an `AdvisoryPatchPlan`; dependency review that the Phase 0 module cannot obtain mount, process, or write-capable catalogue interfaces.
 
 ### Phase 1: Current PCSX2 read-only slice
 
-The implementation supports exactly one provisional, compiled-in HTTPS JSON metadata endpoint and `ReadOnlyPcsx2Adapter`. It fetches one metadata document into bounded memory, hashes it, validates a fixed parser contract labelled `github-git-tree-v1`, reports PCSX2 installation candidates without creating them, reads an existing ArchiveFS catalogue snapshot, and renders an `AdvisoryPatchPlan` through `pcsx2-patch-preview [--json]`. The source definition is not user-editable. The endpoint is the official `PCSX2/pcsx2_patches` repository's Git-tree API, but its use is **not** an approval to redistribute or install repository content; repository-wide patch licensing remains unresolved.
+The implementation supports exactly one provisional, compiled-in HTTPS JSON metadata endpoint and `ReadOnlyPcsx2Adapter`. It fetches one metadata document into bounded memory, hashes it, validates a fixed parser contract labelled `github-git-tree-v1`, reports PCSX2 installation candidates without creating them, reads an existing EmuWiz catalogue snapshot, and renders an `AdvisoryPatchPlan` through `pcsx2-patch-preview [--json]`. The source definition is not user-editable. The endpoint is the official `PCSX2/pcsx2_patches` repository's Git-tree API, but its use is **not** an approval to redistribute or install repository content; repository-wide patch licensing remains unresolved.
 
 The endpoint actually supplies a tree version SHA and entries containing repository path, object type, object SHA, optional size, and ignored fields such as GitHub object URLs. Phase 1 accepts only flat `patches/*.pnach` blob records, validates 40-character Git object IDs, and extracts a syntactically valid PS2 serial and executable CRC from supported filenames. It does not receive authoritative title, region, patch category, supported PCSX2 version range, authenticated publication time, or license fields from downloaded metadata; fixed source provenance and the unresolved license notice are local labels. Downloaded URLs and all unknown fields are ignored and never followed or rendered as actionable links.
 
@@ -717,14 +717,14 @@ Remaining blockers are:
 
 - Confirm that the endpoint may be indexed and displayed under its terms, and determine the licensing/redistribution policy for individual patches before any caching, redistribution, artifact download, or installation.
 - Confirm which PCSX2 versions and Linux layouts may graduate from standard-path candidates to validated installations, including custom/portable layouts and configured patch roots.
-- Decide whether the GitHub API shape is an acceptable long-term source schema or whether ArchiveFS requires a separately versioned manifest with title, region, category, PCSX2-version, licensing, and authenticated freshness fields.
+- Decide whether the GitHub API shape is an acceptable long-term source schema or whether EmuWiz requires a separately versioned manifest with title, region, category, PCSX2-version, licensing, and authenticated freshness fields.
 - Approve authoritative catalogue identity fields. Current catalogue rows have no PS2 serial, executable CRC, or game hash, so production `Exact` matching is blocked.
 - Complete the actual HTTP/TLS and read-only filesystem hardening tests listed in Phase 1 before release claims exceed the current fixture evidence.
 
 ### Later-phase decisions
 
 - Which upstream cheat and patch sources permit indexing, caching, redistribution, mirroring, or bundling under their licenses and terms?
-- Must ArchiveFS distribute only source definitions, or may it redistribute reviewed metadata/artifacts from particular projects?
+- Must EmuWiz distribute only source definitions, or may it redistribute reviewed metadata/artifacts from particular projects?
 - What project policy distinguishes a small lawful patch from copyrighted game content, and what size/format heuristics should trigger rejection or legal review?
 - After Phase 1, which emulator versions and native formats are supported next, and which format semantics can safely be parsed without launching the emulator?
 - Where should manager source configuration, manifests, journals, cache, audit history, and backups live on each supported platform?
@@ -746,9 +746,9 @@ Remaining blockers are:
 ## Non-Goals for the First Release
 
 - Downloading or distributing ROMs, ISOs, complete games, firmware, BIOS files, or emulator binaries.
-- Editing, repacking, deleting, or replacing original ArchiveFS game archives.
+- Editing, repacking, deleting, or replacing original EmuWiz game archives.
 - Executing downloaded scripts, installers, binaries, hooks, or shell fragments.
 - Automatically installing dependencies or invoking privileged commands.
 - Applying IPS, BPS, or xdelta patches to original games.
 - Guessing an emulator installation or game match and silently writing to it.
-- Coupling patch management to ArchiveFS mount or unmount execution.
+- Coupling patch management to EmuWiz mount or unmount execution.

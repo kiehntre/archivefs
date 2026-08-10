@@ -7,7 +7,7 @@ duplicate that content with an older, version-numbered wishlist; that
 duplication has been removed so there is a single source of truth for
 planning.
 
-What remains here are the durable design principles behind how ArchiveFS is
+What remains here are the durable design principles behind how EmuWiz is
 built, which do not change as often as the roadmap itself.
 
 ## Design Principles

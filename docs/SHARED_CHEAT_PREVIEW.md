@@ -1,6 +1,6 @@
 # Shared read-only Cheats & Mods preview
 
-ArchiveFS has a shared source-to-destination preview and conflict model for the
+EmuWiz has a shared source-to-destination preview and conflict model for the
 RetroArch, PCSX2, and Dolphin Cheats & Mods workflows. It is observational:
 
 > Preview only. No files were changed.
@@ -53,7 +53,7 @@ implemented.
 
 ## Destination safety
 
-The preview reuses ArchiveFS's destination-safety validator. It rejects
+The preview reuses EmuWiz's destination-safety validator. It rejects
 relative roots, filesystem roots, traversal or embedded-separator components,
 paths outside the approved root, root/parent/final symlinks, non-directory
 parents, directories or special files at the final path, inaccessible paths,

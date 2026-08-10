@@ -5,7 +5,7 @@ describes what shipped, not a proposal.
 
 ## 1. Where the codebase already stood
 
-Before this branch, most of ArchiveFS's empty-state handling was already
+Before this branch, most of EmuWiz's empty-state handling was already
 correct: the DAT source registry and cheat source preferences file both
 default gracefully when their file is absent
 (`crates/archivefs-core/src/dat/sources/config.rs`,
@@ -48,7 +48,7 @@ pub enum SetupDiagnosticStatus {
 `run_setup_diagnostics_with_checks` now performs one pass after building its
 normal check list: if `config_missing` is true, every check that reads
 `Error` *because* nothing is configured yet — "Config file exists", source
-folder and mount root checks, "ArchiveFS is ready for scanning/actions" — is
+folder and mount root checks, "EmuWiz is ready for scanning/actions" — is
 downgraded to `NotConfigured`. System-tool checks (`ratarmount is
 available`, `fusermount3 or umount is available`) are left untouched:
 whether those tools are installed is a fact about the machine, independent of
@@ -114,13 +114,13 @@ the softening never fires for a broken config, only a confirmed-absent one.
 
 The Setup/Diagnostics screen (`show_setup_diagnostics` in
 `crates/archivefs-gui/src/main.rs`) now shows a compact panel above the
-check list whenever `config_missing` is true: ArchiveFS is unconfigured,
+check list whenever `config_missing` is true: EmuWiz is unconfigured,
 where to begin (Create Starter Config, then a source folder on the Sources
 page), that DAT Sources and Cheat Sources live on their own pages and start
-empty, that RomM is optional, and that ArchiveFS never renames, moves, or
+empty, that RomM is optional, and that EmuWiz never renames, moves, or
 deletes a ROM without a later, explicit, reviewed action. This is a page
 addition, not a new wizard: the existing gated Setup screen with its
-"Create Starter Config" / "Create Mount Root" / "Continue to ArchiveFS"
+"Create Starter Config" / "Create Mount Root" / "Continue to EmuWiz"
 actions already matches the "clear start page with direct navigation
 actions" shape the spec asks for.
 
@@ -130,7 +130,7 @@ recomputation of current filesystem state with no memory of its own, so
 config that was present and readable earlier in this session and has since
 disappeared - which can mean an intentional removal, but can just as easily
 mean a deleted file, an unmounted drive, or a bug. Showing the reassuring
-"Welcome to ArchiveFS, this is expected" copy in the latter case would
+"Welcome to EmuWiz, this is expected" copy in the latter case would
 actively mislead. `ArchiveFsApp` tracks this with one `bool`,
 `config_previously_confirmed`, set the first time `poll_diagnostics` sees a
 `Ready` report with `!config_missing`. `show_setup_diagnostics` (via the
@@ -200,7 +200,7 @@ source and target are both explicitly chosen.
 Per the task brief, none of the following changed on this branch:
 
 - A full multi-step setup wizard — the existing gated Setup/Diagnostics
-  screen with direct actions already serves this purpose at ArchiveFS's
+  screen with direct actions already serves this purpose at EmuWiz's
   current scale.
 - Automatic library discovery.
 - Online account setup.

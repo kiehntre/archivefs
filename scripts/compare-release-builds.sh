@@ -9,7 +9,7 @@ usage() {
     cat <<'EOF'
 Usage: scripts/compare-release-builds.sh [--output-dir DIR]
 
-Build ArchiveFS twice with independent Cargo target and output directories,
+Build EmuWiz twice with independent Cargo target and output directories,
 then compare archive bytes, checksum files, payload hashes, permissions,
 ownership, and timestamps.
 EOF
