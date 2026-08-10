@@ -410,6 +410,11 @@ pub(crate) struct RommCardView {
     /// The last error, already redacted by the core that produced it.
     pub(crate) last_error: Option<String>,
     pub(crate) offline_browsing: bool,
+    /// Whether imported identity is being served without RomM reachable
+    /// (`ReadyOffline`). Such a state is not a failure: the offline copy is
+    /// the intended fallback, so a stale last error reads as informational
+    /// rather than as a scary global failure.
+    pub(crate) offline_usable: bool,
     /// True while an operation is running, which is what disables the actions.
     pub(crate) busy: bool,
     pub(crate) busy_label: Option<String>,
@@ -447,6 +452,7 @@ pub(crate) fn build_card_view(
             actions: Vec::new(),
             last_error: None,
             offline_browsing: false,
+            offline_usable: false,
             busy: true,
             busy_label: Some("Reading RomM status".to_string()),
             cancellable: false,
@@ -613,6 +619,7 @@ pub(crate) fn build_card_view(
         actions,
         last_error: status.last_error.clone(),
         offline_browsing: status.state.can_browse(),
+        offline_usable: status.state == ProviderState::ReadyOffline,
         busy,
         busy_label,
         cancellable,
@@ -829,26 +836,63 @@ pub(crate) struct RommResultView {
     pub(crate) headline: String,
     pub(crate) rows: Vec<CardRow>,
     pub(crate) notes: Vec<String>,
+    /// True for a result that is not a failure in practice (e.g. a connection
+    /// test that failed while the offline copy is still usable). Such a result
+    /// still has `succeeded == false` - the attempt did not succeed - but it
+    /// must not read as a scary global RomM failure.
+    pub(crate) informational: bool,
+}
+
+impl RommResultView {
+    /// The tone the result banner carries. Most failures are Warning; an
+    /// informational one (see [`Self::informational`]) is Info instead.
+    pub(crate) fn tone(&self) -> widgets::StatusTone {
+        if self.informational {
+            widgets::StatusTone::Info
+        } else if self.succeeded {
+            widgets::StatusTone::Success
+        } else {
+            widgets::StatusTone::Warning
+        }
+    }
 }
 
 /// Renders a completed operation as a result view.
+///
+/// `offline_usable` is true when the provider is in the `ReadyOffline` state
+/// — imported identity is still serving — so a failed connection test is
+/// presented as "offline, still usable" rather than as a total failure. The
+/// underlying reason is never dropped: it stays in the result's rows, which
+/// the card shows behind "Technical details".
 pub(crate) fn build_result_view(
     operation: &RommOperation,
     outcome: Result<&RommOperationOutcome, &str>,
+    offline_usable: bool,
 ) -> RommResultView {
     match outcome {
+        Err(message) if offline_usable && *operation == RommOperation::TestConnection => {
+            RommResultView {
+                succeeded: false,
+                headline: "RomM is offline — offline copy still works".to_string(),
+                rows: vec![row("Reason", message)],
+                notes: vec!["Imported identity is still usable. Nothing needs fixing.".to_string()],
+                informational: true,
+            }
+        }
         Err(message) => RommResultView {
             succeeded: false,
             // The message comes from the core, which redacts its own errors.
             headline: format!("{} failed", operation.label()),
             rows: vec![row("Reason", message)],
             notes: Vec::new(),
+            informational: false,
         },
         Ok(RommOperationOutcome::Snapshot(_)) => RommResultView {
             succeeded: true,
             headline: "Status refreshed".to_string(),
             rows: Vec::new(),
             notes: Vec::new(),
+            informational: false,
         },
         Ok(RommOperationOutcome::Enabled(enabled)) => RommResultView {
             succeeded: true,
@@ -863,6 +907,7 @@ pub(crate) fn build_result_view(
             } else {
                 "Configuration and imported identity are kept.".to_string()
             }],
+            informational: false,
         },
         Ok(RommOperationOutcome::ArtworkCleared { items, bytes }) => RommResultView {
             succeeded: true,
@@ -872,6 +917,7 @@ pub(crate) fn build_result_view(
                 "The imported identity, RomM's own artwork and your ROM files were not touched."
                     .to_string(),
             ],
+            informational: false,
         },
         Ok(RommOperationOutcome::Saved(settings)) => RommResultView {
             succeeded: true,
@@ -882,6 +928,7 @@ pub(crate) fn build_result_view(
                  no import ran - use Test connection or Refresh when you are ready."
                     .to_string(),
             ],
+            informational: false,
         },
         Ok(RommOperationOutcome::Preview(summary)) => RommResultView {
             succeeded: summary.path_shape_agrees() && summary.refused == 0,
@@ -892,6 +939,7 @@ pub(crate) fn build_result_view(
                 summary.examples.len(),
                 summary.sample_source
             )],
+            informational: false,
         },
         // Browsing results are the views' own state rather than a card result, so
         // these only ever render if one leaks - which is worth being able to see.
@@ -900,30 +948,35 @@ pub(crate) fn build_result_view(
             headline: format!("{} cached record(s) match", page.matching),
             rows: Vec::new(),
             notes: Vec::new(),
+            informational: false,
         },
         Ok(RommOperationOutcome::RecordDetail(_)) => RommResultView {
             succeeded: true,
             headline: "Record loaded".to_string(),
             rows: Vec::new(),
             notes: Vec::new(),
+            informational: false,
         },
         Ok(RommOperationOutcome::Conflicts(page)) => RommResultView {
             succeeded: true,
             headline: format!("{} conflicting record(s)", page.matching),
             rows: Vec::new(),
             notes: Vec::new(),
+            informational: false,
         },
         Ok(RommOperationOutcome::Stale(view)) => RommResultView {
             succeeded: true,
             headline: format!("{} stale record(s) grouped", view.summary.stale),
             rows: Vec::new(),
             notes: Vec::new(),
+            informational: false,
         },
         Ok(RommOperationOutcome::GameIdentity(panel)) => RommResultView {
             succeeded: true,
             headline: format!("RomM verdict: {}", panel.verdict_explanation),
             rows: Vec::new(),
             notes: Vec::new(),
+            informational: false,
         },
         // A verification *is* a card result: it changed ArchiveFS-owned state, so it
         // is worth a line even though the panel shows the detail.
@@ -938,12 +991,14 @@ pub(crate) fn build_result_view(
                 ),
             ],
             notes: vec![outcome.conclusion()],
+            informational: false,
         },
         Ok(RommOperationOutcome::Cover(outcome)) => RommResultView {
             succeeded: matches!(outcome.state, crate::romm_game::CoverState::Ready(_)),
             headline: "Cover loaded".to_string(),
             rows: Vec::new(),
             notes: vec![outcome.state.line()],
+            informational: false,
         },
         Ok(RommOperationOutcome::Connection(summary)) => build_connection_result(summary),
         Ok(RommOperationOutcome::Sample(summary)) => build_import_result(summary, true),
@@ -1044,6 +1099,7 @@ fn build_connection_result(summary: &RommConnectionSummary) -> RommResultView {
         },
         rows,
         notes,
+        informational: false,
     }
 }
 
@@ -1082,6 +1138,7 @@ fn build_import_result(summary: &RommImportSummary, sample: bool) -> RommResultV
                 ),
             ],
             notes,
+            informational: false,
         };
     }
 
@@ -1201,6 +1258,7 @@ fn build_import_result(summary: &RommImportSummary, sample: bool) -> RommResultV
         },
         rows,
         notes,
+        informational: false,
     }
 }
 
@@ -1316,11 +1374,24 @@ pub(crate) fn show_romm_source_card(
             });
 
         if let Some(error) = &view.last_error {
+            // When imported identity is still being served, a stale contact
+            // error is the expected offline case, not a configuration fault -
+            // so it reads as informational rather than as a global failure.
+            // The exact reason is never dropped; it stays in the banner text
+            // and in History & Logs.
             widgets::banner(
                 ui,
-                "Last operation failed",
+                if view.offline_usable {
+                    "RomM is offline - the offline copy keeps working"
+                } else {
+                    "Last operation failed"
+                },
                 error,
-                widgets::StatusTone::Warning,
+                if view.offline_usable {
+                    widgets::StatusTone::Info
+                } else {
+                    widgets::StatusTone::Warning
+                },
             );
         }
 
@@ -1457,11 +1528,7 @@ pub(crate) fn show_romm_source_card(
                     .first()
                     .cloned()
                     .unwrap_or_else(|| "Completed.".to_string()),
-                if result.succeeded {
-                    widgets::StatusTone::Success
-                } else {
-                    widgets::StatusTone::Warning
-                },
+                result.tone(),
             );
             widgets::technical_details(ui, "Details", |ui| {
                 for CardRow { label, value } in &result.rows {

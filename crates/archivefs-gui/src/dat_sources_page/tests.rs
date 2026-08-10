@@ -878,6 +878,74 @@ fn the_audit_summary_shows_elapsed_time_and_a_shortened_scan_folder() {
 }
 
 #[test]
+fn the_audit_folder_picker_shows_friendly_names_with_the_full_path_secondary() {
+    let fixture = Fixture::new();
+    let roms = fixture.dir("roms");
+    let deep = fixture.dir("library/GameCube");
+    let dat = fixture.write("collection.dat", LOGIQX);
+    let mut page = fixture.page_with_library(vec![roms.clone(), deep.clone()]);
+    page.apply(DatSourcesPageAction::AddFile { path: dat });
+    let view = page.view();
+    let row = view
+        .rows
+        .iter()
+        .find(|r| r.id == "collection")
+        .expect("the added source");
+
+    let mut ui_state = DatSourcesPageUi {
+        open_audit_picker: Some(row.id.clone()),
+        ..DatSourcesPageUi::default()
+    };
+    let output = render(&view, &mut ui_state);
+
+    assert!(rendered_text_contains(&output, "Check which files?"));
+    assert!(
+        rendered_text_contains(&output, "Library folder: GameCube"),
+        "the friendly folder name must come first"
+    );
+    assert!(
+        rendered_text_contains(&output, &deep.to_string_lossy()),
+        "the full path must stay accessible, muted, under the friendly name"
+    );
+    assert!(
+        rendered_text_contains(&output, &roms.to_string_lossy()),
+        "every offered folder's full path must stay reachable"
+    );
+    assert!(rendered_text_contains(&output, "Choose another folder…"));
+}
+
+#[test]
+fn the_audit_folder_picker_stays_usable_at_compact_width() {
+    let fixture = Fixture::new();
+    let deep = fixture.dir("library/GameCube");
+    let dat = fixture.write("collection.dat", LOGIQX);
+    let mut page = fixture.page_with_library(vec![deep.clone()]);
+    page.apply(DatSourcesPageAction::AddFile { path: dat });
+    let view = page.view();
+    let row = view
+        .rows
+        .iter()
+        .find(|r| r.id == "collection")
+        .expect("the added source");
+
+    let mut ui_state = DatSourcesPageUi {
+        open_audit_picker: Some(row.id.clone()),
+        ..DatSourcesPageUi::default()
+    };
+    let output = render_at_width(&view, &mut ui_state, 480.0);
+
+    assert!(
+        rendered_text_contains(&output, "Library folder: GameCube"),
+        "the friendly name must survive a compact window"
+    );
+    assert!(
+        rendered_text_contains(&output, &deep.to_string_lossy()),
+        "the full path must remain reachable at compact width"
+    );
+    assert!(rendered_text_contains(&output, "Choose another folder…"));
+}
+
+#[test]
 fn the_audit_summary_survives_navigation_and_is_replaced_by_a_new_generation() {
     let (_fixture, mut page, roms) = audit_fixture();
     page.apply(DatSourcesPageAction::Audit {

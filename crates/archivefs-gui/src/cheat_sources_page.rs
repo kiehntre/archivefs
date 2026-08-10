@@ -699,10 +699,19 @@ impl CheatSourcesPageUi {
 }
 
 /// Draws the page and returns at most one requested edit.
+///
+/// `gamer_view` controls how much is shown by default. Gamer View keeps the
+/// beginner-facing essentials - name, enabled/disabled, platform scope,
+/// capability and status - and tucks source IDs, numeric priorities, exact
+/// consultation order, the "Multi"-style emulator family labels and the
+/// upstream-review wording behind "Technical details". Advanced View shows
+/// all of it directly. Nothing is removed in either mode and every control
+/// stays reachable, so provider order semantics never change.
 pub(crate) fn show_cheat_sources_page(
     ui: &mut egui::Ui,
     view: &CheatSourcesPageView,
     ui_state: &mut CheatSourcesPageUi,
+    gamer_view: bool,
 ) -> Option<CheatSourcesPageAction> {
     let mut action = None;
 
@@ -726,14 +735,23 @@ pub(crate) fn show_cheat_sources_page(
         ui.add_space(8.0);
     }
 
-    widgets::banner(
-        ui,
-        "About these sources",
-        UPSTREAM_CONTENT_CAVEAT,
-        widgets::StatusTone::Info,
-    );
-    ui.add_space(6.0);
-    ui.label(egui::RichText::new(ORDERING_EXPLANATION).color(theme::muted(ui)));
+    if gamer_view {
+        // The review caveat and the numeric ordering rule are technical detail
+        // for a beginner. They stay one disclosure away, not gone.
+        widgets::technical_details(ui, "cheat-sources-gamer-technical", |ui| {
+            ui.label(UPSTREAM_CONTENT_CAVEAT);
+            ui.label(ORDERING_EXPLANATION);
+        });
+    } else {
+        widgets::banner(
+            ui,
+            "About these sources",
+            UPSTREAM_CONTENT_CAVEAT,
+            widgets::StatusTone::Info,
+        );
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new(ORDERING_EXPLANATION).color(theme::muted(ui)));
+    }
     ui.add_space(10.0);
 
     if let Some(bar_action) = show_save_bar(ui, view) {
@@ -759,12 +777,20 @@ pub(crate) fn show_cheat_sources_page(
     for (emulator, rows) in groups {
         widgets::section_header(
             ui,
-            emulator,
-            Some("Sources for this emulator family, in consultation order."),
+            if gamer_view {
+                gamer_family_label(emulator)
+            } else {
+                emulator
+            },
+            Some(if gamer_view {
+                "Sources for this emulator family."
+            } else {
+                "Sources for this emulator family, in consultation order."
+            }),
         );
         for row in rows {
             if action.is_none()
-                && let Some(row_action) = show_source_row(ui, row, ui_state)
+                && let Some(row_action) = show_source_row(ui, row, ui_state, gamer_view)
             {
                 action = Some(row_action);
             }
@@ -958,6 +984,7 @@ fn show_source_row(
     ui: &mut egui::Ui,
     row: &CheatSourceRowView,
     ui_state: &mut CheatSourcesPageUi,
+    gamer_view: bool,
 ) -> Option<CheatSourcesPageAction> {
     let mut action = None;
     widgets::card(ui, |ui| {
@@ -970,106 +997,209 @@ fn show_source_row(
                 });
             }
             ui.label(egui::RichText::new(&row.display_name).strong());
-            match row.consulted_position {
-                Some(position) => {
-                    widgets::status_badge(
-                        ui,
-                        format!("Consulted {}", ordinal(position)),
-                        widgets::StatusTone::Active,
-                    );
+            // Exact consultation order is technical detail. Gamer View shows
+            // status instead; Advanced View keeps the order badge.
+            if gamer_view {
+                show_source_health_badge(ui, &row.health);
+            } else {
+                match row.consulted_position {
+                    Some(position) => {
+                        widgets::status_badge(
+                            ui,
+                            format!("Consulted {}", ordinal(position)),
+                            widgets::StatusTone::Active,
+                        );
+                    }
+                    None => widgets::status_badge(ui, "Disabled", widgets::StatusTone::Pending),
                 }
-                None => widgets::status_badge(ui, "Disabled", widgets::StatusTone::Pending),
             }
             if row.changed {
                 widgets::status_badge(ui, "Changed", widgets::StatusTone::Warning);
             }
         });
 
-        ui.label(
-            egui::RichText::new(format!("ID: {}", row.id))
-                .color(theme::muted(ui))
-                .monospace(),
-        );
-        ui.label(
-            egui::RichText::new(format!(
-                "{} · {} · {}",
-                row.emulator, row.provider_kind, row.platform_coverage
-            ))
-            .color(theme::muted(ui)),
-        );
-        ui.label(egui::RichText::new(row.trust_label).color(theme::muted(ui)));
-        ui.add_space(4.0);
-        ui.label(&row.description);
+        if gamer_view {
+            // Capability and platform scope, without the internal emulator
+            // family label ("Multi" for a cross-platform source is a parser
+            // provenance detail, not something a beginner needs on the row).
+            ui.label(
+                egui::RichText::new(format!("{} · {}", row.provider_kind, row.platform_coverage))
+                    .color(theme::muted(ui)),
+            );
+            ui.label(&row.description);
+            ui.add_space(4.0);
+            show_source_health(ui, &row.health);
 
-        ui.add_space(6.0);
-        show_source_health(ui, &row.health);
+            // Every advanced field and control stays reachable one disclosure
+            // down - nothing is removed and provider order semantics never change.
+            ui.add_space(4.0);
+            widgets::technical_details(ui, ("cheat-source-technical", row.id.as_str()), |ui| {
+                ui.label(
+                    egui::RichText::new(format!("ID: {}", row.id))
+                        .color(theme::muted(ui))
+                        .monospace(),
+                );
+                ui.label(
+                    egui::RichText::new(format!("Emulator family: {}", row.emulator))
+                        .color(theme::muted(ui)),
+                );
+                match row.consulted_position {
+                    Some(position) => ui.label(format!("Consulted {}", ordinal(position))),
+                    None => ui.label("Not consulted while disabled".to_string()),
+                };
+                ui.label(egui::RichText::new(row.trust_label).color(theme::muted(ui)));
+                ui.add_space(4.0);
+                if action.is_none()
+                    && let Some(priority_action) =
+                        priority_editor(ui, row, &mut ui_state.priority_drafts)
+                {
+                    action = Some(priority_action);
+                }
+                if !row.platforms.is_empty() {
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new("Used for these platforms").strong());
+                    for platform in &row.platforms {
+                        if action.is_none()
+                            && let Some(toggle_action) =
+                                platform_participation_editor(ui, &row.id, platform)
+                        {
+                            action = Some(toggle_action);
+                        }
+                    }
+                }
+                if row.supports_platform_exceptions
+                    && action.is_none()
+                    && let Some(picker_action) = platform_exception_picker(ui, row, ui_state)
+                {
+                    action = Some(picker_action);
+                }
+            });
+        } else {
+            ui.label(
+                egui::RichText::new(format!("ID: {}", row.id))
+                    .color(theme::muted(ui))
+                    .monospace(),
+            );
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} · {} · {}",
+                    row.emulator, row.provider_kind, row.platform_coverage
+                ))
+                .color(theme::muted(ui)),
+            );
+            ui.label(egui::RichText::new(row.trust_label).color(theme::muted(ui)));
+            ui.add_space(4.0);
+            ui.label(&row.description);
 
-        ui.add_space(6.0);
-        if action.is_none()
-            && let Some(priority_action) = priority_editor(ui, row, &mut ui_state.priority_drafts)
-        {
-            action = Some(priority_action);
-        }
-
-        if !row.platforms.is_empty() {
             ui.add_space(6.0);
-            ui.label(egui::RichText::new("Used for these platforms").strong());
-            for platform in &row.platforms {
-                ui.horizontal(|ui| {
-                    let mut participating = platform.participating;
-                    let toggle = ui.add_enabled(
-                        !platform.overridden_by_source_level,
-                        egui::Checkbox::new(&mut participating, &platform.display_name),
-                    );
-                    if toggle.changed() && action.is_none() {
-                        action = Some(CheatSourcesPageAction::SetPlatformParticipation {
-                            id: row.id.clone(),
-                            platform: platform.platform.clone(),
-                            participating,
-                        });
-                    }
-                    if platform.overridden_by_source_level {
-                        ui.label(
-                            egui::RichText::new("(source is disabled everywhere)")
-                                .color(theme::muted(ui))
-                                .small(),
-                        );
-                    } else if !platform.participating {
-                        ui.label(
-                            egui::RichText::new("not used for this platform")
-                                .color(theme::muted(ui))
-                                .small(),
-                        );
-                    }
-                    // Only an exception can be removed. A platform the source
-                    // declares is a fact about the source, not a preference,
-                    // so there is nothing there to take away.
-                    if platform.is_exception
-                        && !platform.participating
-                        && widgets::action_button(
-                            ui,
-                            "Remove exception",
-                            widgets::ActionStyle::Quiet,
-                            true,
-                        )
-                        .clicked()
-                        && action.is_none()
+            show_source_health(ui, &row.health);
+
+            ui.add_space(6.0);
+            if action.is_none()
+                && let Some(priority_action) =
+                    priority_editor(ui, row, &mut ui_state.priority_drafts)
+            {
+                action = Some(priority_action);
+            }
+
+            if !row.platforms.is_empty() {
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Used for these platforms").strong());
+                for platform in &row.platforms {
+                    if action.is_none()
+                        && let Some(toggle_action) =
+                            platform_participation_editor(ui, &row.id, platform)
                     {
-                        action = Some(CheatSourcesPageAction::SetPlatformParticipation {
-                            id: row.id.clone(),
-                            platform: platform.platform.clone(),
-                            participating: true,
-                        });
+                        action = Some(toggle_action);
                     }
-                });
+                }
+            }
+
+            if row.supports_platform_exceptions
+                && action.is_none()
+                && let Some(picker_action) = platform_exception_picker(ui, row, ui_state)
+            {
+                action = Some(picker_action);
             }
         }
+    });
+    action
+}
 
-        if row.supports_platform_exceptions
-            && action.is_none()
-            && let Some(picker_action) = platform_exception_picker(ui, row, ui_state)
+/// A beginner-friendly group title for Gamer View.
+///
+/// The persisted emulator family field is parser provenance: the BSFree
+/// source carries the internal family label "Multi". That reads as an error
+/// to a beginner, so Gamer View spells it as what it means instead.
+fn gamer_family_label(emulator: &str) -> &str {
+    match emulator {
+        "Multi" => "Multi-system",
+        other => other,
+    }
+}
+
+/// The enabled/disabled/health badge a Gamer View row shows where Advanced
+/// View shows the exact consultation order. A source's own state badge is the
+/// beginner-relevant status; the order is behind "Technical details".
+fn show_source_health_badge(ui: &mut egui::Ui, health: &Option<CheatSourceHealth>) {
+    if let Some(health) = health {
+        widgets::status_badge(
+            ui,
+            health_state_label(health.state),
+            health_tone(health.state),
+        );
+    } else {
+        widgets::status_badge(ui, "Status not checked", widgets::StatusTone::Pending);
+    }
+}
+
+/// One platform participation toggle. Shared by both view modes so the
+/// control - and therefore the preference semantics - is identical.
+fn platform_participation_editor(
+    ui: &mut egui::Ui,
+    source_id: &str,
+    platform: &PlatformParticipationView,
+) -> Option<CheatSourcesPageAction> {
+    let mut action = None;
+    ui.horizontal(|ui| {
+        let mut participating = platform.participating;
+        let toggle = ui.add_enabled(
+            !platform.overridden_by_source_level,
+            egui::Checkbox::new(&mut participating, &platform.display_name),
+        );
+        if toggle.changed() {
+            action = Some(CheatSourcesPageAction::SetPlatformParticipation {
+                id: source_id.to_string(),
+                platform: platform.platform.clone(),
+                participating,
+            });
+        }
+        if platform.overridden_by_source_level {
+            ui.label(
+                egui::RichText::new("(source is disabled everywhere)")
+                    .color(theme::muted(ui))
+                    .small(),
+            );
+        } else if !platform.participating {
+            ui.label(
+                egui::RichText::new("not used for this platform")
+                    .color(theme::muted(ui))
+                    .small(),
+            );
+        }
+        // Only an exception can be removed. A platform the source declares is a
+        // fact about the source, not a preference, so there is nothing to take
+        // away.
+        if platform.is_exception
+            && !platform.participating
+            && widgets::action_button(ui, "Remove exception", widgets::ActionStyle::Quiet, true)
+                .clicked()
         {
-            action = Some(picker_action);
+            action = Some(CheatSourcesPageAction::SetPlatformParticipation {
+                id: source_id.to_string(),
+                platform: platform.platform.clone(),
+                participating: true,
+            });
         }
     });
     action

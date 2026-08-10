@@ -38,7 +38,7 @@
 //! is deferred behind a flag - the capability is simply not present.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
@@ -4331,6 +4331,18 @@ pub(crate) fn platform_choice_count(query: &str) -> usize {
         .count()
 }
 
+/// A friendly name for a library folder button: its own name first, with the
+/// full path shown as muted secondary text. Deep configured paths read as
+/// giant buttons otherwise; a beginner recognises "GameCube" faster than
+/// "/media/archives/library/GameCube".
+fn friendly_folder_label(folder: &Path) -> String {
+    folder
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| folder.display().to_string())
+}
+
 fn show_audit_target_picker(
     ui: &mut egui::Ui,
     row: &DatSourceRowView,
@@ -4357,15 +4369,26 @@ fn show_audit_target_picker(
             );
         }
         for folder in &view.library_folders {
-            if widgets::action_button(
-                ui,
-                format!("Library folder: {}", folder.display()),
-                widgets::ActionStyle::Secondary,
-                true,
-            )
-            .clicked()
-                && action.is_none()
-            {
+            // A two-line button: the friendly name first, the full path muted
+            // underneath. Clicking anywhere on it starts the audit.
+            let friendly = friendly_folder_label(folder);
+            let full = folder.display().to_string();
+            let clicked = egui::Frame::new()
+                .fill(theme::card_fill(ui))
+                .stroke(theme::border(ui))
+                .corner_radius(6)
+                .inner_margin(egui::Margin::symmetric(12, 8))
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("Library folder: {friendly}")).strong(),
+                        );
+                        ui.label(egui::RichText::new(full).color(theme::muted(ui)).small());
+                    });
+                })
+                .response
+                .interact(egui::Sense::click());
+            if clicked.clicked() && action.is_none() {
                 action = Some(DatSourcesPageAction::Audit {
                     id: row.id.clone(),
                     scan_root: folder.clone(),

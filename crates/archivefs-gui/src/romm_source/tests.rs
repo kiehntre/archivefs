@@ -722,6 +722,7 @@ fn a_sample_result_says_plainly_that_nothing_was_published() {
     let view = build_result_view(
         &RommOperation::SampleImport { records: 25 },
         Ok(&RommOperationOutcome::Sample(Box::new(summary))),
+        false,
     );
     assert!(view.succeeded);
     assert!(
@@ -791,6 +792,7 @@ fn romm_import_result_surfaces_platform_conflict_for_review() {
     let view = build_result_view(
         &RommOperation::FullImport,
         Ok(&RommOperationOutcome::Import(Box::new(summary))),
+        false,
     );
     assert!(
         view.rows
@@ -810,6 +812,7 @@ fn a_published_import_states_atomic_publication_and_the_cache_path() {
         Ok(&RommOperationOutcome::Import(Box::new(import_summary(
             true, 36_259,
         )))),
+        false,
     );
     assert!(view.succeeded);
     assert!(view.headline.contains("36259"), "{}", view.headline);
@@ -839,6 +842,7 @@ fn an_import_that_adapted_explains_it_in_words() {
     let view = build_result_view(
         &RommOperation::FullImport,
         Ok(&RommOperationOutcome::Import(Box::new(summary))),
+        false,
     );
     let notes = view.notes.join(" ");
     assert!(notes.contains("stepped down from 100 to 1"), "{notes}");
@@ -869,6 +873,7 @@ fn a_failed_import_says_whether_the_old_cache_survived() {
     let view = build_result_view(
         &RommOperation::Refresh,
         Ok(&RommOperationOutcome::Import(Box::new(summary.clone()))),
+        false,
     );
     assert!(!view.succeeded);
     let notes = view.notes.join(" ");
@@ -886,6 +891,7 @@ fn a_failed_import_says_whether_the_old_cache_survived() {
     let first = build_result_view(
         &RommOperation::FullImport,
         Ok(&RommOperationOutcome::Import(Box::new(summary))),
+        false,
     );
     assert!(
         first.notes.join(" ").contains("no previous cache to lose"),
@@ -922,6 +928,7 @@ fn a_connection_result_reports_capability_and_says_it_changed_nothing() {
     let view = build_result_view(
         &RommOperation::TestConnection,
         Ok(&RommOperationOutcome::Connection(Box::new(summary))),
+        false,
     );
     assert!(view.succeeded);
     let labels: Vec<String> = view.rows.iter().map(|row| row.label.clone()).collect();
@@ -960,6 +967,7 @@ fn a_path_shape_mismatch_is_called_out_in_the_connection_result() {
     let view = build_result_view(
         &RommOperation::TestConnection,
         Ok(&RommOperationOutcome::Connection(Box::new(summary))),
+        false,
     );
     let notes = view.notes.join(" ");
     assert!(notes.contains("reports relative paths"), "{notes}");
@@ -978,6 +986,7 @@ fn an_artwork_clear_result_says_what_it_did_not_touch() {
             items: 39,
             bytes: 2_434_474,
         }),
+        false,
     );
     assert!(view.succeeded);
     assert!(view.headline.contains("39"), "{}", view.headline);
@@ -996,6 +1005,7 @@ fn a_failed_operation_is_reported_with_the_cores_own_redacted_message() {
     let view = build_result_view(
         &RommOperation::TestConnection,
         Err("the token file is readable by others (mode 0644); run chmod 600"),
+        false,
     );
     assert!(!view.succeeded);
     assert!(view.headline.contains("failed"), "{}", view.headline);
@@ -1008,10 +1018,73 @@ fn a_failed_operation_is_reported_with_the_cores_own_redacted_message() {
 }
 
 #[test]
+fn a_failed_connection_test_while_offline_is_not_a_total_romm_failure() {
+    let view = build_result_view(
+        &RommOperation::TestConnection,
+        Err("could not reach RomM: an I/O error occurred (connection refused)"),
+        true,
+    );
+    // Not a success - the attempt did not reach RomM - but presented as the
+    // offline case working as intended, never as a scary global failure.
+    assert!(!view.succeeded);
+    assert_eq!(view.tone(), widgets::StatusTone::Info);
+    assert!(view.headline.contains("offline"), "{}", view.headline);
+    assert!(!view.headline.contains("failed"), "{}", view.headline);
+    // The exact technical reason is preserved, in the rows behind
+    // "Technical details".
+    assert!(
+        view.rows
+            .iter()
+            .any(|row| row.value.contains("connection refused")),
+        "{:?}",
+        view.rows
+    );
+    assert!(
+        view.notes.join(" ").contains("still usable"),
+        "{:?}",
+        view.notes
+    );
+}
+
+#[test]
+fn a_failed_connection_test_without_an_offline_copy_still_shows_a_real_failure() {
+    let view = build_result_view(
+        &RommOperation::TestConnection,
+        Err("could not reach RomM: an I/O error occurred (connection refused)"),
+        false,
+    );
+    assert!(!view.succeeded);
+    assert_eq!(view.tone(), widgets::StatusTone::Warning);
+    assert!(view.headline.contains("failed"), "{}", view.headline);
+    assert!(
+        view.rows
+            .iter()
+            .any(|row| row.value.contains("connection refused")),
+        "{:?}",
+        view.rows
+    );
+}
+
+#[test]
+fn an_offline_but_usable_source_marks_the_card_informational_not_failed() {
+    let view = build_card_view(
+        Some(&snapshot(ProviderState::ReadyOffline, true, true)),
+        None,
+        false,
+    );
+    assert!(view.offline_usable);
+    // A stale last error on an offline-but-usable source must not read as a
+    // global failure - the offline copy is the intended fallback.
+    assert!(view.offline_browsing);
+    assert_eq!(view.state_label, "Ready (offline)");
+}
+
+#[test]
 fn enabling_says_that_nothing_was_contacted() {
     let view = build_result_view(
         &RommOperation::SetEnabled(true),
         Ok(&RommOperationOutcome::Enabled(true)),
+        false,
     );
     assert!(view.succeeded);
     assert!(view.headline.contains("enabled"));
@@ -1024,6 +1097,7 @@ fn enabling_says_that_nothing_was_contacted() {
     let disabled = build_result_view(
         &RommOperation::SetEnabled(false),
         Ok(&RommOperationOutcome::Enabled(false)),
+        false,
     );
     assert!(
         disabled.notes.join(" ").contains("identity are kept"),
