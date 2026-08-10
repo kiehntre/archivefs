@@ -642,7 +642,7 @@ impl OperationHistory {
 }
 
 fn gui_version_line() -> String {
-    format!("archivefs-gui {}", env!("CARGO_PKG_VERSION"))
+    format!("emuwiz {}", env!("CARGO_PKG_VERSION"))
 }
 
 struct StderrLogger;
@@ -667,14 +667,23 @@ static LOGGER: StderrLogger = StderrLogger;
 /// resolved profiles, target paths, write/journal outcomes) go through the
 /// `log` facade rather than only the in-app history, so they are visible
 /// even when a failure never reaches a rendered banner. Level defaults to
-/// `info`; set `ARCHIVEFS_LOG` (e.g. `debug`) to see more.
+/// `info`; set `EMUWIZ_LOG` (e.g. `debug`) to see more. The legacy
+/// `ARCHIVEFS_LOG` is honoured during the compatibility period, with
+/// `EMUWIZ_LOG` winning if both are set.
 fn init_logging() {
     let _ = log::set_logger(&LOGGER);
-    let level = std::env::var("ARCHIVEFS_LOG")
-        .ok()
+    let emuwiz = std::env::var("EMUWIZ_LOG").ok();
+    let legacy = std::env::var("ARCHIVEFS_LOG").ok();
+    log::set_max_level(resolve_log_level(emuwiz, legacy));
+}
+
+/// The log level selected by the environment. `EMUWIZ_LOG` wins over the
+/// legacy `ARCHIVEFS_LOG`; an invalid value falls back to `info`.
+fn resolve_log_level(emuwiz: Option<String>, legacy: Option<String>) -> log::LevelFilter {
+    emuwiz
+        .or(legacy)
         .and_then(|value| value.parse::<log::LevelFilter>().ok())
-        .unwrap_or(log::LevelFilter::Info);
-    log::set_max_level(level);
+        .unwrap_or(log::LevelFilter::Info)
 }
 
 fn main() -> eframe::Result<()> {
@@ -693,7 +702,11 @@ fn main() -> eframe::Result<()> {
     }
 
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1100.0, 720.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1100.0, 720.0])
+            // The desktop application id / window class: `emuwiz` is the
+            // user-facing identity for window managers and launchers.
+            .with_app_id("emuwiz"),
         ..Default::default()
     };
 
@@ -37386,13 +37399,7 @@ fn gamer_search_width(available_width: f32) -> f32 {
 /// a GUI-layer-only concept (never read by `archivefs-core` or the CLI),
 /// so it lives in the GUI crate rather than in core.
 fn gui_mode_config_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
-    Some(
-        PathBuf::from(home)
-            .join(".config")
-            .join("archivefs")
-            .join("gui_mode.txt"),
-    )
+    archivefs_core::app_dirs::config_path("gui_mode.txt").ok()
 }
 
 fn parse_gui_mode(contents: &str) -> GuiMode {
@@ -40242,7 +40249,32 @@ mod tests {
     fn gui_version_line_matches_the_workspace_package_version() {
         assert_eq!(
             gui_version_line(),
-            format!("archivefs-gui {}", env!("CARGO_PKG_VERSION"))
+            format!("emuwiz {}", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
+    fn log_level_prefers_emuwiz_over_the_legacy_variable() {
+        use log::LevelFilter;
+        assert_eq!(
+            resolve_log_level(Some("debug".to_string()), Some("warn".to_string())),
+            LevelFilter::Debug,
+            "EMUWIZ_LOG must win when both are set"
+        );
+        assert_eq!(
+            resolve_log_level(None, Some("trace".to_string())),
+            LevelFilter::Trace,
+            "the legacy ARCHIVEFS_LOG must still work"
+        );
+        assert_eq!(
+            resolve_log_level(Some("bogus".to_string()), Some("warn".to_string())),
+            LevelFilter::Info,
+            "an invalid EMUWIZ_LOG falls back to the default, never to the legacy var"
+        );
+        assert_eq!(
+            resolve_log_level(None, None),
+            LevelFilter::Info,
+            "the default level is info"
         );
     }
 

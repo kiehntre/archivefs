@@ -117,7 +117,9 @@ release_note "building EmuWiz v$VERSION with cargo --release --locked"
 (cd "$REPO_ROOT" && cargo "${BUILD_ARGS[@]}")
 BUILD_ROOT="${CARGO_TARGET_DIR:-$REPO_ROOT/target}/release"
 
-for binary in archivefs-cli archivefs-gui; do
+# Package the primary EmuWiz binaries. install.sh creates the legacy
+# `archivefs-cli`/`archivefs-gui` aliases at install time.
+for binary in emuwiz-cli emuwiz; do
     [[ -f "$BUILD_ROOT/$binary" && -x "$BUILD_ROOT/$binary" ]] ||
         release_die "release binary missing or not executable: $BUILD_ROOT/$binary"
     install -m 0755 "$BUILD_ROOT/$binary" "$STAGE_ROOT/$binary"

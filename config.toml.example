@@ -1,8 +1,9 @@
 # Example EmuWiz configuration.
 #
-# Copy this file to ~/.config/archivefs/config.toml and edit mount_root
-# below for your system - source folders do not need to be edited here at
-# all (see below).
+# Copy this file to ~/.config/emuwiz/config.toml and edit mount_root below
+# for your system. An existing ~/.config/archivefs/config.toml is still read
+# and honoured from before the EmuWiz rename. Source folders do not need to
+# be edited here at all (see below).
 
 # Folders EmuWiz scans recursively for supported archives (.zip, .7z,
 # .rar). EmuWiz supports any number of independent source folders, and
@@ -12,9 +13,9 @@
 # You do not need to hand-edit this array: add, enable/disable, scan, and
 # remove source folders from the Sources page in the GUI, or from the
 # command line, e.g.:
-#   archivefs-cli source add /data/archives
-#   archivefs-cli source add /data/more-archives
-#   archivefs-cli sources
+#   emuwiz-cli source add /data/archives
+#   emuwiz-cli source add /data/more-archives
+#   emuwiz-cli sources
 # Both ways write to this same config atomically, and both are safe to
 # use interchangeably at any time - nothing here needs reinstalling.
 #
@@ -45,6 +46,6 @@ ratarmount_bin = "ratarmount"
 # slug mapping, never from display text. Omit the line when you do not want
 # organisation.
 #
-#   archivefs-cli rom-organise set-master-root /mnt/games/roms
+#   emuwiz-cli rom-organise set-master-root /mnt/games/roms
 #
 # master_rom_root = "/mnt/games/roms"

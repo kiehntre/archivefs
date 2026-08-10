@@ -630,13 +630,13 @@ fn print_post_install(journal_path: Option<&Path>, destination_root: &Path) {
     if let Some(journal_path) = journal_path {
         println!("\nUndo and history");
         println!("  journal: {}", journal_path.display());
-        println!("  archivefs retroarch-cheat-history");
+        println!("  emuwiz-cli retroarch-cheat-history");
         println!(
-            "  archivefs retroarch-cheat-inspect '{}'",
+            "  emuwiz-cli retroarch-cheat-inspect '{}'",
             journal_path.display()
         );
         println!(
-            "  archivefs retroarch-cheat-rollback '{}' --cheat-destination-root '{}' --dry-run",
+            "  emuwiz-cli retroarch-cheat-rollback '{}' --cheat-destination-root '{}' --dry-run",
             journal_path.display(),
             destination_root.display()
         );

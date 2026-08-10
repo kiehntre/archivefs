@@ -370,10 +370,7 @@ impl CheatSourceTransport for HttpsCheatSourceTransport {
                 "application/vnd.github+json, application/zip, application/octet-stream",
             )
             .header("Accept-Encoding", "identity")
-            .header(
-                "User-Agent",
-                concat!("archivefs/", env!("CARGO_PKG_VERSION")),
-            )
+            .header("User-Agent", concat!("emuwiz/", env!("CARGO_PKG_VERSION")))
             .call()
             .map_err(classify_ureq_request_error)?;
         let header_bytes = response

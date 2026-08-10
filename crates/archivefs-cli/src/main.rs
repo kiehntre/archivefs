@@ -208,7 +208,7 @@ fn explain_config_load_error(error: ArchiveFsError) -> Box<dyn std::error::Error
     {
         return format!(
             "{error}\nNo configuration file yet - this is normal for a new install. Run \
-             `archivefs config-check` to see what's needed, or copy config.toml.example to {} \
+             `emuwiz-cli config-check` to see what's needed, or copy config.toml.example to {} \
              to get started.",
             path.display()
         )
@@ -1213,7 +1213,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let path = extract_path_flag(&mut input_args)?;
             let Some(platform) = input_args.pop() else {
                 return Err(
-                    "library-set-platform requires a platform, e.g. archivefs-cli library-set-platform \"007 Legends\" Xbox360 (or --id <id> Xbox360, or --path <path> Xbox360)"
+                    "library-set-platform requires a platform, e.g. emuwiz-cli library-set-platform \"007 Legends\" Xbox360 (or --id <id> Xbox360, or --path <path> Xbox360)"
                         .into(),
                 );
             };
@@ -1249,7 +1249,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let paths = extract_repeated_path_flags(&mut input_args)?;
             let Some(platform) = input_args.pop() else {
                 return Err(
-                    "library-set-platform-bulk requires a platform, e.g. archivefs-cli library-set-platform-bulk --id 1 --id 2 GameCube"
+                    "library-set-platform-bulk requires a platform, e.g. emuwiz-cli library-set-platform-bulk --id 1 --id 2 GameCube"
                         .into(),
                 );
             };
@@ -1355,7 +1355,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 let Some(target) = input_args.first().cloned() else {
                     return Err(
-                        "platform-detect requires a path, e.g. archivefs-cli platform-detect /roms/scummvm/laurabow2/RESOURCE.GEN"
+                        "platform-detect requires a path, e.g. emuwiz-cli platform-detect /roms/scummvm/laurabow2/RESOURCE.GEN"
                             .into(),
                     );
                 };
@@ -1402,7 +1402,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "platform-alias-remove" => {
             let Some(alias) = args.next() else {
                 return Err(
-                    "platform-alias-remove requires an alias, e.g. archivefs-cli platform-alias-remove gc"
+                    "platform-alias-remove requires an alias, e.g. emuwiz-cli platform-alias-remove gc"
                         .into(),
                 );
             };
@@ -1468,7 +1468,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 "add" => {
                     let Some(path) = input_args.first().cloned() else {
                         return Err(
-                            "source add requires a path, e.g. archivefs-cli source add /mnt/roms"
+                            "source add requires a path, e.g. emuwiz-cli source add /mnt/roms"
                                 .into(),
                         );
                     };
@@ -1479,7 +1479,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         println!("Added source folder: {}", added.path.display());
                         println!(
-                            "Run 'archivefs-cli source scan {}' to scan it.",
+                            "Run 'emuwiz-cli source scan {}' to scan it.",
                             added.path.display()
                         );
                     }
@@ -1675,7 +1675,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // exactly the same scope `--help`/`-h` already have (neither is
         // special-cased inside any individual subcommand's own argument
         // parsing, here or anywhere else in this file). Any trailing
-        // `cli.args` (e.g. `archivefs-cli --version library-list`) are
+        // `cli.args` (e.g. `emuwiz-cli --version library-list`) are
         // ignored rather than rejected: `print_version` never reads
         // `args`, so this deliberately mirrors how `--help`/`-h` already
         // silently ignore trailing arguments today - "version wins and
@@ -3002,7 +3002,7 @@ fn read_index_or_print_build_hint() -> Result<Option<ArchiveIndex>, Box<dyn std:
     let index_path = default_index_path()?;
     if !Path::new(&index_path).exists() {
         println!(
-            "No archive index found at {}. Run: archivefs index-build",
+            "No archive index found at {}. Run: emuwiz-cli index-build",
             index_path.display()
         );
         return Ok(None);
@@ -3012,10 +3012,10 @@ fn read_index_or_print_build_hint() -> Result<Option<ArchiveIndex>, Box<dyn std:
 
 fn print_index_warnings(freshness: &ArchiveIndexFreshness) {
     if !freshness.missing_archive_paths.is_empty() {
-        println!("Warning: index contains missing archive paths. Run archivefs index-build.");
+        println!("Warning: index contains missing archive paths. Run emuwiz-cli index-build.");
     }
     if !freshness.stale_archive_paths.is_empty() {
-        println!("Warning: index may be stale. Run archivefs index-build.");
+        println!("Warning: index may be stale. Run emuwiz-cli index-build.");
     }
 }
 
@@ -3168,7 +3168,7 @@ fn format_library_status(view: &LibraryStatusView) -> String {
     ));
 
     if !view.health.database_exists {
-        output.push_str("\nNo library database yet. Run: archivefs-cli library-scan\n");
+        output.push_str("\nNo library database yet. Run: emuwiz-cli library-scan\n");
         return output;
     }
 
@@ -3183,7 +3183,7 @@ fn format_library_status(view: &LibraryStatusView) -> String {
     if !view.health.database_opens {
         output.push_str(
             "\nThe database file exists but could not be opened. It is always safe to \
-             delete it and run archivefs-cli library-scan to rebuild it from your \
+             delete it and run emuwiz-cli library-scan to rebuild it from your \
              configured source folders.\n",
         );
         return output;
@@ -3216,7 +3216,7 @@ fn format_library_status(view: &LibraryStatusView) -> String {
                 ));
             } else {
                 output.push_str(
-                    "\nThis database's schema is outdated. Run: archivefs-cli library-scan \
+                    "\nThis database's schema is outdated. Run: emuwiz-cli library-scan \
                      to upgrade it.\n",
                 );
             }
@@ -3264,7 +3264,7 @@ fn format_library_status(view: &LibraryStatusView) -> String {
                 output.push_str(&format!("  Error details: {message}\n"));
             }
         }
-        None => output.push_str("  none yet - run: archivefs-cli library-scan\n"),
+        None => output.push_str("  none yet - run: emuwiz-cli library-scan\n"),
     }
 
     output
@@ -3464,7 +3464,7 @@ fn format_source_folder_views(views: &[SourceFolderView]) -> String {
     let mut output = String::from("EmuWiz Sources\n\n");
     if views.is_empty() {
         output.push_str("No source folders are configured.\n");
-        output.push_str("Add one with: archivefs-cli source add <path>\n");
+        output.push_str("Add one with: emuwiz-cli source add <path>\n");
         return output;
     }
     for view in views {
@@ -3836,7 +3836,7 @@ fn print_library_entries(database_path: &Path, entries: &[LibraryArchiveView]) {
             println!("No archives in the library catalogue yet.");
         } else {
             println!(
-                "No library database found at {}. Run: archivefs-cli library-scan",
+                "No library database found at {}. Run: emuwiz-cli library-scan",
                 database_path.display()
             );
         }
@@ -3921,7 +3921,7 @@ fn parse_platform_alias_add_args(
         [alias, platform] => Ok((json, alias.clone(), platform.clone())),
         _ => Err(
             "platform-alias-add requires exactly an alias and a platform, e.g. \
-             archivefs-cli platform-alias-add gc GameCube"
+             emuwiz-cli platform-alias-add gc GameCube"
                 .into(),
         ),
     }
@@ -4014,7 +4014,7 @@ fn resolve_library_target(
 ) -> Result<(Database, LibraryArchiveView), Box<dyn std::error::Error>> {
     if !database_path.exists() {
         return Err(format!(
-            "No library database found at {}. Run: archivefs-cli library-scan",
+            "No library database found at {}. Run: emuwiz-cli library-scan",
             database_path.display()
         )
         .into());
@@ -4476,7 +4476,7 @@ fn run_library_set_platform_bulk(
 ) -> Result<BulkPlatformAssignmentResult, Box<dyn std::error::Error>> {
     if !database_path.exists() {
         return Err(format!(
-            "No library database found at {}. Run: archivefs-cli library-scan",
+            "No library database found at {}. Run: emuwiz-cli library-scan",
             database_path.display()
         )
         .into());
@@ -4496,7 +4496,7 @@ fn run_library_clear_platform_bulk(
 ) -> Result<BulkPlatformAssignmentResult, Box<dyn std::error::Error>> {
     if !database_path.exists() {
         return Err(format!(
-            "No library database found at {}. Run: archivefs-cli library-scan",
+            "No library database found at {}. Run: emuwiz-cli library-scan",
             database_path.display()
         )
         .into());
@@ -4517,7 +4517,7 @@ fn run_library_remove_missing(
 ) -> Result<MissingArchiveRemovalResult, Box<dyn std::error::Error>> {
     if !database_path.exists() {
         return Err(format!(
-            "No library database found at {}. Run: archivefs-cli library-scan",
+            "No library database found at {}. Run: emuwiz-cli library-scan",
             database_path.display()
         )
         .into());
@@ -4714,7 +4714,7 @@ fn gather_doctor_scan() -> DoctorScan {
             // A missing or unreadable index is not a gather failure: there
             // is simply nothing to report about its freshness yet.
             Err(_) => Gathered::NotLoaded(
-                "No archive index has been built yet, or it could not be read. Run `archivefs index-build` to create one.",
+                "No archive index has been built yet, or it could not be read. Run `emuwiz-cli index-build` to create one.",
             ),
         },
         Err(error) => Gathered::Failed(format!("index path could not be resolved: {error}")),
@@ -4749,7 +4749,7 @@ fn gather_doctor_scan() -> DoctorScan {
 
     let inputs = DoctorScanInputs {
         doctor_report: Gathered::NotLoaded(
-            "The archive-scan and mount-status checks need a library snapshot, which a diagnostic run never builds. Run `archivefs status` or open the GUI for those.",
+            "The archive-scan and mount-status checks need a library snapshot, which a diagnostic run never builds. Run `emuwiz-cli status` or open the GUI for those.",
         ),
         setup: match &setup {
             Gathered::Ready(report) => Gathered::Ready(report),
@@ -4779,7 +4779,7 @@ fn gather_doctor_scan() -> DoctorScan {
         // Discovering RetroArch profiles walks directories, which is a scan.
         // Doctor never starts one; `retroarch-environment` exists for that.
         retroarch: Gathered::NotLoaded(
-            "RetroArch discovery walks directories, so Doctor does not start it. Run `archivefs retroarch-environment` for those findings.",
+            "RetroArch discovery walks directories, so Doctor does not start it. Run `emuwiz-cli retroarch-environment` for those findings.",
         ),
         transactions: match &transactions {
             Gathered::Ready(report) => Gathered::Ready(report),
@@ -4894,7 +4894,7 @@ fn format_doctor_repair(outcome: &DoctorRepairOutcome) -> String {
 
 /// Renders a scan for a terminal.
 ///
-/// Exit-status policy: `archivefs doctor --findings` exits 0 whenever the
+/// Exit-status policy: `emuwiz-cli doctor --findings` exits 0 whenever the
 /// scan itself completed, *including* when it reports critical findings.
 /// Findings describe the installation, not the command, and the existing
 /// `doctor` command behaves the same way, so scripts that only check the
@@ -5478,7 +5478,7 @@ fn format_statuses_json(statuses: &[ArchiveStatus]) -> Result<String, serde_json
 /// invokes git, parses tags, reads a file at runtime, or duplicates the
 /// version as a separate literal anywhere in this source.
 fn version_line() -> String {
-    format!("archivefs-cli {}", env!("CARGO_PKG_VERSION"))
+    format!("emuwiz-cli {}", env!("CARGO_PKG_VERSION"))
 }
 
 fn print_version() {
@@ -5486,7 +5486,7 @@ fn print_version() {
 }
 
 fn print_help() {
-    println!("archivefs [--verbose|-v] [--debug] <command>");
+    println!("emuwiz-cli [--verbose|-v] [--debug] <command>");
     println!();
     println!("Global flags:");
     println!("  -v, --verbose  Show operational logs");
@@ -5533,7 +5533,7 @@ fn print_help() {
         "  identity source romm <status|configure|test|mappings|import|refresh|records|record|conflicts|verify-hash|enable|disable|remove>  Use a local RomM server as an external identity source. Read-only towards RomM: no command writes to it, triggers a scan, edits metadata, or touches a ROM. Only loopback and private LAN addresses are accepted. The token is passed by file path with --token-file and is never printed, logged or stored in config or cache JSON. Add --json for structured output on stdout, with progress on stderr."
     );
     println!(
-        "  identity source romm configure --url <local-url> --token-file <path> [--path-kind relative|absolute] [--page-size <n>] [--enable]  Store the RomM URL and the path to a read-only client token (suggested ~/.config/archivefs/romm-token, which EmuWiz never creates for you). The URL is resolved and refused now if it is not local; the token file must be a regular non-symlink file with restrictive permissions. --path-kind declares the shape of path this instance reports: `relative` for RomM 5.1.0, which returns `roms/gb/game.gb`, or `absolute` for an installation that returns `/romm/library/gb/game.gb`. The shape is never guessed from an individual path; run `test` to see which one your server uses. Contacts nothing."
+        "  identity source romm configure --url <local-url> --token-file <path> [--path-kind relative|absolute] [--page-size <n>] [--enable]  Store the RomM URL and the path to a read-only client token (suggested ~/.config/emuwiz/romm-token, which EmuWiz never creates for you). The URL is resolved and refused now if it is not local; the token file must be a regular non-symlink file with restrictive permissions. --path-kind declares the shape of path this instance reports: `relative` for RomM 5.1.0, which returns `roms/gb/game.gb`, or `absolute` for an installation that returns `/romm/library/gb/game.gb`. The shape is never guessed from an individual path; run `test` to see which one your server uses. Contacts nothing."
     );
     println!(
         "  identity source romm mappings add --romm-root <path> --archivefs-root <path> [--replace]  Map a RomM path prefix onto a local directory, written in the source's declared path shape - `roms` when relative, `/romm/library` when absolute. Matching is on whole components with the longest prefix winning; the destination must be inside a configured source folder. A `..`, a `.`, an empty component, a backslash, a drive letter, a UNC prefix or a control character refuses the path rather than being repaired."
@@ -5681,105 +5681,105 @@ fn print_help() {
     );
     println!();
     println!("Examples:");
-    println!("  archivefs --version");
-    println!("  archivefs doctor");
-    println!("  archivefs doctor --findings");
-    println!("  archivefs doctor --findings --json");
+    println!("  emuwiz-cli --version");
+    println!("  emuwiz-cli doctor");
+    println!("  emuwiz-cli doctor --findings");
+    println!("  emuwiz-cli doctor --findings --json");
     println!(
-        "  archivefs doctor --repair clean_mount_root --finding mount_root.stale_mount_directories --dry-run"
+        "  emuwiz-cli doctor --repair clean_mount_root --finding mount_root.stale_mount_directories --dry-run"
     );
     println!(
-        "  archivefs doctor --repair clean_mount_root --finding mount_root.stale_mount_directories --confirm"
+        "  emuwiz-cli doctor --repair clean_mount_root --finding mount_root.stale_mount_directories --confirm"
     );
-    println!("  archivefs config-check");
-    println!("  archivefs pcsx2-patch-preview");
-    println!("  archivefs pcsx2-patch-preview --json");
-    println!("  archivefs gamehacking-ps2-index-refresh");
-    println!("  archivefs gamehacking-gamecube-index-refresh");
-    println!("  archivefs gamehacking-gamecube-sysid-diagnostic --game-id 54172");
-    println!("  archivefs gamehacking-gamecube-code-format-audit --game-id 54172");
-    println!("  archivefs retroarch-environment");
-    println!("  archivefs retroarch-environment --json");
-    println!("  archivefs retroarch-patch-preview");
-    println!("  archivefs retroarch-patch-preview --json");
-    println!("  archivefs retroarch-cheat-catalogue /path/to/cheat-catalogue");
+    println!("  emuwiz-cli config-check");
+    println!("  emuwiz-cli pcsx2-patch-preview");
+    println!("  emuwiz-cli pcsx2-patch-preview --json");
+    println!("  emuwiz-cli gamehacking-ps2-index-refresh");
+    println!("  emuwiz-cli gamehacking-gamecube-index-refresh");
+    println!("  emuwiz-cli gamehacking-gamecube-sysid-diagnostic --game-id 54172");
+    println!("  emuwiz-cli gamehacking-gamecube-code-format-audit --game-id 54172");
+    println!("  emuwiz-cli retroarch-environment");
+    println!("  emuwiz-cli retroarch-environment --json");
+    println!("  emuwiz-cli retroarch-patch-preview");
+    println!("  emuwiz-cli retroarch-patch-preview --json");
+    println!("  emuwiz-cli retroarch-cheat-catalogue /path/to/cheat-catalogue");
     println!(
-        "  archivefs cheat-provider-coverage --id 12 --id 34 --retroarch-catalogue /path/to/cht --json"
+        "  emuwiz-cli cheat-provider-coverage --id 12 --id 34 --retroarch-catalogue /path/to/cht --json"
     );
-    println!("  archivefs retroarch-cheat-catalogue /path/to/manifest.json --json");
+    println!("  emuwiz-cli retroarch-cheat-catalogue /path/to/manifest.json --json");
     println!(
-        "  archivefs retroarch-cheat-catalogue /path/to/cheat-catalogue --cheat-destination-root /tmp/isolated-preview-root"
-    );
-    println!(
-        "  archivefs retroarch-cheat-install /path/to/cheat-catalogue --cheat-destination-root ~/.config/retroarch/cheats --dry-run"
+        "  emuwiz-cli retroarch-cheat-catalogue /path/to/cheat-catalogue --cheat-destination-root /tmp/isolated-preview-root"
     );
     println!(
-        "  archivefs retroarch-cheat-install /path/to/cheat-catalogue --cheat-destination-root ~/.config/retroarch/cheats --yes"
+        "  emuwiz-cli retroarch-cheat-install /path/to/cheat-catalogue --cheat-destination-root ~/.config/retroarch/cheats --dry-run"
     );
     println!(
-        "  archivefs retroarch-cheat-install /path/to/cheat-catalogue --cheat-destination-root ~/.config/retroarch/cheats --yes --replace-different --json"
+        "  emuwiz-cli retroarch-cheat-install /path/to/cheat-catalogue --cheat-destination-root ~/.config/retroarch/cheats --yes"
     );
-    println!("  archivefs retroarch-cheat-setup /path/to/cheat-catalogue --dry-run");
-    println!("  archivefs retroarch-cheat-setup --source libretro-buildbot-cheats --dry-run");
-    println!("  archivefs retroarch-cheat-source-list --json");
-    println!("  archivefs retroarch-cheat-source-fetch libretro-buildbot-cheats");
-    println!("  archivefs retroarch-cheat-source-inspect libretro-buildbot-cheats");
-    println!("  archivefs retroarch-cheat-snapshot-list --json");
-    println!("  archivefs retroarch-cheat-snapshot-verify --all");
-    println!("  archivefs retroarch-cheat-snapshot-pin <snapshot-id>");
-    println!("  archivefs retroarch-cheat-cache-prune --keep 3 --dry-run");
     println!(
-        "  archivefs retroarch-cheat-setup /path/to/cheat-catalogue --profile <profile-id> --yes"
+        "  emuwiz-cli retroarch-cheat-install /path/to/cheat-catalogue --cheat-destination-root ~/.config/retroarch/cheats --yes --replace-different --json"
     );
-    println!("  archivefs retroarch-cheat-history");
-    println!("  archivefs retroarch-cheat-history --json");
+    println!("  emuwiz-cli retroarch-cheat-setup /path/to/cheat-catalogue --dry-run");
+    println!("  emuwiz-cli retroarch-cheat-setup --source libretro-buildbot-cheats --dry-run");
+    println!("  emuwiz-cli retroarch-cheat-source-list --json");
+    println!("  emuwiz-cli retroarch-cheat-source-fetch libretro-buildbot-cheats");
+    println!("  emuwiz-cli retroarch-cheat-source-inspect libretro-buildbot-cheats");
+    println!("  emuwiz-cli retroarch-cheat-snapshot-list --json");
+    println!("  emuwiz-cli retroarch-cheat-snapshot-verify --all");
+    println!("  emuwiz-cli retroarch-cheat-snapshot-pin <snapshot-id>");
+    println!("  emuwiz-cli retroarch-cheat-cache-prune --keep 3 --dry-run");
     println!(
-        "  archivefs retroarch-cheat-inspect ~/.local/share/archivefs/cheat-install-runs/<run>.json"
+        "  emuwiz-cli retroarch-cheat-setup /path/to/cheat-catalogue --profile <profile-id> --yes"
     );
-    println!("  archivefs status --json");
-    println!("  archivefs stats");
-    println!("  archivefs library-status");
-    println!("  archivefs database-check");
-    println!("  archivefs database-check --json");
-    println!("  archivefs library-scan");
-    println!("  archivefs library-list");
-    println!("  archivefs library-list --unknown-only");
-    println!("  archivefs library-find \"007 Legends\"");
-    println!("  archivefs library-find --unknown-only n64");
-    println!("  archivefs library-set-platform \"Luigi's Mansion\" GameCube");
-    println!("  archivefs library-set-platform --id 42 GameCube");
-    println!("  archivefs library-set-platform --path /roms/n64/Luigis_Mansion.zip GameCube");
-    println!("  archivefs library-clear-platform \"Luigi's Mansion\"");
-    println!("  archivefs library-set-platform-bulk --id 1 --id 2 --id 3 GameCube");
+    println!("  emuwiz-cli retroarch-cheat-history");
+    println!("  emuwiz-cli retroarch-cheat-history --json");
     println!(
-        "  archivefs library-set-platform-bulk --path /roms/n64/a.zip --path /roms/n64/b.zip N64"
+        "  emuwiz-cli retroarch-cheat-inspect ~/.local/share/emuwiz/cheat-install-runs/<run>.json"
     );
-    println!("  archivefs library-clear-platform-bulk --id 1 --id 2 --id 3");
-    println!("  archivefs library-remove-missing --id 12");
-    println!("  archivefs library-remove-missing --path /roms/missing.zip --id 13 --json");
-    println!("  archivefs platform-alias-list");
-    println!("  archivefs platform-alias-add gc GameCube");
-    println!("  archivefs platform-alias-remove gc");
-    println!("  archivefs sources");
-    println!("  archivefs sources --json");
-    println!("  archivefs sources scan-all");
-    println!("  archivefs source add /mnt/usbdrive/retro");
-    println!("  archivefs source enable /mnt/usbdrive/retro");
-    println!("  archivefs source disable 3");
-    println!("  archivefs source scan 3");
-    println!("  archivefs source remove 3 --keep-catalogue");
-    println!("  archivefs view list");
-    println!("  archivefs view preview retrodeck");
-    println!("  archivefs view apply retrodeck");
-    println!("  archivefs view repair retrodeck --json");
-    println!("  archivefs view remove retrodeck --keep-definition");
-    println!("  archivefs stats --json");
-    println!("  archivefs info \"007 Legends\"");
-    println!("  archivefs mount-one \"007 Legends\"");
-    println!("  archivefs unmount-one \"007 Legends\"");
-    println!("  archivefs watch");
+    println!("  emuwiz-cli status --json");
+    println!("  emuwiz-cli stats");
+    println!("  emuwiz-cli library-status");
+    println!("  emuwiz-cli database-check");
+    println!("  emuwiz-cli database-check --json");
+    println!("  emuwiz-cli library-scan");
+    println!("  emuwiz-cli library-list");
+    println!("  emuwiz-cli library-list --unknown-only");
+    println!("  emuwiz-cli library-find \"007 Legends\"");
+    println!("  emuwiz-cli library-find --unknown-only n64");
+    println!("  emuwiz-cli library-set-platform \"Luigi's Mansion\" GameCube");
+    println!("  emuwiz-cli library-set-platform --id 42 GameCube");
+    println!("  emuwiz-cli library-set-platform --path /roms/n64/Luigis_Mansion.zip GameCube");
+    println!("  emuwiz-cli library-clear-platform \"Luigi's Mansion\"");
+    println!("  emuwiz-cli library-set-platform-bulk --id 1 --id 2 --id 3 GameCube");
+    println!(
+        "  emuwiz-cli library-set-platform-bulk --path /roms/n64/a.zip --path /roms/n64/b.zip N64"
+    );
+    println!("  emuwiz-cli library-clear-platform-bulk --id 1 --id 2 --id 3");
+    println!("  emuwiz-cli library-remove-missing --id 12");
+    println!("  emuwiz-cli library-remove-missing --path /roms/missing.zip --id 13 --json");
+    println!("  emuwiz-cli platform-alias-list");
+    println!("  emuwiz-cli platform-alias-add gc GameCube");
+    println!("  emuwiz-cli platform-alias-remove gc");
+    println!("  emuwiz-cli sources");
+    println!("  emuwiz-cli sources --json");
+    println!("  emuwiz-cli sources scan-all");
+    println!("  emuwiz-cli source add /mnt/usbdrive/retro");
+    println!("  emuwiz-cli source enable /mnt/usbdrive/retro");
+    println!("  emuwiz-cli source disable 3");
+    println!("  emuwiz-cli source scan 3");
+    println!("  emuwiz-cli source remove 3 --keep-catalogue");
+    println!("  emuwiz-cli view list");
+    println!("  emuwiz-cli view preview retrodeck");
+    println!("  emuwiz-cli view apply retrodeck");
+    println!("  emuwiz-cli view repair retrodeck --json");
+    println!("  emuwiz-cli view remove retrodeck --keep-definition");
+    println!("  emuwiz-cli stats --json");
+    println!("  emuwiz-cli info \"007 Legends\"");
+    println!("  emuwiz-cli mount-one \"007 Legends\"");
+    println!("  emuwiz-cli unmount-one \"007 Legends\"");
+    println!("  emuwiz-cli watch");
     println!();
-    println!("Config: ~/.config/archivefs/config.toml");
+    println!("Config: ~/.config/emuwiz/config.toml");
     println!("Example config:");
     println!("  source_folders = [\"/data/archives\"]");
     println!("  mount_root = \"/mnt/archivefs\"");
@@ -5805,7 +5805,7 @@ mod tests {
     #[test]
     fn confirmed_missing_config_gets_a_first_run_hint() {
         let missing = std::env::temp_dir()
-            .join("archivefs-cli-test-confirmed-missing-config-does-not-exist.toml");
+            .join("emuwiz-cli-test-confirmed-missing-config-does-not-exist.toml");
         let _ = std::fs::remove_file(&missing);
         let source = std::io::Error::new(std::io::ErrorKind::NotFound, "No such file or directory");
         let original_text = format!("{}: {source}", missing.display());
@@ -5826,7 +5826,7 @@ mod tests {
             "expected a first-run hint, got: {explained}"
         );
         assert!(
-            explained.contains("archivefs config-check"),
+            explained.contains("emuwiz-cli config-check"),
             "expected the hint to point at config-check, got: {explained}"
         );
     }
@@ -5837,7 +5837,7 @@ mod tests {
     #[test]
     fn dangling_symlink_config_path_gets_no_first_run_hint() {
         let dir = std::env::temp_dir().join(format!(
-            "archivefs-cli-test-dangling-symlink-{}",
+            "emuwiz-cli-test-dangling-symlink-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -6952,7 +6952,7 @@ mod tests {
         let line = version_line();
 
         assert!(!line.contains('\n'));
-        assert_eq!(line, format!("archivefs-cli {}", env!("CARGO_PKG_VERSION")));
+        assert_eq!(line, format!("emuwiz-cli {}", env!("CARGO_PKG_VERSION")));
     }
 
     #[test]
@@ -7036,7 +7036,7 @@ mod tests {
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir =
-            std::env::temp_dir().join(format!("archivefs-cli-test-{name}-{}", std::process::id()));
+            std::env::temp_dir().join(format!("emuwiz-cli-test-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -7144,7 +7144,7 @@ mod tests {
 
         let output = format_library_status(&view);
         assert!(output.contains("Exists: no"));
-        assert!(output.contains("No library database yet. Run: archivefs-cli library-scan"));
+        assert!(output.contains("No library database yet. Run: emuwiz-cli library-scan"));
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -8683,7 +8683,7 @@ mod tests {
     fn format_source_folder_views_reports_an_empty_configuration_truthfully() {
         let output = format_source_folder_views(&[]);
         assert!(output.contains("No source folders are configured."));
-        assert!(output.contains("archivefs-cli source add"));
+        assert!(output.contains("emuwiz-cli source add"));
     }
 
     #[test]
@@ -9472,7 +9472,7 @@ mod doctor_stage1c_tests {
     #[test]
     fn a_managed_entry_finding_reaches_the_text_report_with_its_reason() {
         let temporary = std::env::temp_dir().join(format!(
-            "archivefs-cli-managed-{}-{}",
+            "emuwiz-cli-managed-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

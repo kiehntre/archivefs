@@ -1,4 +1,4 @@
-//! `archivefs-cli identity source romm <command>`.
+//! `emuwiz-cli identity source romm <command>`.
 //!
 //! Follows the conventions the rest of this binary already uses: a flat
 //! sub-command match, the shared `--json` flag, the `take_*` argument helpers,

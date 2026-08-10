@@ -166,7 +166,7 @@ user-facing version at
   triggers a scan on it, or touches a ROM. Only loopback and private LAN
   addresses are accepted, and the access token is never printed, logged, or
   stored in config or cache JSON.
-- Ships a desktop GUI (`archivefs-gui`) covering scanning, mounting, sources
+- Ships a desktop GUI (`emuwiz`) covering scanning, mounting, sources
   (including RomM and DAT/Cheat catalogue management), library views,
   duplicates, catalogue health, Cheats & Mods, Doctor, History & Logs, and
   Settings over the same core logic as the CLI.
@@ -224,9 +224,9 @@ From inside the extracted directory, run the installer:
 ./install.sh
 ```
 
-This installs `archivefs-cli` and `archivefs-gui` into `~/.local/bin` (override the location with `--prefix PATH`), creates `~/.config/archivefs`, and copies `config.toml.example` to `config.toml` there - but only if a config does not already exist; an existing config is never touched. It uses no `sudo` and does not modify your shell startup files. It also checks whether `ratarmount` is on `PATH` and prints installation guidance if it is not. It is safe to run again later (for example after upgrading to a newer release tarball).
+This installs `emuwiz-cli` and `emuwiz` into `~/.local/bin` (override the location with `--prefix PATH`), creates `~/.config/emuwiz`, and copies `config.toml.example` to `config.toml` there - but only if a config does not already exist; an existing config is never touched. An existing `~/.config/archivefs` from before the rename is still honoured, so pre-rename settings keep loading. The `emuwiz-gui` alias and legacy `archivefs-cli`/`archivefs-gui` names are installed too. It uses no `sudo` and does not modify your shell startup files. It also checks whether `ratarmount` is on `PATH` and prints installation guidance if it is not. It is safe to run again later (for example after upgrading to a newer release tarball).
 
-Edit `source_folders` and `mount_root` in `~/.config/archivefs/config.toml`, then run `archivefs-cli doctor` (see the PATH note below if that command is not found).
+Edit `source_folders` and `mount_root` in `~/.config/emuwiz/config.toml`, then run `emuwiz-cli doctor` (see the PATH note below if that command is not found).
 
 To remove what it installed (your config is left in place):
 
@@ -242,7 +242,7 @@ Pass the same `--prefix PATH` to `--uninstall` if you installed to a non-default
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-Until then, run the installed binaries with their full path: `~/.local/bin/archivefs-cli doctor`.
+Until then, run the installed binaries with their full path: `~/.local/bin/emuwiz-cli doctor`.
 
 ### Manual installation
 
@@ -251,7 +251,7 @@ Manual installation remains available if you would rather control each step your
 4. Make the binaries executable, if extraction did not already preserve that:
 
    ```sh
-   chmod +x archivefs-cli archivefs-gui
+   chmod +x emuwiz-cli emuwiz
    ```
 
 5. Install `ratarmount` separately. It is an external dependency that EmuWiz shells out to for mounting - it is not bundled in the release tarball, and archive mounting will not work without it. Install it however fits your system, then make sure the `ratarmount` command is on your `PATH` (or point `ratarmount_bin` in the config at its full path).
@@ -259,26 +259,26 @@ Manual installation remains available if you would rather control each step your
 6. Copy the example configuration and edit it for your system:
 
    ```sh
-   mkdir -p ~/.config/archivefs
-   cp config.toml.example ~/.config/archivefs/config.toml
+   mkdir -p ~/.config/emuwiz
+   cp config.toml.example ~/.config/emuwiz/config.toml
    ```
 
-   Edit `source_folders` and `mount_root` in `~/.config/archivefs/config.toml` to point at real paths on your machine.
+   Edit `source_folders` and `mount_root` in `~/.config/emuwiz/config.toml` to point at real paths on your machine.
 
 7. Check that everything is set up correctly:
 
    ```sh
-   ./archivefs-cli doctor
-   ./archivefs-cli config-check
+   ./emuwiz-cli doctor
+   ./emuwiz-cli config-check
    ```
 
 8. Launch the desktop GUI, if you want it:
 
    ```sh
-   ./archivefs-gui
+   ./emuwiz
    ```
 
-   `archivefs-gui` needs a running Linux desktop session (X11 or Wayland) with the usual runtime graphics libraries present - it will not open a window over a bare SSH session or on a headless server with no desktop environment.
+   `emuwiz` needs a running Linux desktop session (X11 or Wayland) with the usual runtime graphics libraries present - it will not open a window over a bare SSH session or on a headless server with no desktop environment.
 
 Archive mounts created by EmuWiz are always read-only; it never modifies files in your configured `source_folders`.
 
@@ -289,7 +289,7 @@ managed cheat/history state. Installing the new binaries preserves existing
 configuration. The v0.7 candidate migrates the catalogue forward through
 schema 6 (migrations `0001`–`0006`); an older binary cannot open that database,
 so rollback requires restoring the backup rather than editing SQLite metadata.
-After upgrading, run `archivefs-cli doctor --findings` and rescan sources whose
+After upgrading, run `emuwiz-cli doctor --findings` and rescan sources whose
 stored platform findings predate the canonical registry.
 
 There is currently no package-manager distribution of EmuWiz (no apt, dnf, pacman, Homebrew, or similar package) - the release tarball above and building from source below are the two supported ways to install it.
@@ -360,17 +360,14 @@ cargo build -p archivefs-gui
 cargo run -p archivefs-gui
 ```
 
-The GUI uses the same `~/.config/archivefs/config.toml` configuration and core scanning/catalogue logic as the CLI. Use **Refresh** to rescan after filesystem or mount-state changes.
+The GUI uses the same `~/.config/emuwiz/config.toml` configuration and core scanning/catalogue logic as the CLI. Use **Refresh** to rescan after filesystem or mount-state changes.
 
 Archive mounting uses `ratarmount`, so install it separately and make sure it is available on `PATH`, or set `ratarmount_bin` in the config.
 
 ## Configuration
 
-EmuWiz reads its default config from:
-
-```text
-~/.config/archivefs/config.toml
-```
+EmuWiz reads its default config from `~/.config/emuwiz/config.toml` (an existing
+`~/.config/archivefs` is still honoured from before the rename).
 
 Example:
 
@@ -380,7 +377,7 @@ mount_root = "/mnt/archivefs"
 ratarmount_bin = "ratarmount"
 ```
 
-The same example, with comments, ships as [`config.toml.example`](config.toml.example) in this repository and in every release tarball - copy it to `~/.config/archivefs/config.toml` as a starting point.
+The same example, with comments, ships as [`config.toml.example`](config.toml.example) in this repository and in every release tarball - copy it to `~/.config/emuwiz/config.toml` as a starting point.
 
 `source_folders` are scanned recursively. `mount_root` is where EmuWiz creates planned mount directories. EmuWiz does not modify files in `source_folders`. `ratarmount_bin` is optional and defaults to `"ratarmount"` resolved from `PATH`.
 
@@ -396,7 +393,7 @@ source_folders = [
 is also accepted, but only this `key = "value"` / `key = [...]` form is understood - there is no support for TOML tables, inline tables, or nested arrays.
 
 Managed Library Views and persistent multi-source configuration use their
-own JSON files under `~/.config/archivefs/` (`library_views.json`,
+own JSON files under `~/.config/emuwiz/` (`library_views.json`,
 `sources.json`) - see [`docs/library-views.md`](docs/library-views.md).
 
 ## Common Commands
@@ -404,81 +401,81 @@ own JSON files under `~/.config/archivefs/` (`library_views.json`,
 Scanning, status, and mounting:
 
 ```sh
-archivefs-cli doctor
-archivefs-cli config-check
-archivefs-cli scan
-archivefs-cli status
-archivefs-cli stats
-archivefs-cli info "007 Legends"
-archivefs-cli mount-one "007 Legends"
-archivefs-cli unmount-one "007 Legends"
-archivefs-cli duplicates
-archivefs-cli index-build
-archivefs-cli index-show
-archivefs-cli index-find "xbox360"
-archivefs-cli watch
+emuwiz-cli doctor
+emuwiz-cli config-check
+emuwiz-cli scan
+emuwiz-cli status
+emuwiz-cli stats
+emuwiz-cli info "007 Legends"
+emuwiz-cli mount-one "007 Legends"
+emuwiz-cli unmount-one "007 Legends"
+emuwiz-cli duplicates
+emuwiz-cli index-build
+emuwiz-cli index-show
+emuwiz-cli index-find "xbox360"
+emuwiz-cli watch
 ```
 
 Persistent catalogue and multi-source management:
 
 ```sh
-archivefs-cli library-status
-archivefs-cli database-check
-archivefs-cli database-check --json
-archivefs-cli library-scan
-archivefs-cli library-list
-archivefs-cli library-find "007 Legends"
-archivefs-cli library-set-platform "Luigi's Mansion" GameCube
-archivefs-cli platform-alias-add gc GameCube
-archivefs-cli platform-detect /data/roms/atarist/game.st
-archivefs-cli sources
-archivefs-cli source add /data/more-archives
-archivefs-cli source scan-all
+emuwiz-cli library-status
+emuwiz-cli database-check
+emuwiz-cli database-check --json
+emuwiz-cli library-scan
+emuwiz-cli library-list
+emuwiz-cli library-find "007 Legends"
+emuwiz-cli library-set-platform "Luigi's Mansion" GameCube
+emuwiz-cli platform-alias-add gc GameCube
+emuwiz-cli platform-detect /data/roms/atarist/game.st
+emuwiz-cli sources
+emuwiz-cli source add /data/more-archives
+emuwiz-cli source scan-all
 ```
 
 Managed library views:
 
 ```sh
-archivefs-cli view list
-archivefs-cli view preview "By Platform"
-archivefs-cli view apply "By Platform"
+emuwiz-cli view list
+emuwiz-cli view preview "By Platform"
+emuwiz-cli view apply "By Platform"
 ```
 
 Patch preview:
 
 ```sh
-archivefs-cli pcsx2-patch-preview
-archivefs-cli pcsx2-patch-preview --json
+emuwiz-cli pcsx2-patch-preview
+emuwiz-cli pcsx2-patch-preview --json
 ```
 
 RetroArch environment discovery:
 
 ```sh
-archivefs-cli retroarch-environment
-archivefs-cli retroarch-environment --json
+emuwiz-cli retroarch-environment
+emuwiz-cli retroarch-environment --json
 ```
 
 RetroArch cheat/patch destination preview:
 
 ```sh
-archivefs-cli retroarch-patch-preview
-archivefs-cli retroarch-patch-preview --json
+emuwiz-cli retroarch-patch-preview
+emuwiz-cli retroarch-patch-preview --json
 ```
 
 RetroArch cheat installation history:
 
 ```sh
-archivefs-cli retroarch-cheat-history
-archivefs-cli retroarch-cheat-history --json
-archivefs-cli retroarch-cheat-inspect ~/.local/share/archivefs/cheat-install-runs/<run>.json
+emuwiz-cli retroarch-cheat-history
+emuwiz-cli retroarch-cheat-history --json
+emuwiz-cli retroarch-cheat-inspect ~/.local/share/archivefs/cheat-install-runs/<run>.json
 ```
 
 Optional BSFree browse-only source:
 
 ```sh
-archivefs-cli cheats source bsfree status --json
-archivefs-cli cheats source bsfree import-local /path/to/bsfree.db
-archivefs-cli cheats source bsfree search --platform NES --title MARIO --json
+emuwiz-cli cheats source bsfree status --json
+emuwiz-cli cheats source bsfree import-local /path/to/bsfree.db
+emuwiz-cli cheats source bsfree search --platform NES --title MARIO --json
 ```
 
 The import/download commands are explicit. Status, search, game browsing, and
@@ -487,28 +484,28 @@ ordinary GUI browsing do not perform network access or write emulator files.
 Use verbose or debug logging when you need more detail:
 
 ```sh
-archivefs-cli --verbose stats
-archivefs-cli --debug watch
+emuwiz-cli --verbose stats
+emuwiz-cli --debug watch
 ```
 
-Run `archivefs-cli --help` for the complete, current command list with
+Run `emuwiz-cli --help` for the complete, current command list with
 descriptions.
 
 ## Typical Workflow
 
-1. Create `~/.config/archivefs/config.toml`.
-2. Run `archivefs-cli config-check` to validate the config.
-3. Run `archivefs-cli doctor` to check source folders, mount root, tools, and current archive state.
-4. Run `archivefs-cli library-scan` to build the persistent catalogue, then `archivefs-cli stats` or `archivefs-cli library-list` to inspect what EmuWiz sees.
-5. Run `archivefs-cli info "name"` to inspect one archive.
-6. Run `archivefs-cli mount-one "name"` to mount a single archive.
-7. Run `archivefs-cli unmount-one "name"` when finished.
-8. Optionally set up a Library View (`archivefs-cli view preview`/`apply`) for an organized, browsable directory tree.
-9. Run `archivefs-cli watch` if you want EmuWiz to refresh the JSON index when source folders change.
+1. Create `~/.config/emuwiz/config.toml` (or keep using an existing pre-rename `~/.config/archivefs/config.toml`).
+2. Run `emuwiz-cli config-check` to validate the config.
+3. Run `emuwiz-cli doctor` to check source folders, mount root, tools, and current archive state.
+4. Run `emuwiz-cli library-scan` to build the persistent catalogue, then `emuwiz-cli stats` or `emuwiz-cli library-list` to inspect what EmuWiz sees.
+5. Run `emuwiz-cli info "name"` to inspect one archive.
+6. Run `emuwiz-cli mount-one "name"` to mount a single archive.
+7. Run `emuwiz-cli unmount-one "name"` when finished.
+8. Optionally set up a Library View (`emuwiz-cli view preview`/`apply`) for an organized, browsable directory tree.
+9. Run `emuwiz-cli watch` if you want EmuWiz to refresh the JSON index when source folders change.
 
 ## Example Output
 
-`archivefs-cli stats`:
+`emuwiz-cli stats`:
 
 ```text
 EmuWiz Stats
@@ -529,7 +526,7 @@ Archive extensions:
   zip: 75
 ```
 
-`archivefs-cli info "007 Legends"`:
+`emuwiz-cli info "007 Legends"`:
 
 ```text
 EmuWiz Info
@@ -548,7 +545,7 @@ Details:
   Health provider: FilesystemHealthProvider
 ```
 
-`archivefs-cli index-show`:
+`emuwiz-cli index-show`:
 
 ```text
 EmuWiz Index

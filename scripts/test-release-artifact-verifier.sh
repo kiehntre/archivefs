@@ -49,11 +49,11 @@ output_root = pathlib.Path(sys.argv[1])
 archive_name, bundle_name, version = sys.argv[2:]
 
 def base_members():
-    cli = f"#!/bin/sh\nprintf '%s\\n' 'archivefs-cli {version}'\n".encode()
-    gui = f"#!/bin/sh\nprintf '%s\\n' 'archivefs-gui {version}'\n".encode()
+    cli = f"#!/bin/sh\nprintf '%s\\n' 'emuwiz-cli {version}'\n".encode()
+    gui = f"#!/bin/sh\nprintf '%s\\n' 'emuwiz {version}'\n".encode()
     values = {
-        "archivefs-cli": (0o755, cli),
-        "archivefs-gui": (0o755, gui),
+        "emuwiz-cli": (0o755, cli),
+        "emuwiz": (0o755, gui),
         "install.sh": (0o755, b"#!/bin/sh\nexit 0\n"),
         "README.md": (0o644, b"EmuWiz release fixture\n"),
         "CHANGELOG.md": (0o644, b"Release fixture\n"),
@@ -99,7 +99,7 @@ def traversal(members):
 
 def bad_mode(members):
     for member, _ in members:
-        if member.name.endswith("/archivefs-cli"):
+        if member.name.endswith("/emuwiz-cli"):
             member.mode = 0o777
             return
     raise RuntimeError("CLI member missing")

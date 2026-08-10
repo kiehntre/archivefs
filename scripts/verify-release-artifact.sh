@@ -86,8 +86,8 @@ import tarfile
 archive, destination, root = sys.argv[1:]
 expected_modes = {
     f"{root}/": 0o755,
-    f"{root}/archivefs-cli": 0o755,
-    f"{root}/archivefs-gui": 0o755,
+    f"{root}/emuwiz-cli": 0o755,
+    f"{root}/emuwiz": 0o755,
     f"{root}/install.sh": 0o755,
     f"{root}/README.md": 0o644,
     f"{root}/CHANGELOG.md": 0o644,
@@ -135,10 +135,10 @@ PY
 PAYLOAD="$EXTRACT_ROOT/$EXPECTED_ROOT"
 [[ -d "$PAYLOAD" ]] || release_die "expected extracted root missing: $EXPECTED_ROOT"
 
-EXPECTED_CLI="archivefs-cli $VERSION"
-EXPECTED_GUI="archivefs-gui $VERSION"
-CLI_VERSION="$(env -i PATH="${PATH:-/usr/bin:/bin}" HOME="$TEMP_ROOT/home" "$PAYLOAD/archivefs-cli" --version)"
-GUI_VERSION="$(env -i PATH="${PATH:-/usr/bin:/bin}" HOME="$TEMP_ROOT/home" "$PAYLOAD/archivefs-gui" --version)"
+EXPECTED_CLI="emuwiz-cli $VERSION"
+EXPECTED_GUI="emuwiz $VERSION"
+CLI_VERSION="$(env -i PATH="${PATH:-/usr/bin:/bin}" HOME="$TEMP_ROOT/home" "$PAYLOAD/emuwiz-cli" --version)"
+GUI_VERSION="$(env -i PATH="${PATH:-/usr/bin:/bin}" HOME="$TEMP_ROOT/home" "$PAYLOAD/emuwiz" --version)"
 [[ "$CLI_VERSION" == "$EXPECTED_CLI" ]] ||
     release_die "CLI version mismatch: '$CLI_VERSION', expected '$EXPECTED_CLI'"
 [[ "$GUI_VERSION" == "$EXPECTED_GUI" ]] ||
@@ -172,7 +172,7 @@ patterns = [
 allowed_prefixes = (b"/build/source", b"/build/home", b"/build/cargo", b"/build/rustup")
 
 for path in sorted(root.iterdir()):
-    if path.name in {"archivefs-cli", "archivefs-gui"}:
+    if path.name in {"emuwiz-cli", "emuwiz"}:
         data = subprocess.run(
             ["strings", "-a", str(path)], check=True, stdout=subprocess.PIPE
         ).stdout

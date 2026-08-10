@@ -141,8 +141,7 @@ mod tests {
 
     #[test]
     fn status_command_is_read_only_and_typed() {
-        let root =
-            std::env::temp_dir().join(format!("archivefs-cli-artwork-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("emuwiz-cli-artwork-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         run(vec![
             "status".into(),

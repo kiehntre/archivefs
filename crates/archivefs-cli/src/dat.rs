@@ -1,4 +1,4 @@
-//! `archivefs-cli dat <command>`.
+//! `emuwiz-cli dat <command>`.
 //!
 //! Stage 1A: read-only inspection, validation, and hash-based audit of DAT
 //! catalogue files (Logiqx XML and ClrMamePro text).

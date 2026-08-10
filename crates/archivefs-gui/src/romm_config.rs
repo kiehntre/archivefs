@@ -45,9 +45,9 @@ pub(crate) const MAX_PREVIEW_LIMIT: usize = 100;
 ///
 /// `install -m 600 /dev/null` creates it empty and private in one step, which is
 /// the part that is easy to get wrong with `touch` followed by `chmod`.
-pub(crate) const TOKEN_FILE_SHELL_EXAMPLE: &str = "mkdir -p ~/.config/archivefs\n\
-     install -m 600 /dev/null ~/.config/archivefs/romm-token\n\
-     nano ~/.config/archivefs/romm-token";
+pub(crate) const TOKEN_FILE_SHELL_EXAMPLE: &str = "mkdir -p ~/.config/emuwiz\n\
+     install -m 600 /dev/null ~/.config/emuwiz/romm-token\n\
+     nano ~/.config/emuwiz/romm-token";
 
 /// One field's verdict.
 #[derive(Clone, Debug, PartialEq, Eq)]
