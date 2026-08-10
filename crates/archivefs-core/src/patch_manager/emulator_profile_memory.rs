@@ -30,13 +30,7 @@ pub struct RememberedEmulatorProfile {
 }
 
 pub fn default_emulator_profile_memory_path() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .ok_or_else(|| ArchiveFsError::Config("HOME is not set".to_string()))?;
-    Ok(PathBuf::from(home)
-        .join(".config")
-        .join("archivefs")
-        .join("emulator_profiles.toml"))
+    crate::app_dirs::config_path("emulator_profiles.toml")
 }
 
 pub fn load_remembered_emulator_profiles_default() -> Result<Vec<RememberedEmulatorProfile>> {

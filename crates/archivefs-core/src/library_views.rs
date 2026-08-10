@@ -31,7 +31,6 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
@@ -226,37 +225,23 @@ impl LibraryViewLayoutTemplate {
     }
 }
 
-/// Resolves `~/.config/archivefs/library_views.json` - the config-y "list
-/// of views" file, alongside `config.toml`/`source_folders` in the same
-/// `.config/archivefs` directory. JSON rather than another hand-rolled
-/// `[[block]]` format: each view's `source_folders`/`platforms` are list
-/// fields, which the existing line-based TOML parser (`parse_config_fields`)
-/// has no support for nesting inside a block - `serde_json` (already an
-/// archivefs-cli dependency) avoids inventing that parser just for this.
+/// Resolves the config-y "list of views" file: `library_views.json` under the
+/// effective config directory (EmuWiz's `~/.config/emuwiz`, or the legacy
+/// `~/.config/archivefs`), alongside `config.toml`/`source_folders`. JSON
+/// rather than another hand-rolled `[[block]]` format: each view's
+/// `source_folders`/`platforms` are list fields, which the existing
+/// line-based TOML parser (`parse_config_fields`) has no support for nesting
+/// inside a block - `serde_json` (already an archivefs-cli dependency)
+/// avoids inventing that parser just for this.
 pub fn default_library_views_config_path() -> Result<PathBuf> {
-    let home = env::var_os("HOME")
-        .or_else(|| env::var_os("USERPROFILE"))
-        .ok_or_else(|| ArchiveFsError::Config("HOME is not set".to_string()))?;
-    Ok(PathBuf::from(home)
-        .join(".config")
-        .join("archivefs")
-        .join("library_views.json"))
+    crate::app_dirs::config_path("library_views.json")
 }
 
-/// Resolves `~/.local/share/archivefs/library_views/` - per-view manifests
-/// live here (see `library_view_manifest_path`), alongside
-/// `library.sqlite3`/`index.json` in the same `.local/share/archivefs`
-/// application-data directory, deliberately never inside a user's source
-/// folder.
+/// Resolves the per-view manifests directory: `library_views/` under the
+/// effective data directory, alongside `library.sqlite3`/`index.json`,
+/// deliberately never inside a user's source folder.
 pub fn default_library_views_data_dir() -> Result<PathBuf> {
-    let home = env::var_os("HOME")
-        .or_else(|| env::var_os("USERPROFILE"))
-        .ok_or_else(|| ArchiveFsError::Config("HOME is not set".to_string()))?;
-    Ok(PathBuf::from(home)
-        .join(".local")
-        .join("share")
-        .join("archivefs")
-        .join("library_views"))
+    Ok(crate::app_dirs::data_dir()?.join("library_views"))
 }
 
 /// The exact manifest path for one view - `{data_dir}/{id}.manifest.json`.

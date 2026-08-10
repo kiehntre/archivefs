@@ -16,6 +16,10 @@ use serde::ser::{SerializeMap, SerializeStruct};
 use serde::{Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
+/// App-directory resolution with legacy ArchiveFS compatibility. See the
+/// module for the reuse-not-migrate strategy that keeps existing user data
+/// reachable during the EmuWiz rename.
+pub mod app_dirs;
 mod database;
 /// Read-only Doctor diagnostics: one shared finding model plus adapters
 /// over the existing per-subsystem reports. See the module documentation
@@ -1626,13 +1630,7 @@ fn run_config_check_with_mount_root_creation(
 }
 
 pub fn default_config_path() -> Result<PathBuf> {
-    let home = env::var_os("HOME")
-        .or_else(|| env::var_os("USERPROFILE"))
-        .ok_or_else(|| ArchiveFsError::Config("HOME is not set".to_string()))?;
-    Ok(PathBuf::from(home)
-        .join(".config")
-        .join("archivefs")
-        .join("config.toml"))
+    app_dirs::config_path("config.toml")
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -5334,14 +5332,7 @@ impl ArchiveIndexFreshness {
 }
 
 pub fn default_index_path() -> Result<PathBuf> {
-    let home = env::var_os("HOME")
-        .or_else(|| env::var_os("USERPROFILE"))
-        .ok_or_else(|| ArchiveFsError::Index("HOME is not set".to_string()))?;
-    Ok(PathBuf::from(home)
-        .join(".local")
-        .join("share")
-        .join("archivefs")
-        .join("index.json"))
+    app_dirs::data_path("index.json")
 }
 
 pub fn build_archive_index(config: &Config) -> Result<ArchiveIndex> {

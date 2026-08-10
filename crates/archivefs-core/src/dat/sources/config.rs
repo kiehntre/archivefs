@@ -25,6 +25,7 @@
 //! directory synced, temporary file removed on any failure. A failed save
 //! therefore leaves the previous file exactly as it was.
 
+#[cfg(test)]
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -184,21 +185,21 @@ impl DatSourceConfigEntry {
 
 /// Where the registry lives for the current user.
 pub fn default_dat_sources_config_path() -> Result<PathBuf, ArchiveFsError> {
-    dat_sources_config_path_in(std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")))
+    crate::app_dirs::config_path("dat_sources.toml")
 }
 
-/// The registry path under `home`, or an error when there is no home.
-///
-/// Split out so the no-home case is testable without removing `HOME` from the
-/// process: these tests run in parallel with others that read it.
+/// The registry path under an injected `home`, mirroring
+/// [`default_dat_sources_config_path`]'s EmuWiz-first/ArchiveFS-fallback
+/// resolution without reading the process environment.
+#[cfg(test)]
 pub(super) fn dat_sources_config_path_in(
     home: Option<OsString>,
 ) -> Result<PathBuf, ArchiveFsError> {
     let home = home.ok_or_else(|| ArchiveFsError::Config("HOME is not set".to_string()))?;
-    Ok(PathBuf::from(home)
-        .join(".config")
-        .join("archivefs")
-        .join("dat_sources.toml"))
+    Ok(crate::app_dirs::config_path_in(
+        Path::new(&home),
+        "dat_sources.toml",
+    ))
 }
 
 pub fn load_dat_sources_config_default() -> Result<DatSourcesConfig, ArchiveFsError> {

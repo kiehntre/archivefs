@@ -22,6 +22,7 @@
 //! and [`super::CheatSourceRegistry::unresolved_preferences`] for how they are
 //! surfaced.
 
+#[cfg(test)]
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -72,23 +73,19 @@ pub struct ProviderPriorityOverride {
 }
 
 pub fn default_cheat_sources_config_path() -> Result<PathBuf, ArchiveFsError> {
-    cheat_sources_config_path_in(
-        std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")),
-    )
+    crate::app_dirs::config_path("cheat_sources.toml")
 }
 
-/// The preferences path under `home`, or an error when there is no home.
-///
-/// Split out so the no-home case can be tested without removing `HOME` from
-/// the process: these tests run in parallel with every other test in the
-/// crate, and several of those read `HOME`, so mutating it made unrelated
-/// tests fail depending on scheduling.
+/// The preferences path under an injected `home`, mirroring
+/// [`default_cheat_sources_config_path`]'s EmuWiz-first/ArchiveFS-fallback
+/// resolution without reading the process environment.
+#[cfg(test)]
 fn cheat_sources_config_path_in(home: Option<OsString>) -> Result<PathBuf, ArchiveFsError> {
     let home = home.ok_or_else(|| ArchiveFsError::Config("HOME is not set".to_string()))?;
-    Ok(PathBuf::from(home)
-        .join(".config")
-        .join("archivefs")
-        .join("cheat_sources.toml"))
+    Ok(crate::app_dirs::config_path_in(
+        Path::new(&home),
+        "cheat_sources.toml",
+    ))
 }
 
 pub fn load_cheat_sources_config_default() -> Result<CheatSourcesConfig, ArchiveFsError> {
@@ -264,12 +261,6 @@ extra_field = "bad"
     }
 
     #[test]
-    fn default_config_path_lives_in_config_dir() {
-        let path = default_cheat_sources_config_path().unwrap();
-        let s = path.to_string_lossy().into_owned();
-        assert!(s.contains(".config/archivefs/cheat_sources.toml"));
-    }
-
     #[test]
     fn save_creates_parent_directories() {
         let root = test_root("nested");
@@ -538,7 +529,25 @@ extra_field = "bad"
             .expect("a home resolves");
         assert_eq!(
             path,
-            PathBuf::from("/home/example/.config/archivefs/cheat_sources.toml")
+            PathBuf::from("/home/example/.config/emuwiz/cheat_sources.toml")
         );
+    }
+
+    #[test]
+    fn a_legacy_archivefs_home_is_reused_for_cheat_preferences() {
+        let root = std::env::temp_dir().join(format!(
+            "archivefs-cheat-sources-legacy-home-{}",
+            std::process::id()
+        ));
+        let legacy = root.join(".config/archivefs");
+        std::fs::create_dir_all(&legacy).unwrap();
+        let path = cheat_sources_config_path_in(Some(root.clone().into_os_string()))
+            .expect("a home resolves");
+        assert_eq!(
+            path,
+            legacy.join("cheat_sources.toml"),
+            "an existing legacy ArchiveFS config dir is reused transparently"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

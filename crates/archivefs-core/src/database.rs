@@ -22,7 +22,10 @@
 //! bytes, so it - like the rest of this Linux-first project - is Unix-only.
 
 use std::collections::{HashMap, HashSet};
+#[cfg(test)]
+use std::env;
 use std::ffi::OsString;
+use std::fs;
 use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -30,7 +33,6 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use std::{env, fs};
 
 use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, params};
 
@@ -46,13 +48,20 @@ use crate::{
     revalidate_archive_for_catalogue, validate_configured_source_roots,
 };
 
-/// Resolves the default library database path:
-/// `~/.local/share/archivefs/library.sqlite3`, alongside the existing JSON
-/// index (`default_index_path`) in the same XDG data directory. Performs no
-/// filesystem I/O and creates nothing - resolving the path and creating the
-/// database are deliberately separate operations (see [`Database::open_or_create`]).
+/// Resolves the default library database path: `library.sqlite3` under the
+/// effective data directory (EmuWiz's `~/.local/share/emuwiz`, or the legacy
+/// `~/.local/share/archivefs` when that is where the user's data lives), next
+/// to the existing JSON index (`default_index_path`). Performs no filesystem
+/// I/O and creates nothing - resolving the path and creating the database are
+/// deliberately separate operations (see [`Database::open_or_create`]).
 pub fn default_database_path() -> Result<PathBuf> {
-    resolve_database_path(env::var_os("HOME").or_else(|| env::var_os("USERPROFILE")))
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .ok_or_else(|| ArchiveFsError::Database("HOME is not set".to_string()))?;
+    Ok(crate::app_dirs::data_path_in(
+        Path::new(&home),
+        "library.sqlite3",
+    ))
 }
 
 /// The logic behind [`default_database_path`], taking the already-resolved
@@ -61,13 +70,13 @@ pub fn default_database_path() -> Result<PathBuf> {
 /// unresolved" case by passing `None` directly, rather than mutating real
 /// process environment variables (which would race with other tests
 /// running in parallel in the same process).
+#[cfg(test)]
 fn resolve_database_path(home: Option<OsString>) -> Result<PathBuf> {
     let home = home.ok_or_else(|| ArchiveFsError::Database("HOME is not set".to_string()))?;
-    Ok(PathBuf::from(home)
-        .join(".local")
-        .join("share")
-        .join("archivefs")
-        .join("library.sqlite3"))
+    Ok(crate::app_dirs::data_path_in(
+        Path::new(&home),
+        "library.sqlite3",
+    ))
 }
 
 /// One forward-only schema migration. Applied in ascending `version` order;
@@ -4357,10 +4366,38 @@ mod tests {
         let path = resolve_database_path(Some(OsStr::new("/home/example").to_os_string()))
             .expect("HOME is present, so this must resolve");
 
+        // A fresh home (neither directory exists yet) resolves to the new
+        // EmuWiz data directory.
         assert_eq!(
             path,
-            PathBuf::from("/home/example/.local/share/archivefs/library.sqlite3")
+            PathBuf::from("/home/example/.local/share/emuwiz/library.sqlite3")
         );
+    }
+
+    #[test]
+    fn default_database_path_reuses_a_legacy_archivefs_home() {
+        let home = temp_dir("legacy-db-home");
+        let legacy = home.join(".local").join("share").join("archivefs");
+        std::fs::create_dir_all(&legacy).unwrap();
+
+        let path = resolve_database_path(Some(home.clone().into_os_string())).unwrap();
+        assert_eq!(path, legacy.join("library.sqlite3"));
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn default_database_path_prefers_emuwiz_when_both_exist() {
+        let home = temp_dir("both-db-home");
+        let emuwiz = home.join(".local").join("share").join("emuwiz");
+        let legacy = home.join(".local").join("share").join("archivefs");
+        std::fs::create_dir_all(&emuwiz).unwrap();
+        std::fs::create_dir_all(&legacy).unwrap();
+
+        let path = resolve_database_path(Some(home.clone().into_os_string())).unwrap();
+        assert_eq!(path, emuwiz.join("library.sqlite3"));
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -4373,14 +4410,14 @@ mod tests {
     #[test]
     fn path_resolution_alone_performs_no_filesystem_writes() {
         let home = temp_dir("path-resolution-no-writes");
-        let data_dir = home.join(".local").join("share").join("archivefs");
+        let data_dir = home.join(".local").join("share").join("emuwiz");
 
         let resolved = resolve_database_path(Some(home.clone().into_os_string())).unwrap();
 
         assert_eq!(resolved, data_dir.join("library.sqlite3"));
         assert!(
             !data_dir.exists(),
-            "resolving the default path must not create ~/.local/share/archivefs"
+            "resolving the default path must not create ~/.local/share/emuwiz"
         );
         assert!(
             !resolved.exists(),

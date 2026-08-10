@@ -31,20 +31,17 @@ const MAX_JOURNAL_NAME_BYTES: usize = 128;
 /// Monotonic per-process sequence for transaction ids and journal names.
 static TRANSACTION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// The default journal directory: `~/.local/share/archivefs/rename-transactions`.
+/// The default journal directory: `rename-transactions/` under the effective
+/// data directory (EmuWiz's or the legacy ArchiveFS one).
 pub fn default_rename_transaction_dir() -> Result<PathBuf, ArchiveFsError> {
-    rename_transaction_dir_in(std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")))
+    Ok(crate::app_dirs::data_dir()?.join(RENAME_TRANSACTIONS_DIRECTORY))
 }
 
 /// The logic behind [`default_rename_transaction_dir`], with the home injected
 /// so tests can exercise the no-home case without racing on the environment.
 pub fn rename_transaction_dir_in(home: Option<OsString>) -> Result<PathBuf, ArchiveFsError> {
     let home = home.ok_or_else(|| ArchiveFsError::Config("HOME is not set".to_string()))?;
-    Ok(PathBuf::from(home)
-        .join(".local")
-        .join("share")
-        .join("archivefs")
-        .join(RENAME_TRANSACTIONS_DIRECTORY))
+    Ok(crate::app_dirs::data_dir_in(Path::new(&home)).join(RENAME_TRANSACTIONS_DIRECTORY))
 }
 
 /// A stable, unique transaction id: `<unix_seconds>-<sequence>`.
@@ -179,6 +176,35 @@ pub fn terminal_state_after_apply(transaction: &RenameTransaction) -> Transactio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn journal_directory_uses_emuwiz_for_a_fresh_home() {
+        let home = tempfile::tempdir().unwrap();
+        let path = rename_transaction_dir_in(Some(home.path().as_os_str().to_os_string())).unwrap();
+        assert_eq!(
+            path,
+            home.path().join(".local/share/emuwiz/rename-transactions")
+        );
+    }
+
+    #[test]
+    fn journal_directory_reuses_legacy_and_prefers_emuwiz() {
+        let home = tempfile::tempdir().unwrap();
+        let legacy = home.path().join(".local/share/archivefs");
+        std::fs::create_dir_all(&legacy).unwrap();
+        let home_arg = Some(home.path().as_os_str().to_os_string());
+        assert_eq!(
+            rename_transaction_dir_in(home_arg.clone()).unwrap(),
+            legacy.join(RENAME_TRANSACTIONS_DIRECTORY)
+        );
+
+        let primary = home.path().join(".local/share/emuwiz");
+        std::fs::create_dir_all(&primary).unwrap();
+        assert_eq!(
+            rename_transaction_dir_in(home_arg).unwrap(),
+            primary.join(RENAME_TRANSACTIONS_DIRECTORY)
+        );
+    }
     use crate::dat::rename_apply::model::{ObjectIdentity, ObjectKind, TransactionEntry};
     use std::path::PathBuf;
 
