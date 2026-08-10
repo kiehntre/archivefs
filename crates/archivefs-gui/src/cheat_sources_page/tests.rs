@@ -1170,7 +1170,7 @@ fn the_rendered_picker_lists_platforms_and_says_they_are_currently_used() {
         picker_query: "PlayStation".to_string(),
         ..CheatSourcesPageUi::default()
     };
-    let output = render_with(&view, &mut ui_state);
+    let output = render_with(&view, &mut ui_state, false);
 
     assert!(
         rendered_text_contains(&output, "Find a platform:"),
@@ -1364,17 +1364,28 @@ fn an_unreadable_file_is_reported_and_never_overwritten() {
 // The list above is about data. These two prove the drawing does not
 // contradict it, since "is it visible?" is ultimately a claim about drawing.
 
-/// Draws the page headlessly, the way the RomM card's tests do.
+/// Draws the page headlessly, the way the RomM card's tests do. Advanced View
+/// by default, so the established assertions on IDs, consultation order and
+/// the review wording keep exercising the full technical layout.
 fn render(view: &CheatSourcesPageView) -> egui::FullOutput {
-    render_with(view, &mut CheatSourcesPageUi::default())
+    render_with(view, &mut CheatSourcesPageUi::default(), false)
+}
+
+/// Draws in Gamer View, where the beginner-facing simplification applies.
+fn render_gamer(view: &CheatSourcesPageView) -> egui::FullOutput {
+    render_with(view, &mut CheatSourcesPageUi::default(), true)
 }
 
 /// Draws with explicit UI state, for the picker's open/closed cases.
-fn render_with(view: &CheatSourcesPageView, ui_state: &mut CheatSourcesPageUi) -> egui::FullOutput {
+fn render_with(
+    view: &CheatSourcesPageView,
+    ui_state: &mut CheatSourcesPageUi,
+    gamer_view: bool,
+) -> egui::FullOutput {
     let context = egui::Context::default();
     context.run(egui::RawInput::default(), |context| {
         egui::CentralPanel::default().show(context, |ui| {
-            let _ = show_cheat_sources_page(ui, view, ui_state);
+            let _ = show_cheat_sources_page(ui, view, ui_state, gamer_view);
         });
     })
 }
@@ -1495,6 +1506,100 @@ fn the_rendered_page_draws_unresolved_entries_rather_than_hiding_them() {
     assert!(
         rendered_text_contains(&output, UNKNOWN_ID),
         "the unrecognised ID must be named so the user can correct it"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Gamer View simplification
+// ---------------------------------------------------------------------------
+
+#[test]
+fn gamer_view_hides_numeric_and_internal_metadata_by_default() {
+    let state = fresh("gamer-hides");
+    let view = state.view();
+    let output = render_gamer(&view);
+
+    // The beginner-facing essentials are present.
+    for row in &view.rows {
+        assert!(
+            rendered_text_contains(&output, &row.display_name),
+            "name must be shown: {}",
+            row.display_name
+        );
+        assert!(
+            rendered_text_contains(&output, row.provider_kind),
+            "capability must be shown for {}",
+            row.display_name
+        );
+        assert!(
+            rendered_text_contains(&output, &row.platform_coverage),
+            "platform scope must be shown for {}",
+            row.display_name
+        );
+    }
+
+    // Numeric/internal metadata is not on the page by default: no raw source
+    // IDs, no consultation order, no bare priority, no "Multi" family label.
+    for row in &view.rows {
+        assert!(
+            !rendered_text_contains(&output, &format!("ID: {}", row.id)),
+            "source ID {} must not be foregrounded in Gamer View",
+            row.id
+        );
+    }
+    assert!(
+        !rendered_text_contains(&output, "Consulted"),
+        "order is technical"
+    );
+    assert!(
+        !rendered_text_contains(&output, "Priority:"),
+        "numeric priority is technical"
+    );
+    assert!(
+        !rendered_text_contains(&output, "not reviewed"),
+        "upstream review wording is technical"
+    );
+    // The internal family label "Multi" is spelled as what it means for a
+    // beginner instead of surfacing as raw parser provenance.
+    assert!(
+        rendered_text_contains(&output, "Multi-system"),
+        "the friendly family label should be shown in Gamer View"
+    );
+}
+
+#[test]
+fn gamer_view_still_reaches_technical_details_and_keeps_controls() {
+    let state = fresh("gamer-technical");
+    let output = render_gamer(&state.view());
+
+    // The disclosure labels are present even when collapsed, so a beginner can
+    // find the advanced fields; the underlying controls are not removed.
+    assert!(
+        rendered_text_contains(&output, "Technical details"),
+        "the advanced fields must be reachable one disclosure down"
+    );
+}
+
+#[test]
+fn advanced_view_still_shows_the_full_technical_layout() {
+    let state = fresh("advanced-full");
+    let view = state.view();
+    let output = render(&view);
+
+    for row in &view.rows {
+        assert!(
+            rendered_text_contains(&output, &format!("ID: {}", row.id)),
+            "Advanced View keeps the stable ID for {}",
+            row.id
+        );
+    }
+    assert!(
+        rendered_text_contains(&output, "Consulted"),
+        "order badge in Advanced View"
+    );
+    assert!(
+        rendered_text_contains(&output, "lowest number first"),
+        "the ordering rule stays visible in Advanced View"
     );
 }
 

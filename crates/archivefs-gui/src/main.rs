@@ -16,8 +16,6 @@ use std::sync::{
 use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-#[cfg(test)]
-use archivefs_core::diagnostics::DoctorCategory;
 use archivefs_core::diagnostics::environment::{
     FreeSpacePolicy, StorageAssessment, assess_storage, mount_table, storage_resources,
 };
@@ -27,12 +25,12 @@ use archivefs_core::diagnostics::profiles::{
     profile_destination_directories,
 };
 use archivefs_core::diagnostics::repair::{
-    DoctorRepairAction, DoctorRepairContext, DoctorRepairOutcome, DoctorRepairRequest,
-    DoctorRepairStatus, DoctorRepairVerification, execute_doctor_repair,
+    DoctorRepairAction, DoctorRepairContext, DoctorRepairOutcome, DoctorRepairRejection,
+    DoctorRepairRequest, DoctorRepairStatus, DoctorRepairVerification, execute_doctor_repair,
 };
 use archivefs_core::diagnostics::{
-    CoverageStatus, DoctorScan, DoctorScanInputs, DoctorSeverity, Finding, Gathered,
-    MountRootSafety, assess_mount_root_safety, run_doctor_scan,
+    CoverageStatus, DoctorCategory, DoctorScan, DoctorScanInputs, DoctorSeverity, Finding,
+    Gathered, MountRootSafety, assess_mount_root_safety, run_doctor_scan,
 };
 use archivefs_core::emulator_environment::HostReadOnlyFilesystem;
 use archivefs_core::emulator_environment::retroarch::{
@@ -459,7 +457,7 @@ const ALL_ACTIVITY_ACTIONS: [ActivityAction; 44] = [
 ];
 
 /// Every `ActivityOutcome`, for the History & Logs "Result" filter.
-const ALL_ACTIVITY_OUTCOMES: [ActivityOutcome; 9] = [
+const ALL_ACTIVITY_OUTCOMES: [ActivityOutcome; 10] = [
     ActivityOutcome::Started,
     ActivityOutcome::Offered,
     ActivityOutcome::Retried,
@@ -469,6 +467,7 @@ const ALL_ACTIVITY_OUTCOMES: [ActivityOutcome; 9] = [
     ActivityOutcome::Completed,
     ActivityOutcome::Failed,
     ActivityOutcome::Rejected,
+    ActivityOutcome::OfflineUsable,
 ];
 
 /// The History & Logs page's filter/sort state. `None` filters mean
@@ -569,6 +568,11 @@ enum ActivityOutcome {
     Completed,
     Failed,
     Rejected,
+    /// A failed connection attempt that is not a failure in practice: the
+    /// offline copy is still being served, so this reads as informational
+    /// rather than as a scary global "Failed". The technical reason is kept
+    /// in the entry's message.
+    OfflineUsable,
 }
 
 impl std::fmt::Display for ActivityOutcome {
@@ -583,6 +587,7 @@ impl std::fmt::Display for ActivityOutcome {
             Self::Completed => "Completed",
             Self::Failed => "Failed",
             Self::Rejected => "Rejected",
+            Self::OfflineUsable => "Offline",
         })
     }
 }
@@ -4888,8 +4893,12 @@ impl ArchiveFsApp {
             return;
         };
         let view = page.view();
-        let action =
-            cheat_sources_page::show_cheat_sources_page(ui, &view, &mut self.cheat_sources_ui);
+        let action = cheat_sources_page::show_cheat_sources_page(
+            ui,
+            &view,
+            &mut self.cheat_sources_ui,
+            self.ui_mode == GuiMode::GamerView,
+        );
         if let Some(action) = action {
             // Reverting throws away in-progress text and any open picker too:
             // leaving a typed priority behind after "Discard changes" would
@@ -5748,21 +5757,44 @@ impl ArchiveFsApp {
         self.romm_hash_progress = None;
 
         let previous_outcome = self.romm_ui.last_outcome.take();
+        let offline_usable = self.romm_snapshot.as_deref().is_some_and(|snapshot| {
+            snapshot.status.state
+                == archivefs_core::identity_source::status::ProviderState::ReadyOffline
+        });
         self.romm_ui.last_outcome = Some(romm_source::build_result_view(
             &operation,
             result.as_ref().map_err(String::as_str),
+            offline_usable,
         ));
         if operation.is_mutating() {
+            // A failed connection test while imported identity is still being
+            // served is the offline case working as intended: it must not
+            // surface as a scary global "Failed". The technical reason stays
+            // in the message, so History & Logs preserves it exactly.
+            let offline_friendly =
+                offline_usable && operation == RommOperation::TestConnection && result.is_err();
             self.history.record(HistoryEntry::new(
                 ActivityAction::RommSource,
                 None,
-                match &result {
-                    Ok(_) => ActivityOutcome::Completed,
-                    Err(_) => ActivityOutcome::Failed,
+                if offline_friendly {
+                    ActivityOutcome::OfflineUsable
+                } else {
+                    match &result {
+                        Ok(_) => ActivityOutcome::Completed,
+                        Err(_) => ActivityOutcome::Failed,
+                    }
                 },
-                match &result {
-                    Ok(_) => format!("{} completed.", operation.label()),
-                    Err(message) => format!("{} failed: {message}", operation.label()),
+                if offline_friendly {
+                    format!(
+                        "RomM could not be reached, but the offline copy still works. \
+                         Technical detail: {message}",
+                        message = result.as_ref().unwrap_err()
+                    )
+                } else {
+                    match &result {
+                        Ok(_) => format!("{} completed.", operation.label()),
+                        Err(message) => format!("{} failed: {message}", operation.label()),
+                    }
                 },
             ));
         }
@@ -14558,6 +14590,7 @@ impl ArchiveFsApp {
                         self.doctor_repair_result.as_deref(),
                         self.doctor_repair_finished_at_unix_seconds,
                         &mut self.clipboard,
+                        self.ui_mode == GuiMode::GamerView,
                     );
                     match action {
                         // Never `self.refresh(context)`: Doctor must not
@@ -16060,6 +16093,7 @@ fn activity_outcome_tone(outcome: ActivityOutcome) -> widgets::StatusTone {
     match outcome {
         ActivityOutcome::Completed => widgets::StatusTone::Success,
         ActivityOutcome::Failed | ActivityOutcome::Rejected => widgets::StatusTone::Blocked,
+        ActivityOutcome::OfflineUsable => widgets::StatusTone::Info,
         ActivityOutcome::Started | ActivityOutcome::Retried | ActivityOutcome::Confirmed => {
             widgets::StatusTone::Active
         }
@@ -16284,6 +16318,10 @@ enum DoctorPageAction {
 /// panel for the selected finding. Where a repair already exists elsewhere
 /// in ArchiveFS the finding *says so in words* and stops there - Stage 1A
 /// exposes no repair control at all.
+/// Draws the whole Doctor page. The parameter list is long because the page is
+/// one cohesive screen; the mode flag (Gamer vs Advanced) is the only thing
+/// this PR's cleanup adds to the existing seven.
+#[allow(clippy::too_many_arguments)]
 fn show_doctor_page(
     ui: &mut egui::Ui,
     state: &DoctorScanState,
@@ -16292,6 +16330,7 @@ fn show_doctor_page(
     repair_result: Option<&DoctorRepairOutcome>,
     repair_finished_at_unix_seconds: Option<i64>,
     clipboard: &mut dyn ClipboardBackend,
+    gamer_view: bool,
 ) -> Option<DoctorPageAction> {
     let mut action = None;
     // The confirmation screen replaces the finding list while it is open, so
@@ -16408,29 +16447,94 @@ fn show_doctor_page(
     // and hand it another card's expansion state. A finding's index in the
     // scan is fixed for as long as the scan is.
     let ordinals = DoctorFindingOrdinals::of(scan);
-    for (category, findings) in scan.by_category() {
-        ui.add_space(theme::SECTION_GAP);
-        egui::CollapsingHeader::new(format!("{} ({})", category.label(), findings.len()))
-            .id_salt(("doctor-category", category.label()))
-            .default_open(true)
-            .show(ui, |ui| {
-                for repeated in doctor_presentation_groups(&findings) {
-                    if repeated_doctor_group_is_compact(&repeated) {
-                        show_repeated_doctor_group(ui, &repeated, selected, &mut action, &ordinals);
-                    } else {
-                        for finding in repeated {
-                            show_doctor_finding_card(ui, finding, selected, &mut action, &ordinals);
-                            ui.add_space(6.0);
-                        }
+
+    if gamer_view {
+        // Gamer View foregrounds what needs attention and summarises the rest.
+        // A real scan can produce hundreds of informational findings; those are
+        // counted exactly, summarised in one line, and kept fully reachable
+        // behind "Technical details" - never silently dropped and never allowed
+        // to bury the actionable findings.
+        let mut info_count = 0usize;
+        for (category, findings) in scan.by_category() {
+            let actionable: Vec<&Finding> = findings
+                .iter()
+                .filter(|finding| finding.severity != DoctorSeverity::Info)
+                .copied()
+                .collect();
+            info_count += findings.len() - actionable.len();
+            if actionable.is_empty() {
+                continue;
+            }
+            show_doctor_category_group(ui, category, &actionable, selected, &mut action, &ordinals);
+        }
+        if info_count > 0 {
+            ui.add_space(theme::SECTION_GAP);
+            widgets::banner(
+                ui,
+                &format!("{info_count} checks are informational or healthy"),
+                "None of these need attention. The exported report keeps every detail, and the \
+                 full list is one disclosure away.",
+                widgets::StatusTone::Info,
+            );
+            widgets::technical_details(ui, "doctor-info-findings", |ui| {
+                for (category, findings) in scan.by_category() {
+                    let informational: Vec<&Finding> = findings
+                        .iter()
+                        .filter(|finding| finding.severity == DoctorSeverity::Info)
+                        .copied()
+                        .collect();
+                    if informational.is_empty() {
+                        continue;
                     }
-                    ui.add_space(6.0);
+                    show_doctor_category_group(
+                        ui,
+                        category,
+                        &informational,
+                        selected,
+                        &mut action,
+                        &ordinals,
+                    );
                 }
             });
+        }
+    } else {
+        for (category, findings) in scan.by_category() {
+            show_doctor_category_group(ui, category, &findings, selected, &mut action, &ordinals);
+        }
     }
 
     ui.add_space(theme::SECTION_GAP);
     show_doctor_coverage(ui, scan);
     action
+}
+
+/// One category's findings inside a collapsible section, shared by both view
+/// modes so the card rendering is identical wherever it appears.
+fn show_doctor_category_group(
+    ui: &mut egui::Ui,
+    category: DoctorCategory,
+    findings: &[&Finding],
+    selected: &mut Option<String>,
+    action: &mut Option<DoctorPageAction>,
+    ordinals: &DoctorFindingOrdinals,
+) {
+    ui.add_space(theme::SECTION_GAP);
+    egui::CollapsingHeader::new(format!("{} ({})", category.label(), findings.len()))
+        .id_salt(("doctor-category", category.label()))
+        .default_open(true)
+        .show(ui, |ui| {
+            for repeated in doctor_presentation_groups(findings) {
+                if repeated_doctor_group_is_compact(&repeated) {
+                    show_repeated_doctor_group(ui, &repeated, selected, action, ordinals);
+                } else {
+                    for finding in repeated {
+                        show_doctor_finding_card(ui, finding, selected, action, ordinals);
+                        ui.add_space(6.0);
+                    }
+                }
+                ui.add_space(6.0);
+            }
+        });
 }
 
 const DOCTOR_REPEATED_GROUP_EXAMPLES: usize = 10;
@@ -16808,10 +16912,19 @@ fn show_doctor_repair_result(ui: &mut egui::Ui, outcome: &DoctorRepairOutcome) {
             "Repair failed and state was preserved",
             widgets::StatusTone::Blocked,
         ),
-        DoctorRepairStatus::Rejected => (
-            "Repair was refused and nothing was changed",
-            widgets::StatusTone::Blocked,
-        ),
+        DoctorRepairStatus::Rejected => {
+            // A refusal because the issue disappeared before repair is not a
+            // failure on the user's part. The exact reason still travels in
+            // the record's summary, which is kept below and in History & Logs.
+            if record.rejection == Some(DoctorRepairRejection::StaleFinding) {
+                ("Nothing needed changing", widgets::StatusTone::Info)
+            } else {
+                (
+                    "Repair was refused and nothing was changed",
+                    widgets::StatusTone::Blocked,
+                )
+            }
+        }
         DoctorRepairStatus::DryRun => ("Validated only", widgets::StatusTone::Info),
     };
     widgets::banner(ui, title, &record.summary, tone);
@@ -19420,11 +19533,14 @@ fn show_bsfree_source_card(
             }
             widgets::status_badge(
                 ui,
-                "GameCube installable via Dolphin",
+                "GameCube cheats installable via Dolphin",
                 widgets::StatusTone::Info,
             );
         });
-        ui.label("GameCube cheats can be installed with Dolphin. Other BSFree formats remain browse only.");
+        ui.label(
+            "This catalogue covers all supported BSFree systems. GameCube cheats can be installed \
+             with Dolphin; other formats remain browse only.",
+        );
         widgets::technical_details(ui, "bsfree-source-provenance", |ui| {
             ui.label("Source: BSFree Archive");
             ui.label("Maintainer: Andrew Mackrodt");
@@ -19685,6 +19801,14 @@ fn show_bsfree_game_browser(
         state.cheats = None;
     }
 
+    // Whether this browser was opened for a GameCube game. Only then is the
+    // "installable via Dolphin" claim relevant to what is being browsed; for
+    // any other platform (or no platform) the catalogue is browse-only, and
+    // saying otherwise would imply this platform's cheats can be installed.
+    let is_gamecube_browse = context.is_some_and(|(_, _, platform)| {
+        archivefs_core::canonical_platform_for_alias(platform) == Some("GameCube")
+    });
+
     widgets::section_header(
         ui,
         "BSFree Archive",
@@ -19692,14 +19816,23 @@ fn show_bsfree_game_browser(
     );
     widgets::card(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
-            widgets::status_badge(
-                ui,
-                "GameCube: installable via Dolphin",
-                widgets::StatusTone::Info,
-            );
-            ui.label(
-                "GameCube cheats can be installed with Dolphin. Other BSFree formats remain browse only.",
-            );
+            if is_gamecube_browse {
+                widgets::status_badge(
+                    ui,
+                    "GameCube: installable via Dolphin",
+                    widgets::StatusTone::Info,
+                );
+                ui.label(
+                    "GameCube cheats can be installed with Dolphin. Other BSFree formats remain \
+                     browse only.",
+                );
+            } else {
+                widgets::status_badge(ui, "Browse only", widgets::StatusTone::Pending);
+                ui.label(
+                    "Cheats here are for reference: they can be viewed and copied, but ArchiveFS \
+                     does not install them for this platform.",
+                );
+            }
         });
         ui.label("Match based on platform and title. Exact game revision is not verified.");
 
@@ -50856,12 +50989,29 @@ $Instant Growth [Nayr]\n";
         render_doctor_page_with(state, selected, None, None, None)
     }
 
+    /// Renders the Doctor page in Gamer View, where informational findings
+    /// are summarised rather than listed card by card.
+    fn render_doctor_page_gamer(state: &DoctorScanState) -> egui::FullOutput {
+        render_doctor_page_with_mode(state, &mut None, None, None, None, true)
+    }
+
     fn render_doctor_page_with(
         state: &DoctorScanState,
         selected: &mut Option<String>,
         review: Option<&DoctorRepairReview>,
         repair_result: Option<&DoctorRepairOutcome>,
         repaired_at: Option<i64>,
+    ) -> egui::FullOutput {
+        render_doctor_page_with_mode(state, selected, review, repair_result, repaired_at, false)
+    }
+
+    fn render_doctor_page_with_mode(
+        state: &DoctorScanState,
+        selected: &mut Option<String>,
+        review: Option<&DoctorRepairReview>,
+        repair_result: Option<&DoctorRepairOutcome>,
+        repaired_at: Option<i64>,
+        gamer_view: bool,
     ) -> egui::FullOutput {
         let mut clipboard = InMemoryClipboard::default();
         let ctx = egui::Context::default();
@@ -50875,6 +51025,7 @@ $Instant Growth [Nayr]\n";
                     repair_result,
                     repaired_at,
                     &mut clipboard,
+                    gamer_view,
                 );
             });
         })
@@ -50919,7 +51070,16 @@ $Instant Growth [Nayr]\n";
         let mut clipboard = InMemoryClipboard::default();
         let details = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                let _ = show_doctor_page(ui, &state, &mut None, None, None, None, &mut clipboard);
+                let _ = show_doctor_page(
+                    ui,
+                    &state,
+                    &mut None,
+                    None,
+                    None,
+                    None,
+                    &mut clipboard,
+                    false,
+                );
             });
         });
         assert!(rendered_text_contains(&details, "By reason"));
@@ -51607,8 +51767,16 @@ $Instant Growth [Nayr]\n";
         let mut frame = |input: egui::RawInput, selected: &mut Option<String>| {
             context.run(input, |context| {
                 egui::CentralPanel::default().show(context, |ui| {
-                    let _ =
-                        show_doctor_page(ui, &state, selected, None, None, None, &mut clipboard);
+                    let _ = show_doctor_page(
+                        ui,
+                        &state,
+                        selected,
+                        None,
+                        None,
+                        None,
+                        &mut clipboard,
+                        false,
+                    );
                 });
             })
         };
@@ -51715,6 +51883,7 @@ $Instant Growth [Nayr]\n";
                             None,
                             None,
                             &mut clipboard,
+                            false,
                         );
                     });
                 })
@@ -51871,6 +52040,111 @@ $Instant Growth [Nayr]\n";
                 "missing {expected}"
             );
         }
+    }
+
+    #[test]
+    fn gamer_view_summarizes_informational_findings_instead_of_flooding() {
+        // A realistic flood: hundreds of informational findings beside one
+        // genuine error and one warning.
+        let mut issues: Vec<HealthIssue> = (0..500)
+            .map(|index| {
+                doctor_health_issue(
+                    &format!("/roms/loose/{index:04}.sfc"),
+                    HealthCategory::CachedOnly,
+                )
+            })
+            .collect();
+        issues.push(doctor_health_issue(
+            "/roms/broken.zip",
+            HealthCategory::TerminalFailure,
+        ));
+        issues.push(doctor_health_issue(
+            "/roms/odd.zip",
+            HealthCategory::Missing,
+        ));
+        let state = doctor_outcome(doctor_scan_from(&issues));
+        let output = render_doctor_page_gamer(&state);
+
+        // Exact counts are retained...
+        for expected in ["Critical: 0", "Error: 1", "Warning: 1", "Info: 500"] {
+            assert!(
+                rendered_text_contains(&output, expected),
+                "missing {expected}"
+            );
+        }
+        // ...the informational pile is summarised in one friendly line...
+        assert!(
+            rendered_text_contains(&output, "500 checks are informational or healthy"),
+            "the info flood must be summarised"
+        );
+        assert!(rendered_text_contains(
+            &output,
+            "None of these need attention"
+        ));
+        // ...and no info-only category group is foregrounded card by card.
+        assert!(
+            !rendered_text_contains(&output, "Library (500)"),
+            "individual info findings must not flood the Gamer View dashboard"
+        );
+        // Errors and warnings stay foregrounded as their own category groups.
+        assert!(
+            rendered_text_contains(&output, "Mounts (1)"),
+            "a genuine error must remain foregrounded"
+        );
+        assert!(
+            rendered_text_contains(&output, "Library (1)"),
+            "a genuine warning must remain foregrounded"
+        );
+        // The full informational detail stays reachable one disclosure down.
+        assert!(
+            rendered_text_contains(&output, "Technical details"),
+            "the full info list must remain reachable"
+        );
+    }
+
+    #[test]
+    fn gamer_view_with_only_informational_findings_renders_a_summary_not_a_flood() {
+        let issues: Vec<HealthIssue> = (0..3)
+            .map(|index| {
+                doctor_health_issue(
+                    &format!("/roms/loose/{index:04}.sfc"),
+                    HealthCategory::CachedOnly,
+                )
+            })
+            .collect();
+        let state = doctor_outcome(doctor_scan_from(&issues));
+        let output = render_doctor_page_gamer(&state);
+
+        assert!(rendered_text_contains(&output, "Info: 3"));
+        assert!(
+            rendered_text_contains(&output, "3 checks are informational or healthy"),
+            "an all-info scan must still be summarised"
+        );
+        // No info-only category group is shown as a foreground card list.
+        assert!(
+            !rendered_text_contains(&output, "Library (3)"),
+            "info-only categories must not flood in Gamer View"
+        );
+    }
+
+    #[test]
+    fn advanced_view_lists_informational_findings_individually() {
+        let issues: Vec<HealthIssue> = (0..3)
+            .map(|index| {
+                doctor_health_issue(
+                    &format!("/roms/loose/{index:04}.sfc"),
+                    HealthCategory::CachedOnly,
+                )
+            })
+            .collect();
+        let state = doctor_outcome(doctor_scan_from(&issues));
+        let output = render_doctor_page(&state, &mut None);
+
+        assert!(rendered_text_contains(&output, "Info: 3"));
+        assert!(
+            rendered_text_contains(&output, "Library (3)"),
+            "Advanced View keeps the full info groups visible"
+        );
     }
 
     #[test]
@@ -52483,6 +52757,93 @@ $Instant Growth [Nayr]\n";
         ] {
             assert!(detail.contains(expected), "missing {expected} in {detail}");
         }
+    }
+
+    #[test]
+    fn a_disappeared_issue_reads_friendly_rather_than_as_a_refusal() {
+        // The issue simply vanished before repair: that is "nothing needed
+        // changing", not a harsh refusal.
+        let outcome = DoctorRepairOutcome {
+            action: DoctorRepairAction::CleanMountPath,
+            spec: DoctorRepairAction::CleanMountPath.spec(),
+            record: archivefs_core::diagnostics::repair::DoctorRepairRecord {
+                action_id: "clean_mount_path",
+                action_title: "Remove this leftover mount folder",
+                finding_id: "mount_root.stale_mount_directory".to_string(),
+                affected: Some(
+                    archivefs_core::emulator_environment::EncodedPath::from_path(Path::new(
+                        "/mount/SNES/Old Game",
+                    )),
+                ),
+                confirmed: true,
+                dry_run: false,
+                status: DoctorRepairStatus::Rejected,
+                verification: DoctorRepairVerification::NotAttempted,
+                changed_paths: Vec::new(),
+                undo: archivefs_core::diagnostics::repair::DoctorRepairUndo::NothingToUndo,
+                summary: "Remove this leftover mount folder was refused: The problem this repair \
+                          addresses is no longer present. Nothing was changed."
+                    .to_string(),
+                rejection: Some(DoctorRepairRejection::StaleFinding),
+                error: None,
+            },
+        };
+        let state = doctor_outcome(doctor_scan_with_repair());
+        let output = render_doctor_page_with(&state, &mut None, None, Some(&outcome), Some(42));
+
+        assert!(
+            rendered_text_contains(&output, "Nothing needed changing"),
+            "a disappeared issue must read as nothing-needed-changing"
+        );
+        assert!(
+            !rendered_text_contains(&output, "Repair was refused"),
+            "the harsh refusal wording must not surface for a disappeared issue"
+        );
+        // The exact technical reason is still preserved below and in history.
+        assert!(
+            rendered_text_contains(&output, "no longer present"),
+            "the technical reason must remain visible"
+        );
+        assert!(rendered_text_contains(
+            &output,
+            "recorded in History & Logs"
+        ));
+    }
+
+    #[test]
+    fn a_real_refusal_keeps_the_exact_safety_wording() {
+        let outcome = DoctorRepairOutcome {
+            action: DoctorRepairAction::CleanMountPath,
+            spec: DoctorRepairAction::CleanMountPath.spec(),
+            record: archivefs_core::diagnostics::repair::DoctorRepairRecord {
+                action_id: "clean_mount_path",
+                action_title: "Remove this leftover mount folder",
+                finding_id: "mount_root.stale_mount_directory".to_string(),
+                affected: Some(
+                    archivefs_core::emulator_environment::EncodedPath::from_path(Path::new(
+                        "/mount/SNES/Old Game",
+                    )),
+                ),
+                confirmed: true,
+                dry_run: false,
+                status: DoctorRepairStatus::Rejected,
+                verification: DoctorRepairVerification::NotAttempted,
+                changed_paths: Vec::new(),
+                undo: archivefs_core::diagnostics::repair::DoctorRepairUndo::NothingToUndo,
+                summary: "Remove this leftover mount folder was refused: That path is inside a \
+                          configured source folder. ArchiveFS never modifies anything there."
+                    .to_string(),
+                rejection: Some(DoctorRepairRejection::PathUnderSourceRoot),
+                error: None,
+            },
+        };
+        let state = doctor_outcome(doctor_scan_with_repair());
+        let output = render_doctor_page_with(&state, &mut None, None, Some(&outcome), Some(42));
+
+        assert!(
+            rendered_text_contains(&output, "Repair was refused and nothing was changed"),
+            "a genuine safety refusal keeps its exact wording"
+        );
     }
 
     #[test]
@@ -66525,13 +66886,49 @@ $Instant Growth [Nayr]\n";
             .next()
             .unwrap();
         assert!(browser.contains("installable via Dolphin"));
-        assert!(browser.contains("Other BSFree formats remain browse only"));
+        assert!(browser.contains("GameCube cheats can be installed with Dolphin"));
+        assert!(browser.contains("Browse only"));
+        assert!(browser.contains("does not install them for this platform"));
         assert!(browser.contains("PageRequest::games(0)"));
         assert!(browser.contains("Previous 100"));
         assert!(browser.contains("Next 100"));
         assert!(browser.contains("archivefs_platform_display_name"));
         assert!(!browser.contains("Install selected"));
         assert!(!browser.contains("BsFreeOperation::Install"));
+    }
+
+    #[test]
+    fn bsfree_browser_is_install_aware_only_for_a_gamecube_context() {
+        // A non-GameCube browse (e.g. Megadrive) must not imply the browsed
+        // platform is Dolphin-installable: it reads as browse-only.
+        let manager = BsFreeManagerState::NotLoaded;
+        let output = render_bsfree_browser(&manager, Some("megadrive"));
+        assert!(
+            rendered_text_contains(&output, "Browse only"),
+            "a Megadrive browse must be clearly browse-only"
+        );
+        assert!(
+            rendered_text_contains(&output, "does not install them for this platform"),
+            "the non-GameCube wording must name the platform's browse-only nature"
+        );
+        assert!(
+            !rendered_text_contains(&output, "installable via Dolphin"),
+            "no Dolphin-install claim for a non-GameCube browse"
+        );
+
+        // A GameCube browse still surfaces the truthful install capability.
+        let output = render_bsfree_browser(&manager, Some("GameCube"));
+        assert!(rendered_text_contains(&output, "installable via Dolphin"));
+        assert!(rendered_text_contains(
+            &output,
+            "GameCube cheats can be installed with Dolphin"
+        ));
+        assert!(!rendered_text_contains(&output, "Browse only"));
+
+        // No context at all defaults to browse-only too.
+        let output = render_bsfree_browser(&manager, None);
+        assert!(rendered_text_contains(&output, "Browse only"));
+        assert!(!rendered_text_contains(&output, "installable via Dolphin"));
     }
 
     // ------------------------------------------------------------------
@@ -66597,6 +66994,27 @@ $Instant Growth [Nayr]\n";
             });
         });
         (output, action)
+    }
+
+    /// Renders the generic BSFree browser with the given platform context.
+    fn render_bsfree_browser(
+        manager: &BsFreeManagerState,
+        platform: Option<&str>,
+    ) -> egui::FullOutput {
+        let ctx = egui::Context::default();
+        let mut state = BsFreeGuiState::default();
+        let context = platform.map(|platform| {
+            (
+                PathBuf::from("/roms"),
+                "Test Game".to_string(),
+                platform.to_string(),
+            )
+        });
+        ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_bsfree_game_browser(ui, manager, false, &mut state, context.as_ref());
+            });
+        })
     }
 
     fn bsfree_test_screen() -> egui::Rect {
@@ -69872,6 +70290,75 @@ mod romm_dispatch_tests {
     }
 
     #[test]
+    fn a_failed_connection_test_while_offline_is_recorded_as_offline_not_failed() {
+        let mut app = app();
+        let context = egui::Context::default();
+        app.romm_snapshot = Some(Box::new(snapshot(36_259, ProviderState::ReadyOffline)));
+        let (sender, _progress, generation) =
+            install_running(&mut app, RommOperation::TestConnection);
+        sender
+            .send((
+                generation,
+                Err("could not reach RomM: an I/O error occurred (connection refused)".to_string()),
+            ))
+            .expect("send");
+        app.poll_romm_operation(&context);
+
+        let outcome = app.romm_ui.last_outcome.as_ref().expect("a result");
+        assert!(outcome.informational, "offline copy is still usable");
+        assert!(
+            !outcome.headline.contains("failed"),
+            "no scary global failure: {}",
+            outcome.headline
+        );
+
+        let entry = app.history.entries().next().expect("an activity entry");
+        assert_eq!(entry.outcome, ActivityOutcome::OfflineUsable);
+        assert_eq!(entry.action, ActivityAction::RommSource);
+        assert!(
+            entry.message.contains("offline copy still works"),
+            "friendly framing: {}",
+            entry.message
+        );
+        // The actual technical reason is preserved in the activity history.
+        assert!(
+            entry.message.contains("connection refused"),
+            "technical reason must survive: {}",
+            entry.message
+        );
+    }
+
+    #[test]
+    fn a_failed_connection_test_without_an_offline_copy_is_still_a_real_failure() {
+        let mut app = app();
+        let context = egui::Context::default();
+        app.romm_snapshot = Some(Box::new(snapshot(36_259, ProviderState::Ready)));
+        let (sender, _progress, generation) =
+            install_running(&mut app, RommOperation::TestConnection);
+        sender
+            .send((
+                generation,
+                Err("could not reach RomM: an I/O error occurred (connection refused)".to_string()),
+            ))
+            .expect("send");
+        app.poll_romm_operation(&context);
+
+        let outcome = app.romm_ui.last_outcome.as_ref().expect("a result");
+        assert!(!outcome.informational);
+        assert!(outcome.headline.contains("failed"), "{}", outcome.headline);
+        assert_eq!(
+            app.history.entries().next().map(|entry| entry.outcome),
+            Some(ActivityOutcome::Failed)
+        );
+        assert!(
+            app.history
+                .entries()
+                .next()
+                .is_some_and(|entry| entry.message.contains("connection refused"))
+        );
+    }
+
+    #[test]
     fn a_new_operation_clears_the_previous_result_so_they_are_never_shown_together() {
         let mut app = app();
         let context = egui::Context::default();
@@ -69882,7 +70369,6 @@ mod romm_dispatch_tests {
             .expect("send");
         app.poll_romm_operation(&context);
         assert!(app.romm_ui.last_outcome.is_some());
-
         // Starting something else drops the old outcome.
         app.romm_operation = None;
         assert!(app.start_romm_operation(context, RommOperation::TestConnection));
