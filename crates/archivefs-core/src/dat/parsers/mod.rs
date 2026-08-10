@@ -5,7 +5,7 @@
 //!
 //! # Why this does not go through `safe_read`/`TrustedRoots`
 //!
-//! That policy exists to constrain paths ArchiveFS derives from *data* - a RomM
+//! That policy exists to constrain paths EmuWiz derives from *data* - a RomM
 //! record's `archivefs_path`, a cheat catalogue's destination - where a hostile
 //! or careless source could otherwise steer a read outside the configured source
 //! folders.

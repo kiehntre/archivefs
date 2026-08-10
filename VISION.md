@@ -1,6 +1,6 @@
-# ArchiveFS Vision
+# EmuWiz Vision
 
-ArchiveFS makes archives behave like normal folders.
+EmuWiz makes archives behave like normal folders.
 
 It is a virtual filesystem layer for people with large digital libraries, ROM collections, media archives, preservation sets, and download folders.
 
@@ -40,4 +40,4 @@ without extracting it and without using extra disk space.
 - Not a ROM, BIOS, firmware, or game download service; not a storefront;
   not a DRM system; not a mandatory cloud service; not a telemetry
   platform. See [`ROADMAP.md`](ROADMAP.md#explicitly-out-of-scope-for-now)
-  for the full list of what ArchiveFS deliberately will not become.
+  for the full list of what EmuWiz deliberately will not become.

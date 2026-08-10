@@ -100,7 +100,7 @@ const DOCUMENTATION_EXTENSIONS: &[&str] = &[
 const NESTED_ARCHIVE_EXTENSIONS: &[&str] = &["zip", "7z", "rar", "tar", "gz", "bz2", "xz"];
 
 /// "Common ROM, disc-image and executable extensions" - the milestone's
-/// wording implies such a list already exists somewhere in ArchiveFS.
+/// wording implies such a list already exists somewhere in EmuWiz.
 /// It does not: platform detection (the `platform` registry and
 /// `detect_platform_from_known_heuristics`) is entirely folder-name
 /// based and has never matched on file extensions. This list is new,

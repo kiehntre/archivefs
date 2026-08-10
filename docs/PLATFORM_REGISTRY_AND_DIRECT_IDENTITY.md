@@ -1,7 +1,7 @@
 # Platform registry and direct game identity
 
 This document covers the canonical platform registry, how folder/source
-evidence resolves to a platform, which disc/ROM formats ArchiveFS can read
+evidence resolves to a platform, which disc/ROM formats EmuWiz can read
 exact game identity from directly (without mounting), and how the Cheats &
 Mods workflow turns that into a final, non-spinning state. It extends
 [`PLATFORM_LIBRARY_RECOVERY.md`](PLATFORM_LIBRARY_RECOVERY.md) - read that
@@ -11,7 +11,7 @@ document first for the original traced root causes.
 
 There is exactly one platform-name table in the whole application:
 `FOLDER_PLATFORM_ALIASES` in `crates/archivefs-core/src/lib.rs`. Every
-caller that needs "what platforms does ArchiveFS know about" or "what
+caller that needs "what platforms does EmuWiz know about" or "what
 canonical platform does this string mean" goes through it, via two
 functions:
 
@@ -101,7 +101,7 @@ visible platform list from live data instead of a fixed array:
   string actually present, sorted, with its real count; `Unknown` is
   counted separately and shown last, only when non-zero. A canonical
   platform the registry recognises but that has zero archives never
-  appears - it is never hidden because ArchiveFS lacks a cheat adapter for
+  appears - it is never hidden because EmuWiz lacks a cheat adapter for
   it, and never shown as a phantom empty tab either.
 - The platform strip uses `egui`'s wrapping layout (`horizontal_wrapped`)
   rather than a fixed-width tab row or a horizontal-scroll-only area, so a
@@ -111,7 +111,7 @@ visible platform list from live data instead of a fixed array:
   entry (scrollable), so assigning a source to Sharp X68000, ZX Spectrum,
   NEC PC-8801, Virtual Boy, Acorn Archimedes, or Arcade works exactly like
   assigning GameCube always did - no special-casing per platform.
-- In Cheats & Mods, a platform ArchiveFS recognises but has no cheat
+- In Cheats & Mods, a platform EmuWiz recognises but has no cheat
   adapter for shows its own name ("Sharp X68000 recognised - cheat support
   is not available yet"), not a generic message and not Unknown.
 

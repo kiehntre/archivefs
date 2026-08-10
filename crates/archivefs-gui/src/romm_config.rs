@@ -438,7 +438,7 @@ pub(crate) fn add_mapping(
     let destination = draft.new_destination.trim().to_string();
     if prefix.is_empty() || destination.is_empty() {
         return AddMappingOutcome::Refused(
-            "Both a RomM prefix and an ArchiveFS folder are needed.".to_string(),
+            "Both a RomM prefix and an EmuWiz folder are needed.".to_string(),
         );
     }
     let candidate = PathMapping {
@@ -729,7 +729,7 @@ pub(crate) fn show_config_dialog(
     widgets::section_header(
         ui,
         "Configure RomM",
-        Some("Nothing here contacts RomM. Saving writes ArchiveFS's own configuration only."),
+        Some("Nothing here contacts RomM. Saving writes EmuWiz's own configuration only."),
     );
     widgets::card(ui, |ui| {
         // --- URL -----------------------------------------------------------
@@ -750,7 +750,7 @@ pub(crate) fn show_config_dialog(
         ui.add_space(theme::SECTION_GAP / 2.0);
         ui.label("Token file");
         ui.label(
-            "ArchiveFS reads the token from this file when it needs it. The contents are never \
+            "EmuWiz reads the token from this file when it needs it. The contents are never \
              shown here, never stored in the configuration, and never written to a log.",
         );
         if ui
@@ -768,7 +768,7 @@ pub(crate) fn show_config_dialog(
             ui.label(format!(
                 "Create a read-only client token in RomM with the platforms.read and roms.read \
                  scopes, then put it in a private file. The suggested location is \
-                 {SUGGESTED_TOKEN_PATH} - ArchiveFS never creates it for you."
+                 {SUGGESTED_TOKEN_PATH} - EmuWiz never creates it for you."
             ));
             ui.add(
                 egui::TextEdit::multiline(&mut TOKEN_FILE_SHELL_EXAMPLE.to_string())
@@ -802,7 +802,7 @@ pub(crate) fn show_config_dialog(
             }
         }
         ui.label(
-            "This is a setting, not a guess: ArchiveFS never infers the shape from individual \
+            "This is a setting, not a guess: EmuWiz never infers the shape from individual \
              records. Run Test connection to see which shape your server actually reports.",
         );
         if !validation.stranded_mappings.is_empty() {
@@ -935,7 +935,7 @@ pub(crate) fn show_config_dialog_footer(
                 request = Some(ConfigDialogRequest::Close);
             }
         }
-        ui.label("Saving writes ArchiveFS's configuration. It contacts nothing.");
+        ui.label("Saving writes EmuWiz's configuration. It contacts nothing.");
     });
     request
 }
@@ -1094,7 +1094,7 @@ fn show_mappings_editor(
         {
             draft.add_problem = None;
         }
-        ui.label("ArchiveFS folder");
+        ui.label("EmuWiz folder");
         if ui
             .add(
                 egui::TextEdit::singleline(&mut draft.new_destination)

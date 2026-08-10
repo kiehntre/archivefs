@@ -1,7 +1,7 @@
 //! Bounded, strict parsing of Xenia Canary's `.patch.toml` format.
 //!
 //! Generic TOML syntax is parsed via the `toml` crate; everything beyond
-//! that is ArchiveFS's own schema-specific validator for this one upstream
+//! that is EmuWiz's own schema-specific validator for this one upstream
 //! format - this module is never a general-purpose TOML interpreter, and
 //! it never executes or interprets the write operations it reads, only
 //! records them.
@@ -119,7 +119,7 @@ pub struct XeniaPatch {
     pub description: String,
     pub author: String,
     /// Upstream's own default `is_enabled` value - informational only.
-    /// ArchiveFS never applies this automatically; the user's own
+    /// EmuWiz never applies this automatically; the user's own
     /// selection is always what gets written.
     pub enabled_by_default: bool,
     pub writes: Vec<XeniaPatchWrite>,

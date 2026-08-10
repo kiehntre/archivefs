@@ -1,4 +1,4 @@
-# ArchiveFS GUI Final Polish Report
+# EmuWiz GUI Final Polish Report
 
 Branch: `sonnet-final-gui-polish`, based on `main` at
 `7da26e83038f82f36e3fdc0660f4b4e6e8e6f332` (which already includes the

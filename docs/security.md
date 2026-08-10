@@ -1,8 +1,8 @@
-# ArchiveFS Security Design
+# EmuWiz Security Design
 
-This document describes the security boundaries and safety rules for ArchiveFS.
+This document describes the security boundaries and safety rules for EmuWiz.
 
-ArchiveFS mounts untrusted archive files as folders. Archives may be incomplete, corrupt, malicious, or unexpectedly large. The security design should assume archive contents and filenames are attacker-controlled.
+EmuWiz mounts untrusted archive files as folders. Archives may be incomplete, corrupt, malicious, or unexpectedly large. The security design should assume archive contents and filenames are attacker-controlled.
 
 ## Goals
 
@@ -27,13 +27,13 @@ ArchiveFS mounts untrusted archive files as folders. Archives may be incomplete,
 
 ### Config File
 
-ArchiveFS reads configuration from:
+EmuWiz reads configuration from:
 
 ```text
 ~/.config/archivefs/config.toml
 ```
 
-The config controls source folders, mount root, and the ratarmount binary path. ArchiveFS should treat config as user-controlled but not archive-controlled.
+The config controls source folders, mount root, and the ratarmount binary path. EmuWiz should treat config as user-controlled but not archive-controlled.
 
 Security rules:
 
@@ -63,19 +63,19 @@ Security rules:
 
 ### Mount Root
 
-The mount root is the only place ArchiveFS should create mount directories.
+The mount root is the only place EmuWiz should create mount directories.
 
 Security rules:
 
 - Generate safe mount names from archive names.
 - Resolve duplicate mount names deterministically.
-- Treat pre-existing mount directories as potentially suspicious unless they are confirmed mounted by ArchiveFS.
+- Treat pre-existing mount directories as potentially suspicious unless they are confirmed mounted by EmuWiz.
 - Only unmount paths under `mount_root`.
 - Prefer unmounting known mounted paths from system mount information, filtered by `mount_root`.
 
 ### Mount Backend
 
-ArchiveFS currently uses `ratarmount` through `RatarmountBackend`.
+EmuWiz currently uses `ratarmount` through `RatarmountBackend`.
 
 Security rules:
 
@@ -86,7 +86,7 @@ Security rules:
 
 ## Path Safety
 
-ArchiveFS must not allow archive names or internal archive paths to escape the configured mount area.
+EmuWiz must not allow archive names or internal archive paths to escape the configured mount area.
 
 Required behavior:
 
@@ -106,10 +106,10 @@ Important states:
 - `MissingParts`: a split archive appears incomplete.
 - `Corrupt`: the archive appears damaged.
 - `Unsupported`: the archive format or layout is unsupported.
-- `PermissionDenied`: ArchiveFS cannot read or mount the archive.
+- `PermissionDenied`: EmuWiz cannot read or mount the archive.
 - `RetryAvailable`: a failed archive can be retried.
 
-Retry behavior should be explicit. ArchiveFS should not silently retry in a tight loop or hide repeated failures.
+Retry behavior should be explicit. EmuWiz should not silently retry in a tight loop or hide repeated failures.
 
 ## Future Work
 

@@ -1,5 +1,5 @@
 #!/bin/sh
-# ArchiveFS installer.
+# EmuWiz installer.
 #
 # Installs archivefs-cli and archivefs-gui for the current user only: no
 # sudo, no system-wide changes, no edits to shell startup files. Safe to
@@ -22,7 +22,7 @@ usage() {
     cat <<EOF
 Usage: $program_name [--prefix PATH] [--uninstall] [--help]
 
-Install ArchiveFS (archivefs-cli, archivefs-gui) for the current user.
+Install EmuWiz (archivefs-cli, archivefs-gui) for the current user.
 No sudo is used and no shell startup files are modified.
 
 Options:
@@ -51,7 +51,7 @@ Without --uninstall, this script:
      offered for an existing config, and never offered for a
      non-interactive install.
   6. Checks whether ratarmount is on PATH and prints installation
-     guidance if it is not (ArchiveFS uses it to mount archives).
+     guidance if it is not (EmuWiz uses it to mount archives).
 EOF
 }
 
@@ -192,7 +192,7 @@ if command -v ratarmount >/dev/null 2>&1; then
 else
     printf '\n' >&2
     printf 'WARNING: ratarmount was not found on PATH.\n' >&2
-    printf 'ArchiveFS uses ratarmount to mount archives read-only, and mounting\n' >&2
+    printf 'EmuWiz uses ratarmount to mount archives read-only, and mounting\n' >&2
     printf 'will not work until it is installed.\n' >&2
     printf 'Install it with: pip install ratarmount\n' >&2
     printf '(see https://github.com/mxmlnkn/ratarmount for other options,\n' >&2

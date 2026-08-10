@@ -4,7 +4,7 @@
 `archivefs retroarch-cheat-setup --source <source-id>` uses a validated trusted
 snapshot. Both discover local
 RetroArch profiles, resolves their configured cheat directories, matches the
-catalogue against the existing ArchiveFS library database, previews every
+catalogue against the existing EmuWiz library database, previews every
 decision, and delegates approved writes to the existing safe installer.
 
 The installer does not download a catalogue. The separate trusted-source layer
@@ -25,13 +25,13 @@ archivefs retroarch-cheat-setup --source <source-id> [options]
 | `--yes` | Approve installation without the final confirmation prompt. |
 | `--replace-different` | Permit replacement of a different existing cheat file, after a verified backup. |
 | `--json` | Emit only the versioned setup result on stdout. Without `--yes`, this is a successful no-write preview. |
-| `--database <path>` | Read an explicit current-schema ArchiveFS library database. |
+| `--database <path>` | Read an explicit current-schema EmuWiz library database. |
 | `--config <path>` | Restrict eligibility to a discovered profile using this exact RetroArch config path. It does not invent an installation around an arbitrary config. |
 | `--source <source-id>` | Retrieve or reuse one compiled-in trusted source; mutually exclusive with the local path. |
 | `--offline` | With `--source`, make no network request and require a valid cached snapshot. |
 | `--force-refresh` | With `--source`, validate a new snapshot before replacing the current pointer. |
 | `--expected-sha256 <hash>` | With `--source`, require this archive digest. |
-| `--cache-root <path>` | Override the ArchiveFS-owned source cache root. |
+| `--cache-root <path>` | Override the EmuWiz-owned source cache root. |
 | `--max-download-bytes <bytes>` | Lower the built-in source download ceiling. |
 
 Trusted-source preview provenance and cache behavior are documented in
@@ -43,7 +43,7 @@ setup never invokes maintenance automatically.
 
 No destination, journal, backup, installation-type, or RetroArch config path
 is needed normally. The destination comes from the selected profile's parsed
-`cheat_database_path`. Journals and backups use the same default ArchiveFS
+`cheat_database_path`. Journals and backups use the same default EmuWiz
 data directory as `retroarch-cheat-install`; `--database` changes only the
 read-only game-library input.
 
@@ -187,7 +187,7 @@ Review rollback, then add `--yes` only when its assessments are expected.
 - **Unresolved cheats directory:** set an absolute `cheat_database_path` in
   RetroArch. Empty values, relative syntax, aliases, and includes are not
   guessed or rewritten.
-- **Missing database:** run the normal ArchiveFS source/library scan. Setup
+- **Missing database:** run the normal EmuWiz source/library scan. Setup
   never creates or migrates it.
 - **No matches:** verify that the game is present and catalogue title/platform
   layout corresponds to it.

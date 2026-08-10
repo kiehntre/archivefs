@@ -5,7 +5,7 @@ Branch: `fable-archivefs-integration`
 Status: Milestone 0 (initializer) only. No production code has been touched.
 
 This document is the architecture reference for integrating the Claude
-Design "stage one" screens (`design-reference/ArchiveFS design stage one.zip`)
+Design "stage one" screens (`design-reference/EmuWiz design stage one.zip`)
 into the existing `archivefs-gui` crate, reusing `archivefs-core` wherever a
 tested capability already exists.
 

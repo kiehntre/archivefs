@@ -9,7 +9,7 @@ usage() {
     cat <<'EOF'
 Usage: scripts/verify-release-artifact.sh [--checksum FILE] ARCHIVE.tar.gz
 
-Verify an existing canonical ArchiveFS release archive without launching the GUI.
+Verify an existing canonical EmuWiz release archive without launching the GUI.
 The checksum defaults to ARCHIVE.tar.gz.sha256.
 EOF
 }

@@ -723,7 +723,7 @@ fn a_thumbnail_whose_file_has_been_corrupted_is_dropped_and_refetched() {
         )
         .expect("stored");
 
-    // Something outside ArchiveFS damaged the file.
+    // Something outside EmuWiz damaged the file.
     fs::write(&stored.path, b"not a png any more").expect("fixture");
     assert!(
         cache.lookup(SERVER, &wanted).is_none(),

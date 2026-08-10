@@ -1,14 +1,16 @@
-<img width="1024" height="559" alt="archivefs-banner" src="https://github.com/user-attachments/assets/aa1816c0-316c-4c1b-986e-ba7c14bae9c5" />
+<img width="1024" height="559" alt="emuwiz-banner" src="https://github.com/user-attachments/assets/aa1816c0-316c-4c1b-986e-ba7c14bae9c5" />
 
-# ArchiveFS
+# EmuWiz
 
-ArchiveFS is a Linux-first, local-first tool for browsing, mounting,
+EmuWiz is a Linux-first, local-first tool for browsing, mounting,
 inspecting, validating, and organizing archived collections you already
 have - games, software, media, documents, or other preservation material -
 without extracting everything permanently. It is alpha-stage software under
 active development.
 
-**ArchiveFS is not:** a game or ROM download service, a storefront, a
+EmuWiz was previously known as ArchiveFS.
+
+**EmuWiz is not:** a game or ROM download service, a storefront, a
 source of BIOS/firmware/copyrighted content, a cloud account service, a DRM
 platform, an emulator replacement, or a universal launcher/frontend
 replacement. See [Current limitations](#current-limitations) and
@@ -26,7 +28,7 @@ BSFree Archive source. See
 
 - **Local-first.** No telemetry, no required cloud account, and it keeps
   working offline.
-- **Read-only by default.** Archives are mounted read-only; ArchiveFS never
+- **Read-only by default.** Archives are mounted read-only; EmuWiz never
   modifies your source archive files.
 - **Explicit over automatic.** Mounting, unmounting, cleanup, patch preview,
   and library-view changes are all explicit user actions - nothing silently
@@ -44,7 +46,7 @@ and responsible-use boundaries are documented separately in
 user-facing version at
 [`docs/CHEATS_MODS_USER_POLICY.md`](docs/CHEATS_MODS_USER_POLICY.md).
 
-## What ArchiveFS does today
+## What EmuWiz does today
 
 - Safely scans absolute, non-symlinked configured source folders for supported
   archives (`.zip`, `.7z`, `.rar`) and supported direct game images, including
@@ -118,13 +120,13 @@ user-facing version at
   locked transaction engine after explicit confirmation (with a separate,
   non-preselected approval before replacing different existing content),
   verify the write, and record a journal entry. History & Logs can open that
-  exact operation and preview/confirm its rollback. ArchiveFS never
+  exact operation and preview/confirm its rollback. EmuWiz never
   auto-applies. PCSX2 remains preview-only. Dolphin uses the same transaction
   engine for selected external Gecko definitions, including rollback; see
   [`docs/RETROARCH_GUI_APPLY_HISTORY.md`](docs/RETROARCH_GUI_APPLY_HISTORY.md)
   and
   [`docs/SHARED_SAFE_APPLY_ROLLBACK.md`](docs/SHARED_SAFE_APPLY_ROLLBACK.md).
-  ArchiveFS does not execute cheat files or any other retrieved content at
+  EmuWiz does not execute cheat files or any other retrieved content at
   any stage of preview, apply, or rollback.
 - The Sources page owns RetroArch trusted-catalogue retrieval end-to-end:
   Download when nothing is cached, Update when a snapshot exists, and an
@@ -177,13 +179,13 @@ user-facing version at
   confirmation, then use the verified transaction/History/Undo path. BSFree is
   browse-only, and unsupported or ambiguous formats remain non-installable.
 - No broad multi-emulator support yet - PCSX2, RetroArch, Dolphin, and Xenia
-  are the only emulators with patch/cheat workflows today, and ArchiveFS never
+  are the only emulators with patch/cheat workflows today, and EmuWiz never
   launches an emulator.
 - Not every archive format, Linux distribution, emulator, or frontend is
   supported or tested - see [Supported/tested environments](#supportedtested-environments-and-formats).
 - No automatic modification of emulator configuration files.
 - No official distribution of games, ROMs, BIOS, firmware, or patches -
-  ArchiveFS organizes and previews collections you already have.
+  EmuWiz organizes and previews collections you already have.
 - This is alpha software: workflows may be incomplete, and defects should
   be expected. See [`CHANGELOG.md`](CHANGELOG.md) for what has actually
   shipped.
@@ -252,7 +254,7 @@ Manual installation remains available if you would rather control each step your
    chmod +x archivefs-cli archivefs-gui
    ```
 
-5. Install `ratarmount` separately. It is an external dependency that ArchiveFS shells out to for mounting - it is not bundled in the release tarball, and archive mounting will not work without it. Install it however fits your system, then make sure the `ratarmount` command is on your `PATH` (or point `ratarmount_bin` in the config at its full path).
+5. Install `ratarmount` separately. It is an external dependency that EmuWiz shells out to for mounting - it is not bundled in the release tarball, and archive mounting will not work without it. Install it however fits your system, then make sure the `ratarmount` command is on your `PATH` (or point `ratarmount_bin` in the config at its full path).
 
 6. Copy the example configuration and edit it for your system:
 
@@ -278,11 +280,11 @@ Manual installation remains available if you would rather control each step your
 
    `archivefs-gui` needs a running Linux desktop session (X11 or Wayland) with the usual runtime graphics libraries present - it will not open a window over a bare SSH session or on a headless server with no desktop environment.
 
-Archive mounts created by ArchiveFS are always read-only; it never modifies files in your configured `source_folders`.
+Archive mounts created by EmuWiz are always read-only; it never modifies files in your configured `source_folders`.
 
 ### Upgrade from v0.6 development builds
 
-Stop ArchiveFS and back up `~/.local/share/archivefs/library.sqlite3` and
+Stop EmuWiz and back up `~/.local/share/archivefs/library.sqlite3` and
 managed cheat/history state. Installing the new binaries preserves existing
 configuration. The v0.7 candidate migrates the catalogue forward through
 schema 6 (migrations `0001`–`0006`); an older binary cannot open that database,
@@ -290,7 +292,7 @@ so rollback requires restoring the backup rather than editing SQLite metadata.
 After upgrading, run `archivefs-cli doctor --findings` and rescan sources whose
 stored platform findings predate the canonical registry.
 
-There is currently no package-manager distribution of ArchiveFS (no apt, dnf, pacman, Homebrew, or similar package) - the release tarball above and building from source below are the two supported ways to install it.
+There is currently no package-manager distribution of EmuWiz (no apt, dnf, pacman, Homebrew, or similar package) - the release tarball above and building from source below are the two supported ways to install it.
 
 ## Supported/tested environments and formats
 
@@ -312,7 +314,7 @@ There is currently no package-manager distribution of ArchiveFS (no apt, dnf, pa
 
 ## Build from Source (Developers)
 
-ArchiveFS is a Rust workspace. It pins an exact Rust toolchain via
+EmuWiz is a Rust workspace. It pins an exact Rust toolchain via
 [`rust-toolchain.toml`](rust-toolchain.toml) - if you have `rustup`
 installed, it will install and use that exact version automatically inside
 this repository. See [`CONTRIBUTING.md`](CONTRIBUTING.md#rust-toolchain-policy)
@@ -349,7 +351,7 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for more on making changes.
 
 ## Desktop GUI
 
-ArchiveFS also includes a desktop frontend built with `egui`/`eframe`. It scans in the background and shows archive totals, mount states, doctor checks, paths, platforms, sources, catalogue duplicates and health, and searchable status rows, with the same read-only-by-default safety model as the CLI.
+EmuWiz also includes a desktop frontend built with `egui`/`eframe`. It scans in the background and shows archive totals, mount states, doctor checks, paths, platforms, sources, catalogue duplicates and health, and searchable status rows, with the same read-only-by-default safety model as the CLI.
 
 Build and run it from the workspace root:
 
@@ -364,7 +366,7 @@ Archive mounting uses `ratarmount`, so install it separately and make sure it is
 
 ## Configuration
 
-ArchiveFS reads its default config from:
+EmuWiz reads its default config from:
 
 ```text
 ~/.config/archivefs/config.toml
@@ -380,9 +382,9 @@ ratarmount_bin = "ratarmount"
 
 The same example, with comments, ships as [`config.toml.example`](config.toml.example) in this repository and in every release tarball - copy it to `~/.config/archivefs/config.toml` as a starting point.
 
-`source_folders` are scanned recursively. `mount_root` is where ArchiveFS creates planned mount directories. ArchiveFS does not modify files in `source_folders`. `ratarmount_bin` is optional and defaults to `"ratarmount"` resolved from `PATH`.
+`source_folders` are scanned recursively. `mount_root` is where EmuWiz creates planned mount directories. EmuWiz does not modify files in `source_folders`. `ratarmount_bin` is optional and defaults to `"ratarmount"` resolved from `PATH`.
 
-**Note on syntax:** ArchiveFS uses a small hand-written config parser, not a full TOML implementation. `source_folders = ["/data/archives"]` on one line (shown above) always works. Splitting the array across multiple lines, e.g.:
+**Note on syntax:** EmuWiz uses a small hand-written config parser, not a full TOML implementation. `source_folders = ["/data/archives"]` on one line (shown above) always works. Splitting the array across multiple lines, e.g.:
 
 ```toml
 source_folders = [
@@ -497,19 +499,19 @@ descriptions.
 1. Create `~/.config/archivefs/config.toml`.
 2. Run `archivefs-cli config-check` to validate the config.
 3. Run `archivefs-cli doctor` to check source folders, mount root, tools, and current archive state.
-4. Run `archivefs-cli library-scan` to build the persistent catalogue, then `archivefs-cli stats` or `archivefs-cli library-list` to inspect what ArchiveFS sees.
+4. Run `archivefs-cli library-scan` to build the persistent catalogue, then `archivefs-cli stats` or `archivefs-cli library-list` to inspect what EmuWiz sees.
 5. Run `archivefs-cli info "name"` to inspect one archive.
 6. Run `archivefs-cli mount-one "name"` to mount a single archive.
 7. Run `archivefs-cli unmount-one "name"` when finished.
 8. Optionally set up a Library View (`archivefs-cli view preview`/`apply`) for an organized, browsable directory tree.
-9. Run `archivefs-cli watch` if you want ArchiveFS to refresh the JSON index when source folders change.
+9. Run `archivefs-cli watch` if you want EmuWiz to refresh the JSON index when source folders change.
 
 ## Example Output
 
 `archivefs-cli stats`:
 
 ```text
-ArchiveFS Stats
+EmuWiz Stats
 
 Summary:
   Total archives: 128
@@ -530,7 +532,7 @@ Archive extensions:
 `archivefs-cli info "007 Legends"`:
 
 ```text
-ArchiveFS Info
+EmuWiz Info
 
 Details:
   Title: 007 Legends
@@ -549,7 +551,7 @@ Details:
 `archivefs-cli index-show`:
 
 ```text
-ArchiveFS Index
+EmuWiz Index
 
 Summary:
   Total archives: 128
@@ -608,4 +610,4 @@ Platforms:
 
 ## Dedication
 
-ArchiveFS is dedicated to [my dad](DEDICATION.md).
+EmuWiz is dedicated to [my dad](DEDICATION.md).

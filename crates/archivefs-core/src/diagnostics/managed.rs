@@ -1,9 +1,9 @@
-//! Read-only detection of ArchiveFS-managed cheat and patch entries that can
+//! Read-only detection of EmuWiz-managed cheat and patch entries that can
 //! no longer be accounted for.
 //!
 //! # What proves ownership on this build
 //!
-//! This check never guesses. An entry is only ever treated as ArchiveFS's if
+//! This check never guesses. An entry is only ever treated as EmuWiz's if
 //! one of exactly two things proves it:
 //!
 //! 1. **An install journal.** `SharedApplyJournal` is a complete ownership
@@ -17,17 +17,17 @@
 //!    `[ArchiveFS_Managed_GameHacking]` section. Both are parsed by the same
 //!    existing readers used by their installers.
 //!
-//! Xenia `.patch.toml` and RetroArch `.cht` files carry **no** ArchiveFS
+//! Xenia `.patch.toml` and RetroArch `.cht` files carry **no** EmuWiz
 //! marker on this build. That means a managed entry whose journal has been
 //! deleted is undetectable for those adapters, and this module says so
 //! rather than pretending otherwise - see the narrowed deferred entry in
 //! `DEFERRED_CHECKS`. Inventing a marker here would be worse than useless: it
-//! would risk classifying a user's own codes as ArchiveFS's.
+//! would risk classifying a user's own codes as EmuWiz's.
 //!
 //! # What is never reported
 //!
 //! - A user's own Gecko, Action Replay, PNACH or Xenia entry. Without one of
-//!   the two ownership proofs above, an entry is simply not ArchiveFS's, and
+//!   the two ownership proofs above, an entry is simply not EmuWiz's, and
 //!   is left entirely alone.
 //! - An empty managed section. `[Gecko_Enabled]` with nothing in it, or a
 //!   `.pnach` with no managed blocks left, is the normal result of a
@@ -81,7 +81,7 @@ pub const MAX_INDIVIDUAL_MALFORMED_FINDINGS: usize = 5;
 
 // --- Model ----------------------------------------------------------------
 
-/// A managed format ArchiveFS writes and can recognise again.
+/// A managed format EmuWiz writes and can recognise again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ManagedFormat {
@@ -106,7 +106,7 @@ impl ManagedFormat {
         }
     }
 
-    /// Whether this format carries an ArchiveFS ownership marker inside the
+    /// Whether this format carries an EmuWiz ownership marker inside the
     /// file, so an entry can be recognised without a journal.
     pub fn has_in_file_marker(self) -> bool {
         matches!(self, Self::DolphinGameSettings | Self::Pcsx2Pnach)
@@ -122,7 +122,7 @@ impl ManagedFormat {
     }
 }
 
-/// What ArchiveFS concluded about one managed entry. These are the states the
+/// What EmuWiz concluded about one managed entry. These are the states the
 /// milestone distinguishes; each is a separate, defensible observation rather
 /// than one vague "orphan".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -138,7 +138,7 @@ pub enum ManagedEntryState {
     RolledBack,
     /// The destination file the journal names is gone.
     DestinationMissing,
-    /// The destination is still there but no longer matches what ArchiveFS
+    /// The destination is still there but no longer matches what EmuWiz
     /// wrote. Something else edited or replaced it.
     DestinationChanged,
     /// The archive the install came from is no longer on disk.
@@ -148,7 +148,7 @@ pub enum ManagedEntryState {
     /// A `.pnach` carries ArchiveFS managed blocks but no journal accounts for
     /// that file. Only detectable for a format with an in-file marker.
     OwnershipRecordMissing,
-    /// An ArchiveFS marker is present but structurally broken.
+    /// An EmuWiz marker is present but structurally broken.
     MalformedMarker,
 }
 
@@ -177,11 +177,11 @@ impl ManagedEntryState {
             Self::IncompleteInstall => "the install that wrote it did not finish",
             Self::RolledBack => "already removed by a recorded rollback",
             Self::DestinationMissing => "the file it was written to is no longer there",
-            Self::DestinationChanged => "the file no longer matches what ArchiveFS wrote",
+            Self::DestinationChanged => "the file no longer matches what EmuWiz wrote",
             Self::SourceGameMissing => "the game it came from is no longer in the library",
             Self::ProfileUnavailable => "the emulator profile it was written to is gone",
             Self::OwnershipRecordMissing => "no install record accounts for it",
-            Self::MalformedMarker => "its ArchiveFS marker is structurally broken",
+            Self::MalformedMarker => "its EmuWiz marker is structurally broken",
         }
     }
 
@@ -199,7 +199,7 @@ impl ManagedEntryState {
     }
 }
 
-/// One managed entry ArchiveFS could account for, or could not.
+/// One managed entry EmuWiz could account for, or could not.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ManagedEntry {
     pub format: ManagedFormat,
@@ -223,7 +223,7 @@ pub struct ManagedEntry {
     pub left_untouched: &'static str,
 }
 
-/// A file whose ArchiveFS marker could not be parsed.
+/// A file whose EmuWiz marker could not be parsed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MalformedManagedFile {
     pub format: ManagedFormat,
@@ -264,7 +264,7 @@ impl ManagedEntryScan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedScanTarget {
     pub format: ManagedFormat,
-    /// The directory ArchiveFS writes managed files into.
+    /// The directory EmuWiz writes managed files into.
     pub destination_root: PathBuf,
 }
 
@@ -298,7 +298,7 @@ pub fn scan_managed_entries(
         }
         let format = ManagedFormat::from_adapter(journal.context.adapter);
         for entry in &journal.entries {
-            // Only entries that actually wrote something are ArchiveFS's.
+            // Only entries that actually wrote something are EmuWiz's.
             if !matches!(
                 entry.outcome,
                 crate::patch_manager::SharedApplyOutcome::InstalledNew
@@ -339,7 +339,7 @@ pub fn scan_managed_entries(
         }
     }
 
-    // --- Direction 2: files carrying an ArchiveFS marker with no journal.
+    // --- Direction 2: files carrying an EmuWiz marker with no journal.
     //
     // Only possible for formats whose ownership marker lives in the file.
     for target in targets.iter().take(MAX_SCANNED_PROFILES) {
@@ -399,7 +399,7 @@ fn classify_journalled_entry(
         // safely checkable rather than reading through it.
         scan.skipped.push(SkippedManagedFile {
             path: EncodedPath::from_path(destination),
-            reason: "the destination is a symlink, which ArchiveFS never follows",
+            reason: "the destination is a symlink, which EmuWiz never follows",
         });
         return ManagedEntryState::DestinationChanged;
     }
@@ -428,7 +428,7 @@ fn classify_journalled_entry(
     }
 }
 
-/// Looks for files carrying an ArchiveFS in-file marker that no journal
+/// Looks for files carrying an EmuWiz in-file marker that no journal
 /// accounts for.
 fn scan_marked_files(
     target: &ManagedScanTarget,
@@ -464,7 +464,7 @@ fn scan_marked_files(
         if metadata.file_type().is_symlink() {
             scan.skipped.push(SkippedManagedFile {
                 path: EncodedPath::from_path(&path),
-                reason: "the file is a symlink, which ArchiveFS never follows",
+                reason: "the file is a symlink, which EmuWiz never follows",
             });
             continue;
         }
@@ -480,7 +480,7 @@ fn scan_marked_files(
                 // file. Leave it alone and say nothing about it.
                 //
                 // An *empty* managed set after an uninstall is the same thing:
-                // there is nothing of ArchiveFS's left, which is exactly what
+                // there is nothing of EmuWiz's left, which is exactly what
                 // a successful uninstall looks like. Never a finding.
                 if ids.is_empty() {
                     continue;
@@ -611,7 +611,7 @@ pub fn findings_from_managed_entries(scan: &ManagedEntryScan) -> Vec<Finding> {
                     severity,
                     format!("{}: {}", entry.format.label(), entry.state.reason()),
                     format!(
-                        "ArchiveFS installed an entry at {}, but {}.",
+                        "EmuWiz installed an entry at {}, but {}.",
                         entry.destination.display,
                         entry.state.reason()
                     ),
@@ -683,9 +683,9 @@ pub fn findings_from_managed_entries(scan: &ManagedEntryScan) -> Vec<Finding> {
                     .filter_map(|entry| entry.state.severity())
                     .min_by_key(|severity| severity.rank())
                     .unwrap_or(DoctorSeverity::Info),
-                "Several ArchiveFS-managed entries could not be accounted for",
+                "Several EmuWiz-managed entries could not be accounted for",
                 format!(
-                    "{} managed cheat or patch entries no longer match ArchiveFS's own install records.",
+                    "{} managed cheat or patch entries no longer match EmuWiz's own install records.",
                     orphans.len()
                 ),
             )
@@ -716,9 +716,9 @@ pub fn findings_from_managed_entries(scan: &ManagedEntryScan) -> Vec<Finding> {
                         DoctorCategory::ManagedEntries,
                         DoctorSubsystem::ManagedEntries,
                         DoctorSeverity::Warning,
-                        format!("{}: broken ArchiveFS marker", file.format.label()),
+                        format!("{}: broken EmuWiz marker", file.format.label()),
                         format!(
-                            "{} contains an ArchiveFS managed block ArchiveFS can no longer parse.",
+                            "{} contains an ArchiveFS managed block EmuWiz can no longer parse.",
                             file.path.display
                         ),
                     )
@@ -736,7 +736,7 @@ pub fn findings_from_managed_entries(scan: &ManagedEntryScan) -> Vec<Finding> {
                         ),
                     ])
                     .with_guidance(
-                        "ArchiveFS will refuse to install into this file until its managed block structure is valid, to avoid corrupting whatever is in there.",
+                        "EmuWiz will refuse to install into this file until its managed block structure is valid, to avoid corrupting whatever is in there.",
                         "No Doctor repair is available yet. The file can be corrected by hand, or the managed block removed.",
                     ),
                 );
@@ -748,7 +748,7 @@ pub fn findings_from_managed_entries(scan: &ManagedEntryScan) -> Vec<Finding> {
                     DoctorCategory::ManagedEntries,
                     DoctorSubsystem::ManagedEntries,
                     DoctorSeverity::Warning,
-                    "Several files have a broken ArchiveFS marker",
+                    "Several files have a broken EmuWiz marker",
                     format!(
                         "{} managed files contain an ArchiveFS managed block that can no longer be parsed.",
                         scan.malformed.len()
@@ -777,7 +777,7 @@ pub fn findings_from_managed_entries(scan: &ManagedEntryScan) -> Vec<Finding> {
                     ),
                 ])
                 .with_guidance(
-                    "ArchiveFS will refuse to install into these files until their managed block structure is valid.",
+                    "EmuWiz will refuse to install into these files until their managed block structure is valid.",
                     "No Doctor repair is available yet.",
                 ),
             );
@@ -792,7 +792,7 @@ fn managed_why_it_matters(state: ManagedEntryState) -> &'static str {
             "An install that did not finish may have left an emulator file part-way between two states. History & Logs can roll it back."
         }
         ManagedEntryState::DestinationChanged => {
-            "Something other than ArchiveFS edited this file, so ArchiveFS's record of it is out of date. Your edits are intact."
+            "Something other than EmuWiz edited this file, so EmuWiz's record of it is out of date. Your edits are intact."
         }
         ManagedEntryState::DestinationMissing => {
             "The file is gone, so the cheat or patch is no longer installed. That is fine if you removed it deliberately."
@@ -804,10 +804,10 @@ fn managed_why_it_matters(state: ManagedEntryState) -> &'static str {
             "The emulator profile has moved or been removed, so this record can no longer be matched to anything."
         }
         ManagedEntryState::OwnershipRecordMissing => {
-            "ArchiveFS wrote a managed block here but has no record of doing so - most likely its install history was cleared."
+            "EmuWiz wrote a managed block here but has no record of doing so - most likely its install history was cleared."
         }
         ManagedEntryState::MalformedMarker => {
-            "ArchiveFS will not install into a file whose managed block it cannot parse."
+            "EmuWiz will not install into a file whose managed block it cannot parse."
         }
         ManagedEntryState::Owned | ManagedEntryState::RolledBack => "",
     }
@@ -825,10 +825,10 @@ pub fn not_checked_from_managed_entries(scan: &ManagedEntryScan) -> Vec<NotCheck
     items.push(NotCheckedCheck {
         name: "Managed entries with no install record".to_string(),
         reason: format!(
-            "{} files carry no ArchiveFS marker inside them, so an entry whose install record was deleted cannot be recognised. ArchiveFS will not guess, because a user's own codes look identical.",
+            "{} files carry no EmuWiz marker inside them, so an entry whose install record was deleted cannot be recognised. EmuWiz will not guess, because a user's own codes look identical.",
             markerless.join(", ")
         ),
-        next_step: "Nothing to do. Keep ArchiveFS's install history and this stays covered."
+        next_step: "Nothing to do. Keep EmuWiz's install history and this stays covered."
             .to_string(),
     });
     if scan.truncated {
@@ -1198,7 +1198,7 @@ mod tests {
         );
         assert!(
             scan.entries.is_empty(),
-            "a file with no ArchiveFS marker is the user's, and ArchiveFS must not claim it"
+            "a file with no EmuWiz marker is the user's, and EmuWiz must not claim it"
         );
         assert!(findings_from_managed_entries(&scan).is_empty());
     }
@@ -1209,7 +1209,7 @@ mod tests {
         let tree = TempTree::new("managed-empty-section");
         let (profile, _) = fixture(&tree);
         // What a successful uninstall leaves behind: the user's own content,
-        // with every ArchiveFS block removed.
+        // with every EmuWiz block removed.
         fs::write(profile.join("SLUS-20946.pnach"), USER_PNACH).expect("fixture");
         fs::write(profile.join("SLUS-00001.pnach"), b"").expect("fixture");
         let scan = scan_managed_entries(
@@ -1221,7 +1221,7 @@ mod tests {
         );
         assert!(
             scan.orphans().is_empty(),
-            "no remaining managed block means nothing of ArchiveFS's is left, which is correct"
+            "no remaining managed block means nothing of EmuWiz's is left, which is correct"
         );
     }
 

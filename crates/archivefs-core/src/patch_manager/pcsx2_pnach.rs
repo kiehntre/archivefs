@@ -1,4 +1,4 @@
-//! Lossless existing-file preservation plus strict ArchiveFS-managed PNACH blocks.
+//! Lossless existing-file preservation plus strict EmuWiz-managed PNACH blocks.
 
 use std::collections::BTreeSet;
 
@@ -134,7 +134,7 @@ impl PnachDocument {
     }
 }
 
-/// Parses only ArchiveFS block structure. All user comments, disabled lines,
+/// Parses only EmuWiz block structure. All user comments, disabled lines,
 /// unknown directives, line endings, and formatting remain opaque bytes and
 /// are reproduced exactly during a merge.
 pub fn parse_pnach_document(bytes: &[u8]) -> Result<PnachDocument, PnachDocumentError> {
@@ -277,7 +277,7 @@ pub fn merge_managed_pnach_cheats(
     Ok(output)
 }
 
-/// The exact original bytes of one already-validated ArchiveFS managed
+/// The exact original bytes of one already-validated EmuWiz managed
 /// block (its `// ArchiveFS managed block: <id>` through `// End ArchiveFS
 /// managed block` lines, inclusive), used to migrate a block verbatim from
 /// one PNACH file into another without re-deriving it from cheat metadata.

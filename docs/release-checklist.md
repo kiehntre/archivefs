@@ -1,4 +1,4 @@
-# ArchiveFS v0.7.0 release checklist
+# EmuWiz v0.7.0 release checklist
 
 This checklist records promotion of the manually approved v0.7.0-rc.1
 candidate. Publication still requires the exact final commit, merge, and tag

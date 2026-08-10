@@ -11,7 +11,7 @@
 //! instance said about itself, and [`client`] performs bounded read-only
 //! requests. The identity model in [`super::model`] knows nothing about RomM, so
 //! supporting a future RomM release means changing the mapping in this directory
-//! rather than reshaping ArchiveFS's identity.
+//! rather than reshaping EmuWiz's identity.
 //!
 //! # Verified against a real instance
 //!

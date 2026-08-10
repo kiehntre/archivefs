@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Safe, non-destructive precondition checker for the Fable/ArchiveFS GUI
+# Safe, non-destructive precondition checker for the Fable/EmuWiz GUI
 # integration campaign. Never installs, mutates, mounts, unmounts, scans
 # the real library, touches RetroArch config, or performs network access.
 set -euo pipefail

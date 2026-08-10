@@ -8,7 +8,7 @@
 //! What that grouping found, on the catalogue this module was written against:
 //!
 //! - 79% were absent *and* flagged `missing_from_fs` by RomM itself - stale rows
-//!   in RomM's own database, nothing to do with ArchiveFS;
+//!   in RomM's own database, nothing to do with EmuWiz;
 //! - 18% were orphaned symlinks whose targets had gone, the mount being up and the
 //!   files simply no longer there;
 //! - 2% were folder-based games that are present as directories, which the

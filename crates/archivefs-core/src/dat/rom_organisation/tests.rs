@@ -1195,7 +1195,7 @@ fn an_unverified_identity_never_supplies_an_authoritative_name() {
 
 // ---------------------------------------------------------------------------
 // Directory ownership (blocker: pre-existing platform dir could be journalled
-// as ArchiveFS-owned and removed by rollback)
+// as EmuWiz-owned and removed by rollback)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -1496,7 +1496,7 @@ fn a_platform_changed_by_another_process_rejects_the_stale_apply() {
     assert_eq!(plan.entries[0].platform.as_deref(), Some("PSP"));
     assert_eq!(plan.entries[0].slug.as_deref(), Some("psp"));
 
-    // Another ArchiveFS process changes PSP -> PS1 after planning.
+    // Another EmuWiz process changes PSP -> PS1 after planning.
     let archive_id = db
         .find_archive_id_by_absolute_path(&source_file)
         .unwrap()

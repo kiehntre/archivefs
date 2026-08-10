@@ -1,6 +1,6 @@
 # RetroArch controlled apply, history, and rollback
 
-ArchiveFS can connect an eligible RetroArch trusted-catalogue match to the
+EmuWiz can connect an eligible RetroArch trusted-catalogue match to the
 shared transaction engine. This is a narrow cheat-file workflow, not a general
 mod installer. PCSX2 remains preview-only. Dolphin and Xenia have separate,
 verified transaction paths documented with their own workflows.
@@ -8,7 +8,7 @@ verified transaction paths documented with their own workflows.
 ## Materialized source and eligibility
 
 The source is the original regular file inside an already-local immutable
-catalogue snapshot. ArchiveFS neither downloads nor copies it during preview or
+catalogue snapshot. EmuWiz neither downloads nor copies it during preview or
 apply. The snapshot directory name, source ID, manifest binding, freshness,
 complete validation, catalogue parse, exact path containment, manifest entry,
 file digest, selected archive, platform, profile, source mode, destination, and

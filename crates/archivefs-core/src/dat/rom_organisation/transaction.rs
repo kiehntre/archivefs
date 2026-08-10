@@ -96,7 +96,7 @@ pub fn build_organisation_transaction(
         return Err("no approved Suggested entries in the plan".to_string());
     }
     // `created_directories` is deliberately left empty here. Directories are
-    // only ever recorded as ArchiveFS-owned *after* `create_dir` succeeds (see
+    // only ever recorded as EmuWiz-owned *after* `create_dir` succeeds (see
     // `apply_organisation_transaction`), so a pre-existing user directory is
     // never journalled as owned and recovery/rollback can never remove it.
     Ok(RenameTransaction {
@@ -428,7 +428,7 @@ pub fn rollback_organisation_transaction(
     })
 }
 
-/// A directory ArchiveFS may remove on rollback: exactly one safe component
+/// A directory EmuWiz may remove on rollback: exactly one safe component
 /// directly beneath the master ROM root.
 fn is_owned_platform_directory(directory: &Path, master_root: &Path) -> bool {
     use crate::dat::rename_apply::preflight::is_safe_basename;

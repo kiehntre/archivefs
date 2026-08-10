@@ -1,7 +1,7 @@
-//! Read-only audit using hashes already known to ArchiveFS.
+//! Read-only audit using hashes already known to EmuWiz.
 //!
 //! Every verdict is derived from a comparison between what the DAT file claims
-//! and what ArchiveFS already knows. Nothing here hashes a local file: the
+//! and what EmuWiz already knows. Nothing here hashes a local file: the
 //! caller supplies known hashes and size, and the audit logic compares them
 //! against the indexed DAT entries.
 //!
@@ -19,7 +19,7 @@
 //! # Every shared algorithm is tried, not just the strongest
 //!
 //! A DAT carries the algorithms its publisher chose; the caller knows whatever
-//! ArchiveFS happens to have computed. The two sets overlap but neither contains
+//! EmuWiz happens to have computed. The two sets overlap but neither contains
 //! the other - a No-Intro DAT publishes CRC32/MD5/SHA-1 and no SHA-256, so
 //! stopping at the strongest hash the *caller* holds reports a perfectly matching
 //! file as absent from the catalogue. Each algorithm is tried in descending order
@@ -124,7 +124,7 @@ pub struct AuditSummary {
 
 /// Known hashes and metadata for a single local file.
 ///
-/// The caller populates this from existing ArchiveFS data — no local
+/// The caller populates this from existing EmuWiz data — no local
 /// hashing is performed inside this module.
 #[derive(Debug, Clone, Default)]
 pub struct KnownFileEvidence {

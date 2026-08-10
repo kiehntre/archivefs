@@ -23,7 +23,7 @@
 //! the expected `<repo>-<sha>/Data/Sys/GameSettings/<GAMEID>.ini` shape.
 //!
 //! The persisted catalogue never touches a Dolphin profile. It lives in
-//! ArchiveFS's own cache, entirely separate from `User/GameSettings`,
+//! EmuWiz's own cache, entirely separate from `User/GameSettings`,
 //! transaction journals, or installed cheat files.
 
 use std::collections::{BTreeMap, HashSet};
@@ -360,7 +360,7 @@ fn reject_symlink_or_non_file(path: &Path) -> Result<(), DolphinCatalogueError> 
 // Removal
 // ---------------------------------------------------------------------
 
-/// Removes only ArchiveFS's own catalogue cache. Never touches Dolphin's
+/// Removes only EmuWiz's own catalogue cache. Never touches Dolphin's
 /// `User/GameSettings`, installed codes, or transaction history - those
 /// live entirely outside `cache_root`.
 pub fn remove_dolphin_catalogue(cache_root: &Path) -> Result<(), DolphinCatalogueError> {

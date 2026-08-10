@@ -6,7 +6,7 @@ coverage, not whether a particular code changes gameplay correctly.
 
 ## The important distinction
 
-Provider discovery working means ArchiveFS can retrieve or open an approved
+Provider discovery working means EmuWiz can retrieve or open an approved
 source, validate its structure, match supported records, and safely preview or
 apply an explicitly selected result. It does **not** mean that source contains
 cheats for every game, region, revision, emulator core, or release.
@@ -43,7 +43,7 @@ archivefs-cli cheat-provider-coverage \
 Optional inputs:
 
 - `--dolphin-cache-root <directory>` selects an existing local Dolphin
-  catalogue cache; otherwise ArchiveFS's normal cache location is read.
+  catalogue cache; otherwise EmuWiz's normal cache location is read.
 - `--retroarch-catalogue <directory-or-manifest>` selects an existing local
   `.cht` tree or bounded JSON manifest. Omitting it produces an honest
   `catalogue_unavailable` result for selected RetroArch games.
@@ -62,7 +62,7 @@ to PCSX2 and Xenia rather than the two providers audited here.
 ### Source and provenance
 
 The approved source is the official `dolphin-emu/dolphin` repository's
-`Data/Sys/GameSettings` dataset. ArchiveFS resolves the moving upstream
+`Data/Sys/GameSettings` dataset. EmuWiz resolves the moving upstream
 revision to an exact commit, downloads the pinned repository archive with
 bounded HTTPS handling, extracts only exact
 `Data/Sys/GameSettings/<GAMEID>.ini` candidates into its own cache, records the
@@ -84,7 +84,7 @@ Dolphin profile. Apply remains a later explicit shared transaction.
 - A code with explicit revision applicability is rejected when it differs
   from the verified disc revision.
 - Current upstream GameSettings entries generally do not declare per-code
-  revision applicability. ArchiveFS labels that uncertainty rather than
+  revision applicability. EmuWiz labels that uncertainty rather than
   pretending every revision was verified.
 
 Dolphin matching does not use serials, CRCs, generic filename similarity, or
@@ -106,8 +106,8 @@ content are unsupported.
 Duplicate provider names are rejected instead of being counted as compatible.
 Same-name definitions with different code bodies are also reported as
 conflicts. During apply, an existing local Gecko definition with the same name
-and different body blocks the merge; ArchiveFS never overwrites it silently.
-An upstream `enabled_by_default` marker remains metadata only—ArchiveFS still
+and different body blocks the merge; EmuWiz never overwrites it silently.
+An upstream `enabled_by_default` marker remains metadata only—EmuWiz still
 requires explicit user selection and confirmation.
 
 ### Proven coverage gaps
@@ -124,14 +124,14 @@ A Dolphin zero-match can mean:
 
 The audit does not turn an absent exact Game-ID record into a fuzzy title
 match. Catalogue breadth is therefore limited by the official upstream data,
-not by weakening ArchiveFS identity rules.
+not by weakening EmuWiz identity rules.
 
 ## RetroArch provider
 
 ### Source and provenance
 
 The enabled approved source is the official `libretro/libretro-database`
-repository, exposed as provider `libretro-buildbot-cheats`. ArchiveFS resolves
+repository, exposed as provider `libretro-buildbot-cheats`. EmuWiz resolves
 `master` to an exact commit, downloads an immutable bounded archive from the
 permitted GitHub host, validates paths/types/counts/sizes, retains only the
 catalogue content described by its manifest, and records provider ID,
@@ -225,7 +225,7 @@ What is missing is an independently reviewed ordinary-cheat source with clear
 ownership, licence, provenance, immutable retrieval, and record-verification
 policy. The official `pcsx2_patches` repository primarily distributes
 widescreen/no-interlace and related patches, not an approved ordinary-cheat
-catalogue. ArchiveFS therefore bundles no downloadable PCSX2 ordinary-cheat
+catalogue. EmuWiz therefore bundles no downloadable PCSX2 ordinary-cheat
 provider and makes no PCSX2 gameplay-coverage claim.
 
 ## Future provider work

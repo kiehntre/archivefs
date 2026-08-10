@@ -71,7 +71,7 @@ fn now_unix() -> u64 {
 // ---------------------------------------------------------------------------
 
 /// The directory under which every cheat source keeps its persisted cache
-/// state: the parent of the ArchiveFS database.
+/// state: the parent of the EmuWiz database.
 pub fn default_cheat_source_data_root() -> Option<PathBuf> {
     crate::default_database_path()
         .ok()?

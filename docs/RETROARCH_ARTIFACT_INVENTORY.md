@@ -28,7 +28,7 @@ not a case-folded or lossy rendering, remain the identity. Patch payloads are
 never parsed or executed. The inventory reports their path, filename, size,
 file type, symlink state, and association evidence only.
 
-For `.cht`, ArchiveFS performs a bounded text read and reports only:
+For `.cht`, EmuWiz performs a bounded text read and reports only:
 
 - the first non-empty `cheatN_desc` value;
 - the declared `cheats` count, when valid;
@@ -37,7 +37,7 @@ For `.cht`, ArchiveFS performs a bounded text read and reports only:
 - malformed line numbers; and
 - whether the bounded metadata view appears complete.
 
-Cheat codes and payload values are not interpreted or executed. ArchiveFS does
+Cheat codes and payload values are not interpreted or executed. EmuWiz does
 not change any enable value.
 
 ## Filesystem boundaries
@@ -61,7 +61,7 @@ Limits are fixed in code:
 
 Configured cheat roots are traversed recursively within those bounds. Patch
 directories are limited to the unique parent directories of destinations
-already derived for present catalogue games; ArchiveFS does not crawl arbitrary
+already derived for present catalogue games; EmuWiz does not crawl arbitrary
 content roots or the whole home directory. A limit or inaccessible directory
 sets `complete: false` and/or emits a structured diagnostic. Partial results are
 never presented as a complete inventory.
@@ -84,9 +84,9 @@ Associations are evidence, not ownership claims. The tiers are:
 The expected destinations already incorporate the existing playlist and core
 selection rules. A finding therefore carries the relevant catalogue game,
 compact playlist evidence, installed-core stem evidence, and expected paths.
-ArchiveFS never silently chooses one game from an ambiguous set. A supported
+EmuWiz never silently chooses one game from an ambiguous set. A supported
 file that cannot be associated remains visible; it is not labelled malformed or
-corrupt merely because ArchiveFS lacks identity evidence.
+corrupt merely because EmuWiz lacks identity evidence.
 
 ## States
 
@@ -101,7 +101,7 @@ corrupt merely because ArchiveFS lacks identity evidence.
   directory, or other wrong type;
 - `orphaned`: a regular supported artifact has no catalogue association;
 - `ambiguous`: more than one game ties;
-- `unsupported`: metadata access failed and ArchiveFS cannot classify further.
+- `unsupported`: metadata access failed and EmuWiz cannot classify further.
 
 Side-by-side destination and finding arrays are intentional: `destinations`
 answers whether every proposal is empty/occupied/conflicting, while `findings`
@@ -140,7 +140,7 @@ This inventory does not:
 - parse cheat codes or patch payloads;
 - infer that a patch is safe, correct, legal, or compatible;
 - mutate RetroArch configuration, playlists, cores, game content, or the
-  ArchiveFS catalogue;
+  EmuWiz catalogue;
 - follow artifact symlinks;
 - extract or inspect archive members;
 - launch RetroArch or execute external commands;

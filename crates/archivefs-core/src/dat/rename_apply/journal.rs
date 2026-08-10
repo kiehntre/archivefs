@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::ArchiveFsError;
 use crate::dat::rename_apply::model::{EntryState, RenameTransaction, TransactionState};
 
-/// The journal directory's name under the ArchiveFS data directory.
+/// The journal directory's name under the EmuWiz data directory.
 pub const RENAME_TRANSACTIONS_DIRECTORY: &str = "rename-transactions";
 
 /// How long a journal filename may grow before it is unusable.

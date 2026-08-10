@@ -1,6 +1,6 @@
-# ArchiveFS Database Schema
+# EmuWiz Database Schema
 
-This document describes the longer-term SQLite schema direction for ArchiveFS.
+This document describes the longer-term SQLite schema direction for EmuWiz.
 
 The narrower persistent catalogue is implemented today at
 `~/.local/share/archivefs/library.sqlite3`; its authoritative current schema
@@ -86,7 +86,7 @@ CREATE TABLE releases (
 
 Why it exists:
 
-`releases` is the layer between a title and concrete archive files. It lets ArchiveFS distinguish, for example, a USA release from a Europe release or a v1.0 release from a v1.1 release.
+`releases` is the layer between a title and concrete archive files. It lets EmuWiz distinguish, for example, a USA release from a Europe release or a v1.0 release from a v1.1 release.
 
 ## archives
 
@@ -118,7 +118,7 @@ CREATE TABLE archives (
 
 Why it exists:
 
-`archives` is the source-of-truth table for actual files ArchiveFS can scan and mount. It stores the identity fields needed to avoid filename-only matching and to detect changed, missing, duplicate, corrupt, or retryable archives.
+`archives` is the source-of-truth table for actual files EmuWiz can scan and mount. It stores the identity fields needed to avoid filename-only matching and to detect changed, missing, duplicate, corrupt, or retryable archives.
 
 ## mounts
 
@@ -143,7 +143,7 @@ CREATE TABLE mounts (
 
 Why it exists:
 
-`mounts` separates archive identity from runtime mount state. This lets ArchiveFS answer status questions, clean up only mountpoints it owns, and later support multiple backends without changing archive records.
+`mounts` separates archive identity from runtime mount state. This lets EmuWiz answer status questions, clean up only mountpoints it owns, and later support multiple backends without changing archive records.
 
 ## health_events
 

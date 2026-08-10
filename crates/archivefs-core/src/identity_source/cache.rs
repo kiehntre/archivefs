@@ -10,7 +10,7 @@
 //! file, atomically swapped". A migration would give up all of that in exchange
 //! for nothing, and would make removing a source a schema-level operation.
 //!
-//! So the cache is one JSON file next to the other ArchiveFS-owned caches,
+//! So the cache is one JSON file next to the other EmuWiz-owned caches,
 //! versioned by [`CACHE_FORMAT_VERSION`], and the application schema is
 //! untouched. If a later stage needs to *join* identity against catalogue rows in
 //! SQL, that is when a migration becomes justified, and it can read this file to
@@ -61,7 +61,7 @@ pub struct IdentityCacheLocation {
 }
 
 impl IdentityCacheLocation {
-    /// The cache directory for one provider, beneath an ArchiveFS-owned root.
+    /// The cache directory for one provider, beneath an EmuWiz-owned root.
     pub fn new(identity_root: &Path, provider: IdentityProvider) -> Self {
         Self {
             directory: identity_root.join(provider.slug()),
@@ -256,7 +256,7 @@ impl IdentityCache {
         &self.records[start..end]
     }
 
-    /// The record claiming one ArchiveFS path, if any.
+    /// The record claiming one EmuWiz path, if any.
     pub fn record_for_path(&self, path: &Path) -> Option<&ExternalIdentityRecord> {
         self.records
             .iter()
@@ -264,7 +264,7 @@ impl IdentityCache {
     }
 
     /// The RomM platform slug this imported instance uses for a canonical
-    /// ArchiveFS platform. This is the safe future directory-organisation seam:
+    /// EmuWiz platform. This is the safe future directory-organisation seam:
     /// it returns provider data already mapped through the registry, never a
     /// slug guessed from a display label. If an instance reports duplicates,
     /// the lexicographically first slug is chosen deterministically.

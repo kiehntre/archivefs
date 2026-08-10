@@ -2,7 +2,7 @@
 //!
 //! # Secret handling, and the gap this had to work around
 //!
-//! ArchiveFS has no secret store. There is no keyring integration, no encrypted
+//! EmuWiz has no secret store. There is no keyring integration, no encrypted
 //! settings file, and no existing convention for holding a credential - the
 //! GameHacking providers only ever fetch public pages, so the question had never
 //! come up. Inventing a home-grown encryption scheme here would be worse than
@@ -48,7 +48,7 @@ pub const MAX_TOKEN_BYTES: usize = 4096;
 /// declares `platforms.read` and `/api/roms` declares `roms.read`.
 pub const REQUIRED_READ_SCOPES: &[&str] = &["platforms.read", "roms.read"];
 
-/// Scopes that would let ArchiveFS change something in RomM. Never requested,
+/// Scopes that would let EmuWiz change something in RomM. Never requested,
 /// and reported as a warning if the supplied token happens to carry them, so a
 /// person can narrow it.
 pub const UNWANTED_WRITE_SCOPES: &[&str] = &[

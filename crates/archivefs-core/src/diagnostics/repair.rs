@@ -4,7 +4,7 @@
 //!
 //! A closed set of four repairs, each of which does nothing but call a
 //! function that already exists and is already tested elsewhere in
-//! ArchiveFS:
+//! EmuWiz:
 //!
 //! | Action | Calls |
 //! |---|---|
@@ -21,7 +21,7 @@
 //!   re-derived from the *current* state of the finding named in the
 //!   request.
 //! - **Not a generic executor.** There is no way to express a repair
-//!   ArchiveFS does not already implement. Adding one means adding a variant
+//!   EmuWiz does not already implement. Adding one means adding a variant
 //!   here and wiring it to a real function, in a reviewed change.
 //! - **Not automatic.** Every repair requires
 //!   [`DoctorRepairRequest::confirmed`], including the ones classified
@@ -290,7 +290,7 @@ impl DoctorRepairRejection {
                 "The affected file or folder is not the same one Doctor saw. Nothing was changed."
             }
             Self::PathUnderSourceRoot => {
-                "That path is inside a configured source folder. ArchiveFS never modifies anything there."
+                "That path is inside a configured source folder. EmuWiz never modifies anything there."
             }
             Self::PathOutsideMountRoot => {
                 "That path is not inside the configured mount root, so this repair refuses to touch it."
@@ -751,7 +751,7 @@ fn affected_path(finding: &Finding) -> Result<PathBuf, DoctorRepairRejection> {
 }
 
 /// Refuses a configured source folder, and anything inside one. This is the
-/// hard boundary: ArchiveFS never modifies the user's library.
+/// hard boundary: EmuWiz never modifies the user's library.
 fn guard_against_source_roots(path: &Path, config: &Config) -> Result<(), DoctorRepairRejection> {
     for source in &config.source_folders {
         if path == source.as_path() || path.starts_with(source) {
@@ -978,7 +978,7 @@ pub fn findings_from_stale_mount_directories(stale: &[PathBuf]) -> Vec<Finding> 
                 super::DoctorSubsystem::MountRootCleanup,
                 DoctorSeverity::Info,
                 "Leftover empty mount folder",
-                "This folder is empty, nothing is mounted on it, and ArchiveFS no longer needs it.",
+                "This folder is empty, nothing is mounted on it, and EmuWiz no longer needs it.",
             )
             .with_affected_path(path)
             .offering(DoctorRepairAction::CleanMountPath)
@@ -995,7 +995,7 @@ pub fn findings_from_stale_mount_directories(stale: &[PathBuf]) -> Vec<Finding> 
             "Leftover empty mount folders"
         },
         format!(
-            "{} empty, unmounted folder(s) are left over beneath the mount root. They are harmless, but ArchiveFS can tidy them up.",
+            "{} empty, unmounted folder(s) are left over beneath the mount root. They are harmless, but EmuWiz can tidy them up.",
             stale.len()
         ),
     )

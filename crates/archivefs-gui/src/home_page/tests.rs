@@ -118,7 +118,7 @@ fn fresh_install_shows_the_welcome_banner_and_not_configured_cards() {
         }
     }
     let (output, _) = render(&view, 1100.0);
-    assert!(rendered_text_contains(&output, "Welcome to ArchiveFS"));
+    assert!(rendered_text_contains(&output, "Welcome to EmuWiz"));
     assert!(rendered_text_contains(&output, "No source folders yet"));
 }
 
@@ -157,7 +157,7 @@ fn config_disappeared_after_being_confirmed_shows_the_warning_banner_not_the_wel
         &output,
         "Configuration file is no longer found"
     ));
-    assert!(!rendered_text_contains(&output, "Welcome to ArchiveFS"));
+    assert!(!rendered_text_contains(&output, "Welcome to EmuWiz"));
 }
 
 // --- Purity: identical inputs produce byte-identical (structurally equal) views ---

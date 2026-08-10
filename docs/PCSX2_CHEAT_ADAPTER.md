@@ -4,11 +4,11 @@ This milestone adds an install-capable PCSX2 core adapter without changing the
 current Cheats & Mods screen composition. It converts a verified PlayStation 2
 identity and explicitly selected, approved provider records into one staged
 CRC-named PNACH, then delegates preview, confirmation, apply, backup, journal,
-verification, and Undo to ArchiveFS's shared transaction engine.
+verification, and Undo to EmuWiz's shared transaction engine.
 
 No provider download is bundled. A GUI or provider integration must construct
 an approved `Pcsx2CheatProviderCatalogue` from a separately reviewed source.
-This is intentional: ArchiveFS does not invent codes or treat a community
+This is intentional: EmuWiz does not invent codes or treat a community
 collection as trusted merely because it exists.
 
 ## PCSX2 evidence and assumptions
@@ -33,9 +33,9 @@ The resulting assumptions are deliberately narrow:
 - `cheats_ws` is a different PCSX2 feature. It may be inventoried read-only,
   but this adapter never selects it as an install destination.
 - Only plaintext `patch=` entries in the implemented grammar are accepted.
-  Encrypted cheat formats are rejected; ArchiveFS performs no conversion.
+  Encrypted cheat formats are rejected; EmuWiz performs no conversion.
 - Installing selected entries does not change PCSX2's global **Enable Cheats**
-  setting. The user enables normal cheats in PCSX2; ArchiveFS neither launches
+  setting. The user enables normal cheats in PCSX2; EmuWiz neither launches
   the emulator nor changes unrelated emulator settings.
 - Every selected managed block contains active PNACH `patch=` directives. No
   unselected provider record is materialized. Existing user lines, including
@@ -123,7 +123,7 @@ setting `Pcsx2ProviderTrust::Approved` and a verified record confidence.
 ## PNACH parser and managed renderer
 
 `parse_pnach_document` preserves the original UTF-8 bytes and recognizes only
-ArchiveFS's deterministic comment-delimited blocks. It rejects oversized or
+EmuWiz's deterministic comment-delimited blocks. It rejects oversized or
 invalid UTF-8 input and malformed, nested, unterminated, or duplicate managed
 blocks. Unknown user lines are not interpreted or normalized.
 
@@ -228,11 +228,11 @@ real cheat code and therefore does **not** claim PCSX2 gameplay recognition.
    a replacement, the backup digest.
 7. Later, and only by explicit user choice, point a disposable/manual PCSX2
    setup at that profile, enable normal cheats, and check recognition. This
-   launch proof is pending GUI/provider integration; ArchiveFS never launches
+   launch proof is pending GUI/provider integration; EmuWiz never launches
    PCSX2.
 8. Close PCSX2, refresh the rollback preview, confirm Undo, and verify the new
    file is removed or the prior file bytes are restored exactly.
-9. Remove the disposable root when finished. It contains no ArchiveFS-managed
+9. Remove the disposable root when finished. It contains no EmuWiz-managed
    live-profile state.
 
 Never use an actual live profile for this procedure unless the user explicitly
@@ -250,7 +250,7 @@ chooses it after reviewing the preview.
 - The GUI must clear candidates, selection, staged data, preview, install
   result, and Undo state whenever the selected archive, verified CRC, confirmed
   profile, or provider snapshot changes.
-- Region is checked when trusted evidence supplies it; ArchiveFS does not infer
+- Region is checked when trusted evidence supplies it; EmuWiz does not infer
   a region merely from serial spelling.
 - Widescreen/no-interlace management, encrypted conversion, ROM/ISO changes,
   emulator settings changes, and PCSX2 launch are out of scope.

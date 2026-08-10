@@ -1,6 +1,6 @@
 # RetroArch cheat cache locking
 
-ArchiveFS coordinates every process using one RetroArch cheat-source cache
+EmuWiz coordinates every process using one RetroArch cheat-source cache
 root with a single exclusive operating-system advisory lock. The lock covers
 trusted-source listing and inspection, offline selection, retrieval and
 publication, snapshot inventory and verification, pinning, prune planning,
@@ -8,7 +8,7 @@ confirmed pruning, and abandoned-staging planning and cleanup.
 
 ## Lock identity and filesystem behaviour
 
-On Unix, ArchiveFS opens the exact cache-root directory and applies `flock`
+On Unix, EmuWiz opens the exact cache-root directory and applies `flock`
 to that directory descriptor. It does not derive identity from a UTF-8 or
 lossy display string, create a PID file, create or delete stale lock files, or
 modify immutable snapshot contents. Absolute non-filesystem-root paths are
@@ -25,7 +25,7 @@ starts, that command retains its initial empty/missing view rather than begin
 unlocked reads.
 
 Platforms without the required advisory-lock implementation fail with
-`cache_lock_unsupported`; ArchiveFS never silently continues unlocked. Locking
+`cache_lock_unsupported`; EmuWiz never silently continues unlocked. Locking
 semantics ultimately depend on the mounted filesystem honoring `flock`.
 
 ## Timeout and lifetime
@@ -58,7 +58,7 @@ is additional defense and does not replace immediate revalidation.
 
 ## Security boundary
 
-The protocol coordinates cooperating ArchiveFS processes. As with the cache
+The protocol coordinates cooperating EmuWiz processes. As with the cache
 itself, the filesystem owner can manually rename, replace, or delete cache
-directories outside ArchiveFS. Remote filesystems that do not implement
+directories outside EmuWiz. Remote filesystems that do not implement
 advisory locks consistently are unsupported for safe concurrent operation.

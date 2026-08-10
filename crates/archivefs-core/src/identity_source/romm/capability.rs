@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// A version outside this range is not refused: it is reported, and the
 /// capability flags below decide what is actually attempted. Refusing an unknown
-/// version would make every RomM upgrade an ArchiveFS outage.
+/// version would make every RomM upgrade an EmuWiz outage.
 pub const VERIFIED_AGAINST: &str = "5.1.0";
 
 /// The oldest major version whose endpoint shape this adapter understands.
@@ -106,7 +106,7 @@ pub struct RommApiCapability {
     /// Whether `/api/roms` accepts `limit`/`offset`, which is the pagination
     /// model Stage 1 relies on.
     pub supports_limit_offset_pagination: bool,
-    /// Hash fields the ROM schema publishes, of those ArchiveFS can use.
+    /// Hash fields the ROM schema publishes, of those EmuWiz can use.
     pub available_hash_fields: Vec<String>,
     /// Artwork fields the ROM schema publishes.
     pub available_artwork_fields: Vec<String>,
@@ -228,7 +228,7 @@ impl RommApiCapability {
         if !self.supports_limit_offset_pagination {
             return Some(
                 "this RomM instance's ROM endpoint does not accept limit/offset paging, which \
-                 ArchiveFS needs to import in bounded pages"
+                 EmuWiz needs to import in bounded pages"
                     .to_string(),
             );
         }

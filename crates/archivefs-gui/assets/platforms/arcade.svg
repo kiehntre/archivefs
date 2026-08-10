@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-  <!-- Original ArchiveFS artwork: generic arcade cabinet silhouette. -->
+  <!-- Original EmuWiz artwork: generic arcade cabinet silhouette. -->
   <path d="M20 8 H44 L48 20 V56 H16 V20 Z" fill="none" stroke="#4a4a4a" stroke-width="3"/>
   <rect x="22" y="16" width="20" height="14" rx="2" fill="none" stroke="#4a4a4a" stroke-width="2"/>
   <circle cx="26" cy="42" r="3" fill="#4a4a4a"/>

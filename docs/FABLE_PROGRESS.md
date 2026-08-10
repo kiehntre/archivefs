@@ -7,7 +7,7 @@
 > release-ready. See `docs/INTEGRATED_GUI_AUDIT.md` for the adversarial audit
 > and rescue recommendations.
 
-This file is the durable, resumable record of the Fable/ArchiveFS GUI
+This file is the durable, resumable record of the Fable/EmuWiz GUI
 integration campaign. Future sessions must be able to resume from this file
 and Git history alone, without depending on prior conversation context.
 
@@ -50,7 +50,7 @@ without re-reading `docs/FABLE_CAMPAIGN_PLAN.md` and
 - `docs/architecture.md` (existing architecture doc — read in full for
   terminology/precedent, not duplicated)
 - `docs/roadmap.md` (line count only)
-- `design-reference/ArchiveFS design stage one.zip` — extracted to a unique
+- `design-reference/EmuWiz design stage one.zip` — extracted to a unique
   `/tmp` directory, screen names and interaction labels enumerated via
   grep, then **the temporary directory was deleted** before finishing.
 
@@ -139,7 +139,7 @@ archive inspection (as an overlay).
 - The design export's 9 top-level screen names were confirmed by string
   search in the extracted HTML; the fine-grained interaction labels listed
   in the capability matrix are the visible button/label text as of the
-  `ArchiveFS design stage one.zip` snapshot present at initializer time —
+  `EmuWiz design stage one.zip` snapshot present at initializer time —
   they are not a live/authoritative spec and should be re-checked against
   `design-reference/` directly during each milestone that touches a given
   screen.
@@ -185,7 +185,7 @@ deferred indefinitely unless a feature forces them.
 
 ## Redesigned application shell (2026-07-22)
 
-Landed in commit "Add redesigned ArchiveFS application shell":
+Landed in commit "Add redesigned EmuWiz application shell":
 
 - `MainView` extended with the redesign destinations `Mount`, `Selected`,
   `ActiveMounts`, `Doctor`, `HistoryLogs`, `Settings`, `About` (existing
@@ -414,7 +414,7 @@ Landed in commit "Add RetroArch cheat workflow to Selected archives":
   untouched.
 - Step 1 (`show_cheat_workflow_step1`): archive identity grid (path,
   name, platform, source root, size), shared profile discovery state,
-  explicit profile choice when several are eligible ("ArchiveFS never
+  explicit profile choice when several are eligible ("EmuWiz never
   silently picks"), single-eligible preselection matching the CLI
   rule, blocker code+detail for ineligible profiles, stale profile
   selection cleared on rescan, Rescan Profiles action.

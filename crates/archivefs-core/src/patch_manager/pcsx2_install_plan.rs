@@ -169,7 +169,7 @@ pub struct StagedPcsx2Pnach {
     pub destination_existed: bool,
     pub original_bytes: Vec<u8>,
     /// Present only when a legacy CRC-only file was found alongside a
-    /// resolved `<SERIAL>_<CRC>.pnach` target and had ArchiveFS-managed
+    /// resolved `<SERIAL>_<CRC>.pnach` target and had EmuWiz-managed
     /// blocks that needed consolidating into the target this PCSX2 build
     /// actually reads.
     pub legacy_migration: Option<StagedPcsx2LegacyMigration>,
@@ -245,7 +245,7 @@ pub fn stage_pcsx2_pnach(
 
     // A legacy `<CRC>.pnach` file only needs attention when the resolved
     // target actually differs from it (a verified serial was available)
-    // and it exists with ArchiveFS-managed content that would otherwise
+    // and it exists with EmuWiz-managed content that would otherwise
     // sit duplicated and unread by this PCSX2 build.
     let pending_migration = if file_name == legacy_file_name {
         None
@@ -285,7 +285,7 @@ pub fn stage_pcsx2_pnach(
                         failure.to_string(),
                     )
                 })?;
-            // Every ArchiveFS-managed block that lived in the legacy file
+            // Every EmuWiz-managed block that lived in the legacy file
             // is now accounted for in the new target (either migrated
             // verbatim, or freshly re-rendered because it was reselected),
             // so all of them are stripped from the legacy file - it never

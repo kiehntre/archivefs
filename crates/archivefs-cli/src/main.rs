@@ -934,7 +934,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
             let data_directory = default_database_path()?
                 .parent()
-                .ok_or("could not determine the ArchiveFS data directory")?
+                .ok_or("could not determine the EmuWiz data directory")?
                 .to_path_buf();
             let options = CheatInstallOptions {
                 destination_root,
@@ -1063,7 +1063,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let journal_path = PathBuf::from(&input_args[0]);
             let data_directory = default_database_path()?
                 .parent()
-                .ok_or("could not determine the ArchiveFS data directory")?
+                .ok_or("could not determine the EmuWiz data directory")?
                 .to_path_buf();
             let options = CheatRollbackOptions {
                 journal_path: journal_path.clone(),
@@ -1543,7 +1543,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             "Removed source folder from configuration: {}",
                             outcome.removed_source.path.display()
                         );
-                        println!("ArchiveFS did not delete the folder or any files inside it.");
+                        println!("EmuWiz did not delete the folder or any files inside it.");
                         match outcome.catalogue_rows_removed {
                             Some(count) => println!(
                                 "Removed {count} catalogue entr{} for this source.",
@@ -1693,7 +1693,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn print_config_check_report(report: &ConfigCheckReport) {
-    println!("ArchiveFS Config Check");
+    println!("EmuWiz Config Check");
     println!("Config: {}", report.config_path.display());
     println!();
     println!("Checks:");
@@ -1752,7 +1752,7 @@ fn format_advisory_patch_plan(plan: &AdvisoryPatchPlan) -> String {
     use std::fmt::Write;
 
     let mut output = String::new();
-    writeln!(&mut output, "ArchiveFS PCSX2 Patch Metadata Preview").unwrap();
+    writeln!(&mut output, "EmuWiz PCSX2 Patch Metadata Preview").unwrap();
     writeln!(
         &mut output,
         "Advisory only: yes (executable: {})",
@@ -1925,7 +1925,7 @@ fn format_retroarch_advisory_plan(plan: &RetroArchAdvisoryPlan) -> String {
     use std::fmt::Write;
 
     let mut output = String::new();
-    writeln!(&mut output, "ArchiveFS RetroArch Patch/Cheat Preview").unwrap();
+    writeln!(&mut output, "EmuWiz RetroArch Patch/Cheat Preview").unwrap();
     writeln!(
         &mut output,
         "Advisory only: yes (executable: {})",
@@ -2039,7 +2039,7 @@ fn run_cheat_provider_coverage(
     retroarch_catalogue_root: Option<&Path>,
 ) -> Result<CheatProviderCoverageReport, Box<dyn std::error::Error>> {
     if !database_path.exists() {
-        return Err("the ArchiveFS library database does not exist; run library-scan first".into());
+        return Err("the EmuWiz library database does not exist; run library-scan first".into());
     }
     let database = Database::open_read_only(database_path)?;
     let archives = database.load_archives()?;
@@ -2156,7 +2156,7 @@ fn format_cheat_provider_coverage(report: &CheatProviderCoverageReport) -> Strin
     use std::fmt::Write;
 
     let mut output = String::new();
-    writeln!(&mut output, "ArchiveFS Cheat Provider Coverage Audit").unwrap();
+    writeln!(&mut output, "EmuWiz Cheat Provider Coverage Audit").unwrap();
     writeln!(
         &mut output,
         "Read-only bounded selection: yes | Games: {} | With compatible cheats: {} | Without: {}",
@@ -2324,7 +2324,7 @@ fn format_cheat_availability_report(report: &CheatAvailabilityReport) -> String 
     use std::fmt::Write;
 
     let mut output = String::new();
-    writeln!(&mut output, "ArchiveFS RetroArch Cheat Catalogue Preview").unwrap();
+    writeln!(&mut output, "EmuWiz RetroArch Cheat Catalogue Preview").unwrap();
     writeln!(&mut output, "Report format: {}", report.format_version).unwrap();
     writeln!(
         &mut output,
@@ -2462,7 +2462,7 @@ fn format_cheat_install_run(outcome: &CheatInstallRunOutcome) -> String {
 
     let run = &outcome.run;
     let mut output = String::new();
-    writeln!(&mut output, "ArchiveFS RetroArch Cheat Installer").unwrap();
+    writeln!(&mut output, "EmuWiz RetroArch Cheat Installer").unwrap();
     writeln!(&mut output, "Run format: {}", run.schema_version).unwrap();
     writeln!(&mut output, "Run ID: {}", run.run_id).unwrap();
     writeln!(
@@ -2717,7 +2717,7 @@ fn format_retroarch_environment_report(report: &RetroArchEnvironmentReport) -> S
     use std::fmt::Write;
 
     let mut output = String::new();
-    writeln!(&mut output, "ArchiveFS RetroArch Environment Report").unwrap();
+    writeln!(&mut output, "EmuWiz RetroArch Environment Report").unwrap();
     writeln!(
         &mut output,
         "Read-only: yes (no files were created, modified, or deleted)"
@@ -3078,7 +3078,7 @@ fn print_library_status_json(view: &LibraryStatusView) -> Result<(), serde_json:
 
 fn format_database_health_report(report: &DatabaseHealthReport) -> String {
     let mut output = String::new();
-    output.push_str("ArchiveFS Database Check\n\n");
+    output.push_str("EmuWiz Database Check\n\n");
     output.push_str(&format!(
         "Database: {}{}\n",
         report.database_path.display,
@@ -3157,7 +3157,7 @@ fn format_library_status_json(view: &LibraryStatusView) -> Result<String, serde_
 
 fn format_library_status(view: &LibraryStatusView) -> String {
     let mut output = String::new();
-    output.push_str("ArchiveFS Library Status\n\n");
+    output.push_str("EmuWiz Library Status\n\n");
     output.push_str(&format!(
         "Database: {}\n",
         view.health.resolved_path.display()
@@ -3210,7 +3210,7 @@ fn format_library_status(view: &LibraryStatusView) -> String {
             if schema_version > view.latest_known_schema_version {
                 output.push_str(&format!(
                     "\nThis database's schema (version {schema_version}) is newer than this \
-                     build of ArchiveFS supports (version {}). Upgrade ArchiveFS, or remove \
+                     build of EmuWiz supports (version {}). Upgrade EmuWiz, or remove \
                      the database file to rebuild it with this version.\n",
                     view.latest_known_schema_version
                 ));
@@ -3296,7 +3296,7 @@ fn format_health_report_json(report: &CatalogueHealthReport) -> Result<String, s
 
 fn format_health_report(report: &CatalogueHealthReport) -> String {
     let mut output = String::new();
-    output.push_str("ArchiveFS Health Report\n\n");
+    output.push_str("EmuWiz Health Report\n\n");
     output.push_str(&format!("Archives checked: {}\n", report.archives_checked));
     output.push_str(&format!("Missing: {}\n", report.missing_count));
     output.push_str(&format!(
@@ -3404,7 +3404,7 @@ fn format_library_scan_json(report: &LibraryScanReport) -> Result<String, serde_
 
 fn format_library_scan(report: &LibraryScanReport) -> String {
     let mut output = String::new();
-    output.push_str("ArchiveFS Library Scan\n\n");
+    output.push_str("EmuWiz Library Scan\n\n");
     output.push_str("Source folders:\n");
     output.push_str(&format!(
         "  Attempted: {}\n",
@@ -3461,7 +3461,7 @@ fn print_source_folder_views(views: &[SourceFolderView]) {
 }
 
 fn format_source_folder_views(views: &[SourceFolderView]) -> String {
-    let mut output = String::from("ArchiveFS Sources\n\n");
+    let mut output = String::from("EmuWiz Sources\n\n");
     if views.is_empty() {
         output.push_str("No source folders are configured.\n");
         output.push_str("Add one with: archivefs-cli source add <path>\n");
@@ -3520,7 +3520,7 @@ struct LibraryViewApplyJson<'a> {
 }
 
 fn print_library_views(views: &[LibraryViewConfig]) {
-    println!("ArchiveFS Library Views");
+    println!("EmuWiz Library Views");
     println!();
     if views.is_empty() {
         println!("No library views are configured.");
@@ -3633,7 +3633,7 @@ fn print_library_view_remove_report(
 ) {
     println!("Library View: {} ({})", view.name, view.id);
     println!("Removed {} managed symlink(s).", report.removed);
-    println!("ArchiveFS did not delete any original archive files.");
+    println!("EmuWiz did not delete any original archive files.");
     if kept_definition {
         println!("The view definition was kept - Preview/Apply will recreate its symlinks.");
     } else {
@@ -3843,7 +3843,7 @@ fn print_library_entries(database_path: &Path, entries: &[LibraryArchiveView]) {
         return;
     }
 
-    println!("ArchiveFS Library List\n");
+    println!("EmuWiz Library List\n");
     print!("{}", format_library_entries(entries));
 }
 
@@ -3853,7 +3853,7 @@ fn print_library_find_results(query: &str, entries: &[LibraryArchiveView]) {
         return;
     }
 
-    println!("ArchiveFS Library Find");
+    println!("EmuWiz Library Find");
     println!("Query: {query}\n");
     print!("{}", format_library_entries(entries));
 }
@@ -3890,7 +3890,7 @@ fn print_platform_aliases(aliases: &[PlatformAlias]) {
         return;
     }
 
-    println!("ArchiveFS Platform Aliases\n");
+    println!("EmuWiz Platform Aliases\n");
     for alias in aliases {
         println!("  Alias: {}", alias.alias);
         println!("  Platform: {}", alias.platform);
@@ -4324,7 +4324,7 @@ fn cheat_history_options(
 ) -> Result<CheatHistoryOptions, Box<dyn std::error::Error>> {
     let data_directory = default_database_path()?
         .parent()
-        .ok_or("could not determine the ArchiveFS data directory")?
+        .ok_or("could not determine the EmuWiz data directory")?
         .to_path_buf();
     Ok(CheatHistoryOptions {
         journal_root: journal_root_override
@@ -4529,14 +4529,14 @@ fn run_library_remove_missing(
 
 fn format_missing_removal(result: &MissingArchiveRemovalResult) -> String {
     format!(
-        "ArchiveFS Library Remove Missing\nRemoved: {} missing catalogue entr{}.\nNo archive files or mounted contents were deleted.\n",
+        "EmuWiz Library Remove Missing\nRemoved: {} missing catalogue entr{}.\nNo archive files or mounted contents were deleted.\n",
         result.removed,
         if result.removed == 1 { "y" } else { "ies" }
     )
 }
 
 fn print_bulk_platform_change(action: &str, summary: &BulkPlatformAssignmentResult) {
-    println!("ArchiveFS Library {action}");
+    println!("EmuWiz Library {action}");
     println!("Requested: {}", summary.requested);
     println!("Changed: {}", summary.changed);
     println!("Unchanged: {}", summary.unchanged);
@@ -4554,7 +4554,7 @@ fn print_bulk_platform_change(action: &str, summary: &BulkPlatformAssignmentResu
 }
 
 fn print_library_platform_change(action: &str, change: &LibraryPlatformChangeView) {
-    println!("ArchiveFS Library {action}");
+    println!("EmuWiz Library {action}");
     println!("Path: {}", change.path.display());
     println!(
         "Old platform: {}",
@@ -4586,7 +4586,7 @@ fn print_index_find_results(query: &str, entries: &[ArchiveIndexEntry]) {
         return;
     }
 
-    println!("ArchiveFS Index Find");
+    println!("EmuWiz Index Find");
     println!("Query: {query}");
     println!();
     println!("Matches:");
@@ -4605,7 +4605,7 @@ fn print_index_find_results(query: &str, entries: &[ArchiveIndexEntry]) {
 }
 
 fn print_index_summary(summary: &ArchiveIndexSummary) {
-    println!("ArchiveFS Index");
+    println!("EmuWiz Index");
     println!();
     println!("Summary:");
     println!("  Total archives: {}", summary.archives_count);
@@ -4903,7 +4903,7 @@ fn format_doctor_repair(outcome: &DoctorRepairOutcome) -> String {
 /// should read `--json` and inspect `findings[].severity`.
 fn format_doctor_scan(scan: &DoctorScan) -> String {
     let mut lines = vec![
-        "ArchiveFS Doctor - read-only diagnostic scan".to_string(),
+        "EmuWiz Doctor - read-only diagnostic scan".to_string(),
         "Nothing was changed, created, mounted, repaired or written.".to_string(),
         String::new(),
     ];
@@ -5047,7 +5047,7 @@ fn format_doctor_report_json(report: &DoctorReport) -> Result<String, serde_json
 
 fn format_doctor_report(report: &DoctorReport) -> String {
     let mut output = String::new();
-    output.push_str("ArchiveFS Doctor\n");
+    output.push_str("EmuWiz Doctor\n");
     output.push_str(&format!("Config: {}\n", report.config_path.display()));
     output.push_str("\nChecks:\n");
     for check in &report.checks {
@@ -5118,7 +5118,7 @@ fn format_duplicate_report_json(report: &DuplicateReport) -> Result<String, serd
 
 fn format_duplicate_report(report: &DuplicateReport) -> String {
     let mut output = String::new();
-    output.push_str("ArchiveFS Duplicates\n\n");
+    output.push_str("EmuWiz Duplicates\n\n");
     output.push_str("Summary:\n");
     output.push_str(&format!("  Records checked: {}\n", report.archives_checked));
     output.push_str(&format!(
@@ -5241,7 +5241,7 @@ fn game_identity_report_rows(report: &GameIdentityReport) -> Vec<(&'static str, 
 }
 
 fn print_game_identity_report(report: &GameIdentityReport) {
-    println!("ArchiveFS Game Identity\n");
+    println!("EmuWiz Game Identity\n");
     for (label, value) in game_identity_report_rows(report) {
         println!("  {label}: {value}");
     }
@@ -5307,7 +5307,7 @@ fn format_archive_info_json(info: &ArchiveInfo) -> Result<String, serde_json::Er
 
 fn format_archive_info(info: &ArchiveInfo) -> String {
     let mut output = String::new();
-    output.push_str("ArchiveFS Info\n\n");
+    output.push_str("EmuWiz Info\n\n");
     output.push_str("Details:\n");
     output.push_str(&format!("  Title: {}\n", info.title));
     output.push_str(&format!(
@@ -5357,7 +5357,7 @@ fn format_archive_stats_json(stats: &ArchiveStats) -> Result<String, serde_json:
 
 fn format_archive_stats(stats: &ArchiveStats) -> String {
     let mut output = String::new();
-    output.push_str("ArchiveFS Stats\n\n");
+    output.push_str("EmuWiz Stats\n\n");
     output.push_str("Summary:\n");
     output.push_str(&format!("  Total archives: {}\n", stats.total_archives));
     output.push_str(&format!("  Mounted: {}\n", stats.mounted_count));
@@ -5494,7 +5494,7 @@ fn print_help() {
     println!();
     println!("Commands:");
     println!("  scan           List supported archives from configured source folders");
-    println!("  doctor         Check whether ArchiveFS is ready to run");
+    println!("  doctor         Check whether EmuWiz is ready to run");
     println!(
         "  platform-detect <path>  Explain how platform detection sees one path: canonical platform, confidence (confirmed/probable/ambiguous/unknown), what decided it, and the full evidence with any conflicting candidates. --json for the complete structured evidence, --root <dir> to set the source-folder boundary, --assume-manual <platform> to see how an explicit assignment would override detection. Read-only: bounded header reads and one directory listing, nothing written."
     );
@@ -5507,7 +5507,7 @@ fn print_help() {
     println!(
         "  doctor --repair <action-id> --finding <finding-id>  Perform one existing repair on a finding from a fresh scan. Actions: clean_mount_root, clean_mount_path, retry_mount, rebuild_index. Add --resource <path> when several findings share an ID; it must exactly match the resource that finding reported, and can only pick out one of Doctor's own findings - it can never point a repair at anything else, even a path that would be a valid target on its own. --confirm to allow the change, --dry-run to validate without changing anything, --json for machine-readable output. No flag accepts an arbitrary path to operate on: the target is resolved from the finding and revalidated. Exits 0 whenever the command ran, including when the repair was refused."
     );
-    println!("  config-check   Validate ArchiveFS configuration");
+    println!("  config-check   Validate EmuWiz configuration");
     println!(
         "  cheats source bsfree <status|validate|download|import-local|enable|disable|remove|systems|devices|search|game|gamecube-preview|gamecube-apply|gamecube-rollback>  Manage and browse the optional immutable BSFree Archive source. GameCube hex-pair codes are installable via the existing Dolphin adapter (gamecube-preview/gamecube-apply, --confirm to apply, gamecube-rollback to restore); all other platforms and formats are browse-only"
     );
@@ -5533,7 +5533,7 @@ fn print_help() {
         "  identity source romm <status|configure|test|mappings|import|refresh|records|record|conflicts|verify-hash|enable|disable|remove>  Use a local RomM server as an external identity source. Read-only towards RomM: no command writes to it, triggers a scan, edits metadata, or touches a ROM. Only loopback and private LAN addresses are accepted. The token is passed by file path with --token-file and is never printed, logged or stored in config or cache JSON. Add --json for structured output on stdout, with progress on stderr."
     );
     println!(
-        "  identity source romm configure --url <local-url> --token-file <path> [--path-kind relative|absolute] [--page-size <n>] [--enable]  Store the RomM URL and the path to a read-only client token (suggested ~/.config/archivefs/romm-token, which ArchiveFS never creates for you). The URL is resolved and refused now if it is not local; the token file must be a regular non-symlink file with restrictive permissions. --path-kind declares the shape of path this instance reports: `relative` for RomM 5.1.0, which returns `roms/gb/game.gb`, or `absolute` for an installation that returns `/romm/library/gb/game.gb`. The shape is never guessed from an individual path; run `test` to see which one your server uses. Contacts nothing."
+        "  identity source romm configure --url <local-url> --token-file <path> [--path-kind relative|absolute] [--page-size <n>] [--enable]  Store the RomM URL and the path to a read-only client token (suggested ~/.config/archivefs/romm-token, which EmuWiz never creates for you). The URL is resolved and refused now if it is not local; the token file must be a regular non-symlink file with restrictive permissions. --path-kind declares the shape of path this instance reports: `relative` for RomM 5.1.0, which returns `roms/gb/game.gb`, or `absolute` for an installation that returns `/romm/library/gb/game.gb`. The shape is never guessed from an individual path; run `test` to see which one your server uses. Contacts nothing."
     );
     println!(
         "  identity source romm mappings add --romm-root <path> --archivefs-root <path> [--replace]  Map a RomM path prefix onto a local directory, written in the source's declared path shape - `roms` when relative, `/romm/library` when absolute. Matching is on whole components with the longest prefix winning; the destination must be inside a configured source folder. A `..`, a `.`, an empty component, a backslash, a drive letter, a UNC prefix or a control character refuses the path rather than being repaired."
@@ -5554,7 +5554,7 @@ fn print_help() {
         "  identity source romm artwork [--fetch <n>] [--clear --confirm]  Report the bounded cover-thumbnail cache: location, item count, size, its 1 GiB ceiling, thumbnail box and cache version, plus how many records have a cover on your RomM instance versus only a public scraper URL. --fetch <n> warms the first n covers, one bounded request each; --clear --confirm empties it. Thumbnails are fetched only from your RomM instance - a cover hosted on igdb.com or retroachievements.org is left as a placeholder rather than fetched from the public internet. Never touches the identity cache, RomM, or a ROM."
     );
     println!(
-        "  identity source romm remove --confirm  Delete only ArchiveFS's own RomM cache and provider configuration (--keep-config keeps the latter). Never deletes your token file, never touches RomM, never touches a ROM."
+        "  identity source romm remove --confirm  Delete only EmuWiz's own RomM cache and provider configuration (--keep-config keeps the latter). Never deletes your token file, never touches RomM, never touches a ROM."
     );
     println!("  pcsx2-patch-preview  Fetch and preview official PCSX2 patch metadata (read-only)");
     println!(
@@ -5630,9 +5630,9 @@ fn print_help() {
     println!("  info           Show details for one archive by path or name");
     println!("  mount          Mount scanned archives with ratarmount");
     println!("  mount-one      Mount one archive by path or name");
-    println!("  unmount        Unmount ArchiveFS mountpoints under mount_root");
+    println!("  unmount        Unmount EmuWiz mountpoints under mount_root");
     println!("  unmount-one    Unmount one archive by path or name");
-    println!("  clean          Remove empty current ArchiveFS mount directories");
+    println!("  clean          Remove empty current EmuWiz mount directories");
     println!("  watch          Watch source folders and refresh the JSON index");
     println!("  index-build    Build the JSON archive index");
     println!("  index-show     Show a summary of the JSON archive index");
@@ -6110,7 +6110,7 @@ mod tests {
         assert_eq!(
             output,
             concat!(
-                "ArchiveFS PCSX2 Patch Metadata Preview\n",
+                "EmuWiz PCSX2 Patch Metadata Preview\n",
                 "Advisory only: yes (executable: false)\n",
                 "Plan format: 1\n",
                 "Plan ID: golden-plan-id\n",
@@ -6364,7 +6364,7 @@ mod tests {
         let plan = retroarch_advisory_fixture();
         let output = format_retroarch_advisory_plan(&plan);
 
-        assert!(output.contains("ArchiveFS RetroArch Patch/Cheat Preview"));
+        assert!(output.contains("EmuWiz RetroArch Patch/Cheat Preview"));
         assert!(output.contains("Advisory only: yes (executable: false)"));
         assert!(output.contains("Plan ID: golden-retroarch-plan-id"));
         assert!(output.contains(
@@ -6476,7 +6476,7 @@ mod tests {
 
         let output = format_doctor_report(&report);
 
-        assert!(output.contains("ArchiveFS Doctor"));
+        assert!(output.contains("EmuWiz Doctor"));
         assert!(output.contains("Config: /home/user/.config/archivefs/config.toml"));
         assert!(output.contains("Checks:"));
         assert!(output.contains("[PASS] config"));
@@ -6511,7 +6511,7 @@ mod tests {
         let json = serde_json::from_str::<serde_json::Value>(&output).unwrap();
 
         assert!(output.starts_with("{\n"));
-        assert!(!output.contains("ArchiveFS Doctor"));
+        assert!(!output.contains("EmuWiz Doctor"));
         assert!(!output.contains("Summary:"));
         assert_eq!(
             json["config_path"],
@@ -6539,7 +6539,7 @@ mod tests {
 
         let output = format_duplicate_report(&report);
 
-        assert!(output.contains("ArchiveFS Duplicates"));
+        assert!(output.contains("EmuWiz Duplicates"));
         assert!(output.contains("Records checked: 2"));
         assert!(output.contains("Duplicate groups found: 0"));
         assert!(output.contains("No duplicate candidates found."));
@@ -6566,7 +6566,7 @@ mod tests {
         let json = serde_json::from_str::<serde_json::Value>(&output).unwrap();
 
         assert!(output.starts_with("{\n"));
-        assert!(!output.contains("ArchiveFS Duplicates"));
+        assert!(!output.contains("EmuWiz Duplicates"));
         assert!(!output.contains("Summary:"));
         assert_eq!(json["detector"], "filename");
         assert_eq!(json["archives_checked"], 2);
@@ -6632,7 +6632,7 @@ mod tests {
         assert_eq!(
             format_duplicate_report(&report),
             concat!(
-                "ArchiveFS Duplicates\n\n",
+                "EmuWiz Duplicates\n\n",
                 "Summary:\n",
                 "  Records checked: 2\n",
                 "  Duplicate groups found: 1\n",
@@ -6755,7 +6755,7 @@ mod tests {
         let json = serde_json::from_str::<serde_json::Value>(&output).unwrap();
 
         assert!(output.starts_with("{\n"));
-        assert!(!output.contains("ArchiveFS Info"));
+        assert!(!output.contains("EmuWiz Info"));
         assert!(!output.contains("Details:"));
         assert_eq!(json["title"], "Halo");
         assert_eq!(json["platform"], "Xbox");
@@ -6793,7 +6793,7 @@ mod tests {
         let json = serde_json::from_str::<serde_json::Value>(&output).unwrap();
 
         assert!(output.starts_with("{\n"));
-        assert!(!output.contains("ArchiveFS Stats"));
+        assert!(!output.contains("EmuWiz Stats"));
         assert_eq!(json["total_archives"], 2);
         assert_eq!(json["mounted_count"], 1);
         assert_eq!(json["pending_count"], 1);
@@ -7072,7 +7072,7 @@ mod tests {
 
         let human = format_database_health_report(&report);
         assert_eq!(human, format_database_health_report(&report));
-        assert!(human.starts_with("ArchiveFS Database Check\n\n"));
+        assert!(human.starts_with("EmuWiz Database Check\n\n"));
         assert!(human.contains("Quick check: Ok"));
         assert!(human.contains("RollbackJournal: absent"));
 
@@ -7770,7 +7770,7 @@ mod tests {
     /// heading text without duplicating `print_library_find_results`'s
     /// stdout-writing shape.
     fn print_library_find_results_for_test(query: &str, entries: &[LibraryArchiveView]) -> String {
-        let mut output = format!("ArchiveFS Library Find\nQuery: {query}\n\n");
+        let mut output = format!("EmuWiz Library Find\nQuery: {query}\n\n");
         output.push_str(&format_library_entries(entries));
         output
     }
@@ -9459,7 +9459,7 @@ mod doctor_stage1c_tests {
         for stale in [
             "Free disk space - ",
             "Read-only filesystem detection - ",
-            "Orphaned ArchiveFS-managed cheat entries - ",
+            "Orphaned EmuWiz-managed cheat entries - ",
         ] {
             assert!(
                 !text.contains(stale),
@@ -9954,7 +9954,7 @@ const MILESTONE_PLATFORMS: &[&str] = &[
 
 fn format_platform_audit(report: &PlatformAuditReport) -> String {
     let mut lines = vec![
-        "ArchiveFS platform-detection audit (read-only)".to_string(),
+        "EmuWiz platform-detection audit (read-only)".to_string(),
         format!("Root: {}", report.root),
         format!(
             "Considered: {} files, {} directories in {} ms",

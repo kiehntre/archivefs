@@ -2,7 +2,7 @@
 //!
 //! Two questions, answered without writing anything:
 //!
-//! 1. **How much room is left** on each filesystem ArchiveFS depends on
+//! 1. **How much room is left** on each filesystem EmuWiz depends on
 //!    ([`assess_storage`]). Answered with `statvfs(3)`, which reports what
 //!    the kernel already knows. Nothing is created, and free space is never
 //!    estimated by walking directory contents.
@@ -34,7 +34,7 @@ use super::{
 use crate::Config;
 use crate::emulator_environment::EncodedPath;
 
-/// Which ArchiveFS resource a path is. Drives both severity (a read-only
+/// Which EmuWiz resource a path is. Drives both severity (a read-only
 /// source folder is fine; a read-only database is not) and the free-space
 /// floor applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -48,18 +48,18 @@ pub enum ResourceRole {
     /// Where install journals and backups live.
     TransactionStorage,
     MountRoot,
-    /// A configured library folder. ArchiveFS only ever reads these.
+    /// A configured library folder. EmuWiz only ever reads these.
     SourceRoot,
     ArchiveIndex,
-    /// A destination ArchiveFS may write an emulator file into.
+    /// A destination EmuWiz may write an emulator file into.
     EmulatorProfile,
 }
 
 impl ResourceRole {
     pub fn label(self) -> &'static str {
         match self {
-            Self::DataDirectory => "ArchiveFS data directory",
-            Self::CacheDirectory => "ArchiveFS cache directory",
+            Self::DataDirectory => "EmuWiz data directory",
+            Self::CacheDirectory => "EmuWiz cache directory",
             Self::Database => "catalogue database",
             Self::TransactionStorage => "install history and backups",
             Self::MountRoot => "mount root",
@@ -69,7 +69,7 @@ impl ResourceRole {
         }
     }
 
-    /// Whether ArchiveFS ever writes here. A source folder is read-only by
+    /// Whether EmuWiz ever writes here. A source folder is read-only by
     /// design, so it being on a read-only filesystem is not a fault.
     pub fn archivefs_writes_here(self) -> bool {
         !matches!(self, Self::SourceRoot)
@@ -87,7 +87,7 @@ impl ResourceRole {
     /// How bad a read-only filesystem is for this role.
     fn read_only_severity(self) -> Option<DoctorSeverity> {
         match self {
-            // ArchiveFS cannot function: these are written during ordinary use.
+            // EmuWiz cannot function: these are written during ordinary use.
             Self::Database
             | Self::CacheDirectory
             | Self::TransactionStorage
@@ -140,7 +140,7 @@ impl FilesystemStat {
 /// Read-only: `statvfs` reports counters the kernel already maintains. It
 /// creates nothing, opens no file for writing, and does not change any
 /// timestamp. `f_bavail` is used rather than `f_bfree` because it excludes
-/// blocks reserved for root, which is what an unprivileged ArchiveFS can
+/// blocks reserved for root, which is what an unprivileged EmuWiz can
 /// actually use.
 #[cfg(unix)]
 pub fn filesystem_stat(path: &Path) -> Option<FilesystemStat> {
@@ -346,8 +346,8 @@ impl FreeSpacePolicy {
         archivefs_writes_here: bool,
     ) -> Option<DoctorSeverity> {
         if !archivefs_writes_here {
-            // ArchiveFS never writes to a source folder, so its free space is
-            // not ArchiveFS's problem to report.
+            // EmuWiz never writes to a source folder, so its free space is
+            // not EmuWiz's problem to report.
             return None;
         }
         let mut severity: Option<DoctorSeverity> = None;
@@ -386,7 +386,7 @@ impl FreeSpacePolicy {
 
 // --- Assessment -----------------------------------------------------------
 
-/// One filesystem, with every ArchiveFS resource that lives on it.
+/// One filesystem, with every EmuWiz resource that lives on it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct FilesystemGroup {
     /// The first resource path observed on this filesystem - what findings
@@ -398,7 +398,7 @@ pub struct FilesystemGroup {
     pub filesystem_type: Option<String>,
     pub mount_mode: MountMode,
     pub stat: Option<FilesystemStat>,
-    /// Every ArchiveFS resource sharing this filesystem, deduplicated.
+    /// Every EmuWiz resource sharing this filesystem, deduplicated.
     pub roles: Vec<ResourceRole>,
     /// Every path that resolved here.
     pub paths: Vec<EncodedPath>,
@@ -662,11 +662,11 @@ pub fn findings_from_free_space(
             )
             .with_guidance(
                 if group.holds_transactional_data() {
-                    "ArchiveFS writes install journals and backups here. Running out of room part-way through an operation is what makes one unrecoverable."
+                    "EmuWiz writes install journals and backups here. Running out of room part-way through an operation is what makes one unrecoverable."
                 } else {
-                    "ArchiveFS needs room here to write. Operations will start failing before the filesystem is completely full."
+                    "EmuWiz needs room here to write. Operations will start failing before the filesystem is completely full."
                 },
-                "Free some space on this filesystem, or move the affected ArchiveFS directory to one with more room.",
+                "Free some space on this filesystem, or move the affected EmuWiz directory to one with more room.",
             ),
         );
     }
@@ -675,7 +675,7 @@ pub fn findings_from_free_space(
 
 /// Read-only-filesystem findings, one per affected filesystem.
 ///
-/// A read-only *source folder* produces no finding at all: ArchiveFS only
+/// A read-only *source folder* produces no finding at all: EmuWiz only
 /// ever reads a library, so a read-only share or a mounted image is a
 /// perfectly ordinary setup.
 pub fn findings_from_read_only_filesystems(assessment: &StorageAssessment) -> Vec<Finding> {
@@ -716,7 +716,7 @@ pub fn findings_from_read_only_filesystems(assessment: &StorageAssessment) -> Ve
             evidence.push(format!("Filesystem type: {filesystem_type}"));
         }
         evidence.push(format!(
-            "ArchiveFS needs to write to: {}",
+            "EmuWiz needs to write to: {}",
             writable_roles.join(", ")
         ));
         if !read_only_roles.is_empty() {
@@ -734,9 +734,9 @@ pub fn findings_from_read_only_filesystems(assessment: &StorageAssessment) -> Ve
                 DoctorCategory::Filesystems,
                 DoctorSubsystem::FilesystemMountState,
                 severity,
-                "A filesystem ArchiveFS writes to is mounted read-only",
+                "A filesystem EmuWiz writes to is mounted read-only",
                 format!(
-                    "The filesystem holding {} is mounted read-only, so ArchiveFS cannot write there.",
+                    "The filesystem holding {} is mounted read-only, so EmuWiz cannot write there.",
                     writable_roles.join(", ")
                 ),
             )
@@ -763,7 +763,7 @@ pub fn findings_from_read_only_filesystems(assessment: &StorageAssessment) -> Ve
             )
             .with_guidance(
                 "This is the mount's own state, not a permissions problem. No change to file permissions can make it writable.",
-                "Remount that filesystem read-write, or point the affected ArchiveFS setting at a writable location.",
+                "Remount that filesystem read-write, or point the affected EmuWiz setting at a writable location.",
             ),
         );
     }
@@ -777,7 +777,7 @@ pub fn not_checked_from_storage(assessment: &StorageAssessment) -> Vec<NotChecke
     if !assessment.mount_table_available {
         items.push(NotCheckedCheck {
             name: "Filesystem mount state".to_string(),
-            reason: "The mount table could not be read, so ArchiveFS cannot tell whether any filesystem is mounted read-only.".to_string(),
+            reason: "The mount table could not be read, so EmuWiz cannot tell whether any filesystem is mounted read-only.".to_string(),
             next_step: "This is unusual. Check that /proc is mounted.".to_string(),
         });
     }
@@ -785,7 +785,7 @@ pub fn not_checked_from_storage(assessment: &StorageAssessment) -> Vec<NotChecke
         items.push(NotCheckedCheck {
             name: format!("Free space for the {}", resource.role.label()),
             reason: format!("{}: {}", resource.path.display, resource.reason),
-            next_step: "Nothing is wrong yet - ArchiveFS simply cannot report on this path."
+            next_step: "Nothing is wrong yet - EmuWiz simply cannot report on this path."
                 .to_string(),
         });
     }
@@ -797,7 +797,7 @@ pub fn not_checked_from_storage(assessment: &StorageAssessment) -> Vec<NotChecke
                     "{} is not covered by any recognised mount entry, so read-only state is unknown.",
                     group.representative_path.display
                 ),
-                next_step: "Nothing is wrong yet - ArchiveFS simply cannot confirm this one way or the other.".to_string(),
+                next_step: "Nothing is wrong yet - EmuWiz simply cannot confirm this one way or the other.".to_string(),
             });
         }
     }
@@ -806,7 +806,7 @@ pub fn not_checked_from_storage(assessment: &StorageAssessment) -> Vec<NotChecke
 
 // --- Writability assessment ----------------------------------------------
 
-/// What ArchiveFS can honestly say about being able to write somewhere,
+/// What EmuWiz can honestly say about being able to write somewhere,
 /// without writing to find out.
 ///
 /// There is deliberately no `Writable` variant. A write can still fail
@@ -827,7 +827,7 @@ pub enum WritabilityAssessment {
     PermissionDenied,
     /// The path is not there.
     MissingDestination,
-    /// Exists but is not a directory, or is a symlink ArchiveFS will not
+    /// Exists but is not a directory, or is a symlink EmuWiz will not
     /// follow.
     UnsafeDestination,
     /// Not established - unknown mount state, unreadable metadata, or a
@@ -843,7 +843,7 @@ impl WritabilityAssessment {
             Self::ReadOnlyFilesystem => "Not writable: the filesystem is mounted read-only",
             Self::PermissionDenied => "Not writable: permissions deny it for this user",
             Self::MissingDestination => "Destination does not exist",
-            Self::UnsafeDestination => "Destination is not a directory ArchiveFS will write into",
+            Self::UnsafeDestination => "Destination is not a directory EmuWiz will write into",
             Self::NotProven => "Writability not proven without a write probe",
         }
     }
@@ -875,7 +875,7 @@ pub struct PathPermissions {
 ///
 /// `symlink_metadata` is used deliberately: a symlinked destination is
 /// reported as unsafe rather than silently followed, matching the rule the
-/// rest of ArchiveFS applies to destinations.
+/// rest of EmuWiz applies to destinations.
 #[cfg(unix)]
 pub fn assess_permissions(path: &Path) -> Option<PathPermissions> {
     use std::os::unix::fs::MetadataExt;
@@ -942,7 +942,7 @@ pub fn assess_writability(
 
 // --- Building the resource list -------------------------------------------
 
-/// Collects the storage locations ArchiveFS depends on, from paths the caller
+/// Collects the storage locations EmuWiz depends on, from paths the caller
 /// has already resolved.
 ///
 /// Resolving a path is not the same as using it: nothing here touches the
@@ -950,7 +950,7 @@ pub fn assess_writability(
 /// [`assess_storage`] reports it as unassessed rather than silently dropping
 /// it.
 ///
-/// Source folders are included deliberately even though ArchiveFS never writes
+/// Source folders are included deliberately even though EmuWiz never writes
 /// to them: a read-only source is entirely normal and must never be reported
 /// as a problem, and the only way to say that confidently is to know the
 /// filesystem is read-only.
@@ -1368,7 +1368,7 @@ mod tests {
         assert_eq!(
             findings[0].severity,
             DoctorSeverity::Warning,
-            "a read-only emulator profile blocks cheats, not ArchiveFS itself"
+            "a read-only emulator profile blocks cheats, not EmuWiz itself"
         );
     }
 

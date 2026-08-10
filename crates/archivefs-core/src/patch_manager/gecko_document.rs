@@ -532,7 +532,7 @@ pub fn merge_external_gecko_codes(
                 return Err(GeckoMergeError {
                     code_name: Some(code.name.clone()),
                     detail: format!(
-                        "an existing Gecko code named {:?} has a different body; ArchiveFS will not overwrite it",
+                        "an existing Gecko code named {:?} has a different body; EmuWiz will not overwrite it",
                         code.name
                     ),
                 });
@@ -649,7 +649,7 @@ pub fn merge_external_action_replay_codes(
                 return Err(GeckoMergeError {
                     code_name: Some(code.name.clone()),
                     detail: format!(
-                        "an existing Action Replay code named {:?} has a different body; ArchiveFS will not overwrite it",
+                        "an existing Action Replay code named {:?} has a different body; EmuWiz will not overwrite it",
                         code.name
                     ),
                 });

@@ -461,9 +461,9 @@ fn inspect_game_identity_with_platform_trust(
             "catalogue platform context; not derived from disc bytes"
         },
         if trusted_platform {
-            "trusted ArchiveFS library platform context"
+            "trusted EmuWiz library platform context"
         } else {
-            "ArchiveFS catalogue context"
+            "EmuWiz catalogue context"
         },
     ));
     add_filename_candidate(&mut report);
@@ -515,7 +515,7 @@ fn inspect_game_identity_with_platform_trust(
             add_unavailable(
                 &mut report,
                 IdentityStatus::Deferred,
-                "format has no existing safe bounded reader in ArchiveFS",
+                "format has no existing safe bounded reader in EmuWiz",
             );
         }
         _ => add_unavailable(
@@ -1648,7 +1648,7 @@ fn wbfs_disc_header_offset(
     if occupied.next().is_some() {
         return Err((
             IdentityStatus::Ambiguous,
-            "WBFS container holds more than one disc; ArchiveFS will not choose one silently",
+            "WBFS container holds more than one disc; EmuWiz will not choose one silently",
         ));
     }
 

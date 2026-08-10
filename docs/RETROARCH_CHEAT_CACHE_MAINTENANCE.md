@@ -1,6 +1,6 @@
 # RetroArch cheat snapshot maintenance
 
-ArchiveFS publishes a retrieved cheat catalogue as a content-addressed
+EmuWiz publishes a retrieved cheat catalogue as a content-addressed
 snapshot. Snapshot contents and their per-snapshot manifest are immutable;
 maintenance never edits or repairs either one. This document covers the
 deliberate inventory, verification, pinning, and pruning operations around
@@ -42,7 +42,7 @@ the original operating-system path bytes, including non-UTF-8 cache roots.
 
 Inventory enumerates snapshot directories deterministically by source,
 newest recorded retrieval timestamp, identity and lossless path. A directory
-name is never sufficient evidence. ArchiveFS reads the corresponding manifest,
+name is never sufficient evidence. EmuWiz reads the corresponding manifest,
 checks its schema, source/hash/cache-path binding, and reuses retrieval's
 bounded tree walk and SHA-256 file manifest. It reports provenance, archive and
 expanded sizes, entry count, freshness, current/last-known-good status, pins,
@@ -59,7 +59,7 @@ Inventory walks and maintenance metadata reads have explicit entry and byte
 limits. Exceeding a limit fails safely or leaves affected snapshots protected;
 forged size fields use saturating accounting and cannot wrap a cache budget.
 
-ArchiveFS does not infer a last-use time from filesystem access times because
+EmuWiz does not infer a last-use time from filesystem access times because
 that would be unreliable and platform-dependent. `last_successful_use` is
 therefore currently absent. The retrieval schema has one validated `current`
 pointer; that same snapshot is conservatively treated as last-known-good.
@@ -73,7 +73,7 @@ manifest-bound snapshot. Malformed, wrongly bound or symlinked pin metadata is
 rejected, including duplicate pin entries; pruning then protects every
 affected snapshot because pin state is unknown.
 
-A pin only prevents ArchiveFS pruning. It cannot prevent the filesystem owner
+A pin only prevents EmuWiz pruning. It cannot prevent the filesystem owner
 from manually changing or deleting cache data. Verification detects such
 changes.
 
@@ -106,7 +106,7 @@ Every entry carries deterministic reasons such as `exceeds_keep_count`,
 `verification_required` or `unsafe_or_ambiguous_path`.
 
 `retroarch-cheat-cache-prune`, `--dry-run`, JSON mode and non-terminal use are
-preview-only unless `--yes` is explicitly supplied. ArchiveFS never prompts
+preview-only unless `--yes` is explicitly supplied. EmuWiz never prompts
 from this command and has no automatic or background pruning.
 
 ## Confirmed deletion and staging cleanup
@@ -122,7 +122,7 @@ actually removed.
 Snapshot deletion removes only the exact content-addressed directory and its
 matching immutable manifest. It never removes the cache root, source metadata,
 pin metadata, retained snapshots, or catalogue files outside the selected
-ArchiveFS cache. Empty parent directories are deliberately left in place.
+EmuWiz cache. Empty parent directories are deliberately left in place.
 
 Retrieval's `.staging` entries are not published snapshots. Cleanup considers
 only exact children of a source's `.staging` directory. Recent entries are
@@ -141,7 +141,7 @@ failure.
 
 Applied maintenance history is not written in this milestone. Existing cheat
 history is intentionally bound to installation and rollback journal schemas,
-not generic cache operations, and ArchiveFS has no standalone operation-history
+not generic cache operations, and EmuWiz has no standalone operation-history
 store that could be reused without adding an unrelated database dependency.
 The confirmed result itself is the complete auditable record and may be saved
 by callers. A future shared operation-journal design can persist it without

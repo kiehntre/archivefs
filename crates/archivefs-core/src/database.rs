@@ -129,7 +129,7 @@ fn latest_known_version(migrations: &[Migration]) -> i64 {
         .unwrap_or(0)
 }
 
-/// An open connection to the ArchiveFS library database, with all pending
+/// An open connection to the EmuWiz library database, with all pending
 /// migrations already applied. The inner `rusqlite::Connection` is private;
 /// nothing outside this module touches it directly.
 #[derive(Debug)]
@@ -179,7 +179,7 @@ impl Database {
     /// Opens the database at `path`, creating the file and its parent
     /// directory if needed, and applying any pending migrations inside
     /// transactions. Fails clearly, without mutating the file, if its
-    /// schema version is newer than this build of ArchiveFS understands.
+    /// schema version is newer than this build of EmuWiz understands.
     pub fn open_or_create(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         if let Some(parent) = path.parent()
@@ -594,7 +594,7 @@ pub fn diagnose_database(path: impl AsRef<Path>) -> DatabaseHealthReport {
                 report.diagnostics.push(diagnostic(
                     DatabaseDiagnosticCode::SchemaVersionUnsupported,
                     DatabaseDiagnosticSeverity::Error,
-                    "database schema is newer than this ArchiveFS build supports",
+                    "database schema is newer than this EmuWiz build supports",
                     None,
                 ));
             }
@@ -900,7 +900,7 @@ fn apply_migrations(connection: &mut Connection, migrations: &[Migration]) -> Re
     if current_version > target_version {
         return Err(ArchiveFsError::Database(format!(
             "database schema version {current_version} is newer than the highest version \
-             ({target_version}) this build of ArchiveFS understands; refusing to open it \
+             ({target_version}) this build of EmuWiz understands; refusing to open it \
              automatically"
         )));
     }
@@ -2181,7 +2181,7 @@ impl Database {
     }
 
     /// Enriches catalogue rows addressed by a published RomM cache. The cache
-    /// is derived provider metadata; this method writes only ArchiveFS's
+    /// is derived provider metadata; this method writes only EmuWiz's
     /// platform assignment history and never opens a ROM path.
     pub fn enrich_platforms_from_romm_cache(
         &mut self,
@@ -3684,7 +3684,7 @@ pub struct RecentScanAdditions {
     pub truncated: bool,
 }
 
-/// The highest schema version this build of ArchiveFS understands - the
+/// The highest schema version this build of EmuWiz understands - the
 /// same value [`Database::open_or_create`] refuses to open a newer
 /// database than. Exposed so callers (the CLI's `library-status`) can
 /// distinguish "this database's schema is newer than this build

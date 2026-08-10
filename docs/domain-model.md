@@ -1,10 +1,10 @@
-# ArchiveFS Domain Model
+# EmuWiz Domain Model
 
-This document describes the core ArchiveFS domain types used by `archivefs-core`.
+This document describes the core EmuWiz domain types used by `archivefs-core`.
 
 ## Library Hierarchy
 
-ArchiveFS models a library as a hierarchy from broad organization down to concrete files and mounts.
+EmuWiz models a library as a hierarchy from broad organization down to concrete files and mounts.
 
 ```text
 Library
@@ -111,7 +111,7 @@ ArchiveHealth {
 - `MissingParts`: split archive parts are missing.
 - `Corrupt`: archive appears damaged.
 - `Unsupported`: archive format or structure is unsupported.
-- `PermissionDenied`: ArchiveFS cannot read or mount the archive due to permissions.
+- `PermissionDenied`: EmuWiz cannot read or mount the archive due to permissions.
 - `RetryAvailable`: a failed archive can be retried.
 
 Retryable states are `Failed`, `MissingParts`, and `RetryAvailable`.
@@ -150,7 +150,7 @@ MountState {
 - `Mounted`: mount path is currently mounted.
 - `MountPathExists`: mount path exists but is not detected as mounted.
 - `NotMountable`: a library item such as a loose cartridge ROM that is
-  intentionally excluded from ArchiveFS mount and queue operations.
+  intentionally excluded from EmuWiz mount and queue operations.
 
 ## MountBackend
 

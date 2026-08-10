@@ -395,11 +395,11 @@ fn rendering_is_deterministic() {
     let document = parse(REAL_WORLD_CHT);
     let first = render_cht_file(
         &install_entries(&document, &[0, 1, 2]),
-        &["ArchiveFS".to_string()],
+        &["EmuWiz".to_string()],
     );
     let second = render_cht_file(
         &install_entries(&document, &[0, 1, 2]),
-        &["ArchiveFS".to_string()],
+        &["EmuWiz".to_string()],
     );
     assert_eq!(first, second);
 }
@@ -447,9 +447,9 @@ fn header_comments_are_written_before_the_header_and_stripped_of_control_bytes()
     let document = parse(REAL_WORLD_CHT);
     let rendered = render_cht_file(
         &install_entries(&document, &[0]),
-        &["Installed by ArchiveFS\u{7}".to_string()],
+        &["Installed by EmuWiz\u{7}".to_string()],
     );
-    assert!(rendered.starts_with("# Installed by ArchiveFS\n\ncheats = 1\n"));
+    assert!(rendered.starts_with("# Installed by EmuWiz\n\ncheats = 1\n"));
 }
 
 #[test]

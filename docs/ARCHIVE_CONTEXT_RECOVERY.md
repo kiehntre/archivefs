@@ -60,11 +60,11 @@ and virtualized vertical rows remain independent and usable.
    sections, creation/backup state, warnings, and SHA-256.
 9. Review and confirm apply. Open Dolphin and verify the chosen Gecko code is
    displayed for Animal Crossing.
-10. Return to ArchiveFS and use **Roll back this install**; verify Dolphin's
+10. Return to EmuWiz and use **Roll back this install**; verify Dolphin's
     prior file is restored exactly, or that a file created by this transaction
     is removed.
 
-ArchiveFS never invents Gecko definitions. GAFE01 definitions come from the
+EmuWiz never invents Gecko definitions. GAFE01 definitions come from the
 official Dolphin upstream GameSettings dataset. Provider retrieval, apply,
 Dolphin display, and rollback still require manual proof on the real profile;
 automated tests use recorded provider fixtures and isolated temporary paths.

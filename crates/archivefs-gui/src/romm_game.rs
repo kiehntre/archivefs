@@ -4,7 +4,7 @@
 //! # Provider-scoped
 //!
 //! Everything here describes RomM and only RomM. CheatBase evidence is not merged
-//! in, and no verdict shown here claims to be ArchiveFS's combined opinion of the
+//! in, and no verdict shown here claims to be EmuWiz's combined opinion of the
 //! file - that belongs to a later stage. This panel answers one question: what does
 //! the imported RomM catalogue say about the file selected in the Library?
 //!
@@ -19,7 +19,7 @@
 //!
 //! When several RomM records translate to the same local file, the verdict is
 //! Ambiguous and every claimant is listed. Choosing one is a person's decision,
-//! recorded in the panel, and it still does not overwrite anything ArchiveFS
+//! recorded in the panel, and it still does not overwrite anything EmuWiz
 //! determined for itself.
 //!
 //! # Confirmed means hashed
@@ -66,7 +66,7 @@ pub(crate) const MAX_THUMBNAIL_READ_BYTES: u64 = 2 * 1024 * 1024;
 /// Which algorithms a verification computes, as one line of text.
 pub(crate) const VERIFIED_ALGORITHMS: &str = "CRC32, MD5 and SHA-1, in one pass";
 
-/// What ArchiveFS itself says this file's platform is.
+/// What EmuWiz itself says this file's platform is.
 ///
 /// `manual` is the part that matters: a deliberate per-archive assignment is local
 /// evidence of the strongest kind, so a RomM record that disagrees with it produces
@@ -121,7 +121,7 @@ impl ArtworkAvailability {
         match self {
             Self::None => Some("No artwork recorded. A labelled placeholder is shown."),
             Self::PublicOnly => Some(
-                "Public artwork reference recorded, but ArchiveFS does not fetch from public \
+                "Public artwork reference recorded, but EmuWiz does not fetch from public \
                  hosts.",
             ),
             Self::Fetchable => None,
@@ -252,7 +252,7 @@ impl GameIdentityPanel {
         }
         if let Some(platform) = &self.local_platform {
             rows.push(CardRow {
-                label: "ArchiveFS platform".to_string(),
+                label: "EmuWiz platform".to_string(),
                 value: platform.clone(),
             });
         }
@@ -479,7 +479,7 @@ fn verify_blocker(presence: LocalPresence, candidate: Option<&CandidateView>) ->
         }
         LocalPresence::Other => {
             return Some(
-                "This is not a regular file - a device, socket or pipe - and ArchiveFS will not \
+                "This is not a regular file - a device, socket or pipe - and EmuWiz will not \
                  read it."
                     .to_string(),
             );
@@ -523,7 +523,7 @@ fn summary_for(
             "This file was hashed and its hash matched what RomM published.".to_string()
         }
         ExternalVerification::StrongExternal => {
-            "RomM's record agrees with everything ArchiveFS can check without reading the file. \
+            "RomM's record agrees with everything EmuWiz can check without reading the file. \
              The bytes themselves have not been compared."
                 .to_string()
         }
@@ -795,7 +795,7 @@ pub(crate) struct CoverOutcome {
 /// Decodes a cached thumbnail into pixels, on the worker.
 ///
 /// PNG only, which is the only thing the artwork cache writes. The read is bounded
-/// because a file in ArchiveFS's own cache directory is still a file on disk.
+/// because a file in EmuWiz's own cache directory is still a file on disk.
 pub(crate) fn decode_thumbnail(
     thumbnail: &CachedThumbnail,
     from_cache: bool,
@@ -1133,9 +1133,9 @@ fn show_candidate_choice(
         ui,
         "More than one RomM record maps here",
         &format!(
-            "{} records translate to this same file. ArchiveFS will not guess which one is right. \
+            "{} records translate to this same file. EmuWiz will not guess which one is right. \
              Choosing one below shows its evidence and changes nothing on disk, in RomM, or in \
-             ArchiveFS's own identity.",
+             EmuWiz's own identity.",
             panel.claimants
         ),
         widgets::StatusTone::Warning,

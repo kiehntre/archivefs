@@ -353,7 +353,7 @@ pub fn load_token_file(path: Option<&Path>) -> Result<RommToken, TokenFileRefusa
 }
 
 /// The default identity root: `<data dir>/identity`, beside the library
-/// database and the other ArchiveFS-owned caches.
+/// database and the other EmuWiz-owned caches.
 pub fn default_identity_root() -> Result<PathBuf, String> {
     let database = crate::database::default_database_path().map_err(|error| error.to_string())?;
     Ok(database

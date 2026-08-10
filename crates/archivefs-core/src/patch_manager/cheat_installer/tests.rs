@@ -13,7 +13,7 @@ use crate::patch_manager::parse_cheat_install_run;
 // ---------------------------------------------------------------------
 // Fixture helpers - every test uses its own temporary directories under
 // `std::env::temp_dir()`; nothing here ever touches a real `$HOME`, a
-// real RetroArch cheat directory, or the live ArchiveFS database.
+// real RetroArch cheat directory, or the live EmuWiz database.
 // ---------------------------------------------------------------------
 
 fn temp_root(name: &str) -> PathBuf {

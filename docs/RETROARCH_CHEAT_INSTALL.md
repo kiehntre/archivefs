@@ -56,7 +56,7 @@ command never installs:
 - **ambiguous matches** - always `skipped_not_eligible`;
 - **unsupported matches** - always `skipped_not_eligible`;
 - **unresolved platforms** - a platform hint that does not resolve through
-  ArchiveFS's own canonical alias table is `skipped_not_eligible` at
+  EmuWiz's own canonical alias table is `skipped_not_eligible` at
   preview time, and would independently be rejected again
   (`failed_unsafe_path`) if it somehow reached this command's own
   destination reconstruction step;
@@ -138,7 +138,7 @@ With `--replace-different`:
 1. The existing destination is re-verified against the hash the preview
    captured, then copied into a **backup** - written the same
    temp-file/`fsync`/verify/atomic-rename way as a new install, under a
-   dedicated ArchiveFS-managed backup directory (never beside the source
+   dedicated EmuWiz-managed backup directory (never beside the source
    or destination files themselves): `<original filename>.<run
    ID>.<previous-content-hash prefix>.bak`, guaranteeing no collision
    between runs or between two different previous contents of the same
@@ -163,7 +163,7 @@ never silently treated as success.
 A real (non-dry-run, confirmed) run writes exactly one journal file -
 the same [`CheatInstallRun`](RETROARCH_CHEAT_INSTALL_RESULT.md) JSON model
 `--json` prints - under a dedicated `cheat-install-runs` directory inside
-the ArchiveFS XDG data directory (`~/.local/share/archivefs/`, alongside
+the EmuWiz XDG data directory (`~/.local/share/archivefs/`, alongside
 the library database; backups live in a sibling `cheat-install-backups`
 directory). The journal is written through a temporary file, `fsync`ed,
 and atomically finalized the same never-clobber way as an installed cheat

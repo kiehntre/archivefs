@@ -316,12 +316,12 @@ const ACTIVITY_PANEL_COLLAPSED_DEFAULT_HEIGHT: f32 = 44.0;
 /// Only used as the very first frame's guess for the "activity_expanded"
 /// panel id, for the same reason as the collapsed default above.
 const ACTIVITY_PANEL_EXPANDED_DEFAULT_HEIGHT: f32 = 220.0;
-const NORMAL_UNMOUNT_FAILURE_SUMMARY: &str = "ArchiveFS could not unmount this archive normally.\n\nA program may still be using files from this mount, or this may indicate that the mount is not responding correctly.";
+const NORMAL_UNMOUNT_FAILURE_SUMMARY: &str = "EmuWiz could not unmount this archive normally.\n\nA program may still be using files from this mount, or this may indicate that the mount is not responding correctly.";
 const NORMAL_UNMOUNT_RECOVERY_GUIDANCE: &str = "Before using Lazy Unmount:\n\n1. Close any emulator, file manager, terminal, media player, or other application that may be using this mount.\n2. Wait a few seconds.\n3. Try Normal Unmount again.\n\nUse Lazy Unmount only when the mount will not release normally.";
 const LAZY_UNMOUNT_WARNING: &str = "Lazy Unmount removes the mount from the visible filesystem immediately, even if a program still has files open.\n\nThis can interrupt applications using the mount and may cause unsaved work or incomplete file operations to be lost.\n\nClose applications using this mount before continuing.\n\nUse this only when Normal Unmount repeatedly fails.";
 const LAZY_UNMOUNT_SUCCESS: &str = "Lazy unmount completed.\n\nThe mount is no longer visible. Some applications may still hold references to files that were open before the unmount. Close and reopen those applications before remounting.";
 const LAZY_CLEANUP_SUCCESS: &str = "Empty mount directories were cleaned safely.";
-const LAZY_CLEANUP_FAILURE: &str = "The mount was detached successfully, but ArchiveFS could not remove one or more empty directories. No non-empty directory was removed.";
+const LAZY_CLEANUP_FAILURE: &str = "The mount was detached successfully, but EmuWiz could not remove one or more empty directories. No non-empty directory was removed.";
 const REMOUNT_GUIDANCE: &str = "Make sure applications that used the previous mount have been closed. Remounting while an application still holds the old mount may cause confusing or stale file access.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -698,7 +698,7 @@ fn main() -> eframe::Result<()> {
     };
 
     eframe::run_native(
-        "ArchiveFS",
+        "EmuWiz",
         options,
         Box::new(|creation_context| {
             Ok(Box::new(ArchiveFsApp::new(
@@ -1778,7 +1778,7 @@ fn gather_doctor_inputs() -> DoctorGathered {
             Ok(config) => Gathered::Ready(assess_mount_root_safety(&config.mount_root)),
             Err(error) => Gathered::Failed(format!("configuration could not be read: {error}")),
         },
-        // Read-only: walks only ArchiveFS's own mount root, never an archive,
+        // Read-only: walks only EmuWiz's own mount root, never an archive,
         // and shares its removability predicate with the remover.
         stale_mount_directories: match &config {
             Ok(config) => match plan_stale_mount_directories(config) {
@@ -1809,7 +1809,7 @@ fn gather_doctor_inputs() -> DoctorGathered {
             Err(error) => Gathered::Failed(format!("source folders could not be listed: {error}")),
         },
         transactions: transactions.clone(),
-        // Free space and mount state for every location ArchiveFS depends on,
+        // Free space and mount state for every location EmuWiz depends on,
         // read from `statvfs` and `/proc/self/mountinfo`. No probe file.
         storage: Gathered::Ready(assess_storage(&storage_resources(
             config.as_ref().ok(),
@@ -2309,7 +2309,7 @@ fn classify_unhealthy_database(health: DatabaseHealth) -> DatabaseLoadError {
         return DatabaseLoadError::Failed {
             message: format!(
                 "This database's schema (version {version}) is newer than this build of \
-                 ArchiveFS supports (version {}). Upgrade ArchiveFS, or remove the database \
+                 EmuWiz supports (version {}). Upgrade EmuWiz, or remove the database \
                  file to rebuild it.",
                 latest_schema_version()
             ),
@@ -2916,7 +2916,7 @@ enum MainView {
     /// applying moves of identified games into a configured master ROM root.
     CanonicalOrganisation,
     /// The registered DAT catalogues: which local DAT files and folders
-    /// ArchiveFS can check a library against. Its own destination for the
+    /// EmuWiz can check a library against. Its own destination for the
     /// same reason Cheat Sources is: it is configuration that outlives any
     /// one archive being worked on.
     DatSources,
@@ -3333,7 +3333,7 @@ fn show_primary_navigation(
 ) -> Option<MainView> {
     let mut clicked_view = None;
     ui.vertical(|ui| {
-        ui.label(egui::RichText::new("ArchiveFS").size(23.0).strong());
+        ui.label(egui::RichText::new("EmuWiz").size(23.0).strong());
         ui.label(egui::RichText::new("Archive library manager").color(theme::muted(ui)));
         ui.add_space(18.0);
         ui.label(
@@ -3401,7 +3401,7 @@ impl ArchiveContext {
     }
 }
 
-/// The one GUI-owned ArchiveFS configuration snapshot.
+/// The one GUI-owned EmuWiz configuration snapshot.
 ///
 /// Rendering is deliberately unable to load this from disk. A failed deliberate
 /// reload keeps the last usable value, while retaining an actionable error for the
@@ -3470,9 +3470,9 @@ impl GuiConfigSnapshot {
             .as_ref()
             .map(|config| config.source_folders.as_slice())
             .ok_or_else(|| {
-                self.last_error.clone().unwrap_or_else(|| {
-                    "ArchiveFS configuration has not been loaded yet.".to_string()
-                })
+                self.last_error
+                    .clone()
+                    .unwrap_or_else(|| "EmuWiz configuration has not been loaded yet.".to_string())
             })
     }
 }
@@ -3665,7 +3665,7 @@ struct ArchiveFsApp {
     /// `ToolsOverlay`'s doc comment.
     tools_overlay: ToolsOverlay,
     show_activity: bool,
-    /// Whether the Help "About ArchiveFS" window is open.
+    /// Whether the Help "About EmuWiz" window is open.
     show_about: bool,
     /// A one-shot signal from the Library menu's "Select all visible" item.
     /// `show_loaded_data` consumes and clears it the same way it already
@@ -3811,7 +3811,7 @@ struct ArchiveFsApp {
     confirm_bulk_platform_action: Option<(Vec<PathBuf>, BulkPlatformActionKind)>,
     focus_bulk_platform_cancel: bool,
     bulk_platform_action_typed_count: String,
-    /// ArchiveFS-owned, upgrade-stable custom artwork directory. `None` is
+    /// EmuWiz-owned, upgrade-stable custom artwork directory. `None` is
     /// possible only when the operating-system data root cannot be resolved.
     custom_platform_artwork_directory: Option<PathBuf>,
     /// Decoded local artwork and failed-decode fingerprints for this
@@ -4561,7 +4561,7 @@ impl ArchiveFsApp {
                     None,
                     ActivityOutcome::Completed,
                     if report.ready_for_actions {
-                        "Diagnostics completed: ArchiveFS is ready."
+                        "Diagnostics completed: EmuWiz is ready."
                     } else {
                         "Diagnostics completed: setup needs attention."
                     },
@@ -5962,7 +5962,7 @@ impl ArchiveFsApp {
                 self.feedback = Some(ActionFeedback {
                     succeeded: false,
                     message: format!(
-                        "RomM was saved, but ArchiveFS could not reload its main configuration: \
+                        "RomM was saved, but EmuWiz could not reload its main configuration: \
                          {error}. The previous in-memory configuration is still in use."
                     ),
                     cleanup: None,
@@ -6078,7 +6078,7 @@ impl ArchiveFsApp {
         if let Err(problem) = source_roots_result {
             widgets::banner(
                 ui,
-                "ArchiveFS configuration unavailable",
+                "EmuWiz configuration unavailable",
                 &format!(
                     "The previous in-memory configuration is being preserved, but this dialog \
                      cannot validate source-folder mappings: {problem}"
@@ -6435,7 +6435,7 @@ impl ArchiveFsApp {
         }
     }
 
-    /// What ArchiveFS itself says the selected archive's platform is.
+    /// What EmuWiz itself says the selected archive's platform is.
     ///
     /// Read from the catalogue the GUI already holds. `manual` is the whole point: it
     /// makes the assignment count as verified local evidence, which is what stops a
@@ -6612,7 +6612,7 @@ impl ArchiveFsApp {
                 self.bsfree_ui = BsFreeGuiState::default();
                 self.feedback = Some(ActionFeedback {
                     succeeded: true,
-                    message: "Removed ArchiveFS's local BSFree source copy only.".to_string(),
+                    message: "Removed EmuWiz's local BSFree source copy only.".to_string(),
                     cleanup: None,
                     warning: None,
                     more_information: None,
@@ -7557,7 +7557,7 @@ impl ArchiveFsApp {
                         warning: None,
                         more_information: normal_unmount_recovery.then(|| {
                             format!(
-                                "{NORMAL_UNMOUNT_RECOVERY_GUIDANCE}\n\nArchiveFS detail: {}",
+                                "{NORMAL_UNMOUNT_RECOVERY_GUIDANCE}\n\nEmuWiz detail: {}",
                                 failure.message
                             )
                         }),
@@ -7892,7 +7892,7 @@ impl ArchiveFsApp {
     /// session. This is what lets a remembered portable Dolphin install
     /// or a remembered Xenia Canary directory be rediscovered
     /// automatically without asking again, since neither adapter has a
-    /// single standard path ArchiveFS can otherwise find on its own.
+    /// single standard path EmuWiz can otherwise find on its own.
     fn seed_explicit_root_from_remembered_profile(&mut self, adapter: &str) {
         let Some(root) = self.remembered_profile_root(adapter) else {
             return;
@@ -9597,7 +9597,7 @@ impl ArchiveFsApp {
         let Some(identity) = pcsx2_identity_for_workflow(workflow) else {
             if let Some(workflow) = self.cheat_workflow.as_mut() {
                 workflow.pcsx2_gamehacking = CheatStepResource::Failed(
-                    "ArchiveFS needs a verified local PCSX2 executable CRC before checking the cached GameHacking.org PS2 catalogue."
+                    "EmuWiz needs a verified local PCSX2 executable CRC before checking the cached GameHacking.org PS2 catalogue."
                         .to_string(),
                 );
             }
@@ -9804,9 +9804,9 @@ impl ArchiveFsApp {
             if let Some(workflow) = self.cheat_workflow.as_mut() {
                 workflow.gamecube_gamehacking = CheatStepResource::Failed(
                     if is_wii {
-                        "ArchiveFS needs a verified local Dolphin Game ID before checking the cached GameHacking.org Wii catalogue."
+                        "EmuWiz needs a verified local Dolphin Game ID before checking the cached GameHacking.org Wii catalogue."
                     } else {
-                        "ArchiveFS needs a verified local Dolphin Game ID before checking the cached GameHacking.org GameCube catalogue."
+                        "EmuWiz needs a verified local Dolphin Game ID before checking the cached GameHacking.org GameCube catalogue."
                     }
                     .to_string(),
                 );
@@ -10253,7 +10253,7 @@ impl ArchiveFsApp {
     }
 
     /// GameHacking.org GameCube removal: stages removal of exactly the
-    /// selected, already-ArchiveFS-managed cheats from the real Dolphin
+    /// selected, already-EmuWiz-managed cheats from the real Dolphin
     /// GameSettings file, reusing the same shared preview/apply/rollback
     /// pipeline as install.
     fn start_gamecube_gamehacking_removal_preview(&mut self) {
@@ -11741,7 +11741,7 @@ impl ArchiveFsApp {
         }
         // Dolphin: try the local catalogue/cache first, synchronously and
         // read-only - never gated behind `cfg!(test)` since it never spawns
-        // a thread or touches the network, only ArchiveFS's own cache
+        // a thread or touches the network, only EmuWiz's own cache
         // files (which simply won't exist under `cargo test`, so this is a
         // fast no-op there exactly like every other "no catalogue" case).
         // Per the Dolphin cheat catalogue design, if that finds nothing,
@@ -13085,7 +13085,7 @@ impl ArchiveFsApp {
         let Some(root) = self.custom_platform_artwork_directory.clone() else {
             self.platform_artwork_manager.message = Some((
                 false,
-                "ArchiveFS could not resolve its local data directory.".to_owned(),
+                "EmuWiz could not resolve its local data directory.".to_owned(),
             ));
             return;
         };
@@ -13264,7 +13264,7 @@ impl ArchiveFsApp {
             self.start_bsfree_operation(context.clone(), BsFreeOperation::LoadStatus);
         }
         // Only once the Sources page is actually open, and only local reads - so
-        // starting ArchiveFS still makes no network request of any kind.
+        // starting EmuWiz still makes no network request of any kind.
         if self.view == MainView::Sources
             && self.romm_snapshot.is_none()
             && self.romm_operation.is_none()
@@ -13424,7 +13424,7 @@ impl ArchiveFsApp {
                                 egui::Button::new("Refresh"),
                             )
                             .on_hover_text(
-                                "Refresh ArchiveFS's current view of your files without running a full scan.",
+                                "Refresh EmuWiz's current view of your files without running a full scan.",
                             )
                             .clicked()
                         {
@@ -13456,7 +13456,7 @@ impl ArchiveFsApp {
                         }
                         if ui
                             .button("Doctor checks")
-                            .on_hover_text("Run the read-only Doctor scan of this ArchiveFS installation.")
+                            .on_hover_text("Run the read-only Doctor scan of this EmuWiz installation.")
                             .clicked()
                         {
                             self.tools_overlay = ToolsOverlay::DoctorChecks;
@@ -13464,7 +13464,7 @@ impl ArchiveFsApp {
                         }
                         if ui
                             .button("Platform Aliases")
-                            .on_hover_text("Review the folder and filename aliases ArchiveFS uses to recognise platforms.")
+                            .on_hover_text("Review the folder and filename aliases EmuWiz uses to recognise platforms.")
                             .clicked()
                         {
                             self.tools_overlay = ToolsOverlay::PlatformAliases;
@@ -13494,7 +13494,7 @@ impl ArchiveFsApp {
                         }
                     });
                     ui.menu_button("Help", |ui| {
-                        if ui.button("About ArchiveFS").clicked() {
+                        if ui.button("About EmuWiz").clicked() {
                             self.show_about = true;
                             ui.close();
                         }
@@ -13883,7 +13883,7 @@ impl ArchiveFsApp {
                         ui,
                         crate::ui::icons::SOURCES,
                         "Sources",
-                        "Manage the configured folders ArchiveFS scans for archives, and keep the trusted cheat database up to date.",
+                        "Manage the configured folders EmuWiz scans for archives, and keep the trusted cheat database up to date.",
                     );
                     show_sources_overview(
                         ui,
@@ -13955,7 +13955,7 @@ impl ArchiveFsApp {
                         ui,
                         "Database and sources",
                         Some(
-                            "Download, update, or verify the trusted cheat database ArchiveFS uses for cheat setup.",
+                            "Download, update, or verify the trusted cheat database EmuWiz uses for cheat setup.",
                         ),
                     );
                     let catalogue_action = show_retroarch_catalogue_manager(
@@ -14580,7 +14580,7 @@ impl ArchiveFsApp {
                         ui,
                         crate::ui::icons::CHECK,
                         "Check Library",
-                        "Find problems with your ArchiveFS setup and library. Running it changes nothing.",
+                        "Find problems with your EmuWiz setup and library. Running it changes nothing.",
                     );
                     let action = show_doctor_page(
                         ui,
@@ -14838,7 +14838,7 @@ impl ArchiveFsApp {
                         ui.vertical_centered(|ui| {
                             ui.add_space(80.0);
                             ui.spinner();
-                            ui.heading("Loading ArchiveFS data...");
+                            ui.heading("Loading EmuWiz data...");
                             ui.label("Scanning runs in the background.");
                         });
                         // Requirement 1: show cached library rows before the
@@ -14940,7 +14940,7 @@ impl ArchiveFsApp {
                             ui.add_space(80.0);
                             ui.colored_label(
                                 ui.visuals().error_fg_color,
-                                "Could not load ArchiveFS",
+                                "Could not load EmuWiz",
                             );
                             ui.label(error);
                             ui.add_space(8.0);
@@ -15407,7 +15407,7 @@ fn describe_platform_assignment(platform: Option<&str>, source: Option<&str>) ->
 /// core change that adds a real per-entry reason only has to update the
 /// call sites below, not invent new copy. See docs/GUI_SIMPLIFICATION.md
 /// for the core API shape that would unlock per-entry reasons.
-const UNKNOWN_PLATFORM_EXPLANATION: &str = "ArchiveFS checks the filename, title, and folder \
+const UNKNOWN_PLATFORM_EXPLANATION: &str = "EmuWiz checks the filename, title, and folder \
     path against known platform names and folder aliases. When none of those match, the \
     platform is left Unknown rather than guessed. Assign a platform manually below, or add a \
     folder alias in Sources so future scans recognize it automatically.";
@@ -15908,7 +15908,7 @@ fn show_setup_diagnostics(
 ) -> Option<DiagnosticsUiAction> {
     let mut action = None;
     ui.heading("Setup / Diagnostics");
-    ui.label("Check configuration, folders, and required system tools before using ArchiveFS.");
+    ui.label("Check configuration, folders, and required system tools before using EmuWiz.");
     ui.add_space(8.0);
     if let Some(error) = refresh_error {
         ui.colored_label(
@@ -15942,22 +15942,22 @@ fn show_setup_diagnostics(
     let DiagnosticsState::Ready { report, .. } = state else {
         ui.spinner();
         ui.label("Running diagnostics in the background...");
-        ui.add_enabled(false, egui::Button::new("Continue to ArchiveFS"));
+        ui.add_enabled(false, egui::Button::new("Continue to EmuWiz"));
         return None;
     };
     if report.config_missing && report.config_path_error.is_none() {
         if missing_config_is_first_run(config_previously_confirmed) {
             egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.strong("Welcome to ArchiveFS");
+                ui.strong("Welcome to EmuWiz");
                 ui.label(
-                    "ArchiveFS is not configured yet - that is expected on a fresh install, not \
+                    "EmuWiz is not configured yet - that is expected on a fresh install, not \
                      an error. Select Create Starter Config below to begin, then add a source \
                      folder on the Sources page.",
                 );
                 ui.label(
                     "DAT Sources and Cheat Sources live on their own pages and start empty; \
                      both are optional. RomM is optional too. Audits are always read-only: \
-                     ArchiveFS will not rename, move or delete any ROM without a later, \
+                     EmuWiz will not rename, move or delete any ROM without a later, \
                      explicit, reviewed action.",
                 );
             });
@@ -15970,7 +15970,7 @@ fn show_setup_diagnostics(
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.colored_label(theme::WARNING, "Configuration file is no longer found");
                 ui.label(
-                    "ArchiveFS found your configuration earlier in this session, and it is no \
+                    "EmuWiz found your configuration earlier in this session, and it is no \
                      longer present. If you did not remove it intentionally, check whether it \
                      was deleted, moved, or is on a drive that is no longer mounted, before \
                      creating a new one below.",
@@ -16032,7 +16032,7 @@ fn show_setup_diagnostics(
         if ui
             .add_enabled(
                 !action_running && diagnostics_state_can_continue(state),
-                egui::Button::new("Continue to ArchiveFS"),
+                egui::Button::new("Continue to EmuWiz"),
             )
             .clicked()
         {
@@ -16316,7 +16316,7 @@ enum DoctorPageAction {
 ///
 /// Shows severity counts, findings grouped by category, and an evidence
 /// panel for the selected finding. Where a repair already exists elsewhere
-/// in ArchiveFS the finding *says so in words* and stops there - Stage 1A
+/// in EmuWiz the finding *says so in words* and stops there - Stage 1A
 /// exposes no repair control at all.
 /// Draws the whole Doctor page. The parameter list is long because the page is
 /// one cohesive screen; the mode flag (Gamer vs Advanced) is the only thing
@@ -16838,7 +16838,7 @@ fn show_doctor_repair_review(
                 ui.add(egui::Label::new(format!("Affected resource: {affected}")).wrap());
             }
             None => {
-                ui.label("Affected resource: this ArchiveFS installation");
+                ui.label("Affected resource: this EmuWiz installation");
             }
         }
         ui.add_space(6.0);
@@ -17017,7 +17017,7 @@ fn show_doctor_finding_details(ui: &mut egui::Ui, finding: &Finding, key: &str) 
     ));
 }
 
-/// What this scan actually covered, what it could not, and what ArchiveFS
+/// What this scan actually covered, what it could not, and what EmuWiz
 /// does not check at all yet. Without this a clean result would read as
 /// "everything is fine", which would be untrue.
 fn show_doctor_coverage(ui: &mut egui::Ui, scan: &DoctorScan) {
@@ -17052,7 +17052,7 @@ fn show_doctor_coverage(ui: &mut egui::Ui, scan: &DoctorScan) {
                 }
             }
             ui.add_space(6.0);
-            ui.label(egui::RichText::new("Not checked by ArchiveFS yet").strong());
+            ui.label(egui::RichText::new("Not checked by EmuWiz yet").strong());
             ui.weak(
                 "These are not covered by the result above, so a healthy result does not mean they are fine.",
             );
@@ -17119,7 +17119,7 @@ const DOCTOR_READ_ONLY_NOTICE: &str = "This scan is read-only: it inspects confi
 fn doctor_scan_report_text(outcome: &DoctorScanOutcome) -> String {
     let scan = &outcome.scan;
     let mut lines = vec![
-        "ArchiveFS Doctor - read-only diagnostic scan".to_string(),
+        "EmuWiz Doctor - read-only diagnostic scan".to_string(),
         format!(
             "Last run: {}",
             format_unix_timestamp_utc(outcome.finished_at_unix_seconds)
@@ -17183,7 +17183,7 @@ fn doctor_scan_report_text(outcome: &DoctorScanOutcome) -> String {
         ));
     }
     lines.push(String::new());
-    lines.push("Not checked by ArchiveFS yet:".to_string());
+    lines.push("Not checked by EmuWiz yet:".to_string());
     for deferred in scan.deferred {
         lines.push(format!("  {} - {}", deferred.name, deferred.reason));
     }
@@ -17226,7 +17226,7 @@ fn doctor_summary_text(report: &DoctorReport) -> String {
 /// "Suggested action" row).
 fn doctor_report_text(report: &DoctorReport) -> String {
     let mut lines = vec![
-        format!("ArchiveFS doctor report"),
+        format!("EmuWiz doctor report"),
         format!("Config: {}", report.config_path.display()),
         doctor_summary_text(report),
         String::new(),
@@ -17252,7 +17252,7 @@ fn show_doctor_checks_panel(ui: &mut egui::Ui, doctor: Option<&DoctorReport>) {
         widgets::empty_state(
             ui,
             "Health checks unavailable",
-            "Scan the library before running the full ArchiveFS health report.",
+            "Scan the library before running the full EmuWiz health report.",
             None,
         );
         return;
@@ -18888,7 +18888,7 @@ fn show_dolphin_catalogue_manager(
             if let Ok(root) = default_dolphin_catalogue_cache_root() {
                 ui.label(format!("Managed destination: {}", root.display()));
             }
-            ui.label("This only affects ArchiveFS's own catalogue cache. Your Dolphin profile and installed codes are never touched by this action.");
+            ui.label("This only affects EmuWiz's own catalogue cache. Your Dolphin profile and installed codes are never touched by this action.");
             ui.horizontal(|ui| {
                 if ui.button("Confirm").clicked() {
                     action = Some(DolphinCatalogueManagerAction::Confirm);
@@ -18909,7 +18909,7 @@ fn show_dolphin_catalogue_manager(
             .resizable(false)
             .open(&mut open)
             .show(ui.ctx(), |ui| {
-                ui.label("This removes only ArchiveFS's own catalogue cache.");
+                ui.label("This removes only EmuWiz's own catalogue cache.");
                 ui.label("It never removes installed Dolphin codes and never alters your Dolphin User/GameSettings files.");
                 ui.horizontal(|ui| {
                     if ui.button("Remove").clicked() {
@@ -19086,7 +19086,7 @@ fn show_sources_page(
     widgets::section_header(
         ui,
         "Configured sources",
-        Some("Manage the configured folders ArchiveFS scans for archives."),
+        Some("Manage the configured folders EmuWiz scans for archives."),
     );
 
     widgets::card(ui, |ui| {
@@ -19355,7 +19355,7 @@ fn show_sources_page(
             .resizable(false)
             .open(&mut open)
             .show(ui.ctx(), |ui| {
-                ui.label("Add an existing, readable directory as an ArchiveFS source folder.");
+                ui.label("Add an existing, readable directory as an EmuWiz source folder.");
                 ui.horizontal(|ui| {
                     ui.label("Path:");
                     show_text_edit_with_context_menu(
@@ -19418,12 +19418,12 @@ fn show_sources_page(
         let mut confirmed = false;
         let mut cancel = false;
         let mut keep_catalogue = dialog.keep_catalogue;
-        egui::Window::new("Remove this source from ArchiveFS?")
+        egui::Window::new("Remove this source from EmuWiz?")
             .collapsible(false)
             .resizable(false)
             .open(&mut open)
             .show(ui.ctx(), |ui| {
-                ui.label("ArchiveFS will not delete the folder or any files inside it.");
+                ui.label("EmuWiz will not delete the folder or any files inside it.");
                 ui.add_space(4.0);
                 ui.strong(dialog.path.display().to_string());
                 ui.add_space(4.0);
@@ -19546,12 +19546,12 @@ fn show_bsfree_source_card(
             ui.label("Maintainer: Andrew Mackrodt");
             ui.label("Origin: Historical bsfree.org database");
             ui.label("Distribution status: Optional third-party download");
-            ui.label("Verification: Historical community data, not verified by ArchiveFS");
+            ui.label("Verification: Historical community data, not verified by EmuWiz");
         });
         widgets::banner(
             ui,
             "Database-content licence not established",
-            "The upstream application code is MIT, but ArchiveFS does not claim that licence covers the historical cheat dataset.",
+            "The upstream application code is MIT, but EmuWiz does not claim that licence covers the historical cheat dataset.",
             widgets::StatusTone::Warning,
         );
 
@@ -19686,7 +19686,7 @@ fn show_bsfree_source_card(
             widgets::banner(
                 ui,
                 "Download optional third-party database?",
-                "Approximately 283 MiB. Network access is required. The database-content licence is not established, it will be stored in ArchiveFS's data directory, and no cheats will be installed.",
+                "Approximately 283 MiB. Network access is required. The database-content licence is not established, it will be stored in EmuWiz's data directory, and no cheats will be installed.",
                 widgets::StatusTone::Warning,
             );
             ui.horizontal(|ui| {
@@ -19709,8 +19709,8 @@ fn show_bsfree_source_card(
         if state.remove_confirm {
             widgets::banner(
                 ui,
-                "Remove ArchiveFS's local BSFree copy?",
-                "Only the BSFree database and ArchiveFS-owned BSFree metadata are removed. Emulator profiles and other cheat providers are untouched.",
+                "Remove EmuWiz's local BSFree copy?",
+                "Only the BSFree database and EmuWiz-owned BSFree metadata are removed. Emulator profiles and other cheat providers are untouched.",
                 widgets::StatusTone::Warning,
             );
             ui.horizontal(|ui| {
@@ -19757,7 +19757,7 @@ fn bsfree_compatibility_label(compatibility: DeviceFormatCompatibility) -> &'sta
 /// hex-pair codes classify as installable through the existing Dolphin
 /// adapter (Gecko-equivalent or native Action Replay); every other platform
 /// and every unsupported format stays reference-only. This never claims
-/// ArchiveFS has verified the BSFree database - it states only which formats
+/// EmuWiz has verified the BSFree database - it states only which formats
 /// an existing adapter can represent.
 fn bsfree_code_capability(
     cheat: &BsFreeCheat,
@@ -19829,7 +19829,7 @@ fn show_bsfree_game_browser(
             } else {
                 widgets::status_badge(ui, "Browse only", widgets::StatusTone::Pending);
                 ui.label(
-                    "Cheats here are for reference: they can be viewed and copied, but ArchiveFS \
+                    "Cheats here are for reference: they can be viewed and copied, but EmuWiz \
                      does not install them for this platform.",
                 );
             }
@@ -20269,7 +20269,7 @@ fn show_library_views_page(
         "Views",
         Some(
             "Organised, symlink-based folder trees that point at your existing archives. \
-             ArchiveFS never moves, copies, renames, or deletes an original archive file.",
+             EmuWiz never moves, copies, renames, or deletes an original archive file.",
         ),
     );
     ui.add_space(2.0);
@@ -20667,7 +20667,7 @@ fn show_library_views_page(
             .open(&mut open)
             .show(ui.ctx(), |ui| {
                 ui.label(
-                    "ArchiveFS will remove only the managed symlinks recorded for this view. \
+                    "EmuWiz will remove only the managed symlinks recorded for this view. \
                      Original archive files are never touched.",
                 );
                 ui.add_space(4.0);
@@ -20721,7 +20721,7 @@ fn show_about_window(
     mount_root: Option<&Path>,
     clipboard: &mut dyn ClipboardBackend,
 ) {
-    egui::Window::new("About ArchiveFS")
+    egui::Window::new("About EmuWiz")
         .open(open)
         .resizable(false)
         .collapsible(false)
@@ -20735,7 +20735,7 @@ fn system_information_text(
     mount_root: Option<&str>,
 ) -> String {
     format!(
-        "ArchiveFS {}\nOS: {} ({})\nDesktop: {}\nSession: {}\nDatabase schema: v{}\nDatabase path: {}\nConfiguration path: {}\nMount root: {}",
+        "EmuWiz {}\nOS: {} ({})\nDesktop: {}\nSession: {}\nDatabase schema: v{}\nDatabase path: {}\nConfiguration path: {}\nMount root: {}",
         env!("CARGO_PKG_VERSION"),
         std::env::consts::OS,
         std::env::consts::ARCH,
@@ -20758,7 +20758,7 @@ fn show_about_contents(
     widgets::page_header_with_icon(
         ui,
         crate::ui::icons::ABOUT,
-        "ArchiveFS",
+        "EmuWiz",
         "A Linux archive library and safe mount manager.",
     );
 
@@ -20847,7 +20847,7 @@ fn mount_validation_label(state: MountState) -> &'static str {
         MountState::Pending => "Ready to mount",
         MountState::Mounted => "Already mounted — will be skipped",
         MountState::MountPathExists => "Destination already exists — will be skipped",
-        MountState::NotMountable => "Loose ROM · no ArchiveFS mount required",
+        MountState::NotMountable => "Loose ROM · no EmuWiz mount required",
     }
 }
 
@@ -22355,7 +22355,7 @@ struct CheatWorkflowState {
     selected_dolphin_profile_id: Option<String>,
     /// An optional additional Dolphin configuration directory to scan,
     /// typed by the user - covers portable/AppImage installs, which have
-    /// no fixed native or Flatpak path ArchiveFS can discover on its own.
+    /// no fixed native or Flatpak path EmuWiz can discover on its own.
     /// Never auto-populated; rescanning without it drops nothing already
     /// found under the standard native/Flatpak locations.
     dolphin_explicit_root: String,
@@ -22397,7 +22397,7 @@ struct CheatWorkflowState {
     dolphin_show_exact_changes: bool,
     selected_xenia_profile_id: Option<String>,
     /// An explicit Xenia Canary directory typed by the user - the only
-    /// way ArchiveFS ever learns of a Xenia install, since it has no
+    /// way EmuWiz ever learns of a Xenia install, since it has no
     /// single standard location.
     xenia_explicit_root: String,
     xenia_provider_request: Option<XeniaProviderRequestKey>,
@@ -22758,7 +22758,7 @@ fn wii_match_state(
 struct GeneratedPcsx2Install {
     staging_root: PathBuf,
     /// Present only when a legacy CRC-only file was found with
-    /// ArchiveFS-managed cheats that needed consolidating into the
+    /// EmuWiz-managed cheats that needed consolidating into the
     /// serial+CRC file this PCSX2 build actually reads. Applied as its own
     /// chained operation, with its own journal and independent Undo (via
     /// the generic History & Logs rollback flow), immediately after the
@@ -22891,7 +22891,7 @@ impl CheatSourceMode {
     fn label(self) -> &'static str {
         match self {
             Self::ExistingRetroArchLibrary => "Existing RetroArch library",
-            Self::ArchiveFsTrustedCatalogue => "ArchiveFS cached catalogue",
+            Self::ArchiveFsTrustedCatalogue => "EmuWiz cached catalogue",
         }
     }
 }
@@ -23366,7 +23366,7 @@ fn dolphin_identity_unavailable_detail(report: &GameIdentityReport) -> String {
             "{format_label} is recognised as a GameCube/Wii image, but its disc header could not be verified. The file may be malformed or use an unrecognised layout."
         ),
         Some(IdentityStatus::Deferred) => format!(
-            "{format_label} is recognised as a GameCube/Wii image, but ArchiveFS cannot yet read an exact Game ID from it without decompressing the full image. Cheats cannot be matched safely without one."
+            "{format_label} is recognised as a GameCube/Wii image, but EmuWiz cannot yet read an exact Game ID from it without decompressing the full image. Cheats cannot be matched safely without one."
         ),
         Some(IdentityStatus::Missing) => {
             format!("{format_label} is recognised, but the disc-header block is not present in it.")
@@ -23413,7 +23413,7 @@ fn dolphin_provider_fetch_status_label(status: GeckoProviderFetchStatus) -> &'st
 /// the milestone specifies. Every adapter maps its own technical state
 /// into this same small vocabulary so a first-time user never has to
 /// learn provider/profile/identity terminology just to tell whether
-/// ArchiveFS found anything yet.
+/// EmuWiz found anything yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BeginnerCheatStatus {
     FindingCompatibleCheats,
@@ -23439,7 +23439,7 @@ enum BeginnerCheatStatus {
     UsingSavedResultsWhileOffline,
     /// Identity inspection reached a final result, but it never produced a
     /// `Verified` exact game ID (malformed image, or a recognised format
-    /// ArchiveFS cannot yet decode without extracting the full image) -
+    /// EmuWiz cannot yet decode without extracting the full image) -
     /// a terminal state, never re-attempted automatically, so the page
     /// never spins on "Finding compatible cheats" forever.
     IdentityUnavailable {
@@ -23505,7 +23505,7 @@ fn dolphin_beginner_status(workflow: &CheatWorkflowState) -> BeginnerCheatStatus
         return wii_gamehacking_beginner_status(workflow);
     }
     // Identity has reached a final result but never produced a `Verified`
-    // exact game ID (malformed image, or a recognised format ArchiveFS
+    // exact game ID (malformed image, or a recognised format EmuWiz
     // cannot yet decode - see `dolphin_identity_unavailable_detail`).
     // `start_dolphin_provider_fetch`/`try_resolve_dolphin_provider_from_local_sources`
     // both require a verified game ID before doing anything, so without
@@ -23830,12 +23830,12 @@ enum CheatWorkflowAction {
 }
 
 const MODS_UNAVAILABLE_BODY: &str = "This workspace is reserved for future verified emulator-specific adapters, including patches, texture packs, widescreen fixes, and frame-rate patches. No mod workflow is available yet.";
-const LOCAL_INSPECTION_PRIVACY_COPY: &str = "Trusted catalogue archives are validated locally on this device for unsafe paths, special entries, resource-limit violations, and unexpected structure. Scan results, filenames, file contents, hashes, and metadata are not sent to the ArchiveFS developers or any third party. General local or community-source inspection is planned and is not active yet.";
-const IMPORT_CONSENT_COPY: &str = "Only import cheats or mods from sources you trust. ArchiveFS performs local structural and format checks where an implemented adapter provides them, but it is not an antivirus scanner.";
-const ETHICAL_USE_COPY: &str = "ArchiveFS is intended for preservation, accessibility, personal customization, and legitimate interoperability. It must not be used to bypass copy protection, licensing systems, access controls, or other technical protections. Game developers, artists, musicians, writers, testers, and publishers invest substantial effort in creating games; supporting legitimate releases helps future games, updates, and preservation efforts.";
-const USER_RESPONSIBILITY_COPY: &str = "You are responsible for ensuring that you have the right to use, modify, import, and distribute cheats, patches, mods, textures, or related files. ArchiveFS does not verify ownership or licensing.";
+const LOCAL_INSPECTION_PRIVACY_COPY: &str = "Trusted catalogue archives are validated locally on this device for unsafe paths, special entries, resource-limit violations, and unexpected structure. Scan results, filenames, file contents, hashes, and metadata are not sent to the EmuWiz developers or any third party. General local or community-source inspection is planned and is not active yet.";
+const IMPORT_CONSENT_COPY: &str = "Only import cheats or mods from sources you trust. EmuWiz performs local structural and format checks where an implemented adapter provides them, but it is not an antivirus scanner.";
+const ETHICAL_USE_COPY: &str = "EmuWiz is intended for preservation, accessibility, personal customization, and legitimate interoperability. It must not be used to bypass copy protection, licensing systems, access controls, or other technical protections. Game developers, artists, musicians, writers, testers, and publishers invest substantial effort in creating games; supporting legitimate releases helps future games, updates, and preservation efforts.";
+const USER_RESPONSIBILITY_COPY: &str = "You are responsible for ensuring that you have the right to use, modify, import, and distribute cheats, patches, mods, textures, or related files. EmuWiz does not verify ownership or licensing.";
 const SCANNING_DISABLED_WARNING: &str =
-    "Turning this off does not make unsafe files safe. It only stops ArchiveFS checking them.";
+    "Turning this off does not make unsafe files safe. It only stops EmuWiz checking them.";
 
 fn import_trust_label(state: ImportTrustState) -> &'static str {
     match state {
@@ -23858,7 +23858,7 @@ fn import_source_presentation(kind: ImportSourceKind) -> (&'static str, &'static
         ImportSourceKind::EmulatorManagedLibrary => {
             ("Existing emulator-managed library", "Existing content")
         }
-        ImportSourceKind::ArchiveFsTrustedCatalogue => ("ArchiveFS trusted catalogue", "Available"),
+        ImportSourceKind::ArchiveFsTrustedCatalogue => ("EmuWiz trusted catalogue", "Available"),
         ImportSourceKind::LocalUnverifiedSource => ("Local unverified source", "Planned"),
         ImportSourceKind::RemoteUnverifiedSource => ("Future remote unverified source", "Planned"),
     }
@@ -24261,7 +24261,7 @@ fn show_cheats_mods_safety_information(ui: &mut egui::Ui) {
                     ui.label("No general local or community-source scanner or setting is active yet.");
                 });
                 ui.label(LOCAL_INSPECTION_PRIVACY_COPY);
-                ui.label("ArchiveFS never silently rewrites, deletes, or sanitizes an original import source. A future sanitized import would be a separate copy with an exclusion report.");
+                ui.label("EmuWiz never silently rewrites, deletes, or sanitizes an original import source. A future sanitized import would be a separate copy with an exclusion report.");
                 ui.label(IMPORT_CONSENT_COPY);
                 ui.label(format!("Future scanning control: {SCANNING_DISABLED_WARNING}"));
                 ui.add_space(6.0);
@@ -24278,7 +24278,7 @@ fn show_cheats_mods_safety_information(ui: &mut egui::Ui) {
                         );
                     }
                 });
-                ui.label("Trusted means a reviewed adapter and known provenance. Unverified means not reviewed by ArchiveFS; it does not mean malicious. Blocked is reserved for a concrete technical danger or adapter incompatibility.");
+                ui.label("Trusted means a reviewed adapter and known provenance. Unverified means not reviewed by EmuWiz; it does not mean malicious. Blocked is reserved for a concrete technical danger or adapter incompatibility.");
                 ui.add_space(6.0);
                 ui.label(ETHICAL_USE_COPY);
                 ui.label(USER_RESPONSIBILITY_COPY);
@@ -24495,7 +24495,7 @@ fn platform_is_dolphin(platform: Option<&str>) -> bool {
 /// Library and Mount. Derived purely from live per-archive platform
 /// strings (never a fixed list), so a canonical platform the registry
 /// recognises but that has zero archives never clutters the strip, and a
-/// platform with real archives is never hidden just because ArchiveFS has
+/// platform with real archives is never hidden just because EmuWiz has
 /// no cheat adapter for it. `None` (no assigned platform) counts as
 /// Unknown, matching `persisted_archive_has_unknown_platform`.
 struct DetectedPlatformCounts {
@@ -24606,9 +24606,7 @@ fn show_pcsx2_workflow(
     widgets::section_header(
         ui,
         "Stage 1 · PCSX2 profile",
-        Some(
-            "ArchiveFS selects automatically only when exactly one discovered profile is eligible.",
-        ),
+        Some("EmuWiz selects automatically only when exactly one discovered profile is eligible."),
     );
     match profiles {
         Pcsx2ProfilesState::NotScanned => {
@@ -24684,7 +24682,7 @@ fn show_pcsx2_workflow(
                         widgets::banner(
                             ui,
                             "PCSX2 cheats directory could not be confidently identified",
-                            "ArchiveFS will not guess a cheats directory for this profile. Choose a different profile, or resolve the profile's blockers above, before installing.",
+                            "EmuWiz will not guess a cheats directory for this profile. Choose a different profile, or resolve the profile's blockers above, before installing.",
                             widgets::StatusTone::Blocked,
                         );
                     }
@@ -24722,7 +24720,7 @@ fn show_pcsx2_workflow(
                 ("Changed · No", widgets::StatusTone::Info),
             ],
         );
-        ui.label("ArchiveFS inspects PNACH structure locally. It never invokes PCSX2, evaluates directives, or claims that structural inspection proves content is malware-free.");
+        ui.label("EmuWiz inspects PNACH structure locally. It never invokes PCSX2, evaluates directives, or claims that structural inspection proves content is malware-free.");
     });
     let Some(selected_profile_id) = workflow.selected_pcsx2_profile_id.as_deref() else {
         widgets::banner(
@@ -24843,7 +24841,7 @@ fn show_dolphin_beginner_summary(
     match &status {
         BeginnerCheatStatus::CouldNotCheckForCheats { .. } => {
             ui.label(
-                "ArchiveFS could not load compatible cheats. Check your connection and try again.",
+                "EmuWiz could not load compatible cheats. Check your connection and try again.",
             );
             if widgets::action_button(ui, "Try again", widgets::ActionStyle::Secondary, true)
                 .clicked()
@@ -24860,7 +24858,7 @@ fn show_dolphin_beginner_summary(
         }
         BeginnerCheatStatus::EmulatorSetupNeeded => {
             ui.label(
-                "ArchiveFS could not resolve one Dolphin profile safely. Open Details to select a discovered profile or provide a custom user directory.",
+                "EmuWiz could not resolve one Dolphin profile safely. Open Details to select a discovered profile or provide a custom user directory.",
             );
         }
         BeginnerCheatStatus::FindingCompatibleCheats => {
@@ -25012,7 +25010,7 @@ fn show_dolphin_profile_chooser(
     widgets::card(ui, |ui| {
         ui.strong("Select the Dolphin profile to use");
         ui.label(format!(
-            "ArchiveFS found {} credible Dolphin profile{}.",
+            "EmuWiz found {} credible Dolphin profile{}.",
             eligible.len(),
             if eligible.len() == 1 { "" } else { "s" }
         ));
@@ -25086,9 +25084,7 @@ fn show_beginner_install_confirm(
             "enhancements"
         };
         ui.strong(format!("Install {count} {noun} in {emulator_name}?"));
-        ui.label(
-            "ArchiveFS will back up the existing settings and you can undo this change later.",
-        );
+        ui.label("EmuWiz will back up the existing settings and you can undo this change later.");
         if replacement_required {
             ui.checkbox(
                 replacement_approved,
@@ -25249,7 +25245,7 @@ fn show_dolphin_workflow_details(
         ui,
         "Stage 1 · Dolphin profile",
         Some(
-            "A unique running Dolphin profile wins. Otherwise ArchiveFS selects automatically only when exactly one credible profile exists.",
+            "A unique running Dolphin profile wins. Otherwise EmuWiz selects automatically only when exactly one credible profile exists.",
         ),
     );
     match profiles {
@@ -25347,7 +25343,7 @@ fn show_dolphin_workflow_details(
                 ("Changed · No", widgets::StatusTone::Info),
             ],
         );
-        ui.label("ArchiveFS inspects INI structure locally. It never invokes Dolphin, evaluates codes, follows referenced mod paths, or claims that structural inspection proves content is malware-free.");
+        ui.label("EmuWiz inspects INI structure locally. It never invokes Dolphin, evaluates codes, follows referenced mod paths, or claims that structural inspection proves content is malware-free.");
     });
     let Some(selected_profile_id) = workflow.selected_dolphin_profile_id.as_deref() else {
         widgets::banner(
@@ -25455,9 +25451,7 @@ fn show_dolphin_external_provider(
     widgets::section_header(
         ui,
         "Stage 2 · Find matching cheats",
-        Some(
-            "ArchiveFS looks up the exact GameCube ID in Dolphin's upstream GameSettings dataset.",
-        ),
+        Some("EmuWiz looks up the exact GameCube ID in Dolphin's upstream GameSettings dataset."),
     );
     widgets::card(ui, |ui| {
         widgets::status_rows(
@@ -25756,7 +25750,7 @@ fn eligible_xenia_profile_ids(discovery: &XeniaProfileDiscovery) -> Vec<&str> {
 }
 
 /// Maps Xenia's own discovery result into the adapter-agnostic shape
-/// `select_emulator_profile` understands. Every Xenia profile ArchiveFS
+/// `select_emulator_profile` understands. Every Xenia profile EmuWiz
 /// can discover is already an explicit, caller-supplied directory (there
 /// is no single native Xenia Canary path to guess), so none of them are
 /// singled out as "the portable one" - `is_portable` is left `false` for
@@ -25829,7 +25823,7 @@ fn show_xenia_beginner_summary(
     match &status {
         BeginnerCheatStatus::CouldNotCheckForCheats { .. } => {
             ui.label(
-                "ArchiveFS could not load compatible patches. Check your connection and try again.",
+                "EmuWiz could not load compatible patches. Check your connection and try again.",
             );
             if widgets::action_button(ui, "Try again", widgets::ActionStyle::Secondary, true)
                 .clicked()
@@ -25841,7 +25835,7 @@ fn show_xenia_beginner_summary(
         }
         BeginnerCheatStatus::EmulatorSetupNeeded => {
             ui.label(
-                "ArchiveFS could not find a Xenia Canary installation to use yet. Open Details to type the Xenia Canary directory.",
+                "EmuWiz could not find a Xenia Canary installation to use yet. Open Details to type the Xenia Canary directory.",
             );
         }
         BeginnerCheatStatus::FindingCompatibleCheats => {
@@ -25866,7 +25860,7 @@ fn show_xenia_beginner_summary(
         widgets::banner(
             ui,
             "More information needed",
-            "This patch matches the game, but ArchiveFS cannot confirm the exact executable version.",
+            "This patch matches the game, but EmuWiz cannot confirm the exact executable version.",
             widgets::StatusTone::Warning,
         );
         let mut acknowledged = state.selection.partial_verification_acknowledged;
@@ -26005,7 +25999,7 @@ fn show_xenia_profile_chooser(
     let eligible: Vec<&XeniaProfile> = discovery.profiles.iter().filter(|p| p.eligible).collect();
     widgets::card(ui, |ui| {
         ui.strong(format!(
-            "ArchiveFS found {} Xenia Canary installations.",
+            "EmuWiz found {} Xenia Canary installations.",
             eligible.len()
         ));
         ui.label("Choose the one you use:");
@@ -26105,7 +26099,7 @@ fn show_xenia_workflow_details(
             ui.label(format!("Media ID: {media_id}"));
         }
         ui.label(
-            "ArchiveFS never computes or verifies a module hash - patches that require one are always shown as only partially verified.",
+            "EmuWiz never computes or verifies a module hash - patches that require one are always shown as only partially verified.",
         );
     });
 
@@ -26310,7 +26304,7 @@ fn show_xenia_external_provider(
         ui,
         "Stage 2 · Find matching patches",
         Some(
-            "ArchiveFS looks up the exact Title ID in the xenia-canary/game-patches upstream dataset.",
+            "EmuWiz looks up the exact Title ID in the xenia-canary/game-patches upstream dataset.",
         ),
     );
     widgets::card(ui, |ui| {
@@ -26557,7 +26551,7 @@ fn show_xenia_patch_picker(
         widgets::banner(
             ui,
             "Exact game version could not be confirmed",
-            "This file's module hash cannot be computed or verified by ArchiveFS. Acknowledge explicitly before any patch from it can be applied.",
+            "This file's module hash cannot be computed or verified by EmuWiz. Acknowledge explicitly before any patch from it can be applied.",
             widgets::StatusTone::Warning,
         );
         let mut acknowledged = state.selection.partial_verification_acknowledged;
@@ -27444,7 +27438,7 @@ fn show_pcsx2_gamehacking(
         ui,
         "GameHacking.org",
         Some(
-            "Matches this local PS2 game against ArchiveFS's private complete index cache; only the selected game's export is downloaded.",
+            "Matches this local PS2 game against EmuWiz's private complete index cache; only the selected game's export is downloaded.",
         ),
     );
     let identity_ready = pcsx2_identity_for_workflow(workflow)
@@ -27643,7 +27637,7 @@ fn show_pcsx2_gamehacking(
     {
         widgets::card(ui, |ui| {
             ui.strong("Install the selected cheats?");
-            ui.label("ArchiveFS will use the verified serial+CRC filename this PCSX2 build reads (falling back to CRC-only if no verified serial exists), keep a backup, and make this change undoable.");
+            ui.label("EmuWiz will use the verified serial+CRC filename this PCSX2 build reads (falling back to CRC-only if no verified serial exists), keep a backup, and make this change undoable.");
             for entry in &plan.entries {
                 ui.label(format!(
                     "Target file: {}/{}",
@@ -27657,7 +27651,7 @@ fn show_pcsx2_gamehacking(
                     .is_some_and(|generated| generated.legacy_migration_report.is_some())
             {
                 ui.label(
-                    "A legacy CRC-only file for this game was found and will be migrated into the file above, then stripped of ArchiveFS content (kept, with a backup, as its own separately undoable step).",
+                    "A legacy CRC-only file for this game was found and will be migrated into the file above, then stripped of EmuWiz content (kept, with a backup, as its own separately undoable step).",
                 );
             }
             let replacement_required = plan.entries.iter().any(|entry| {
@@ -27706,9 +27700,9 @@ fn show_gamecube_gamehacking(
         ui,
         &format!("GameHacking.org ({platform})"),
         Some(if is_wii {
-            "Matches the verified six-character Dolphin Game ID against ArchiveFS's private Wii catalogue cache. Only explicitly labelled, safety-checked Action Replay and Gecko cheats can be installed into the resolved Dolphin GameSettings file."
+            "Matches the verified six-character Dolphin Game ID against EmuWiz's private Wii catalogue cache. Only explicitly labelled, safety-checked Action Replay and Gecko cheats can be installed into the resolved Dolphin GameSettings file."
         } else {
-            "Matches this local GameCube game against ArchiveFS's private complete index cache; only the selected game's cheats are downloaded. Only Action Replay and Gecko cheats can be installed into the real Dolphin GameSettings file."
+            "Matches this local GameCube game against EmuWiz's private complete index cache; only the selected game's cheats are downloaded. Only Action Replay and Gecko cheats can be installed into the real Dolphin GameSettings file."
         }),
     );
     let identity_ready = if is_wii {
@@ -27799,7 +27793,7 @@ fn show_gamecube_gamehacking(
             );
             if is_wii {
                 ui.label(
-                    "Offline option: save the Wii game page in your browser, then import it with `archivefs-cli gamehacking-wii-import-page --game-id <ID> --image <WII_IMAGE> --file <SAVED_HTML>`. ArchiveFS validates the platform and Game ID before caching it.",
+                    "Offline option: save the Wii game page in your browser, then import it with `archivefs-cli gamehacking-wii-import-page --game-id <ID> --image <WII_IMAGE> --file <SAVED_HTML>`. EmuWiz validates the platform and Game ID before caching it.",
                 );
             }
         }
@@ -27909,7 +27903,7 @@ fn show_gamecube_gamehacking(
                             );
                         }
                         if entry.already_managed {
-                            ui.weak("Already installed by ArchiveFS.");
+                            ui.weak("Already installed by EmuWiz.");
                         }
                     } else {
                         ui.strong(&cheat.name);
@@ -27931,7 +27925,7 @@ fn show_gamecube_gamehacking(
                     ));
                     if entry.is_none_or(|entry| !entry.selectable) {
                         ui.weak(
-                            "Preview only - ArchiveFS never installs a cheat whose Action Replay/Gecko format wasn't explicitly labelled by GameHacking.org.",
+                            "Preview only - EmuWiz never installs a cheat whose Action Replay/Gecko format wasn't explicitly labelled by GameHacking.org.",
                         );
                     }
                 });
@@ -28039,7 +28033,7 @@ fn show_gamecube_gamehacking(
         widgets::card(ui, |ui| {
             ui.strong("Install or remove the selected cheats?");
             ui.label(
-                "ArchiveFS will write only to the [Gecko]/[ActionReplay] sections of this exact Dolphin GameSettings file, keep a backup, and make this change undoable.",
+                "EmuWiz will write only to the [Gecko]/[ActionReplay] sections of this exact Dolphin GameSettings file, keep a backup, and make this change undoable.",
             );
             if let Some((profile, staging_path)) = &gamecube_install_context {
                 ui.label(format!(
@@ -28174,7 +28168,7 @@ fn show_bsfree_gamecube(
                 });
             } else {
                 widgets::status_badge(ui, "Game identity incomplete", widgets::StatusTone::Blocked);
-                ui.label("ArchiveFS needs a verified Dolphin Game ID before it can search BSFree.");
+                ui.label("EmuWiz needs a verified Dolphin Game ID before it can search BSFree.");
             }
         }
         CheatStepResource::Loading { .. } => {
@@ -28443,7 +28437,7 @@ fn show_bsfree_review_card(
             s = if count == 1 { "" } else { "s" }
         ));
         ui.label(
-            "ArchiveFS will write only to the [Gecko]/[ActionReplay] sections of this exact \
+            "EmuWiz will write only to the [Gecko]/[ActionReplay] sections of this exact \
              Dolphin GameSettings file, keep a backup, and make this change undoable.",
         );
         if let Some(title) = &matched_title {
@@ -28861,7 +28855,7 @@ fn preview_identity(
 
 /// The selected profile's own resolved cheat directory, or `None` when no
 /// eligible profile is selected or its path cannot be represented exactly.
-/// ArchiveFS never invents a default cheat directory.
+/// EmuWiz never invents a default cheat directory.
 fn selected_retroarch_cheat_root(
     workflow: &CheatWorkflowState,
     profiles: &RetroArchProfilesState,
@@ -28927,7 +28921,7 @@ impl CheatCandidatePrerequisite {
 
 /// Gathers everything stage 4 needs, or explains exactly why it cannot
 /// start yet. Assumes the caller has already confirmed the adapter and
-/// source mode are RetroArch + ArchiveFS trusted catalogue - the only
+/// source mode are RetroArch + EmuWiz trusted catalogue - the only
 /// context "Find matching cheat files" is ever shown in.
 fn build_cheat_candidate_request(
     workflow: &CheatWorkflowState,
@@ -29416,7 +29410,7 @@ fn preview_match_strength_presentation(
         PreviewMatchStrength::Ambiguous => (
             "Ambiguous",
             widgets::StatusTone::Blocked,
-            "More than one catalogue entry could apply here. ArchiveFS will not guess between them.",
+            "More than one catalogue entry could apply here. EmuWiz will not guess between them.",
         ),
         PreviewMatchStrength::Unsupported => (
             "Unsupported",
@@ -29463,7 +29457,7 @@ fn show_cheat_candidate_stages(
             widgets::card(ui, |ui| {
                 ui.label(
                     "Select a RetroArch profile and retrieve the trusted catalogue, then \
-                     ArchiveFS matches this exact archive against it.",
+                     EmuWiz matches this exact archive against it.",
                 );
                 if show_find_matching_cheats_button(ui).clicked() {
                     action = Some(CheatWorkflowAction::MatchCandidates);
@@ -29872,7 +29866,7 @@ fn show_shared_cheat_preview(
     widgets::banner(
         ui,
         "Preview only. No files were changed.",
-        "ArchiveFS performs bounded local reads. A write can be offered only after an exact materialized source enters the reviewed transaction pipeline.",
+        "EmuWiz performs bounded local reads. A write can be offered only after an exact materialized source enters the reviewed transaction pipeline.",
         widgets::StatusTone::Info,
     );
     match &workflow.preview {
@@ -30200,7 +30194,7 @@ fn show_shared_transaction_readiness(
             widgets::banner(
                 ui,
                 "No write is available",
-                "There is no eligible materialized source bound to this exact preview, so ArchiveFS shows no Apply control.",
+                "There is no eligible materialized source bound to this exact preview, so EmuWiz shows no Apply control.",
                 widgets::StatusTone::Pending,
             );
         }
@@ -30552,7 +30546,7 @@ fn show_cheats_mods_page(
                             "This platform is recognised, but cheat support is not available yet. Assign a different platform in Library if this is wrong."
                         }
                         None => {
-                            "ArchiveFS could not determine this archive's platform, so no Cheats & Mods adapter can be chosen. Assign a platform in Library if you know it."
+                            "EmuWiz could not determine this archive's platform, so no Cheats & Mods adapter can be chosen. Assign a platform in Library if you know it."
                         }
                     },
                     widgets::StatusTone::Info,
@@ -30626,7 +30620,7 @@ fn show_cheat_source_modes(
     widgets::section_header(
         ui,
         "Cheat source",
-        Some("Choose where ArchiveFS should look for cheats for this game."),
+        Some("Choose where EmuWiz should look for cheats for this game."),
     );
     let show_existing = |ui: &mut egui::Ui, selected: bool| {
         let mut clicked = false;
@@ -30640,9 +30634,9 @@ fn show_cheat_source_modes(
     let show_trusted = |ui: &mut egui::Ui, selected: bool| {
         let mut clicked = false;
         widgets::card(ui, |ui| {
-            clicked = ui.radio(selected, "ArchiveFS cheat catalogue").clicked();
+            clicked = ui.radio(selected, "EmuWiz cheat catalogue").clicked();
             widgets::status_badge(ui, "Ready to search", widgets::StatusTone::Success);
-            ui.label("Search the cheat catalogue bundled with ArchiveFS.");
+            ui.label("Search the cheat catalogue bundled with EmuWiz.");
         });
         clicked
     };
@@ -30891,7 +30885,7 @@ fn show_cheat_workflow_step2(
     widgets::section_header(
         ui,
         "Available cheats",
-        Some("ArchiveFS will show the cheats available for the selected game."),
+        Some("EmuWiz will show the cheats available for the selected game."),
     );
     if workflow.selected_profile_id.is_none() {
         widgets::banner(
@@ -31306,7 +31300,7 @@ fn show_cheat_workflow_step1(
     widgets::section_header(
         ui,
         "Choose a RetroArch profile",
-        Some("Choose where ArchiveFS should look for and save cheats for this game."),
+        Some("Choose where EmuWiz should look for and save cheats for this game."),
     );
     widgets::section_header(ui, "RetroArch profile", None);
     match profiles {
@@ -31349,7 +31343,7 @@ fn show_cheat_workflow_step1(
                 );
             } else if eligible.len() > 1 && workflow.selected_profile_id.is_none() {
                 ui.label(format!(
-                    "{} eligible profiles were found. ArchiveFS never silently picks \
+                    "{} eligible profiles were found. EmuWiz never silently picks \
                      between them — choose one explicitly.",
                     eligible.len()
                 ));
@@ -31864,7 +31858,7 @@ fn show_platform_artwork_manager(
                             manager.pending_remove = Some(platform.id.to_owned());
                         }
                         if manager.pending_remove.as_deref() == Some(platform.id) {
-                            ui.label("Remove ArchiveFS's custom copy?");
+                            ui.label("Remove EmuWiz's custom copy?");
                             if ui
                                 .add_enabled(!running, egui::Button::new("Confirm restore default"))
                                 .clicked()
@@ -31904,7 +31898,7 @@ fn show_settings_page(
         ui,
         crate::ui::icons::SETTINGS,
         "Settings",
-        "Set up ArchiveFS: locations, configuration, and integrations.",
+        "Set up EmuWiz: locations, configuration, and integrations.",
     );
 
     let database_path = database_state_path(database_state).map(|path| path.display().to_string());
@@ -31919,7 +31913,7 @@ fn show_settings_page(
 
     widgets::section_header(
         ui,
-        "1. ArchiveFS locations",
+        "1. EmuWiz locations",
         Some("Full paths remain available through hover and Copy without dominating the page."),
     );
     widgets::card(ui, |ui| {
@@ -31951,7 +31945,7 @@ fn show_settings_page(
     widgets::section_header(
         ui,
         "2. Configuration validation",
-        Some("ArchiveFS validates the active configuration without changing it."),
+        Some("EmuWiz validates the active configuration without changing it."),
     );
     let (validation_title, validation_detail, validation_tone) = match diagnostics {
         DiagnosticsState::Ready { report, .. } if diagnostics_can_continue(report) => (
@@ -32165,7 +32159,7 @@ fn show_settings_page(
         ui,
         &crate::ui::icons::with_icon(crate::ui::icons::ARTWORK, "5. Platform artwork"),
         Some(
-            "Manage local, upgrade-stable artwork overrides. ArchiveFS never identifies a machine \
+            "Manage local, upgrade-stable artwork overrides. EmuWiz never identifies a machine \
              from its picture: choose the canonical platform explicitly. Imports are normalised \
              off the UI thread and never overwrite the selected original.",
         ),
@@ -32670,7 +32664,7 @@ fn show_duplicate_review_panel(
         ui,
         "Duplicates",
         Some(
-            "Review only — ArchiveFS will not change archive files here. Groups are likely \
+            "Review only — EmuWiz will not change archive files here. Groups are likely \
              duplicates, not claims that files are byte-identical.",
         ),
     );
@@ -33846,8 +33840,8 @@ fn selected_missing_paths(
 
 fn missing_removal_confirmation_text(count: usize) -> String {
     format!(
-        "Remove {count} missing entr{} from the ArchiveFS catalogue?\n\n\
-         This removes only ArchiveFS database records.\n\
+        "Remove {count} missing entr{} from the EmuWiz catalogue?\n\n\
+         This removes only EmuWiz database records.\n\
          It will not delete archive files or mounted contents.\n\
          Entries will return if the archives are found in a later scan.",
         if count == 1 { "y" } else { "ies" }
@@ -35544,8 +35538,8 @@ fn show_single_row_context_menu(
         }
     } else if record.is_some() {
         ui.add_enabled(false, egui::Button::new("No mount required"))
-            .on_disabled_hover_text("Loose ROM · no ArchiveFS mount required");
-        ui.label("Loose ROM · no ArchiveFS mount required");
+            .on_disabled_hover_text("Loose ROM · no EmuWiz mount required");
+        ui.label("Loose ROM · no EmuWiz mount required");
     } else {
         ui.add_enabled(false, egui::Button::new("Mount"))
             .on_disabled_hover_text("Archive is catalogue-only.");
@@ -36511,7 +36505,7 @@ fn show_selected_archive(
             widgets::banner(
                 ui,
                 "No mount required",
-                "Loose ROM · no ArchiveFS mount required. Inspect, Cheats & Mods, copy-path, and library metadata actions remain available.",
+                "Loose ROM · no EmuWiz mount required. Inspect, Cheats & Mods, copy-path, and library metadata actions remain available.",
                 widgets::StatusTone::Info,
             );
             return;
@@ -38425,7 +38419,7 @@ fn show_gamer_view(
 // (no network access, no download, no runtime fetch of any kind - see
 // docs/PLATFORM_ARTWORK.md's "no-network guarantee"). Built-in artwork
 // includes exact hardware PNGs compiled into the executable plus the
-// original ArchiveFS SVG/native-glyph fallback set. An explicitly
+// original EmuWiz SVG/native-glyph fallback set. An explicitly
 // configured local PNG remains highest priority. SVG remains an
 // inspectable source asset for fallbacks, but is never parsed at runtime.
 // =====================================================================
@@ -42710,7 +42704,7 @@ mod tests {
             None,
             "asset ids cannot escape the configured directory"
         );
-        // Never copied into any ArchiveFS-owned location - the resolved
+        // Never copied into any EmuWiz-owned location - the resolved
         // path is the user's own file, unchanged.
         assert!(asset_path.exists());
         let _ = std::fs::remove_dir_all(&temp);
@@ -45860,7 +45854,7 @@ $Instant Growth [Nayr]\n";
                 member_index: None,
                 method: "test fixture".to_string(),
             },
-            diagnostic: "format has no existing safe bounded reader in ArchiveFS".to_string(),
+            diagnostic: "format has no existing safe bounded reader in EmuWiz".to_string(),
         }];
         workflow.identity = CheatStepResource::Ready((request.clone(), report));
         app
@@ -45874,7 +45868,7 @@ $Instant Growth [Nayr]\n";
 
         assert!(
             !dolphin_provider_auto_fetch_needed(workflow),
-            "a format ArchiveFS cannot decode must never trigger a provider fetch"
+            "a format EmuWiz cannot decode must never trigger a provider fetch"
         );
         let status = dolphin_beginner_status(workflow);
         assert!(
@@ -46158,7 +46152,7 @@ $Instant Growth [Nayr]\n";
         assert!(
             rendered_text_contains(
                 &output,
-                "This patch matches the game, but ArchiveFS cannot confirm the exact executable version."
+                "This patch matches the game, but EmuWiz cannot confirm the exact executable version."
             ),
             "rendering mismatch"
         );
@@ -46480,7 +46474,7 @@ $Instant Growth [Nayr]\n";
             selected_archive: archive_path.clone(),
             verified_game_identity: "GAFE01".to_string(),
             profile_id: "dolphin-native-test".to_string(),
-            source_mode: "ArchiveFS trusted catalogue".to_string(),
+            source_mode: "EmuWiz trusted catalogue".to_string(),
         };
         let plan_entry = SharedPlanEntry {
             adapter: PreviewAdapter::Dolphin,
@@ -46617,7 +46611,7 @@ $Instant Growth [Nayr]\n";
             "Selected archive",
             "/roms/a.zip",
             "Source mode",
-            "ArchiveFS trusted catalogue",
+            "EmuWiz trusted catalogue",
             "Destination root",
             "/dolphin/GameSettings",
             "Journal path",
@@ -46954,7 +46948,7 @@ $Instant Growth [Nayr]\n";
         assert!(rendered_text_contains(&output, "Try again"));
         assert!(rendered_text_contains(
             &output,
-            "ArchiveFS could not load compatible cheats. Check your connection and try again."
+            "EmuWiz could not load compatible cheats. Check your connection and try again."
         ));
         assert!(!rendered_text_contains(&output, "HTTP 503"));
         assert!(!rendered_text_contains(
@@ -47109,7 +47103,7 @@ $Instant Growth [Nayr]\n";
         );
         assert!(rendered_text_contains(
             &output,
-            "ArchiveFS found 2 credible Dolphin profiles."
+            "EmuWiz found 2 credible Dolphin profiles."
         ));
         assert!(rendered_text_contains(&output, "Native profile 1"));
         assert!(rendered_text_contains(&output, "Native profile 2"));
@@ -50355,7 +50349,7 @@ $Instant Growth [Nayr]\n";
         assert!(IMPORT_CONSENT_COPY.contains("not an antivirus scanner"));
         assert!(SCANNING_DISABLED_WARNING.contains("does not make unsafe files safe"));
         assert!(ETHICAL_USE_COPY.contains("must not be used to bypass copy protection"));
-        assert!(USER_RESPONSIBILITY_COPY.contains("ArchiveFS does not verify ownership"));
+        assert!(USER_RESPONSIBILITY_COPY.contains("EmuWiz does not verify ownership"));
         assert_eq!(
             local_scanning_presentation(LocalSafetyScanningState::current()).0,
             "Local safety scanning · Planned"
@@ -50376,7 +50370,7 @@ $Instant Growth [Nayr]\n";
         );
         assert_eq!(
             import_source_presentation(ImportSourceKind::ArchiveFsTrustedCatalogue),
-            ("ArchiveFS trusted catalogue", "Available")
+            ("EmuWiz trusted catalogue", "Available")
         );
         assert_eq!(
             import_source_presentation(ImportSourceKind::LocalUnverifiedSource).1,
@@ -50604,7 +50598,7 @@ $Instant Growth [Nayr]\n";
     #[test]
     fn system_information_text_includes_all_labelled_fields() {
         let text = system_information_text(Some("/db/library.sqlite3"), None, Some("/mnt/root"));
-        assert!(text.contains(&format!("ArchiveFS {}", env!("CARGO_PKG_VERSION"))));
+        assert!(text.contains(&format!("EmuWiz {}", env!("CARGO_PKG_VERSION"))));
         assert!(text.contains("Database schema: v"));
         assert!(text.contains("Database path: /db/library.sqlite3"));
         assert!(
@@ -52215,7 +52209,7 @@ $Instant Growth [Nayr]\n";
                 name: "ratarmount is available".to_string(),
                 status: SetupDiagnosticStatus::Error,
                 detail: "ratarmount was not found.".to_string(),
-                why_it_matters: "ArchiveFS uses ratarmount to expose archive contents.".to_string(),
+                why_it_matters: "EmuWiz uses ratarmount to expose archive contents.".to_string(),
                 next_step: "Install ratarmount and ensure it is available on PATH.".to_string(),
             }],
         };
@@ -52229,7 +52223,7 @@ $Instant Growth [Nayr]\n";
         assert!(rendered_text_contains(&output, "Why it matters"));
         assert!(rendered_text_contains(
             &output,
-            "ArchiveFS uses ratarmount to expose archive contents."
+            "EmuWiz uses ratarmount to expose archive contents."
         ));
         assert!(rendered_text_contains(&output, "Recommended next step"));
         assert!(rendered_text_contains(
@@ -52253,7 +52247,7 @@ $Instant Growth [Nayr]\n";
 
         assert!(rendered_text_contains(
             &output,
-            "A repair action already exists elsewhere in ArchiveFS"
+            "A repair action already exists elsewhere in EmuWiz"
         ));
         assert!(rendered_text_contains(&output, "Library → Health, Retry"));
         // No repair control is rendered anywhere on the page.
@@ -52295,10 +52289,7 @@ $Instant Growth [Nayr]\n";
 
         assert!(rendered_text_contains(&output, "What was checked"));
         assert!(rendered_text_contains(&output, "Not checked in this run"));
-        assert!(rendered_text_contains(
-            &output,
-            "Not checked by ArchiveFS yet"
-        ));
+        assert!(rendered_text_contains(&output, "Not checked by EmuWiz yet"));
         assert!(rendered_text_contains(
             &output,
             "a healthy result does not mean they are fine"
@@ -52831,7 +52822,7 @@ $Instant Growth [Nayr]\n";
                 changed_paths: Vec::new(),
                 undo: archivefs_core::diagnostics::repair::DoctorRepairUndo::NothingToUndo,
                 summary: "Remove this leftover mount folder was refused: That path is inside a \
-                          configured source folder. ArchiveFS never modifies anything there."
+                          configured source folder. EmuWiz never modifies anything there."
                     .to_string(),
                 rejection: Some(DoctorRepairRejection::PathUnderSourceRoot),
                 error: None,
@@ -53840,8 +53831,8 @@ $Instant Growth [Nayr]\n";
     fn missing_removal_confirmation_is_explicit_about_catalogue_only_safety() {
         let wording = missing_removal_confirmation_text(3);
 
-        assert!(wording.contains("Remove 3 missing entries from the ArchiveFS catalogue?"));
-        assert!(wording.contains("only ArchiveFS database records"));
+        assert!(wording.contains("Remove 3 missing entries from the EmuWiz catalogue?"));
+        assert!(wording.contains("only EmuWiz database records"));
         assert!(wording.contains("will not delete archive files or mounted contents"));
         assert!(wording.contains("return if the archives are found in a later scan"));
         assert_eq!(REMOVE_MISSING_CANCEL_LABEL, "Cancel");
@@ -61865,7 +61856,7 @@ $Instant Growth [Nayr]\n";
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.vertical(|ui| {
-                    ui.label(egui::RichText::new("ArchiveFS").size(23.0).strong());
+                    ui.label(egui::RichText::new("EmuWiz").size(23.0).strong());
                     ui.label(
                         egui::RichText::new("Archive library manager").color(theme::muted(ui)),
                     );
@@ -64728,7 +64719,7 @@ $Instant Growth [Nayr]\n";
             name: "ratarmount is available".to_string(),
             status: SetupDiagnosticStatus::Error,
             detail: "ratarmount was not found.".to_string(),
-            why_it_matters: "ArchiveFS uses ratarmount to expose archives.".to_string(),
+            why_it_matters: "EmuWiz uses ratarmount to expose archives.".to_string(),
             next_step: "Install ratarmount.".to_string(),
         }];
         let reason = archive_action_block_reason(
@@ -64756,7 +64747,7 @@ $Instant Growth [Nayr]\n";
             name: "Mount root is writable".to_string(),
             status: SetupDiagnosticStatus::Error,
             detail: "Writable directory required: /mnt/archivefs".to_string(),
-            why_it_matters: "ArchiveFS must create mount-point directories.".to_string(),
+            why_it_matters: "EmuWiz must create mount-point directories.".to_string(),
             next_step: "Grant write access.".to_string(),
         }];
         let reason = archive_action_block_reason(
@@ -64933,7 +64924,7 @@ $Instant Growth [Nayr]\n";
                 name: "Mount root is writable".to_string(),
                 status: SetupDiagnosticStatus::Error,
                 detail: "Writable directory required: /mnt/archivefs".to_string(),
-                why_it_matters: "ArchiveFS must create mount-point directories.".to_string(),
+                why_it_matters: "EmuWiz must create mount-point directories.".to_string(),
                 next_step: "Grant write access.".to_string(),
             },
         ];
@@ -69088,7 +69079,7 @@ fn confine_to_source_roots(path: &Path, roots: &[PathBuf]) -> Result<PathBuf, St
         .map(|parent| parent.join(path.file_name().unwrap_or_default()));
     if !lexical.as_deref().is_some_and(&inside) {
         return Err(format!(
-            "{} is not inside a configured source folder, so ArchiveFS will not read it.",
+            "{} is not inside a configured source folder, so EmuWiz will not read it.",
             path.display()
         ));
     }
@@ -69104,7 +69095,7 @@ fn confine_to_source_roots(path: &Path, roots: &[PathBuf]) -> Result<PathBuf, St
     })?;
     if !inside(&resolved) {
         return Err(format!(
-            "{} leads out of your configured source folders; ArchiveFS will not follow it.",
+            "{} leads out of your configured source folders; EmuWiz will not follow it.",
             path.display()
         ));
     }
@@ -70111,7 +70102,7 @@ mod romm_dispatch_tests {
     #[test]
     fn a_published_import_refreshes_the_gamer_view_identity_index() {
         // The signal that makes a game which has just gained a RomM identity
-        // eligible for artwork without restarting ArchiveFS.
+        // eligible for artwork without restarting EmuWiz.
         let (_app, before, after) = deliver(
             RommOperation::FullImport,
             Ok(RommOperationOutcome::Import(Box::new(summary(36_259)))),

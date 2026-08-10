@@ -130,7 +130,7 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
 
     let data_directory = default_database_path()?
         .parent()
-        .ok_or("could not determine the ArchiveFS data directory")?
+        .ok_or("could not determine the EmuWiz data directory")?
         .to_path_buf();
     let run_id = generate_setup_run_id();
     let journal_directory = data_directory.join(CHEAT_INSTALL_RUNS_DIRECTORY_NAME);
@@ -499,7 +499,7 @@ fn print_preview(plan: &RetroArchCheatSetupPlan, options: &SetupCliOptions) {
         }
     }
     println!(
-        "Cheat catalogue\n  path: {}\n  ArchiveFS database: {}\n  game records examined: {}\n  cheat records discovered: {}\n",
+        "Cheat catalogue\n  path: {}\n  EmuWiz database: {}\n  game records examined: {}\n  cheat records discovered: {}\n",
         options.catalogue_path.display(),
         options.database_path.display(),
         summary.archivefs_game_records_examined,
@@ -760,7 +760,7 @@ fn next_steps(journal_path: &Path, destination_root: &Path) -> Vec<RetroArchChea
         step(
             6,
             "view_history",
-            "Review ArchiveFS cheat installation history.",
+            "Review EmuWiz cheat installation history.",
             Some(vec!["archivefs".into(), "retroarch-cheat-history".into()]),
         ),
         step(

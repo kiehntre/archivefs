@@ -5,7 +5,7 @@ same exclusive cache-root lock as snapshot maintenance. See
 [`RETROARCH_CHEAT_CACHE_LOCKING.md`](RETROARCH_CHEAT_CACHE_LOCKING.md) for the
 timeout, platform, path-identity, and lock-ordering guarantees.
 
-ArchiveFS retrieves reviewed remote cheat catalogues without giving the
+EmuWiz retrieves reviewed remote cheat catalogues without giving the
 installer network access:
 
 `explicit user confirmation → exact upstream commit resolution → immutable HTTPS archive → bounded download → hash/ZIP validation → safe extraction → strict local catalogue validation → immutable snapshot → separate setup/install flow`
@@ -13,7 +13,7 @@ installer network access:
 Fetching never installs cheats. Listing and inspection never access the
 network or mutate the cache.
 
-The built-in adapter is **Trusted** in ArchiveFS's three-state source model:
+The built-in adapter is **Trusted** in EmuWiz's three-state source model:
 its provenance, format, host and limits were reviewed. That status does not
 claim that structural inspection proves content malware-free. Local and
 community sources are **Unverified**, not malicious by definition, and a
@@ -27,7 +27,7 @@ The compiled registry enables `libretro-buildbot-cheats` for compatibility,
 but its authoritative provider is now the official
 `https://github.com/libretro/libretro-database` repository. The provider's
 moving `master` reference is resolved through the GitHub commits API to an
-exact 40-character commit ID. ArchiveFS then downloads only the immutable
+exact 40-character commit ID. EmuWiz then downloads only the immutable
 `codeload.github.com/libretro/libretro-database/zip/<commit>` archive. The
 manifest records the canonical repository, resolver endpoint, exact commit,
 immutable archive URL, and archive SHA-256; a branch name alone is never an
@@ -66,7 +66,7 @@ rollback rules.
 Fetching or inspecting a source never modifies RetroArch, installs catalogue
 entries, or duplicates files in RetroArch's cheat directory. Installation is a
 separate explicit workflow with destination conflict, backup and journal
-rules. ArchiveFS does not execute catalogue content.
+rules. EmuWiz does not execute catalogue content.
 
 ## Network and extraction protections
 
@@ -86,7 +86,7 @@ bytes are counted and stopped at the lower of the registry's 256 MiB maximum and
 `--max-download-bytes`. Compressed HTTP transfer encoding is rejected. Missing
 Content-Length is accepted; a mismatching declared length is rejected.
 Accepted bytes stream in 64 KiB chunks directly into an exclusively created
-attempt-specific staging file. ArchiveFS updates SHA-256 incrementally and
+attempt-specific staging file. EmuWiz updates SHA-256 incrementally and
 never accumulates the ZIP as an in-memory response. Progress is emitted at
 most once per 2 MiB plus phase transitions, with at most 512 events delivered.
 
@@ -162,7 +162,7 @@ after headers, between chunks, before/during retry waits, before extraction,
 and before activation. Current-process partial files are removed. A crash can
 leave an inactive operation directory; the next provider operation, while
 holding the exclusive cache lock, removes at most 16 entries whose names and
-types prove they are inactive ArchiveFS staging directories. Unexpected entries
+types prove they are inactive EmuWiz staging directories. Unexpected entries
 fail closed. The current metadata pointer and previous valid snapshot are
 unchanged. `--force-refresh`
 retains the previous snapshot until a replacement validates. `--offline` makes no network call, reports stale reuse,
@@ -213,7 +213,7 @@ Invalid manifest, Incomplete, Unsupported schema, Verification failed,
 Retrieval failed, Cancelled, and Resource limit reached states. Download is
 shown only without a snapshot; Update is shown when local state exists; Verify
 is always read-only. Download or Update first opens a review dialog containing
-the provider and ArchiveFS-managed destination. Network access begins only
+the provider and EmuWiz-managed destination. Network access begins only
 after `Confirm retrieval`. Closing that dialog writes nothing.
 
 During retrieval the Sources page offers cancellation and shows revision,
@@ -244,7 +244,7 @@ ambiguous, PCSX2, and Dolphin entries do not become writable through this
 manager.
 
 The canonical Libretro `Sega - Mega Drive - Genesis` and `Nintendo - Super
-Nintendo Entertainment System` directories map to ArchiveFS's existing
+Nintendo Entertainment System` directories map to EmuWiz's existing
 MegaDrive and SNES platform identities. Valid entries for both systems remain
 matchable when unrelated catalogue files are excluded.
 
@@ -290,7 +290,7 @@ Manual Saltbox checks for the streaming downloader:
 10. Cancel during download and confirm partial attempt files are removed.
 11. Confirm the previous snapshot remains usable after cancellation.
 12. Confirm Alien 3 matching remains available throughout failed updates.
-13. Restart ArchiveFS and confirm no incomplete snapshot is active.
+13. Restart EmuWiz and confirm no incomplete snapshot is active.
 14. Confirm no curl, wget, or other external process is launched.
 
 Current limitations are one reviewed source, ZIP only, integer-seconds

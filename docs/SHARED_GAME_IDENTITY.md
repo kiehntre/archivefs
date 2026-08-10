@@ -1,6 +1,6 @@
 # Shared verified game identity
 
-ArchiveFS can inspect narrowly defined, local disc metadata for a selected
+EmuWiz can inspect narrowly defined, local disc metadata for a selected
 PlayStation 2, GameCube, or Wii archive, and stable local-byte identity for a
 supported loose Mega Drive or SNES cartridge ROM. The result is a typed
 evidence report, not a guessed game name. It is shown asynchronously in Cheats
@@ -26,7 +26,7 @@ verified identity and the matcher-facing API returns only `Verified` evidence.
   API is sequential.
 
 CHD, CSO, RVZ, WBFS, 7z, RAR, multiple-ISO ZIPs, encrypted ZIPs, and extracted
-directory trees are deferred or unsupported. ArchiveFS has no existing safe,
+directory trees are deferred or unsupported. EmuWiz has no existing safe,
 bounded image API for them in this milestone. It does not invoke `chdman`,
 `7z`, a mount helper, PCSX2, Dolphin, or any other process.
 
@@ -35,13 +35,13 @@ bounded image API for them in this milestone. It does not invoke `chdman`,
 For a loose cartridge ROM, exact trusted scanner or manual platform evidence
 is required. Mega Drive supports `.md`, `.gen`, `.smd`, and contextual `.bin`;
 SNES supports `.sfc` and `.smc` identity where an exact platform context is
-already available. ArchiveFS hashes the complete, unchanged on-disk file with
+already available. EmuWiz hashes the complete, unchanged on-disk file with
 SHA-256 within a 64 MiB limit and records the format, size, exact path, and a
 normalized display-title candidate. This is verified local-file identity, not
 a known-good or canonical dump hash. See
 [Loose-ROM RetroArch cheat support](LOOSE_ROM_CHEAT_SUPPORT.md).
 
-For GameCube and Wii, ArchiveFS reads bytes `0x00..0x20`, validates the
+For GameCube and Wii, EmuWiz reads bytes `0x00..0x20`, validates the
 platform-specific magic (`0x1c` for GameCube or `0x18` for Wii), and accepts a
 six-byte Game ID only when every byte is an uppercase ASCII letter or digit.
 Game ID, disc number, and raw region-code byte are verified. GameCube revision
@@ -49,13 +49,13 @@ is verified from byte `0x07`. Wii outer-header revision remains a candidate:
 Dolphin can use revision metadata in the game-partition header, which this
 milestone does not decrypt or inspect.
 
-For PlayStation 2, ArchiveFS reads the ISO 9660 primary volume descriptor and
+For PlayStation 2, EmuWiz reads the ISO 9660 primary volume descriptor and
 root directory, finds `SYSTEM.CNF`, parses exactly one `BOOT2` assignment, and
 accepts only a `cdrom:` or `cdrom0:` path with no empty, dot, or traversal
 component. The product code is derived from that exact executable name and is
 verified structured metadata. The executable is then resolved through the ISO
 directory rather than guessed. When its complete size is within the bound and
-it has an ELF signature, ArchiveFS calculates PCSX2's reviewed executable CRC:
+it has an ELF signature, EmuWiz calculates PCSX2's reviewed executable CRC:
 XOR of every complete little-endian 32-bit word; trailing one to three bytes
 are ignored, matching PCSX2. Otherwise CRC evidence is missing, invalid,
 deferred, or resource-limited, never guessed.

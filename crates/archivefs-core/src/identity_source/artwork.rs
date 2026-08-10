@@ -1,6 +1,6 @@
 //! A bounded, provider-owned thumbnail cache.
 //!
-//! RomM stays the owner of cover art. ArchiveFS caches only what a card needs to
+//! RomM stays the owner of cover art. EmuWiz caches only what a card needs to
 //! draw: a thumbnail fitting inside [`THUMBNAIL_MAX_WIDTH`] x
 //! [`THUMBNAIL_MAX_HEIGHT`], fetched lazily when artwork becomes visible, never in
 //! bulk during a catalogue import.
@@ -163,7 +163,7 @@ impl ArtworkRefusal {
             Self::NoArtwork => "RomM has no cover for this game".to_string(),
             Self::RemoteHostNotAllowed { host } => format!(
                 "RomM's only cover for this game is hosted at {host}, on the public internet. \
-                 ArchiveFS fetches artwork from your RomM instance and nowhere else, so this one \
+                 EmuWiz fetches artwork from your RomM instance and nowhere else, so this one \
                  is left as a placeholder. Letting RomM download the cover into its own library \
                  makes it available here."
             ),
@@ -373,7 +373,7 @@ fn index_mutex(index_path: &Path) -> Arc<Mutex<()>> {
 ///
 /// Best effort by design. The process-local mutex above is the guarantee - exact,
 /// needing no filesystem support, holding on every platform. This layer covers the
-/// case the mutex cannot see: a second ArchiveFS, typically the CLI clearing
+/// case the mutex cannot see: a second EmuWiz, typically the CLI clearing
 /// thumbnails while the GUI is browsing. It works on any filesystem that
 /// implements `flock` honestly, which a local one does and a network mount may not,
 /// so a failure to acquire it is not treated as a failure to update.

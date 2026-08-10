@@ -1,6 +1,6 @@
-# ArchiveFS release engineering
+# EmuWiz release engineering
 
-This document is the maintained release procedure for ArchiveFS. The scripts
+This document is the maintained release procedure for EmuWiz. The scripts
 described here build and inspect artifacts; they do not create tags, push
 branches, or publish releases.
 
@@ -57,7 +57,7 @@ scripts/build-release.sh --output-dir "$PWD/target/release-artifacts"
 The builder:
 
 1. verifies the worktree is clean;
-2. reads one consistent ArchiveFS version from `cargo metadata`;
+2. reads one consistent EmuWiz version from `cargo metadata`;
 3. runs `cargo build --workspace --release --locked` with neutral compiler-path
    remapping;
 4. stages only the required files with fixed permissions;
@@ -232,7 +232,7 @@ commands would be:
 git fetch origin
 git status --short
 git rev-parse HEAD
-git tag -a v0.7.0 <VERIFIED_COMMIT_SHA> -m "ArchiveFS v0.7.0"
+git tag -a v0.7.0 <VERIFIED_COMMIT_SHA> -m "EmuWiz v0.7.0"
 git push origin v0.7.0
 ```
 
@@ -243,12 +243,12 @@ published bytes again.
 
 ## Rollback and database downgrade warning
 
-Before upgrading an alpha installation, stop ArchiveFS and copy the database
+Before upgrading an alpha installation, stop EmuWiz and copy the database
 and managed-state directory. Keep the previous verified application artifact
 and checksum.
 
-Application rollback means stopping ArchiveFS and restoring the previous
-binary bundle. **In-place database downgrade is not supported.** ArchiveFS
+Application rollback means stopping EmuWiz and restoring the previous
+binary bundle. **In-place database downgrade is not supported.** EmuWiz
 v0.7 uses schema 6; older binaries reject a schema-6 database. To run an older
 binary, restore the pre-upgrade database copy to a separate compatible path.
 Keep the v0.7 database and managed state untouched for later recovery. Never

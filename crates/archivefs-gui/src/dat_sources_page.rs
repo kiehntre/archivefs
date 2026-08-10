@@ -78,7 +78,7 @@ pub(crate) const READ_ONLY_PROMISE: &str = "Your files won't be renamed unless y
 /// as a tooltip (`READ_ONLY_PROMISE`) but never front and centre.
 pub(crate) const SAFE_PROMISE: &str = "Your files won't be renamed unless you approve it.";
 /// The prominent, repeated statement the rename-planning section must show.
-pub(crate) const PLAN_ONLY_PROMISE: &str = "Planning only — ArchiveFS will not rename any files. This section derives suggested names \
+pub(crate) const PLAN_ONLY_PROMISE: &str = "Planning only — EmuWiz will not rename any files. This section derives suggested names \
      from verified DAT matches and explains them; nothing here changes, moves, deletes or rewrites \
      a file.";
 
@@ -1483,7 +1483,7 @@ impl EtaEstimator {
 
 pub(crate) struct DatSourcesPageState {
     config_path: PathBuf,
-    /// Existing ArchiveFS catalogue to enrich after a completed audit. Absent
+    /// Existing EmuWiz catalogue to enrich after a completed audit. Absent
     /// in injected tests and when no catalogue exists.
     database_path: Option<PathBuf>,
     /// What is on disk, as last read or last written.
@@ -4529,7 +4529,7 @@ fn show_inspect(ui: &mut egui::Ui, row: &DatSourceRowView) {
                 "Conflicting catalogue identities",
                 Some(
                     "More than one file claims to be the same catalogue. Both are still read; \
-                     ArchiveFS does not pick one for you.",
+                     EmuWiz does not pick one for you.",
                 ),
             );
             for line in &detail.duplicate_identities {
@@ -4646,7 +4646,7 @@ fn show_dat_policy_section(
         ui,
         "DAT matching policy",
         Some(
-            "How ArchiveFS prefers one verified candidate over another. Nothing here renames, \
+            "How EmuWiz prefers one verified candidate over another. Nothing here renames, \
              moves, deletes or rewrites a file.",
         ),
     );
@@ -5074,7 +5074,7 @@ fn show_rename_apply_section(
                 });
                 ui.label(
                     egui::RichText::new(
-                        "An interrupted rename transaction was found. ArchiveFS will never \
+                        "An interrupted rename transaction was found. EmuWiz will never \
                          resume it automatically.",
                     )
                     .color(theme::muted(ui))

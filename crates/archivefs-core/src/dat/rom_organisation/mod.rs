@@ -1,7 +1,7 @@
 //! Canonical ROM organisation into a user-configured master ROM root.
 //!
 //! The user configures a master ROM root (for example `/mnt/games/roms`).
-//! ArchiveFS can then *plan*, and after explicit approval *apply*, moving
+//! EmuWiz can then *plan*, and after explicit approval *apply*, moving
 //! identified games into canonical RomM-compatible platform directories
 //! beneath that root - never guessing a folder name from a display label.
 //!

@@ -8,19 +8,19 @@
 //! `GameCubeCheatSelection::from_cheats` marks them unselectable at
 //! construction, and every merge/removal entry point re-checks the format
 //! again before touching a file, so no caller bug can smuggle one through.
-//! ArchiveFS never guesses which Dolphin section an unlabeled or malformed
+//! EmuWiz never guesses which Dolphin section an unlabeled or malformed
 //! code belongs in (see `GameCubeCodeFormat`'s own doc comment for why that
 //! would be an unsafe guess), so those stay preview-only forever, not
 //! merely "not yet supported".
 //!
-//! ## Why a separate ArchiveFS-managed tracking section, not inline markers
+//! ## Why a separate EmuWiz-managed tracking section, not inline markers
 //!
 //! Dolphin's `[Gecko]`/`[ActionReplay]` bodies are parsed line-by-line by
 //! `gecko_document`'s existing `parse_gecko_codes`: every line between two
 //! `$Name` headers is attributed to the current code as a hex line, a
-//! `*Note`, or a malformed-line warning. An inline `// ArchiveFS managed`
+//! `*Note`, or a malformed-line warning. An inline `// EmuWiz managed`
 //! comment inside a code's body would therefore be misparsed as a bogus
-//! code line on every future read. Recording which code *names* ArchiveFS
+//! code line on every future read. Recording which code *names* EmuWiz
 //! itself installed in a wholly separate, inert section
 //! ([`MANAGED_SECTION_NAME`]) avoids that entirely: Dolphin ignores an
 //! unknown section, and `gecko_document` preserves it byte-for-byte like
@@ -31,7 +31,7 @@
 //! Re-installing the same selection twice is a no-op: `gecko_document`'s
 //! merge functions already treat a same-name, same-body existing code as
 //! nothing to do. A same-name code with a *different* body - whether or
-//! not it happens to be ArchiveFS-managed - is always a hard error; this
+//! not it happens to be EmuWiz-managed - is always a hard error; this
 //! milestone never silently overwrites a code's content, only adds new
 //! ones or removes exactly the names it itself tracks as managed.
 
@@ -54,7 +54,7 @@ use super::shared_preview::{
 
 pub const MAX_GENERATED_INI_BYTES: usize = 512 * 1024;
 
-/// The bookkeeping section name ArchiveFS writes into a Dolphin
+/// The bookkeeping section name EmuWiz writes into a Dolphin
 /// GameSettings file - see the module doc comment for why this exists
 /// instead of inline markers. Body shape: one `$Name` line per managed
 /// code, exactly like `[Gecko_Enabled]`'s own body.
@@ -110,7 +110,7 @@ fn map_merge_error(failure: super::gecko_document::GeckoMergeError) -> GameCubeI
 /// Dolphin's own convention for a code's display name is `"Display Name
 /// [Author]"` (see `GeckoCode::name`'s doc comment) - never split apart by
 /// Dolphin itself, and reproduced exactly here so a cheat installed by
-/// ArchiveFS looks identical to one Dolphin's own catalogue would offer.
+/// EmuWiz looks identical to one Dolphin's own catalogue would offer.
 #[must_use]
 pub fn dolphin_code_name(cheat: &GameHackingGameCubeCheat) -> String {
     match cheat.author.as_deref().map(str::trim) {
@@ -454,10 +454,10 @@ pub fn stage_gamecube_gamehacking_install(
 // Staging: removal
 // ---------------------------------------------------------------------
 
-/// Stages removal of exactly the given ArchiveFS-managed code names.
+/// Stages removal of exactly the given EmuWiz-managed code names.
 /// Refuses to touch any name not currently listed in
 /// [`MANAGED_SECTION_NAME`] - including a same-named code the user added
-/// themselves - so removal can never delete a code ArchiveFS did not
+/// themselves - so removal can never delete a code EmuWiz did not
 /// itself install.
 pub fn stage_gamecube_gamehacking_removal(
     staging_root: &Path,
@@ -474,7 +474,7 @@ pub fn stage_gamecube_gamehacking_removal(
                 GameCubeInstallPlanErrorKind::NotManaged,
                 Some(name.as_str()),
                 format!(
-                    "{name:?} is not an ArchiveFS-managed GameHacking code; ArchiveFS will not \
+                    "{name:?} is not an EmuWiz-managed GameHacking code; EmuWiz will not \
                      remove a code it did not install"
                 ),
             ));
@@ -485,7 +485,7 @@ pub fn stage_gamecube_gamehacking_removal(
         return Err(error(
             GameCubeInstallPlanErrorKind::NoSelectedCheats,
             None,
-            "no ArchiveFS-managed codes selected for removal",
+            "no EmuWiz-managed codes selected for removal",
         ));
     }
 

@@ -14,7 +14,7 @@ archivefs retroarch-cheat-catalogue /path/to/manifest.json --json
 archivefs retroarch-cheat-catalogue /path/to/cheat-catalogue --cheat-destination-root /tmp/isolated-preview-root
 ```
 
-The local catalogue path is always required and always exact. ArchiveFS
+The local catalogue path is always required and always exact. EmuWiz
 never searches your home directory, a default catalogue location, or any
 remote source for one.
 
@@ -103,7 +103,7 @@ treated as a match or a conflict - it simply cannot decide that tier.
 4. **Exact normalized title + canonical platform + region.**
 5. **Exact normalized title + canonical platform** (region ignored for the
    match itself, but see below). External platform hints are resolved through
-   ArchiveFS's existing normalized folder-platform alias table; the original
+   EmuWiz's existing normalized folder-platform alias table; the original
    source string remains visible as provenance. Unknown or ambiguous hints do
    not participate in platform-gated tiers.
 6. **Filename-only evidence** - normalized title alone, no platform
@@ -115,7 +115,7 @@ Confidence levels, stable lower-snake-case JSON values:
 - `strong`: tier 4 or 5, exactly one candidate.
 - `weak`: tier 6, exactly one candidate.
 - `ambiguous`: two or more catalogue games tie at the best available tier -
-  every tied candidate is listed; ArchiveFS never silently picks one.
+  every tied candidate is listed; EmuWiz never silently picks one.
 - `unsupported`: no tier produced a candidate.
 
 Region and revision differences remain visible rather than being silently
@@ -190,7 +190,7 @@ the top of this document. Fields:
 
 ### Destination resolution
 
-The destination directory component is **only** ArchiveFS's own canonical
+The destination directory component is **only** EmuWiz's own canonical
 platform name for the catalogue record's platform hint (the same alias
 table "Identity evidence and confidence" above uses for matching - e.g.
 `"Atari - 2600"` resolves the same way to `"Atari2600"`). An unknown,
@@ -341,7 +341,7 @@ This command does not:
 - launch RetroArch, load a core, or execute any external command;
 - modify RetroArch configuration, playlists, or cores;
 - write to, migrate, or open (other than the existing read-only catalogue
-  helper already used by sibling preview commands) the ArchiveFS database;
+  helper already used by sibling preview commands) the EmuWiz database;
 - run a live library scan;
 - parse or execute a cheat *code* body, only its bounded description
   metadata;

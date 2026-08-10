@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Shared, side-effect-free helpers for ArchiveFS release tooling.
+# Shared, side-effect-free helpers for EmuWiz release tooling.
 # This file is sourced by the executable scripts in this directory.
 
 release_die() {
@@ -38,7 +38,7 @@ versions = {
     if package["name"] in {"archivefs-cli", "archivefs-core", "archivefs-gui"}
 }
 if len(versions) != 1:
-    raise SystemExit(f"ArchiveFS workspace package versions disagree: {sorted(versions)}")
+    raise SystemExit(f"EmuWiz workspace package versions disagree: {sorted(versions)}")
 print(versions.pop())
 '
     )

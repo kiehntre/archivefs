@@ -91,7 +91,7 @@ impl XeniaOutcomeBlockedReason {
     pub fn message(self) -> &'static str {
         match self {
             Self::NoVerifiedTitleIdAvailable => {
-                "ArchiveFS has no separately verified Xbox 360 Title ID for this archive yet."
+                "EmuWiz has no separately verified Xbox 360 Title ID for this archive yet."
             }
             Self::InvalidVerifiedTitleId => "The verified Title ID is not eight hex characters.",
             Self::NoPatchesReturnedByProvider => {
@@ -109,7 +109,7 @@ pub enum XeniaCandidateCompatibility {
     ExactCompatible,
     /// Title ID matches and no declared constraint is contradicted, but at
     /// least one constraint (almost always the module hash, which
-    /// ArchiveFS never computes) could not be independently verified.
+    /// EmuWiz never computes) could not be independently verified.
     /// Selectable only after explicit user acknowledgement.
     PartiallyVerified,
     /// Title ID mismatch, or a declared Media ID this archive's own
@@ -134,7 +134,7 @@ pub struct XeniaCandidate {
     pub evidence: Vec<XeniaCandidateEvidence>,
     pub document_warnings: Vec<String>,
     pub patches: Vec<XeniaPatch>,
-    /// True whenever this file declares a module hash - which ArchiveFS
+    /// True whenever this file declares a module hash - which EmuWiz
     /// can never compute or verify without decoding the module. Kept
     /// distinct from `compatibility` so the GUI can always explain *why*
     /// a candidate is only partially verified, even when every other
@@ -266,7 +266,7 @@ fn classify_candidate(
                 evidence.push(candidate_evidence(
                     "module_hash",
                     format!(
-                        "file requires one of {} module hash(es); ArchiveFS cannot compute or verify a module hash",
+                        "file requires one of {} module hash(es); EmuWiz cannot compute or verify a module hash",
                         document.hashes.len()
                     ),
                 ));

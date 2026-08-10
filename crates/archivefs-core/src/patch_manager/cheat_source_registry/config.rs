@@ -127,8 +127,7 @@ pub fn save_cheat_sources_config_to(
     config: &CheatSourcesConfig,
 ) -> Result<(), ArchiveFsError> {
     let path = path.as_ref();
-    let header =
-        "# ArchiveFS cheat source preferences\n# Only non-default values are recorded.\n\n";
+    let header = "# EmuWiz cheat source preferences\n# Only non-default values are recorded.\n\n";
     let body = toml::to_string_pretty(config).map_err(|e| {
         ArchiveFsError::Config(format!("failed to serialize cheat source config: {e}"))
     })?;
@@ -206,7 +205,7 @@ mod tests {
         let cfg = CheatSourcesConfig::default();
         save_cheat_sources_config_to(&path, &cfg).unwrap();
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.contains("ArchiveFS cheat source preferences"));
+        assert!(text.contains("EmuWiz cheat source preferences"));
     }
 
     #[test]

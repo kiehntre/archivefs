@@ -75,9 +75,9 @@ requiring a manual "Fetch" click first:
 
 Dolphin has no single native install path (it also supports portable/
 AppImage installs with their own directory), and Xenia Canary has no
-native path at all - ArchiveFS only ever learns about either through an
+native path at all - EmuWiz only ever learns about either through an
 explicitly typed directory or a previous discovery. To avoid asking every
-time, ArchiveFS now remembers the profile you last chose, in
+time, EmuWiz now remembers the profile you last chose, in
 `~/.config/archivefs/emulator_profiles.toml` (a small file separate from
 `config.toml`, so remembering a profile can never interact with source
 folder management).
@@ -90,13 +90,13 @@ Selection order, applied whenever profile discovery completes:
    several otherwise-equal valid profiles.
 4. The only valid profile, if there's just one.
 5. Otherwise, if more than one valid profile exists, a chooser appears:
-   *"ArchiveFS found N \<emulator\> profiles. Choose the one you use:"*
+   *"EmuWiz found N \<emulator\> profiles. Choose the one you use:"*
    with one friendly radio choice per profile. Clicking the choice selects
    and remembers it in the same non-destructive action; exact paths remain
    available under Details.
 
 If a remembered profile stops being valid (its directory disappeared, or
-it no longer passes the same eligibility checks), ArchiveFS does not
+it no longer passes the same eligibility checks), EmuWiz does not
 silently fall back to guessing - it shows a plain "Emulator setup needed"
 state and asks again, the same as if nothing had ever been remembered.
 
@@ -122,11 +122,11 @@ Compatibility evidence is translated into four labels:
 
 Incompatible candidates are never shown in the default list - Xenia's own
 candidate-matching step never even builds a selection for one - but the
-exact technical evidence for anything ArchiveFS considered is still
+exact technical evidence for anything EmuWiz considered is still
 available under Details.
 
 For a partially verified Xenia patch, the beginner view shows exactly one
-warning - *"This patch matches the game, but ArchiveFS cannot confirm the
+warning - *"This patch matches the game, but EmuWiz cannot confirm the
 exact executable version."* - with one checkbox: *"I understand this patch
 may target a different executable version."* This is the same
 `XeniaPatchSelection::partial_verification_acknowledged` flag the

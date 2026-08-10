@@ -7,7 +7,7 @@
 //! - A view's destination root may never be inside a configured source
 //!   folder, and no configured source folder may be inside a destination
 //!   root (`validate_library_view_destination`).
-//! - Every symlink ArchiveFS creates is recorded in a per-view manifest
+//! - Every symlink EmuWiz creates is recorded in a per-view manifest
 //!   (`LibraryViewManifest`); cleanup (`remove_library_view_symlinks`) only
 //!   ever removes a path that is *still* a symlink pointing at the *exact*
 //!   target the manifest recorded for it - never a path that has since
@@ -321,13 +321,13 @@ pub fn save_library_view_configs_to(
     atomic_write_text(path.as_ref(), &contents)
 }
 
-/// One managed symlink ArchiveFS created, as recorded in a view's manifest.
+/// One managed symlink EmuWiz created, as recorded in a view's manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LibraryViewManifestEntry {
     /// Relative to the view's `destination_root` at the time this entry
     /// was written - never an absolute path, so a manifest stays valid if
     /// the whole destination tree is ever relocated by the user outside
-    /// ArchiveFS (repair would then simply report every entry as broken).
+    /// EmuWiz (repair would then simply report every entry as broken).
     #[serde(with = "path_json")]
     pub relative_link_path: PathBuf,
     /// The exact symlink target - never a lossy display string, so a
@@ -978,7 +978,7 @@ pub enum LibraryViewApplyOutcome {
     /// no longer matches what the manifest recorded (already gone, replaced
     /// by a real file, or repointed by something else since planning) - so
     /// nothing was touched. Not an error: this is the safety model working
-    /// as intended ("never remove anything ArchiveFS did not record as
+    /// as intended ("never remove anything EmuWiz did not record as
     /// managed", re-checked at the moment of removal, not just at plan
     /// time).
     LeftUnchanged,
@@ -1547,7 +1547,7 @@ fn create_or_repair_symlink(destination: &Path, target: &Path) -> Result<()> {
 /// `Ok(false)` if `destination` no longer matches (already gone, replaced
 /// by a real file, or repointed by something else) - in the `Ok(false)`
 /// case nothing is touched at all, satisfying "never remove anything
-/// ArchiveFS did not record as managed" even when the manifest is stale
+/// EmuWiz did not record as managed" even when the manifest is stale
 /// relative to the filesystem.
 fn remove_managed_symlink(destination: &Path, recorded_target: &Path) -> Result<bool> {
     let metadata = match fs::symlink_metadata(destination) {
@@ -1569,7 +1569,7 @@ fn remove_managed_symlink(destination: &Path, recorded_target: &Path) -> Result<
 }
 
 /// Best-effort cleanup: after removing managed symlinks, removes any
-/// now-empty directory ArchiveFS created under `destination_root` - never
+/// now-empty directory EmuWiz created under `destination_root` - never
 /// `destination_root` itself (milestone requirement: "never treat the
 /// destination directory itself as removable"), and never anything outside
 /// it. `fs::remove_dir` on a non-empty directory simply fails and is
@@ -1855,7 +1855,7 @@ mod tests {
         let archive = make_archive(1, 1, &archive_path, Some("NES"));
         let view = make_view("view-1", &destination, vec![], vec![]);
         // Not previously recorded in any manifest - this symlink was not
-        // created by ArchiveFS, but already points exactly where ArchiveFS
+        // created by EmuWiz, but already points exactly where EmuWiz
         // would put it.
         let manifest = empty_manifest(&view.id, &destination);
 
@@ -2130,7 +2130,7 @@ mod tests {
         };
 
         // The path the manifest thinks is a managed symlink has since been
-        // replaced by a real file - e.g. by the user, outside ArchiveFS.
+        // replaced by a real file - e.g. by the user, outside EmuWiz.
         write_file(&link_path, b"a real file now sits here");
 
         let removed = remove_managed_symlink(&link_path, &archive_path).unwrap();

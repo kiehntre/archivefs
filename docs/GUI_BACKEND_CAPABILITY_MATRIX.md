@@ -1,6 +1,6 @@
 # GUI ↔ Backend Capability Matrix
 
-Maps each design-reference screen (`design-reference/ArchiveFS design stage
+Maps each design-reference screen (`design-reference/EmuWiz design stage
 one.zip` — screens confirmed present by text search: Mount, Selected,
 Active Mounts, Library, Sources, Doctor, History & Logs, Settings, About) to
 the current state of `archivefs-core`/`archivefs-gui` as of campaign base

@@ -1,6 +1,6 @@
 # Changelog
 
-All notable user-facing changes to ArchiveFS are recorded here. The format is
+All notable user-facing changes to EmuWiz are recorded here. The format is
 loosely inspired by [Keep a Changelog](https://keepachangelog.com/), but this
 project does not yet claim strict compliance with that format, and versions
 prior to 1.0 do not follow semantic versioning guarantees.

@@ -30,7 +30,7 @@ trap 'printf "\nFailed near line %s\n" "$LINENO" >&2' ERR
     "Set NOBARA_HOST, for example: NOBARA_HOST=davedap@192.168.1.50 $0"
 
 [[ -d "$PROJECT_DIR/.git" ]] || die \
-    "ArchiveFS repository not found at $PROJECT_DIR"
+    "EmuWiz repository not found at $PROJECT_DIR"
 
 cd "$PROJECT_DIR"
 
@@ -181,7 +181,7 @@ if [[ -f "$DB" ]]; then
     printf '\n==> Backing up database to %s\n' "$BACKUP"
     cp --preserve=mode,timestamps "$DB" "$BACKUP"
 else
-    printf '\n==> No existing ArchiveFS database to back up\n'
+    printf '\n==> No existing EmuWiz database to back up\n'
 fi
 
 printf '\n==> Installing test build\n'

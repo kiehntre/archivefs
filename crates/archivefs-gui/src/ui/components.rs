@@ -281,7 +281,7 @@ pub(crate) fn activity_row_header(
 
 /// One consistent presentation for "an operation failed, but the previous
 /// good result is still active" - the shape most retrieval/refresh
-/// failures in ArchiveFS take (the old cheat database, the old catalogue,
+/// failures in EmuWiz take (the old cheat database, the old catalogue,
 /// the old snapshot all remain usable). Shows the plain-language headline
 /// and, when the prior state is still active, a short retained-state note,
 /// directly; the original detailed error text is preserved in full but

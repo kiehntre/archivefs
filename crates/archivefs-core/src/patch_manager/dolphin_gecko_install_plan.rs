@@ -36,7 +36,7 @@ use super::shared_preview::{
 pub const MAX_DOLPHIN_INI_BYTES: u64 = 256 * 1024;
 pub const MAX_GENERATED_INI_BYTES: usize = 512 * 1024;
 pub const GENERATED_INI_PROVENANCE: &str =
-    "# Gecko_Enabled section written by ArchiveFS from this file's own trusted codes.";
+    "# Gecko_Enabled section written by EmuWiz from this file's own trusted codes.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -116,7 +116,7 @@ impl DolphinCandidateBlockedReason {
     pub fn message(self) -> &'static str {
         match self {
             Self::NoVerifiedGameIdAvailable => {
-                "ArchiveFS has no separately verified GameCube game ID for this archive yet."
+                "EmuWiz has no separately verified GameCube game ID for this archive yet."
             }
             Self::InvalidVerifiedGameId => {
                 "The verified game ID is not three to six ASCII letters or digits."
@@ -125,7 +125,7 @@ impl DolphinCandidateBlockedReason {
                 "No GameSettings file in this profile matches this game's verified ID."
             }
             Self::MultipleIniFilesForGame => {
-                "More than one GameSettings file matches this game's verified ID. ArchiveFS will \
+                "More than one GameSettings file matches this game's verified ID. EmuWiz will \
                  not guess between them."
             }
             Self::RevisionMismatch => {

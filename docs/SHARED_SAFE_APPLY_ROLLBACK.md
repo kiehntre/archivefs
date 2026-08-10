@@ -1,6 +1,6 @@
 # Shared safe apply, journal, and rollback foundation
 
-ArchiveFS has a bounded transaction pipeline for exact file-oriented Cheats &
+EmuWiz has a bounded transaction pipeline for exact file-oriented Cheats &
 Mods entries. It is not a general mod installer. Execution is available only
 for an eligible shared preview backed by a separately verified identity, an
 adapter-approved materialized local source, and an exact safe destination.
@@ -49,7 +49,7 @@ is journalled.
 Replacement first creates a verified, never-overwritten backup under:
 
 ```text
-<ArchiveFS managed backup root>/<operation ID>/<destination digest>.bak
+<EmuWiz managed backup root>/<operation ID>/<destination digest>.bak
 ```
 
 Only then is the verified temporary file atomically renamed over the freshly
@@ -59,7 +59,7 @@ there is no automatic pruning.
 ## Journal and partial success
 
 One schema-version-1 JSON journal is atomically written with exclusive final
-creation under the ArchiveFS-managed history root as `<operation ID>.json`.
+creation under the EmuWiz-managed history root as `<operation ID>.json`.
 Operation IDs are validated filename components, duplicate journals are
 rejected, and journal serialization is bounded. Journals preserve exact Unix
 path bytes in hexadecimal alongside display text.
@@ -122,7 +122,7 @@ seam the core and existing RetroArch installer already use.
 The pipeline performs no download, upload, mount, or process execution. It does
 not interpret cheat directives and never launches an emulator, script, binary,
 or discovered executable. Writes are limited to explicitly approved destination
-files/directories and ArchiveFS-managed backup, history, temporary, and rollback
+files/directories and EmuWiz-managed backup, history, temporary, and rollback
 marker paths.
 
 Future work includes multi-root transactions, cancellation checkpoints after

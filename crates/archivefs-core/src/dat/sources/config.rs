@@ -235,7 +235,7 @@ pub fn save_dat_sources_config_to(
     config: &DatSourcesConfig,
 ) -> Result<(), ArchiveFsError> {
     let path = path.as_ref();
-    let header = "# ArchiveFS DAT source registry\n\
+    let header = "# EmuWiz DAT source registry\n\
                   # Managed by the DAT Sources page. Keys this build does not\n\
                   # recognise are preserved rather than removed.\n\n";
     let body = toml::to_string_pretty(config).map_err(|error| {

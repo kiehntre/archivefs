@@ -2,7 +2,7 @@
 
 Status: implemented on `feature/bsfree-cheat-apply`.
 
-ArchiveFS now applies a small, proven subset of the BSFree Archive database
+EmuWiz now applies a small, proven subset of the BSFree Archive database
 through its **existing** GameCube GameHacking adapter and shared
 preview/apply/journal/rollback transaction pipeline. Everything else in BSFree
 remains browse-only. This document records the data audit, the identity
@@ -28,7 +28,7 @@ for this work. Findings:
   serials, CRCs, hashes, or emulator Game IDs.
 - **Code formats** (GameCube, 82 889 records; device "Action Replay"):
 
-  | Format | Count | ArchiveFS disposition |
+  | Format | Count | EmuWiz disposition |
   |---|---|---|
   | Base-31 encrypted AR (`XXXX-XXXX-XXXXX`) | 74 530 | Browse-only (no verified decryptor) |
   | Master/zero/self-modifying hex-pair AR | ~450 | Browse-only (Dolphin refuses at runtime) |
@@ -37,7 +37,7 @@ for this work. Findings:
 
 - **PS2** (797 942 records): CodeBreaker/GameShark/ARMax format. PCSX2 needs
   raw PNACH `patch=` lines; translating those code families requires dedicated
-  decoders that ArchiveFS does not have and this work does not invent. PS2 is
+  decoders that EmuWiz does not have and this work does not invent. PS2 is
   therefore browse-only.
 - **Everything else** (NES/SNES/Genesis/GB/GBA/N64/DS/PSP/etc.): device codes
   (Game Genie, etc.) with no existing adapter. Browse-only.
@@ -153,7 +153,7 @@ marker. A failed apply leaves a recoverable journal.
 
 Unchanged: the BSFree database-content licence is not established and remains
 clearly warned in the GUI and CLI. Applying a code locally does not establish
-redistribution rights; the database is never bundled into ArchiveFS, and
+redistribution rights; the database is never bundled into EmuWiz, and
 acquisition stays explicit (download or local import).
 
 ## Tests
@@ -173,7 +173,7 @@ acquisition stays explicit (download or local import).
   ~90% of GameCube codes (encrypted dash format) and every other platform
   remain browse-only.
 - The encrypted dash-format codes are real AR content Dolphin could decrypt,
-  but ArchiveFS has no verified decryptor and therefore cannot inspect what
+  but EmuWiz has no verified decryptor and therefore cannot inspect what
   they decode to; they stay browse-only rather than risking unknown content.
 - No Wii/Xbox 360 data exists in BSFree.
 - The GUI Cheats & Mods page does not yet offer a BSFree apply control; install

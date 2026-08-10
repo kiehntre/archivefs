@@ -78,7 +78,7 @@ model (§2, §3, §4, §5).
 - **Validation:** reject empty, reserved, or duplicate IDs; reject characters
   outside the allowed set; reject leading/trailing `.`.
 - **Scope:** source-level (identity is never per-platform).
-- **Plain-language effect:** "The permanent name ArchiveFS uses to remember this
+- **Plain-language effect:** "The permanent name EmuWiz uses to remember this
   source. It won't change if the file moves."
 
 ### 1.3 Source path
@@ -106,7 +106,7 @@ model (§2, §3, §4, §5).
   elevation requires a confirmation checkbox; changing scheme/origin/base path
   on an existing trusted source downgrades it and requires re-review.
 - **Scope:** source-level (never per-platform).
-- **Plain-language effect:** "Not reviewed yet — ArchiveFS's developers haven't
+- **Plain-language effect:** "Not reviewed yet — EmuWiz's developers haven't
   checked this source. You can mark a source you have reviewed as 'You reviewed
   this'."
 
@@ -175,7 +175,7 @@ model (§2, §3, §4, §5).
   DAT file or historical provenance (model §14.3).
 - **Scope:** source-level.
 - **Plain-language effect:** "This source is no longer registered. The DAT file
-  on disk and ArchiveFS's record of what it found are kept."
+  on disk and EmuWiz's record of what it found are kept."
 
 ---
 
@@ -214,7 +214,7 @@ fields and are resolved by the shared resolver.
   never carry parent metadata is warned, not rejected (model §15.7); parser-side
   relationship cycles are a parser warning, never a policy value.
 - **Scope:** global by default; overridable per source and per platform.
-- **Plain-language effect:** "How ArchiveFS treats clone entries — a different
+- **Plain-language effect:** "How EmuWiz treats clone entries — a different
   region or revision of a game that lists another entry as its parent. Default:
   treat every entry independently."
 
@@ -264,7 +264,7 @@ fields and are resolved by the shared resolver.
 ### 2.6 Rename safety
 
 - **Label:** "File renaming"
-- **Purpose:** Tell the user, unambiguously, that ArchiveFS does not rename
+- **Purpose:** Tell the user, unambiguously, that EmuWiz does not rename
   their files (model §12).
 - **Safe default:** n/a — **this is not a control.** It is a fixed statement of
   behaviour rendered in the policy summary.
@@ -411,15 +411,15 @@ Not in milestone 1: trust display (3.5, needs a core field), revision policy
 
   Wherever a source's content is about to be previewed or applied, the
   accompanying text states plainly that codes come from the upstream community
-  and ArchiveFS does not endorse them.
+  and EmuWiz does not endorse them.
 
-> DECISION (approved) — shipping a scraper or provider does not mean ArchiveFS
+> DECISION (approved) — shipping a scraper or provider does not mean EmuWiz
 > reviewed or endorsed the upstream content. Six of the nine built-in entries
 > carry community-submitted codes no maintainer has read. A bare "Reviewed"
 > badge on those rows would be a false claim, so the scope travels with the
 > label everywhere it appears.
 - **Scope:** per-source.
-- **Plain-language effect:** "Reviewed by ArchiveFS's developers", "You reviewed
+- **Plain-language effect:** "Reviewed by EmuWiz's developers", "You reviewed
   this", or "Not reviewed yet."
 
 ### 3.6 Enabled (cheat source)
@@ -464,11 +464,11 @@ Not in milestone 1: trust display (3.5, needs a core field), revision policy
 - **Validation:** must be exactly 64 hex chars; a mismatch fails closed.
 - **Scope:** per-source.
 - **Plain-language effect:** "If you have an independently published digest for
-  this archive, ArchiveFS will require the download to match it."
+  this archive, EmuWiz will require the download to match it."
 
 ### 3.9 Source mode cards (Cheats & Mods)
 
-- **Label:** "Existing RetroArch library" and "ArchiveFS trusted catalogue"
+- **Label:** "Existing RetroArch library" and "EmuWiz trusted catalogue"
   (existing `show_cheat_source_modes`), plus the planned
   "Local unverified source" and "Remote unverified source" cards.
 - **Purpose:** Choose the source mode before matching/install (the model's
@@ -483,7 +483,7 @@ Not in milestone 1: trust display (3.5, needs a core field), revision policy
   as planned/pending.
 - **Scope:** workflow-level (per archive being worked on).
 - **Plain-language effect:** "Existing RetroArch library: read-only inventory of
-  your installed cheats. ArchiveFS trusted catalogue: a validated cached
+  your installed cheats. EmuWiz trusted catalogue: a validated cached
   snapshot. Unverified sources are future options, shown but not active."
 
 ### 3.10 Cheat source list
@@ -500,7 +500,7 @@ Not in milestone 1: trust display (3.5, needs a core field), revision policy
   independently. Health of `None` renders as "Not checked", never as healthy or
   failed.
 - **Scope:** global list.
-- **Plain-language effect:** "Every cheat source ArchiveFS knows about, in the
+- **Plain-language effect:** "Every cheat source EmuWiz knows about, in the
   order it consults them. Disabled ones stay in place so you can see what you
   turned off."
 
@@ -551,7 +551,7 @@ Not in milestone 1: trust display (3.5, needs a core field), revision policy
   assert both unknown entries survive byte-for-byte.
 - **Scope:** every preference write.
 - **Plain-language effect:** "Changing one setting never deletes another. If
-  ArchiveFS doesn't recognise something in your preferences file, it keeps it
+  EmuWiz doesn't recognise something in your preferences file, it keeps it
   and tells you."
 
 > DECISION (approved) — this is a **prerequisite bug fix**, required before any
@@ -639,7 +639,7 @@ beyond what the model defines.
   hidden, not shown-and-disabled, for the other registry entries — rendering a
   byte ceiling for a source that never downloads implies a bound that is not
   enforced anywhere (resource policy, audit §6.1, §6.5).
-- **Plain-language effect:** "ArchiveFS will stop a download that exceeds this
+- **Plain-language effect:** "EmuWiz will stop a download that exceeds this
   size."
 
 ---
@@ -678,8 +678,8 @@ provenance the model requires (§14).
   limits; elevation is recorded in provenance; a material change later
   downgrades and requires re-review (model §3.3).
 - **Scope:** per-source.
-- **Plain-language effect:** "You are telling ArchiveFS you have reviewed this
-  source and want to trust it. This only changes how ArchiveFS labels it — it
+- **Plain-language effect:** "You are telling EmuWiz you have reviewed this
+  source and want to trust it. This only changes how EmuWiz labels it — it
   does not disable any safety check."
 
 ### 5.3 Review rename plan — not implemented
@@ -707,7 +707,7 @@ placeholder for it.
   recorded; never presented as a single "best" answer.
 - **Scope:** per-conflict.
 - **Plain-language effect:** "Two entries claim the same game. See both and
-  decide, rather than ArchiveFS guessing."
+  decide, rather than EmuWiz guessing."
 
 ---
 
@@ -731,7 +731,7 @@ types.
   any policy edit or scope change.
 - **Scope:** reflects current source+platform context; a global view shows
   global resolution.
-- **Plain-language effect:** "This is exactly what ArchiveFS will do with the
+- **Plain-language effect:** "This is exactly what EmuWiz will do with the
   settings above, after applying platform overrides."
 
 ### 6.2 Where a value comes from
@@ -755,7 +755,7 @@ types.
 - **Allowed values:** present/absent per field.
 - **Validation:** derived from the resolver's safe-default table.
 - **Scope:** per-field.
-- **Plain-language effect:** "This setting is not ArchiveFS's default. You can
+- **Plain-language effect:** "This setting is not EmuWiz's default. You can
   revert it with one click."
 
 ### 6.4 Revert to default
@@ -769,7 +769,7 @@ types.
   resolves to the same defaults the migration document guarantees.
 - **Scope:** current scope (global or the selected source/platform override).
 - **Plain-language effect:** "Put every setting in this scope back to
-  ArchiveFS's safe defaults."
+  EmuWiz's safe defaults."
 
 ### 6.5 Runtime status strip
 

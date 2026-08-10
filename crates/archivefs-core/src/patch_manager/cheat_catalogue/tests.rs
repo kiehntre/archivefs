@@ -1482,7 +1482,7 @@ fn staging_traversal_style_game_name_is_rejected_with_valid_platform() {
 #[test]
 fn staging_unknown_platform_hint_is_not_eligible() {
     // A platform string that is perfectly safe as a path component but is
-    // simply not a platform ArchiveFS's own alias table recognizes must
+    // simply not a platform EmuWiz's own alias table recognizes must
     // never be laundered into a trusted destination directory just
     // because it contains no unsafe characters. Confidence is `exact`
     // (matched via serial) precisely to prove the platform gate fires

@@ -16,7 +16,7 @@
 //! is already loaded on `ArchiveFsApp` - never from a fresh read.
 //!
 //! Three of the seven cards (Cheats & Mods' source count, DAT Sources'
-//! registry count, RomM's provider state) read state that ArchiveFS
+//! registry count, RomM's provider state) read state that EmuWiz
 //! deliberately does not load until the user visits that page - loading it
 //! eagerly here would mean opening Home always triggers three background
 //! reads nobody asked for, network-shaped or not. So when the real page
@@ -88,7 +88,7 @@ impl CardReadiness {
 }
 
 /// How much visual presence a Home card gets. Primary destinations (the
-/// major jobs a user comes to ArchiveFS for) are larger and drawn first;
+/// major jobs a user comes to EmuWiz for) are larger and drawn first;
 /// secondary/admin destinations stay available but quieter. Nothing is
 /// hidden - this is hierarchy, not removal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,7 +195,7 @@ pub(crate) enum RommReadinessLabel {
     Ready(&'static str),
 }
 
-const READ_ONLY_ROMM_NOTE: &str = "ArchiveFS treats RomM as a read-only identity source: nothing in your RomM library is ever changed.";
+const READ_ONLY_ROMM_NOTE: &str = "EmuWiz treats RomM as a read-only identity source: nothing in your RomM library is ever changed.";
 
 /// Turns already-loaded state into what Home draws. Pure: the same inputs
 /// always produce the same view, and nothing here touches disk or a
@@ -264,7 +264,7 @@ pub(crate) fn build_home_view(inputs: &HomeInputs) -> HomeView {
             card: HomeCard::BrowseGames,
             icon: crate::ui::icons::GAMES,
             title: "My Games",
-            explanation: "Browse your games. See the library ArchiveFS has found, organised and searchable.",
+            explanation: "Browse your games. See the library EmuWiz has found, organised and searchable.",
             tier: HomeCardTier::Primary,
             accent: Some(HomeAccent::Games),
             readiness: Some(browse_readiness),
@@ -286,7 +286,7 @@ pub(crate) fn build_home_view(inputs: &HomeInputs) -> HomeView {
             card: HomeCard::CheckSetup,
             icon: crate::ui::icons::CHECK,
             title: "Check Library",
-            explanation: "Find problems with your ArchiveFS setup and library.",
+            explanation: "Find problems with your EmuWiz setup and library.",
             tier: HomeCardTier::Primary,
             accent: Some(HomeAccent::Check),
             readiness: Some(setup_readiness),
@@ -319,7 +319,7 @@ pub(crate) fn build_home_view(inputs: &HomeInputs) -> HomeView {
             card: HomeCard::Settings,
             icon: crate::ui::icons::SETTINGS,
             title: "Settings",
-            explanation: "Set up ArchiveFS: sources, mounts, and preferences.",
+            explanation: "Set up EmuWiz: sources, mounts, and preferences.",
             tier: HomeCardTier::Primary,
             accent: Some(HomeAccent::Settings),
             readiness: None,
@@ -331,7 +331,7 @@ pub(crate) fn build_home_view(inputs: &HomeInputs) -> HomeView {
             card: HomeCard::BuildLibrary,
             icon: crate::ui::icons::SOURCES,
             title: "Build my library",
-            explanation: "ArchiveFS needs one or more source folders before it can scan for archives.",
+            explanation: "EmuWiz needs one or more source folders before it can scan for archives.",
             tier: HomeCardTier::Secondary,
             accent: None,
             readiness: Some(library_readiness),
@@ -415,8 +415,8 @@ pub(crate) fn show_home_page(ui: &mut egui::Ui, view: &HomeView) -> Option<HomeC
         HomeBanner::FreshInstall => {
             widgets::banner(
                 ui,
-                "Welcome to ArchiveFS",
-                "ArchiveFS is not configured yet - that is expected on a fresh install, not an \
+                "Welcome to EmuWiz",
+                "EmuWiz is not configured yet - that is expected on a fresh install, not an \
                  error. Pick a task below to get started.",
                 widgets::StatusTone::Info,
             );
@@ -426,7 +426,7 @@ pub(crate) fn show_home_page(ui: &mut egui::Ui, view: &HomeView) -> Option<HomeC
             widgets::banner(
                 ui,
                 "Configuration file is no longer found",
-                "ArchiveFS found your configuration earlier in this session, and it is no \
+                "EmuWiz found your configuration earlier in this session, and it is no \
                  longer present. Check Doctor before starting a new task.",
                 widgets::StatusTone::Warning,
             );

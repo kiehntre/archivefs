@@ -1,6 +1,6 @@
-# ArchiveFS Provider Pipeline
+# EmuWiz Provider Pipeline
 
-This document describes how ArchiveFS providers should cooperate when building
+This document describes how EmuWiz providers should cooperate when building
 `ArchiveRecord` values.
 
 Providers are extension points for deriving archive metadata, archive health,
@@ -63,7 +63,7 @@ provider registration or config.
 
 Conflicts happen when two providers return different values for the same field.
 
-ArchiveFS should resolve conflicts using field-level rules:
+EmuWiz should resolve conflicts using field-level rules:
 
 - Empty values never override populated values.
 - Higher-priority providers may override lower-priority providers only for
@@ -177,7 +177,7 @@ Registration should include:
 Registration must be deterministic. Loading plugins in a different filesystem
 order should not change provider order unless the user config says so.
 
-Plugins should not mutate global ArchiveFS state during registration. They
+Plugins should not mutate global EmuWiz state during registration. They
 should describe capabilities first, then execute only when the pipeline invokes
 them.
 
@@ -198,7 +198,7 @@ External providers must be opt-in. They should declare:
 External results should be cached and merged with lower trust than explicit
 local user metadata unless configured otherwise.
 
-ArchiveFS should support offline operation. Lack of network access must not
+EmuWiz should support offline operation. Lack of network access must not
 break scanning, status, mounting, unmounting, or local index commands.
 
 ## Caching

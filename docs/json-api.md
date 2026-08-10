@@ -1,6 +1,6 @@
 # JSON API
 
-This document describes ArchiveFS command output that is intended for programmatic use.
+This document describes EmuWiz command output that is intended for programmatic use.
 
 Commands that currently support JSON output:
 
@@ -109,7 +109,7 @@ Filesystem path to the source archive represented as a string.
 
 `mount_path`
 
-Filesystem path where ArchiveFS mounts, or would mount, the archive.
+Filesystem path where EmuWiz mounts, or would mount, the archive.
 
 `state`
 
@@ -211,7 +211,7 @@ The object keys are data values, not a fixed enum. Integrations should handle ne
 
 Object keyed by lowercase archive extension, such as `zip`, `7z`, or `rar`. Values are archive counts for that extension.
 
-The object keys are data values. Integrations should handle new keys if ArchiveFS supports more archive types later.
+The object keys are data values. Integrations should handle new keys if EmuWiz supports more archive types later.
 
 `largest_archive`
 
@@ -291,7 +291,7 @@ Filesystem path to the archive represented as a string.
 
 `mount_path`
 
-Filesystem path where ArchiveFS would mount this archive.
+Filesystem path where EmuWiz would mount this archive.
 
 `extension`
 

@@ -127,7 +127,7 @@ impl NoCover {
             Self::NoRommIdentity => "No RomM identity for this file, so no cover is available.",
             Self::NoArtwork => "RomM recorded no artwork for this game.",
             Self::PublicOnly => {
-                "Public artwork reference recorded, but ArchiveFS does not fetch from public hosts."
+                "Public artwork reference recorded, but EmuWiz does not fetch from public hosts."
             }
             Self::Unavailable => "No cached cover, and RomM was not reachable.",
             Self::Failed => "The cover could not be loaded.",

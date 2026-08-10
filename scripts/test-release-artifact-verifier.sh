@@ -55,7 +55,7 @@ def base_members():
         "archivefs-cli": (0o755, cli),
         "archivefs-gui": (0o755, gui),
         "install.sh": (0o755, b"#!/bin/sh\nexit 0\n"),
-        "README.md": (0o644, b"ArchiveFS release fixture\n"),
+        "README.md": (0o644, b"EmuWiz release fixture\n"),
         "CHANGELOG.md": (0o644, b"Release fixture\n"),
         "LICENSE": (0o644, b"MIT fixture\n"),
         "config.toml.example": (0o644, b"mount_dir = '/tmp/archivefs'\n"),

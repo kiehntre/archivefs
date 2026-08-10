@@ -1,6 +1,6 @@
 # RetroArch Cheat Installation History
 
-ArchiveFS can discover and inspect its RetroArch cheat installation journals
+EmuWiz can discover and inspect its RetroArch cheat installation journals
 without opening their JSON files manually:
 
 Journals produced by guided
@@ -35,7 +35,7 @@ separately gated [`retroarch-cheat-install`](RETROARCH_CHEAT_INSTALL.md) and
 This is resolved beneath the same home-directory data location used by the
 current installer. `--journal-root <path>` selects
 an explicit installation-journal directory for history discovery. It does not
-change the expected ArchiveFS backup or rollback-journal roots.
+change the expected EmuWiz backup or rollback-journal roots.
 
 A missing history directory is a successful, empty result and is not created.
 A symlinked, inaccessible, or otherwise unsafe root produces a warning and no
@@ -58,7 +58,7 @@ of raw JSON. Equal or absent timestamps use stable journal-path ordering.
 
 `--json` emits the versioned `CheatHistoryReport` model. History contains all
 valid run inspections plus structured `warnings`. Inspect emits a versioned
-envelope with `ok` and either `inspection` or `error`. Paths use an ArchiveFS
+envelope with `ok` and either `inspection` or `error`. Paths use an EmuWiz
 `{ "display": ..., "lossy": ... }` representation. On Unix, a non-UTF-8
 history path additionally carries `raw_bytes`, preserving its exact identity
 for core/GUI consumers. Security decisions always use the original
@@ -75,14 +75,14 @@ of the destination. It also retains the recorded source and destination paths.
 | --- | --- |
 | `unchanged_since_install` | A safe regular destination file still has the installed hash. |
 | `missing` | No destination entry exists. For `installed_new`, rollback is already unnecessary; for a replacement, the unexpected absence blocks rollback. |
-| `changed` | A safe regular destination exists but its hash differs. ArchiveFS will not overwrite it during rollback. |
+| `changed` | A safe regular destination exists but its hash differs. EmuWiz will not overwrite it during rollback. |
 | `inaccessible` | Metadata or content could not be read; missing is reported separately. |
 | `unsafe_path` | Root binding, traversal, symlink, component, or file-type safety failed. The file is not hashed. |
 | `unknown` | The journal does not provide enough safe information for an assessment. |
 
 Replacement entries also report backup state: `present_and_valid`, `missing`,
 `changed`, `inaccessible`, `unsafe_path`, `unknown`, or `not_applicable`.
-Backups must be direct children of ArchiveFS's expected
+Backups must be direct children of EmuWiz's expected
 `cheat-install-backups` root and match the recorded previous hash.
 
 ## Rollback availability
@@ -99,7 +99,7 @@ Backups must be direct children of ArchiveFS's expected
 | `blocked_invalid_journal` | Required install metadata is internally incomplete. |
 | `unknown` | Inaccessibility or ambiguity prevents a safe conclusion. |
 
-Rollback journals are not associated by filename. ArchiveFS validates the
+Rollback journals are not associated by filename. EmuWiz validates the
 recorded install run ID, original journal path, destination root, and every
 entry's destination, expected installed/previous hashes, and backup path.
 Multiple fully bound records are reported as ambiguous; a record that merely

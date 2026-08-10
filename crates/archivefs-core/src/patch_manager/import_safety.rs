@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 /// The product rule applied to every future imported active-content adapter.
 pub const UNKNOWN_CODE_POLICY: &str =
-    "ArchiveFS may inspect imported content, but it never executes unknown code automatically.";
+    "EmuWiz may inspect imported content, but it never executes unknown code automatically.";
 
 /// The three user-facing trust states. Missing provenance alone is not a
 /// technical-danger finding and therefore does not turn `Unverified` into

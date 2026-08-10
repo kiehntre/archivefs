@@ -10,7 +10,7 @@
 # this script's own location (via `git -C <script dir> rev-parse
 # --show-toplevel`), never from the caller's current directory. Exits
 # non-zero with a clear message if that resolved root is not the
-# ArchiveFS repository (no crates/archivefs-core, or no archivefs-core
+# EmuWiz repository (no crates/archivefs-core, or no archivefs-core
 # workspace member in Cargo.toml).
 #
 # What it does:
@@ -46,7 +46,7 @@
 #
 # Tests: tests/test_barry_checkpoint.sh (run it directly, or see the
 # "Run the script's tests" step in the project's normal validation flow).
-# It builds a disposable, minimal fake ArchiveFS repository under a
+# It builds a disposable, minimal fake EmuWiz repository under a
 # temporary directory (its own git history, its own Cargo.toml/Cargo.lock,
 # its own copy of this script under scripts/) and drives that copy
 # end-to-end - it never touches this real repository's working tree,
@@ -75,11 +75,11 @@ repo_root="$(git -C "$script_dir" rev-parse --show-toplevel 2>/dev/null)" ||
     die "not inside a git repository (resolved from this script's location: $script_dir)"
 
 [[ -f "$repo_root/Cargo.toml" ]] ||
-    die "not inside the ArchiveFS repository: no Cargo.toml at resolved root $repo_root"
+    die "not inside the EmuWiz repository: no Cargo.toml at resolved root $repo_root"
 [[ -d "$repo_root/crates/archivefs-core" ]] ||
-    die "not inside the ArchiveFS repository: no crates/archivefs-core under resolved root $repo_root"
+    die "not inside the EmuWiz repository: no crates/archivefs-core under resolved root $repo_root"
 grep -q 'archivefs-core' "$repo_root/Cargo.toml" ||
-    die "not inside the ArchiveFS repository: Cargo.toml at $repo_root does not mention archivefs-core"
+    die "not inside the EmuWiz repository: Cargo.toml at $repo_root does not mention archivefs-core"
 
 cd "$repo_root"
 
@@ -229,7 +229,7 @@ output_tmp="$(mktemp "$barry_dir/.project-state.md.tmp.XXXXXX")"
 if [[ ! -f "$barry_file" ]]; then
     # Brand new file: a minimal heading, then the facts block.
     {
-        printf '# ArchiveFS Project State\n\n'
+        printf '# EmuWiz Project State\n\n'
         cat -- "$facts_tmp"
     } >"$output_tmp"
 elif start_line="$(grep -Fn -- "$start_marker" "$barry_file" | head -n1 | cut -d: -f1)" &&
