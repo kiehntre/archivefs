@@ -261,7 +261,6 @@ extra_field = "bad"
     }
 
     #[test]
-    #[test]
     fn save_creates_parent_directories() {
         let root = test_root("nested");
         let path = root.join("deep/nest/cheat_sources.toml");

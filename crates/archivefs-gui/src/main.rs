@@ -702,11 +702,7 @@ fn main() -> eframe::Result<()> {
     }
 
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1100.0, 720.0])
-            // The desktop application id / window class: `emuwiz` is the
-            // user-facing identity for window managers and launchers.
-            .with_app_id("emuwiz"),
+        viewport: egui::ViewportBuilder::default().with_inner_size([1100.0, 720.0]),
         ..Default::default()
     };
 

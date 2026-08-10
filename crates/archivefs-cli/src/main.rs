@@ -5805,7 +5805,7 @@ mod tests {
     #[test]
     fn confirmed_missing_config_gets_a_first_run_hint() {
         let missing = std::env::temp_dir()
-            .join("emuwiz-cli-test-confirmed-missing-config-does-not-exist.toml");
+            .join("archivefs-cli-test-confirmed-missing-config-does-not-exist.toml");
         let _ = std::fs::remove_file(&missing);
         let source = std::io::Error::new(std::io::ErrorKind::NotFound, "No such file or directory");
         let original_text = format!("{}: {source}", missing.display());
@@ -5837,7 +5837,7 @@ mod tests {
     #[test]
     fn dangling_symlink_config_path_gets_no_first_run_hint() {
         let dir = std::env::temp_dir().join(format!(
-            "emuwiz-cli-test-dangling-symlink-{}",
+            "archivefs-cli-test-dangling-symlink-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -7036,7 +7036,7 @@ mod tests {
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir =
-            std::env::temp_dir().join(format!("emuwiz-cli-test-{name}-{}", std::process::id()));
+            std::env::temp_dir().join(format!("archivefs-cli-test-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -9472,7 +9472,7 @@ mod doctor_stage1c_tests {
     #[test]
     fn a_managed_entry_finding_reaches_the_text_report_with_its_reason() {
         let temporary = std::env::temp_dir().join(format!(
-            "emuwiz-cli-managed-{}-{}",
+            "archivefs-cli-managed-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

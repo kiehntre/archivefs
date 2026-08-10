@@ -77,13 +77,11 @@ pub(crate) fn config_dir_in(home: &Path) -> PathBuf {
 pub(crate) fn data_dir_in(home: &Path) -> PathBuf {
     choose_dir(
         &home.join(".local").join("share").join(DATA_DIR_NAME),
-        &home
-            .join(".local")
-            .join("share")
-            .join(LEGACY_DATA_DIR_NAME),
+        &home.join(".local").join("share").join(LEGACY_DATA_DIR_NAME),
     )
 }
 
+#[cfg(test)]
 pub(crate) fn config_path_in(home: &Path, leaf: &str) -> PathBuf {
     config_dir_in(home).join(leaf)
 }
@@ -129,12 +127,7 @@ pub fn legacy_config_dir_exists() -> bool {
 /// Whether the legacy `archivefs` data directory exists for the current user.
 pub fn legacy_data_dir_exists() -> bool {
     home()
-        .map(|home| {
-            path_is_present(&home.join(".local")
-                .join("share")
-                .join(LEGACY_DATA_DIR_NAME)
-            )
-        })
+        .map(|home| path_is_present(&home.join(".local").join("share").join(LEGACY_DATA_DIR_NAME)))
         .unwrap_or(false)
 }
 
