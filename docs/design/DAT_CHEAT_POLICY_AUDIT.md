@@ -84,10 +84,10 @@ The DAT subsystem lives in `archivefs-core::dat` and is deliberately read-only:
 
 ### 1.3 Current CLI surface
 
-- `archivefs-cli dat inspect <path> [--json]` — parse and print catalogue info.
-- `archivefs-cli dat validate <path> [--json]` — parse and report validity,
+- `emuwiz-cli dat inspect <path> [--json]` — parse and print catalogue info.
+- `emuwiz-cli dat validate <path> [--json]` — parse and report validity,
   warnings, and hash coverage.
-- `archivefs-cli dat audit <path> [--file <path> ...] [--json]` — compare named
+- `emuwiz-cli dat audit <path> [--file <path> ...] [--json]` — compare named
   files against the DAT by name only; no file contents are read.
 
 There is no GUI integration for DATs today.
@@ -212,12 +212,12 @@ its CLI wrappers in `archivefs-cli`:
 
 Registry and preferences (PR #2):
 
-- `archivefs cheat-source list [--json]` — all nine entries in priority order
+- `emuwiz-cli cheat-source list [--json]` — all nine entries in priority order
   (lowest number first), including disabled ones.
-- `archivefs cheat-source info <source-id> [--json]`
-- `archivefs cheat-source enable <source-id> [--json]`
-- `archivefs cheat-source disable <source-id> [--json]`
-- `archivefs cheat-source set-priority <source-id> <1-999> [--json]`
+- `emuwiz-cli cheat-source info <source-id> [--json]`
+- `emuwiz-cli cheat-source enable <source-id> [--json]`
+- `emuwiz-cli cheat-source disable <source-id> [--json]`
+- `emuwiz-cli cheat-source set-priority <source-id> <1-999> [--json]`
 
 `enable`, `disable`, and `set-priority` **persist immediately** to
 `~/.config/archivefs/cheat_sources.toml`; there is no preview or confirmation
@@ -226,19 +226,19 @@ per-platform overrides can only be set by editing the TOML by hand.
 
 Retrieval pipeline:
 
-- `archivefs retroarch-cheat-source-list [--cache-root <path>] [--json]`
-- `archivefs retroarch-cheat-source-fetch <source-id> [--force-refresh] [--offline]
+- `emuwiz-cli retroarch-cheat-source-list [--cache-root <path>] [--json]`
+- `emuwiz-cli retroarch-cheat-source-fetch <source-id> [--force-refresh] [--offline]
   [--expected-sha256 <hash>] [--cache-root <path>] [--max-download-bytes <bytes>] [--json]`
-- `archivefs retroarch-cheat-source-inspect <source-id|snapshot-path> [--cache-root <path>] [--json]`
-- `archivefs retroarch-cheat-snapshot-list [--source <id>] [--cache-root <path>] [--json]`
-- `archivefs retroarch-cheat-snapshot-verify [--all | --source <id> | <snapshot-id>] [--cache-root <path>] [--json]`
-- `archivefs retroarch-cheat-snapshot-pin <snapshot-id> [--cache-root <path>] [--json]`
-- `archivefs retroarch-cheat-snapshot-unpin <snapshot-id> [--cache-root <path>] [--json]`
-- `archivefs retroarch-cheat-cache-prune [--keep <n>] [--older-than-days <d>]
+- `emuwiz-cli retroarch-cheat-source-inspect <source-id|snapshot-path> [--cache-root <path>] [--json]`
+- `emuwiz-cli retroarch-cheat-snapshot-list [--source <id>] [--cache-root <path>] [--json]`
+- `emuwiz-cli retroarch-cheat-snapshot-verify [--all | --source <id> | <snapshot-id>] [--cache-root <path>] [--json]`
+- `emuwiz-cli retroarch-cheat-snapshot-pin <snapshot-id> [--cache-root <path>] [--json]`
+- `emuwiz-cli retroarch-cheat-snapshot-unpin <snapshot-id> [--cache-root <path>] [--json]`
+- `emuwiz-cli retroarch-cheat-cache-prune [--keep <n>] [--older-than-days <d>]
   [--max-cache-bytes <b>] [--include-abandoned-staging] [--abandoned-staging-min-hours <h>]
   [--source <id>] [--cache-root <path>] [--dry-run] [--yes] [--json]`
-- `archivefs retroarch-cheat-setup --source <source-id> ...` or
-  `archivefs retroarch-cheat-setup <catalogue-path> ...`
+- `emuwiz-cli retroarch-cheat-setup --source <source-id> ...` or
+  `emuwiz-cli retroarch-cheat-setup <catalogue-path> ...`
 
 ### 2.4 GUI integration points
 

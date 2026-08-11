@@ -15,8 +15,8 @@ automatic.
 Run:
 
 ```sh
-archivefs database-check
-archivefs database-check --json
+emuwiz-cli database-check
+emuwiz-cli database-check --json
 ```
 
 The command opens only an existing regular file with SQLite's explicit
@@ -40,7 +40,7 @@ extended `SQLITE_READONLY_ROLLBACK` result is reported as
 For a manual process check, use read-only commands such as:
 
 ```sh
-pgrep -a archivefs
+pgrep -af 'emuwiz|archivefs'
 lsof ~/.local/share/archivefs/*
 fuser ~/.local/share/archivefs/*
 ```

@@ -12,7 +12,7 @@ the repository automatically installs and uses the pinned version - you do
 not need to run `rustup override` yourself.
 
 ```sh
-cd archivefs
+cd emuwiz
 cargo --version   # should print the version from rust-toolchain.toml
 ```
 

@@ -20,7 +20,7 @@ game ID.
 Build or resume the catalogue with:
 
 ```text
-archivefs-cli gamehacking-ps2-index-refresh --resume
+emuwiz-cli gamehacking-ps2-index-refresh --resume
 ```
 
 `--cache-root <absolute-path>` and `--json` are also supported. Progress is

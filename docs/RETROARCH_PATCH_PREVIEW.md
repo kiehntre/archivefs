@@ -1,6 +1,6 @@
 # RetroArch Cheat/Patch Destination Preview
 
-`archivefs retroarch-patch-preview` is a strictly read-only command that
+`emuwiz-cli retroarch-patch-preview` is a strictly read-only command that
 previews where a RetroArch cheat file or soft-patch sibling file *would*
 go for each catalogued game, for each discovered RetroArch installation
 profile. It makes no filesystem changes, launches no process, loads no
@@ -227,8 +227,8 @@ exactly mirroring the equivalent PCSX2 fixture test.
 ## CLI
 
 ```
-archivefs retroarch-patch-preview
-archivefs retroarch-patch-preview --json
+emuwiz-cli retroarch-patch-preview
+emuwiz-cli retroarch-patch-preview --json
 ```
 
 Only `--json` is accepted, matching `pcsx2-patch-preview`'s existing

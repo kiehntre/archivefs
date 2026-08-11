@@ -46,11 +46,11 @@ view:
 ## Commands
 
 ```sh
-archivefs view list
-archivefs view preview <name-or-id>
-archivefs view apply <name-or-id>
-archivefs view repair <name-or-id>
-archivefs view remove <name-or-id> [--keep-definition]
+emuwiz-cli view list
+emuwiz-cli view preview <name-or-id>
+emuwiz-cli view apply <name-or-id>
+emuwiz-cli view repair <name-or-id>
+emuwiz-cli view remove <name-or-id> [--keep-definition]
 ```
 
 - `list` prints configured views.

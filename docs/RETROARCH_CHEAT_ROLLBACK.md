@@ -18,9 +18,9 @@ journal-binding, and confirmation checks; retrieval provenance does not weaken
 rollback safety.
 
 ```console
-archivefs retroarch-cheat-rollback ~/.local/share/archivefs/cheat-install-runs/<run>.json \
+emuwiz-cli retroarch-cheat-rollback ~/.local/share/archivefs/cheat-install-runs/<run>.json \
   --cheat-destination-root ~/.config/retroarch/cheats --yes
-archivefs retroarch-cheat-rollback /tmp/install.json \
+emuwiz-cli retroarch-cheat-rollback /tmp/install.json \
   --cheat-destination-root /tmp/retroarch-cheats --dry-run --json
 ```
 

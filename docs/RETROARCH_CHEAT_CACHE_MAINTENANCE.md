@@ -17,13 +17,13 @@ lock.
 ## Commands
 
 ```text
-archivefs retroarch-cheat-snapshot-list [--source <source-id>] [--cache-root <path>] [--json]
-archivefs retroarch-cheat-snapshot-verify <snapshot-id> [--cache-root <path>] [--json]
-archivefs retroarch-cheat-snapshot-verify --source <source-id> [--cache-root <path>] [--json]
-archivefs retroarch-cheat-snapshot-verify --all [--cache-root <path>] [--json]
-archivefs retroarch-cheat-snapshot-pin <snapshot-id> [--cache-root <path>] [--json]
-archivefs retroarch-cheat-snapshot-unpin <snapshot-id> [--cache-root <path>] [--json]
-archivefs retroarch-cheat-cache-prune [policy] [--cache-root <path>] [--json]
+emuwiz-cli retroarch-cheat-snapshot-list [--source <source-id>] [--cache-root <path>] [--json]
+emuwiz-cli retroarch-cheat-snapshot-verify <snapshot-id> [--cache-root <path>] [--json]
+emuwiz-cli retroarch-cheat-snapshot-verify --source <source-id> [--cache-root <path>] [--json]
+emuwiz-cli retroarch-cheat-snapshot-verify --all [--cache-root <path>] [--json]
+emuwiz-cli retroarch-cheat-snapshot-pin <snapshot-id> [--cache-root <path>] [--json]
+emuwiz-cli retroarch-cheat-snapshot-unpin <snapshot-id> [--cache-root <path>] [--json]
+emuwiz-cli retroarch-cheat-cache-prune [policy] [--cache-root <path>] [--json]
 ```
 
 The default root remains
@@ -150,12 +150,12 @@ changing snapshot or pin formats.
 ## Examples
 
 ```text
-archivefs retroarch-cheat-snapshot-list
-archivefs retroarch-cheat-snapshot-verify --all --json
-archivefs retroarch-cheat-snapshot-pin c02d6ea1
-archivefs retroarch-cheat-cache-prune --keep 3 --older-than-days 90
-archivefs retroarch-cheat-cache-prune --keep 3 --older-than-days 90 --yes
-archivefs retroarch-cheat-cache-prune --include-abandoned-staging --dry-run
+emuwiz-cli retroarch-cheat-snapshot-list
+emuwiz-cli retroarch-cheat-snapshot-verify --all --json
+emuwiz-cli retroarch-cheat-snapshot-pin c02d6ea1
+emuwiz-cli retroarch-cheat-cache-prune --keep 3 --older-than-days 90
+emuwiz-cli retroarch-cheat-cache-prune --keep 3 --older-than-days 90 --yes
+emuwiz-cli retroarch-cheat-cache-prune --include-abandoned-staging --dry-run
 ```
 
 Current limitations are the absence of reliable last-use timestamps, a single

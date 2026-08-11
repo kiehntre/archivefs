@@ -5,15 +5,15 @@ This document describes EmuWiz command output that is intended for programmatic 
 Commands that currently support JSON output:
 
 ```sh
-archivefs database-check --json
-archivefs status --json
-archivefs stats --json
-archivefs info <archive> --json
+emuwiz-cli database-check --json
+emuwiz-cli status --json
+emuwiz-cli stats --json
+emuwiz-cli info <archive> --json
 ```
 
 JSON mode always writes the JSON document to stdout. Human headings, summaries, and explanatory text are omitted. Operational logs, when enabled with `--verbose` or `--debug`, are written to stderr by the normal logger and must not be mixed into stdout.
 
-Three other commands support `--json` but document their own schema in a dedicated design document rather than here, since their output is defined alongside a larger feature design: `archivefs pcsx2-patch-preview --json` (see [`PATCH_CHEAT_MANAGER_DESIGN.md`](PATCH_CHEAT_MANAGER_DESIGN.md)), `archivefs retroarch-environment --json` (see [`RETROARCH_ENVIRONMENT.md`](RETROARCH_ENVIRONMENT.md)), and `archivefs retroarch-patch-preview --json` (see [`RETROARCH_PATCH_PREVIEW.md`](RETROARCH_PATCH_PREVIEW.md)). The stability guarantees below apply to all documented JSON output, not only the three commands listed immediately above.
+Three other commands support `--json` but document their own schema in a dedicated design document rather than here, since their output is defined alongside a larger feature design: `emuwiz-cli pcsx2-patch-preview --json` (see [`PATCH_CHEAT_MANAGER_DESIGN.md`](PATCH_CHEAT_MANAGER_DESIGN.md)), `emuwiz-cli retroarch-environment --json` (see [`RETROARCH_ENVIRONMENT.md`](RETROARCH_ENVIRONMENT.md)), and `emuwiz-cli retroarch-patch-preview --json` (see [`RETROARCH_PATCH_PREVIEW.md`](RETROARCH_PATCH_PREVIEW.md)). The stability guarantees below apply to all documented JSON output, not only the three commands listed immediately above.
 
 The RetroArch playlist identity/matching milestone added only additive fields to the two RetroArch schemas above (both `format_version`s stayed `1`, per the "new fields may be added" guarantee below) - see [`RETROARCH_PLAYLISTS.md`](RETROARCH_PLAYLISTS.md) for the playlist-specific field documentation.
 
@@ -25,7 +25,7 @@ the enclosing format version. The nested inventory has its own
 `format_version: 1`, exact key set, lower-snake-case enums, and byte-safe paths;
 see [`RETROARCH_ARTIFACT_INVENTORY.md`](RETROARCH_ARTIFACT_INVENTORY.md).
 
-## `archivefs database-check --json`
+## `emuwiz-cli database-check --json`
 
 `database-check` is a read-only database diagnostic. Its top-level key set is
 stable and exact:
@@ -76,13 +76,13 @@ the main database as corrupt.
 The command never creates a missing file or parent directory, runs a migration,
 changes journal mode, checkpoints WAL, deletes a sidecar, or repairs data.
 
-## `archivefs status --json`
+## `emuwiz-cli status --json`
 
 Command syntax:
 
 ```sh
-archivefs status
-archivefs status --json
+emuwiz-cli status
+emuwiz-cli status --json
 ```
 
 Both forms inspect the configured archive sources through the same status collection path. The first prints the existing human-readable table. The second pretty-prints a JSON array and no human heading or explanatory text.
@@ -134,9 +134,9 @@ Status output contains no byte-count fields. Any byte counts added to this schem
 ]
 ```
 
-## `archivefs stats --json`
+## `emuwiz-cli stats --json`
 
-`archivefs stats --json` scans the configured archive sources through the normal stats path and prints a pretty JSON representation of `ArchiveStats`.
+`emuwiz-cli stats --json` scans the configured archive sources through the normal stats path and prints a pretty JSON representation of `ArchiveStats`.
 
 ### Schema
 
@@ -233,9 +233,9 @@ Archive size in bytes.
 
 Sum of known archive sizes in bytes. Archives without known sizes do not contribute to this total.
 
-## `archivefs info <archive> --json`
+## `emuwiz-cli info <archive> --json`
 
-`archivefs info <archive> --json` resolves the archive using the same selection path as the human `info` command and prints a pretty JSON representation of `ArchiveInfo`.
+`emuwiz-cli info <archive> --json` resolves the archive using the same selection path as the human `info` command and prints a pretty JSON representation of `ArchiveInfo`.
 
 If no archive matches, or multiple archives match, the command returns the same selection error as human mode instead of printing JSON.
 
@@ -323,7 +323,7 @@ Name of the health provider that supplied the displayed health value.
 
 ## Cheat provider coverage JSON
 
-`archivefs-cli cheat-provider-coverage --id <id>... --json` emits format
+`emuwiz-cli cheat-provider-coverage --id <id>... --json` emits format
 version `1` with these stable top-level keys:
 
 ```text
@@ -381,8 +381,8 @@ Guidelines for future JSON commands:
 
 Potential future JSON outputs may include:
 
-- `archivefs duplicates --json`
-- `archivefs index-show --json`
-- `archivefs index-find --json`
+- `emuwiz-cli duplicates --json`
+- `emuwiz-cli index-show --json`
+- `emuwiz-cli index-find --json`
 
 These are not implemented today.

@@ -1,7 +1,7 @@
 # Guided RetroArch Cheat Setup
 
-`archivefs retroarch-cheat-setup <catalogue-path>` is the local entry point;
-`archivefs retroarch-cheat-setup --source <source-id>` uses a validated trusted
+`emuwiz-cli retroarch-cheat-setup <catalogue-path>` is the local entry point;
+`emuwiz-cli retroarch-cheat-setup --source <source-id>` uses a validated trusted
 snapshot. Both discover local
 RetroArch profiles, resolves their configured cheat directories, matches the
 catalogue against the existing EmuWiz library database, previews every
@@ -14,8 +14,8 @@ change playlists or cores, or touch game archives.
 ## Syntax and options
 
 ```console
-archivefs retroarch-cheat-setup <catalogue-path> [options]
-archivefs retroarch-cheat-setup --source <source-id> [options]
+emuwiz-cli retroarch-cheat-setup <catalogue-path> [options]
+emuwiz-cli retroarch-cheat-setup --source <source-id> [options]
 ```
 
 | Option | Meaning |
@@ -111,19 +111,19 @@ no-`--yes` preview behavior.
 
 ```console
 # Human-readable no-write preview
-archivefs retroarch-cheat-setup ~/cheats --dry-run
+emuwiz-cli retroarch-cheat-setup ~/cheats --dry-run
 
 # Deterministic JSON preview
-archivefs retroarch-cheat-setup ~/cheats \
+emuwiz-cli retroarch-cheat-setup ~/cheats \
   --profile native-user-0123456789abcdef --json
 
 # Interactive or non-interactive installation
-archivefs retroarch-cheat-setup ~/cheats
-archivefs retroarch-cheat-setup ~/cheats \
+emuwiz-cli retroarch-cheat-setup ~/cheats
+emuwiz-cli retroarch-cheat-setup ~/cheats \
   --profile native-user-0123456789abcdef --yes
 
 # Verified backup and replacement
-archivefs retroarch-cheat-setup ~/cheats --yes --replace-different
+emuwiz-cli retroarch-cheat-setup ~/cheats --yes --replace-different
 ```
 
 ## Installation safety
@@ -170,9 +170,9 @@ emulator core, and cheat format can affect compatibility.
 Completion prints the actual journal and follow-up commands:
 
 ```console
-archivefs retroarch-cheat-history
-archivefs retroarch-cheat-inspect ~/.local/share/archivefs/cheat-install-runs/<run>.json
-archivefs retroarch-cheat-rollback ~/.local/share/archivefs/cheat-install-runs/<run>.json \
+emuwiz-cli retroarch-cheat-history
+emuwiz-cli retroarch-cheat-inspect ~/.local/share/archivefs/cheat-install-runs/<run>.json
+emuwiz-cli retroarch-cheat-rollback ~/.local/share/archivefs/cheat-install-runs/<run>.json \
   --cheat-destination-root /resolved/profile/cheats --dry-run
 ```
 

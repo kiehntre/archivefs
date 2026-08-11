@@ -15,7 +15,7 @@ Core project principles:
 
 ```text
                   +----------------------+
-                  |    archivefs-cli     |
+                  |     emuwiz-cli       |
                   | commands + printing  |
                   +----------+-----------+
                              |
@@ -81,7 +81,7 @@ Core project principles:
 
 # Commands
 
-This section groups commands by area. Run `archivefs --help` for the exact,
+This section groups commands by area. Run `emuwiz-cli --help` for the exact,
 current, authoritative list and usage examples - this document explains what
 each group does, not every flag.
 
