@@ -1,6 +1,1 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-  <!-- Original EmuWiz artwork: generic computer silhouette. -->
-  <rect x="8" y="10" width="48" height="32" rx="3" fill="none" stroke="#4a4a4a" stroke-width="3"/>
-  <line x1="32" y1="42" x2="32" y2="50" stroke="#4a4a4a" stroke-width="3"/>
-  <line x1="18" y1="54" x2="46" y2="54" stroke="#4a4a4a" stroke-width="3"/>
-</svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="48" height="32" x="8" y="10" fill="none" stroke="#4a4a4a" stroke-width="3" rx="3"/><line x1="32" x2="32" y1="42" y2="50" stroke="#4a4a4a" stroke-width="3"/><line x1="18" x2="46" y1="54" y2="54" stroke="#4a4a4a" stroke-width="3"/></svg>
