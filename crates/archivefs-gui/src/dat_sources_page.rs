@@ -44,6 +44,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::time::Instant;
 
+use archivefs_core::dat::classification::{
+    ContentSelectionPolicy, DatContentClassification, DatContentSummary,
+};
 use archivefs_core::dat::limits::DatLimits;
 use archivefs_core::dat::parser::DiagnosticSeverity;
 use archivefs_core::dat::policy::{
@@ -77,6 +80,7 @@ pub(crate) const READ_ONLY_PROMISE: &str = "Your files won't be renamed unless y
 /// The short, simple promise shown on the page. Longer detail stays available
 /// as a tooltip (`READ_ONLY_PROMISE`) but never front and centre.
 pub(crate) const SAFE_PROMISE: &str = "Your files won't be renamed unless you approve it.";
+pub(crate) const GAMES_ONLY_EXPLANATION: &str = "Games only hides entries confidently identified as things like magazines, music, demos, manuals, or other non-game material. Unknown entries are kept for review.";
 /// The prominent, repeated statement the rename-planning section must show.
 pub(crate) const PLAN_ONLY_PROMISE: &str = "Planning only — EmuWiz will not rename any files. This section derives suggested names \
      from verified DAT matches and explains them; nothing here changes, moves, deletes or rewrites \
@@ -213,7 +217,7 @@ impl DatSourceRowView {
     }
 }
 
-/// The four policy fields of one scope, borrowed for editing.
+/// The policy fields of one scope, borrowed for editing.
 ///
 /// This is what lets a policy edit act on "global or this platform's
 /// override" through one code path; the field shapes of
@@ -224,6 +228,7 @@ struct PolicyTargets<'a> {
     language: &'a mut Option<Vec<String>>,
     revision: &'a mut Option<String>,
     clone: &'a mut Option<String>,
+    content: &'a mut Option<String>,
 }
 
 impl<'a> PolicyTargets<'a> {
@@ -232,12 +237,14 @@ impl<'a> PolicyTargets<'a> {
         language: &'a mut Option<Vec<String>>,
         revision: &'a mut Option<String>,
         clone: &'a mut Option<String>,
+        content: &'a mut Option<String>,
     ) -> Self {
         Self {
             region,
             language,
             revision,
             clone,
+            content,
         }
     }
 
@@ -532,7 +539,12 @@ impl RenamePlanFilter {
             Self::Ambiguous => row.state == ProposalState::Ambiguous,
             Self::Conflicts => row.state == ProposalState::Conflict,
             Self::Unsupported => row.state == ProposalState::Unsupported,
-            Self::Blocked => row.state == ProposalState::Blocked,
+            Self::Blocked => matches!(
+                row.state,
+                ProposalState::Blocked
+                    | ProposalState::ExcludedByContentPolicy
+                    | ProposalState::UnclassifiedContent
+            ),
         }
     }
 }
@@ -567,6 +579,7 @@ pub(crate) struct RenamePlanRowView {
     pub(crate) game_name: Option<String>,
     pub(crate) rom_name: Option<String>,
     pub(crate) verdict_label: String,
+    pub(crate) content: ContentTechnicalView,
     pub(crate) state: ProposalState,
     pub(crate) object_kind_label: &'static str,
     pub(crate) explanations: Vec<String>,
@@ -688,6 +701,7 @@ pub(crate) struct DatPolicyView {
     pub(crate) language_preferences: Vec<PolicyPreferenceRowView>,
     pub(crate) revision_policy: RevisionPolicy,
     pub(crate) clone_policy: ClonePolicy,
+    pub(crate) content_selection: ContentSelectionPolicy,
     pub(crate) effective: EffectivePolicySummaryView,
     /// Validation problems in the persisted policy (unknown values, bad
     /// platform keys). Never blocks a save; the values are preserved.
@@ -727,6 +741,7 @@ pub(crate) struct EffectivePolicySummaryView {
     pub(crate) language: String,
     pub(crate) revision: String,
     pub(crate) clone: String,
+    pub(crate) content: String,
     /// "field — where it came from" rows.
     pub(crate) source_of: Vec<(String, String)>,
 }
@@ -775,6 +790,8 @@ pub(crate) struct AuditResultView {
     pub(crate) unreadable_catalogues: Vec<String>,
     pub(crate) truncated: bool,
     pub(crate) files_scanned: usize,
+    pub(crate) content_selection: ContentSelectionPolicy,
+    pub(crate) content_summary: DatContentSummary,
     /// The Effective Policy Summary annotation, when the audit carried a
     /// policy. Never changes a verdict; it shows the preferred candidate
     /// order for the files whose hash matched several catalogue entries.
@@ -814,6 +831,16 @@ pub(crate) struct AuditEntryView {
     pub(crate) file_name: String,
     pub(crate) verdict: &'static str,
     pub(crate) detail: String,
+    pub(crate) content: Vec<ContentTechnicalView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ContentTechnicalView {
+    pub(crate) classification: String,
+    pub(crate) confidence: String,
+    pub(crate) evidence: Vec<String>,
+    pub(crate) original_metadata: Vec<(String, String)>,
+    pub(crate) classifier_version: String,
 }
 
 /// How many audited files are listed individually.
@@ -905,6 +932,10 @@ pub(crate) enum DatSourcesPageAction {
     SetClonePolicy {
         scope: Option<String>,
         policy: ClonePolicy,
+    },
+    SetContentSelection {
+        scope: Option<String>,
+        policy: ContentSelectionPolicy,
     },
     /// Records or clears a review decision on one proposal. Decisions are
     /// session-only and never touch a file.
@@ -1209,6 +1240,12 @@ fn effective_summary_view(
             "Clone policy".to_string(),
             effective.scope_of[&PolicyField::Clone].label().to_string(),
         ),
+        (
+            "Content selection".to_string(),
+            effective.scope_of[&PolicyField::Content]
+                .label()
+                .to_string(),
+        ),
     ];
     EffectivePolicySummaryView {
         platform,
@@ -1217,6 +1254,7 @@ fn effective_summary_view(
         language,
         revision: effective.revision_policy.label().to_string(),
         clone: effective.clone_policy.label().to_string(),
+        content: effective.content_selection.label().to_string(),
         source_of,
     }
 }
@@ -2135,6 +2173,19 @@ impl DatSourcesPageState {
                     *targets.clone = Some(policy.as_str().to_string());
                 });
             }
+            DatSourcesPageAction::SetContentSelection { scope, policy } => {
+                self.with_policy_targets(&scope, |targets| {
+                    *targets.content = Some(policy.as_str().to_string());
+                });
+                // The completed audit remains authoritative, but its selection
+                // annotation and any action plan were built for the old policy.
+                self.audit = None;
+                self.audit_error = None;
+                self.rename_plan = None;
+                self.rename_plan_error = None;
+                self.review_decisions.clear();
+                self.abandon_apply_work();
+            }
             DatSourcesPageAction::SetReviewDecision { path, decision } => match decision {
                 Some(decision) => {
                     self.review_decisions.insert(path, decision);
@@ -2373,6 +2424,7 @@ impl DatSourcesPageState {
                     &mut policy.language_preferences,
                     &mut policy.revision_policy,
                     &mut policy.clone_policy,
+                    &mut policy.content_selection,
                 );
                 edit(&mut targets);
                 targets.normalise_empty_lists();
@@ -2389,6 +2441,7 @@ impl DatSourcesPageState {
                     &mut entry.language_preferences,
                     &mut entry.revision_policy,
                     &mut entry.clone_policy,
+                    &mut entry.content_selection,
                 );
                 edit(&mut targets);
                 targets.normalise_empty_lists();
@@ -2409,6 +2462,7 @@ impl DatSourcesPageState {
                 || entry.language_preferences.is_some()
                 || entry.revision_policy.is_some()
                 || entry.clone_policy.is_some()
+                || entry.content_selection.is_some()
         });
         if overrides.is_empty() {
             policy.platforms = None;
@@ -2814,6 +2868,10 @@ impl DatSourcesPageState {
                 game_name: proposal.game_name.clone(),
                 rom_name: proposal.rom_name.clone(),
                 verdict_label: proposal.verdict_label.clone(),
+                content: content_technical_view(
+                    &proposal.content_classification,
+                    &proposal.original_metadata,
+                ),
                 state: proposal.state,
                 object_kind_label: proposal.object_kind.label(),
                 explanations: proposal.explanations.clone(),
@@ -2923,6 +2981,7 @@ impl DatSourcesPageState {
             language_preferences,
             revision_policy: effective.revision_policy,
             clone_policy: effective.clone_policy,
+            content_selection: effective.content_selection,
             effective: summary,
             problems,
             editable: self.load_error.is_none(),
@@ -3267,15 +3326,39 @@ fn audit_view(outcome: &DatAuditOutcome, elapsed_seconds: Option<u64>) -> AuditR
         },
     ];
 
+    let content_by_path: std::collections::HashMap<_, _> = outcome
+        .content
+        .matches
+        .iter()
+        .map(|matched| (matched.local_path.as_str(), matched))
+        .collect();
     let entries: Vec<AuditEntryView> = outcome
         .report
         .entries
         .iter()
         .take(MAX_AUDIT_ENTRIES_SHOWN)
-        .map(|entry| AuditEntryView {
-            file_name: entry.local_filename.clone(),
-            verdict: entry.verdict.label(),
-            detail: verdict_detail(&entry.verdict),
+        .map(|entry| {
+            let content = content_by_path
+                .get(entry.local_path.as_str())
+                .map(|matched| {
+                    matched
+                        .candidates
+                        .iter()
+                        .map(|candidate| {
+                            content_technical_view(
+                                &candidate.classification,
+                                &candidate.original_metadata,
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            AuditEntryView {
+                file_name: entry.local_filename.clone(),
+                verdict: entry.verdict.label(),
+                detail: verdict_detail(&entry.verdict),
+                content,
+            }
         })
         .collect();
     let entries_truncated = outcome.report.entries.len().saturating_sub(entries.len());
@@ -3301,7 +3384,37 @@ fn audit_view(outcome: &DatAuditOutcome, elapsed_seconds: Option<u64>) -> AuditR
         unreadable_catalogues: outcome.unreadable_catalogues.clone(),
         truncated: outcome.truncated,
         files_scanned: outcome.files_scanned,
+        content_selection: outcome.content.selection,
+        content_summary: outcome.content.catalogue,
         policy: outcome.policy.as_ref().map(audit_policy_view),
+    }
+}
+
+fn content_technical_view(
+    classification: &DatContentClassification,
+    metadata: &archivefs_core::dat::classification::DatOriginalMetadata,
+) -> ContentTechnicalView {
+    ContentTechnicalView {
+        classification: classification.class.label().to_string(),
+        confidence: classification.confidence.label().to_string(),
+        evidence: classification
+            .evidence
+            .iter()
+            .map(|item| {
+                let upstream = item
+                    .original_value
+                    .as_deref()
+                    .map(|value| format!(" — upstream: {value}"))
+                    .unwrap_or_default();
+                format!("{} ({}){upstream}", item.kind.label(), item.rule)
+            })
+            .collect(),
+        original_metadata: metadata
+            .fields
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+        classifier_version: classification.classifier_version.clone(),
     }
 }
 
@@ -4691,6 +4804,31 @@ fn show_dat_policy_section(
         );
         ui.add_space(10.0);
 
+        ui.horizontal(|ui| {
+            ui.label("Show:");
+            egui::ComboBox::from_id_salt("dat-policy-content")
+                .selected_text(view.content_selection.label())
+                .show_ui(ui, |ui| {
+                    for policy in ContentSelectionPolicy::ALL {
+                        if ui
+                            .selectable_label(view.content_selection == policy, policy.label())
+                            .clicked()
+                        {
+                            action = Some(DatSourcesPageAction::SetContentSelection {
+                                scope: view.scope.clone(),
+                                policy,
+                            });
+                        }
+                    }
+                });
+        });
+        ui.label(
+            egui::RichText::new(GAMES_ONLY_EXPLANATION)
+                .color(theme::muted(ui))
+                .small(),
+        );
+        ui.add_space(10.0);
+
         if let Some(policy_action) = show_region_preference_editor(ui, view) {
             action = Some(policy_action);
         }
@@ -5008,6 +5146,7 @@ fn show_effective_policy_summary(ui: &mut egui::Ui, view: &DatPolicyView) {
         summary_row(ui, "Language preference", &view.effective.language);
         summary_row(ui, "Revision rule", &view.effective.revision);
         summary_row(ui, "Clone rule", &view.effective.clone);
+        summary_row(ui, "Show", &view.effective.content);
         ui.add_space(6.0);
         ui.separator();
         ui.label(egui::RichText::new("Where each value comes from").strong());
@@ -5035,7 +5174,8 @@ fn plan_state_tone(state: ProposalState) -> widgets::StatusTone {
         ProposalState::Ambiguous => widgets::StatusTone::Warning,
         ProposalState::Conflict => widgets::StatusTone::Warning,
         ProposalState::Unsupported => widgets::StatusTone::Info,
-        ProposalState::Blocked => widgets::StatusTone::Blocked,
+        ProposalState::Blocked | ProposalState::UnclassifiedContent => widgets::StatusTone::Blocked,
+        ProposalState::ExcludedByContentPolicy => widgets::StatusTone::Info,
     }
 }
 
@@ -5359,13 +5499,15 @@ fn show_rename_plan_section(
             ui.label(
                 egui::RichText::new(format!(
                     "{} suggested · {} already canonical · {} ambiguous · {} conflicts · {} \
-                     unsupported · {} blocked",
+                     unsupported · {} blocked · {} not selected · {} unknown",
                     plan.counts.suggested,
                     plan.counts.already_canonical,
                     plan.counts.ambiguous,
                     plan.counts.conflicts,
                     plan.counts.unsupported,
-                    plan.counts.blocked
+                    plan.counts.blocked,
+                    plan.counts.excluded_by_content_policy,
+                    plan.counts.unclassified_content
                 ))
                 .small(),
             );
@@ -5520,6 +5662,7 @@ fn show_rename_plan_row(
                     .small(),
                 );
             }
+            show_content_technical_details(ui, &row.content);
             if !row.explanations.is_empty() {
                 ui.add_space(2.0);
                 for line in &row.explanations {
@@ -5701,6 +5844,20 @@ fn show_audit_result(ui: &mut egui::Ui, audit: &AuditResultView) {
             .color(theme::muted(ui))
             .small(),
         );
+        ui.label(
+            egui::RichText::new(format!(
+                "Show: {} · full catalogue {} · games {} · compilations {} · required multidisc parts {} · non-game {} · unknown {}",
+                audit.content_selection.label(),
+                audit.content_summary.total,
+                audit.content_summary.games,
+                audit.content_summary.game_compilations,
+                audit.content_summary.required_multidisc_parts,
+                audit.content_summary.non_game,
+                audit.content_summary.unknown,
+            ))
+            .color(theme::muted(ui))
+            .small(),
+        );
         if let Some(elapsed) = audit.elapsed_seconds {
             ui.label(
                 egui::RichText::new(format!("Completed in {}", format_elapsed(elapsed)))
@@ -5774,16 +5931,21 @@ fn show_audit_result(ui: &mut egui::Ui, audit: &AuditResultView) {
             .id_salt("dat-audit-entries")
             .show(ui, |ui| {
                 for entry in &audit.entries {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_top(|ui| {
                         ui.label(egui::RichText::new(entry.verdict).monospace().small());
-                        ui.label(&entry.file_name);
-                        if !entry.detail.is_empty() {
-                            ui.label(
-                                egui::RichText::new(&entry.detail)
-                                    .color(theme::muted(ui))
-                                    .small(),
-                            );
-                        }
+                        ui.vertical(|ui| {
+                            ui.label(&entry.file_name);
+                            if !entry.detail.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(&entry.detail)
+                                        .color(theme::muted(ui))
+                                        .small(),
+                                );
+                            }
+                            for content in &entry.content {
+                                show_content_technical_details(ui, content);
+                            }
+                        });
                     });
                 }
             });
@@ -5798,6 +5960,26 @@ fn show_audit_result(ui: &mut egui::Ui, audit: &AuditResultView) {
             );
         }
     });
+}
+
+fn show_content_technical_details(ui: &mut egui::Ui, content: &ContentTechnicalView) {
+    egui::CollapsingHeader::new("Technical classification details")
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.label(format!("Classification: {}", content.classification));
+            ui.label(format!("Confidence: {}", content.confidence));
+            ui.label(format!("Classifier: {}", content.classifier_version));
+            for evidence in &content.evidence {
+                ui.label(format!("Evidence: {evidence}"));
+            }
+            if content.original_metadata.is_empty() {
+                ui.label("Original metadata: none supplied by this DAT export");
+            } else {
+                for (field, value) in &content.original_metadata {
+                    ui.label(format!("Original {field}: {value}"));
+                }
+            }
+        });
 }
 
 fn show_kept_but_not_understood(ui: &mut egui::Ui, view: &DatSourcesPageView) {

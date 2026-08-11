@@ -166,6 +166,10 @@ user-facing version at
   triggers a scan on it, or touches a ROM. Only loopback and private LAN
   addresses are accepted, and the access token is never printed, logged, or
   stored in config or cache JSON.
+- Keeps full preservation DAT catalogues authoritative for verification and
+  audit while offering a reversible **All entries / Games only** selection for
+  gamer-facing rename and organisation work. Unknown content remains visible
+  for review and is never acted on in Games-only mode.
 - Ships a desktop GUI (`emuwiz`) covering scanning, mounting, sources
   (including RomM and DAT/Cheat catalogue management), library views,
   duplicates, catalogue health, Cheats & Mods, Doctor, History & Logs, and

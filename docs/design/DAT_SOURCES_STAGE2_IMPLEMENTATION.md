@@ -24,6 +24,7 @@ and the Effective Policy Summary. All file operations remain read-only.
 | Language preference | ordered `Vec<LanguagePreference>` | empty (all equal) | audit reports every candidate |
 | Revision policy | `RevisionPolicy` | `AskWhenAmbiguous` | audit never picks a revision |
 | Clone policy | `ClonePolicy` | `KeepAllVariants` | audit ignores parent relationships |
+| Content selection | `ContentSelectionPolicy` | `AllEntries` | all verified entries may be selected |
 | Source priority | persisted `u32` | `100`, lower wins | platform-local ordering |
 | Per-platform participation | platform-scoped resolution | all enabled | `sorted_enabled_for_platform` |
 
@@ -55,6 +56,7 @@ region_preferences = ["europe", "usa"]
 language_preferences = ["en", "multi"]
 revision_policy = "latest_verified"
 clone_policy = "prefer_parent"
+content_selection = "games_only"
 
 [policy.platforms.NES]
 region_preferences = ["japan"]
@@ -136,8 +138,38 @@ sources registered) and an **Effective policy** summary:
 - preferred languages: add (via a picker) / move / remove, plus `multi` and
   `original` entries;
 - revision policy and clone policy selectors;
+- a plain **Show: All entries / Games only** selector. Games only is a
+  reversible selection policy for gamer-facing rename and organisation work;
+  it is not a DAT rewrite and does not change the audit;
 - a fixed statement "Your files won't be renamed unless you approve it." — no selector for the
   future rename modes, per design decision 5;
+
+## 6.1 Games-only content selection
+
+The parser dispatch remains the single parsing path. Immediately after a DAT
+is parsed, core annotates each entry with a normalized class (`Game`,
+`GameCompilation`, `RequiredMultidiscPart`, `NonGame`, or `Unknown`), exact
+evidence, confidence, classifier version, and any structured upstream fields
+used. The annotation is derived data: upstream names, hashes, relationships,
+and catalogue membership are preserved verbatim.
+
+The full upstream catalogue remains authoritative for matching, verification,
+audit counts, and provenance. **Games only is a selection policy, not DAT
+rewriting.** It selects confirmed games, compilations, and every required
+multidisc part. It excludes only entries confidently classified `NonGame`.
+`Unknown` is explicit, remains visible in catalogue and technical counts, and
+fails safe: restrictive rename or organisation plans cannot act on it. Changing
+back to All entries is immediate and does not re-download or mutate a DAT.
+
+Provider confidence varies. TOSEC rules use exact category-separated set names
+and strict multidisc tokens. No-Intro uses supported structured category fields
+when an export actually supplies them. Redump, generic Logiqx/ClrMamePro, and
+OMNI_DAT entries remain `Unknown` when EmuWiz has no trustworthy structured
+category; filenames alone never promote an entry to `Game` or `NonGame`.
+
+Technical details show the normalized class, evidence, confidence, original
+structured metadata, and classifier version. These details explain selection
+without replacing the upstream classification or provenance.
 - the Effective Policy Summary: current platform, sources consulted in order,
   resolved region/language/revision/clone values, and "where each value comes
   from" (global vs platform override);
