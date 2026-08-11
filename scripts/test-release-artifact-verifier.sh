@@ -245,4 +245,14 @@ for label in unexpected traversal bad-mode privacy-leak missing-icon substituted
 done
 [[ ! -e "$TEMP_ROOT/escape" ]] || release_die "path traversal fixture escaped extraction"
 
+# tampered-installer specifically must fail for install.sh byte-identity -
+# every other fixture above tampers with something that fails earlier
+# structural checks first, so a generic "the verifier rejected it" alone
+# wouldn't distinguish this from a fixture that happened to be caught for
+# an unrelated reason.
+grep -q 'release install.sh differs from the canonical script in the repository' \
+    "$TEMP_ROOT/tampered-installer.out" ||
+    release_die "tampered-installer fixture was rejected for the wrong reason (expected the install.sh byte-identity check to fire): $(cat "$TEMP_ROOT/tampered-installer.out")"
+release_note "tampered-installer fixture rejected specifically for install.sh byte-identity"
+
 release_note "artifact verifier negative tests passed"
