@@ -523,9 +523,17 @@ load_manifest() {
     parse_ok=1
 
     while [ "$parse_ok" -eq 1 ] && IFS=' ' read -r key rest; do
+        # Nothing may follow "end" - not a record, not a header field, and
+        # not a comment either. This guard runs before any dispatch at all,
+        # so it applies uniformly to every line shape, not just the ones
+        # that happened to have their own seen_end check.
+        if [ "$seen_end" -eq 1 ]; then
+            parse_ok=0
+            continue
+        fi
         case "$key" in
             '#'*)
-                : # comments are allowed anywhere and never counted
+                : # comments are allowed anywhere before "end" and never counted
                 ;;
             schema_version)
                 if [ "$seen_schema" -eq 1 ]; then parse_ok=0
@@ -548,38 +556,28 @@ load_manifest() {
                 fi
                 ;;
             end)
-                if [ "$seen_end" -eq 1 ]; then parse_ok=0
-                else seen_end=1
-                fi
+                seen_end=1
                 ;;
             bin-emuwiz-cli|bin-emuwiz|desktop|icon-32|icon-64|icon-128|icon-256|icon-512)
-                if [ "$seen_end" -eq 1 ]; then
-                    parse_ok=0
-                else
-                    fld_kind=""; fld_fp=""; fld_size=""
-                    IFS=' ' read -r fld_kind fld_fp fld_size <<EOF
+                fld_kind=""; fld_fp=""; fld_size=""
+                IFS=' ' read -r fld_kind fld_fp fld_size <<EOF
 $rest
 EOF
-                    if [ "$fld_kind" = file ] && validate_file_digest "$fld_fp" && validate_size "$fld_size"; then
-                        store_file_slot "$key" "$fld_fp" "$fld_size"
-                    else
-                        parse_ok=0
-                    fi
+                if [ "$fld_kind" = file ] && validate_file_digest "$fld_fp" && validate_size "$fld_size"; then
+                    store_file_slot "$key" "$fld_fp" "$fld_size"
+                else
+                    parse_ok=0
                 fi
                 ;;
             alias-archivefs-cli|alias-emuwiz-gui|alias-archivefs-gui)
-                if [ "$seen_end" -eq 1 ]; then
-                    parse_ok=0
-                else
-                    fld_kind=""; fld_target=""
-                    IFS=' ' read -r fld_kind fld_target <<EOF
+                fld_kind=""; fld_target=""
+                IFS=' ' read -r fld_kind fld_target <<EOF
 $rest
 EOF
-                    if [ "$fld_kind" = symlink ] && validate_symlink_fp "$fld_target"; then
-                        store_symlink_slot "$key" "$fld_target"
-                    else
-                        parse_ok=0
-                    fi
+                if [ "$fld_kind" = symlink ] && validate_symlink_fp "$fld_target"; then
+                    store_symlink_slot "$key" "$fld_target"
+                else
+                    parse_ok=0
                 fi
                 ;;
             *)
