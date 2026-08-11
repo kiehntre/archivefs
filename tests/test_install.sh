@@ -1495,6 +1495,38 @@ assert_manifest_rejected "a manifest missing the end marker fails safe"
 grep -v '^record_count ' "$work/pristine-manifest" >"$work/mutated-manifest"
 assert_manifest_rejected "a manifest missing record_count fails safe"
 
+sed '/^record_count /{p}' "$work/pristine-manifest" >"$work/mutated-manifest"
+assert_manifest_rejected "a duplicate record_count line invalidates the whole manifest"
+
+sed 's/^record_count 11/record_count 12/' "$work/pristine-manifest" >"$work/mutated-manifest"
+assert_manifest_rejected "an incorrect record_count (too high, otherwise complete) fails safe"
+
+sed 's/^record_count 11/record_count 10/' "$work/pristine-manifest" >"$work/mutated-manifest"
+assert_manifest_rejected "an incorrect record_count (too low, otherwise complete) fails safe"
+
+# The parser contract is that nothing follows "end" - not a record, not a
+# header field, and not even a comment. Confirmed on both install (the
+# manifest must be rejected outright, exactly as if it had never existed)
+# and uninstall (no destructive action may be taken on the strength of a
+# manifest with trailing content after its own end marker: the binaries,
+# which have zero fallback recognition of their own, must be left in
+# place rather than removed).
+cat -- "$work/pristine-manifest" >"$work/mutated-manifest"
+printf '# trailing comment after end - must invalidate the whole manifest\n' >>"$work/mutated-manifest"
+assert_manifest_rejected "a comment appended after the end marker invalidates the manifest (install)"
+
+cp -- "$work/pristine-manifest" "$manifest"
+printf '# trailing comment after end - must invalidate the whole manifest\n' >>"$manifest"
+uninstall_warn=$(env HOME="$home" sh "$work/bundle/install.sh" --uninstall --prefix "$bin_dir" 2>&1 1>/dev/null) || true
+assert_contains "uninstall also rejects a manifest with a trailing comment after end" \
+    "$uninstall_warn" "leaving foreign path untouched"
+assert_executable "uninstall took no destructive action: the binary is still there (looked foreign, correctly not removed)" \
+    "$bin_dir/emuwiz-cli"
+assert_executable "uninstall took no destructive action: the other binary is still there too" \
+    "$bin_dir/emuwiz"
+# Recover before the next sub-test.
+cp -- "$work/pristine-manifest" "$manifest"
+
 # A valid, intentionally partial manifest IS supported: omit just the
 # bin-emuwiz slot's record (adjusting record_count to match) and confirm
 # the manifest as a WHOLE is still accepted - bin-emuwiz-cli, still
