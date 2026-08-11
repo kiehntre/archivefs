@@ -66,6 +66,13 @@ use sha2::{Digest, Sha256};
 
 use super::ReadOnlyCheatCatalogue;
 use super::bsfree::{BSFREE_UPSTREAM_PROJECT, BsFreeCatalogue, BsFreeCheat, BsFreeError};
+use super::dolphin_code::{
+    ArLineFamily, MemoryOperation, ar_line_family, derive_memory_operations, hex_sha256,
+    is_gecko_addressable_write,
+};
+use super::dolphin_dedup::{
+    DolphinCheat, DolphinDedupFinding, DolphinDedupFindingKind, analyze_dolphin_duplicates,
+};
 use super::gamehacking_gamecube_install_plan::{
     GameCubeCheatSelection, GameCubeGameHackingInstallPreview,
     GameCubeGameHackingInstallPreviewRequest, GameCubeInstallPlanError,
@@ -129,74 +136,6 @@ impl BsFreeGameCubeCodeFormat {
     }
 }
 
-/// Per-line Action Replay command family, decoded from the first word's bit
-/// fields exactly as Dolphin's `ActionReplay.cpp` does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ArLineFamily {
-    Write8,
-    Write16,
-    Write32,
-    WriteFloat,
-    WritePointer,
-    AddCode,
-    MasterCode,
-    Conditional,
-    ZeroCode,
-    SelfModifying,
-    Malformed,
-}
-
-/// Decodes one `XXXXXXXX YYYY` hex-pair line under the GameCube Action
-/// Replay bit layout (`subtype:2 | type:3 | size:2 | gcaddr:25`).
-fn ar_line_family(line: &str) -> ArLineFamily {
-    let mut pieces = line.split_whitespace();
-    let (Some(first), Some(second)) = (pieces.next(), pieces.next()) else {
-        return ArLineFamily::Malformed;
-    };
-    if pieces.next().is_some() {
-        return ArLineFamily::Malformed;
-    }
-    if first.len() != 8
-        || second.len() != 8
-        || !first.bytes().all(|byte| byte.is_ascii_hexdigit())
-        || !second.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        return ArLineFamily::Malformed;
-    }
-    let word = u32::from_str_radix(first, 16).unwrap_or(0);
-    if word == 0 {
-        return ArLineFamily::ZeroCode;
-    }
-    if (0x2000..0x3000).contains(&word) {
-        return ArLineFamily::SelfModifying;
-    }
-    let subtype = (word >> 30) & 0b11;
-    let code_type = (word >> 27) & 0b111;
-    let size = (word >> 25) & 0b11;
-    match code_type {
-        0 => match subtype {
-            0 => match size {
-                0 => ArLineFamily::Write8,
-                1 => ArLineFamily::Write16,
-                2 => ArLineFamily::Write32,
-                _ => ArLineFamily::WriteFloat,
-            },
-            1 => ArLineFamily::WritePointer,
-            2 => ArLineFamily::AddCode,
-            _ => ArLineFamily::MasterCode,
-        },
-        1..=7 => ArLineFamily::Conditional,
-        _ => ArLineFamily::Malformed,
-    }
-}
-
-/// Whether a `04XXXXXX` 32-bit RAM write's address fits Gecko's 24-bit
-/// address field (i.e. the write lands below `0x81000000`).
-fn is_gecko_addressable_write(word: u32) -> bool {
-    let gcaddr = word & 0x01FF_FFFF;
-    gcaddr < 0x0100_0000
-}
-
 /// A normalized, classified BSFree GameCube cheat. This is the provider-side
 /// intermediate representation: provider syntax (BSFree's free-text `code`
 /// and device label) is resolved here into a strict format classification and
@@ -225,7 +164,7 @@ impl BsFreeGameCubeCheat {
     /// emulator file, combined with the section it targets. `GeckoEquivalent`
     /// codes target `[Gecko]`; everything else targets `[ActionReplay]`.
     #[must_use]
-    fn output_digest(&self) -> String {
+    pub fn output_digest(&self) -> String {
         let mut hasher = Sha256::new();
         match self.code_format {
             BsFreeGameCubeCodeFormat::GeckoEquivalent => {
@@ -238,6 +177,43 @@ impl BsFreeGameCubeCheat {
             hasher.update(b"\n");
         }
         hex_sha256(&hasher.finalize())
+    }
+}
+
+/// The normalized Dolphin view the shared duplicate/conflict analyser needs.
+/// `GeckoEquivalent` cheats target `[Gecko]`, everything else `[ActionReplay]`,
+/// matching the digest above exactly so cross-provider fingerprints agree.
+impl DolphinCheat for BsFreeGameCubeCheat {
+    fn upstream_id(&self) -> i64 {
+        self.upstream_id
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn dolphin_name(&self) -> String {
+        bsfree_dolphin_code_name(self)
+    }
+
+    fn code_lines(&self) -> &[String] {
+        &self.code_lines
+    }
+
+    fn target_gecko(&self) -> bool {
+        self.code_format == BsFreeGameCubeCodeFormat::GeckoEquivalent
+    }
+
+    fn output_digest(&self) -> String {
+        self.output_digest()
+    }
+
+    fn installable(&self) -> bool {
+        self.code_format.is_installable()
+    }
+
+    fn memory_operations(&self) -> Vec<MemoryOperation> {
+        derive_memory_operations(&self.code_lines)
     }
 }
 
@@ -369,275 +345,36 @@ pub fn bsfree_gamecube_cheats(
         .collect())
 }
 
-/// Typed duplicate/conflict finding from the two-pass analysis described in
-/// the module doc comment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BsFreeDedupFindingKind {
-    /// The exact same record (name + canonical body) appears more than once
-    /// in the BSFree game's own catalogue.
-    DuplicateRecord,
-    /// Two different BSFree records share the same canonical code body
-    /// before any conversion (different labels, identical code).
-    DuplicateBody,
-    /// Two different BSFree records share the same name but differ in body.
-    DuplicateNameConflict,
-    /// After classification/conversion, two selected cheats resolve to
-    /// byte-identical emulator output.
-    ConvertedCollision,
-    /// The cheat's final output body already exists in the destination under
-    /// this same name (identical re-install; reported, not rewritten).
-    AlreadyInstalled,
-    /// The cheat's final output body already exists in the destination under
-    /// a different name in the *same* section.
-    AlreadyInstalledDifferentName,
-    /// The cheat's final output body already exists in the destination in the
-    /// *other* section (e.g. a Gecko-equivalent body that is already present
-    /// as an Action Replay code). Uncertain equivalence; requires review.
-    CrossSectionCollision,
-    /// The cheat's name already exists in the destination with a different
-    /// body. Never silently overwritten.
-    SameLabelDifferentBody,
-    /// The cheat is not a well-formed/installable format at all.
-    NotInstallable,
-}
+/// GameCube duplicate/conflict finding kind.
+///
+/// This is the GameCube view of the shared [`DolphinDedupFindingKind`]: the
+/// exact same generalized analyser (`[`analyze_dolphin_duplicates`]`) serves
+/// GameCube, Wii and any other Dolphin-targeted provider, so the finding set
+/// is identical across providers and the GameCube behaviour is unchanged.
+pub type BsFreeDedupFindingKind = DolphinDedupFindingKind;
 
-impl BsFreeDedupFindingKind {
-    #[must_use]
-    pub const fn blocks_selection(self) -> bool {
-        matches!(
-            self,
-            Self::DuplicateNameConflict
-                | Self::CrossSectionCollision
-                | Self::SameLabelDifferentBody
-                | Self::NotInstallable
-        )
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct BsFreeDedupFinding {
-    pub kind: BsFreeDedupFindingKind,
-    pub cheat_upstream_id: i64,
-    pub cheat_name: String,
-    pub relates_to: Option<String>,
-    pub detail: String,
-}
+/// GameCube duplicate/conflict finding, preserving provider provenance. See
+/// [`DolphinDedupFinding`].
+pub type BsFreeDedupFinding = DolphinDedupFinding;
 
 /// Two-pass duplicate/conflict analysis for a set of classified BSFree
 /// GameCube cheats against an existing Dolphin GameSettings document.
 ///
-/// Pass A (source-level) runs over the BSFree records alone: duplicate
-/// records, duplicate bodies, and same-name-different-body records.
-///
-/// Pass B (output-level) runs over the *final output form* produced by any
-/// classification: two records converting to identical Gecko/AR output, a
-/// converted result colliding with an already-installed user/EmuWiz cheat
-/// in the same or the other section, and same-name-different-body collisions
-/// with installed content.
+/// Delegates to the shared, platform-parameterized analyser
+/// ([`analyze_dolphin_duplicates`]); GameCube output is byte-for-byte the
+/// same as before the generalization. `BsFreeGameCubeCheat` implements
+/// [`DolphinCheat`] with `GeckoEquivalent` → `[Gecko]`, everything else →
+/// `[ActionReplay]`, so cross-provider fingerprints (e.g. GameHacking Wii
+/// versus BSFree Wii) are comparable.
 pub fn analyze_bsfree_gamecube_duplicates<'a>(
     cheats: impl IntoIterator<Item = &'a BsFreeGameCubeCheat>,
     destination: &DolphinIniDocument,
 ) -> Vec<BsFreeDedupFinding> {
-    let cheats = cheats.into_iter().collect::<Vec<_>>();
-    let mut findings = Vec::new();
-
-    // Pass A: source-level duplicates.
-    let mut by_record: std::collections::BTreeMap<(String, String), Vec<usize>> =
-        std::collections::BTreeMap::new();
-    let mut by_body: std::collections::BTreeMap<String, Vec<usize>> =
-        std::collections::BTreeMap::new();
-    let mut by_name: std::collections::BTreeMap<String, Vec<usize>> =
-        std::collections::BTreeMap::new();
-    for (index, cheat) in cheats.iter().enumerate() {
-        by_record
-            .entry((cheat.name.clone(), cheat.canonical_digest.clone()))
-            .or_default()
-            .push(index);
-        by_body
-            .entry(cheat.canonical_digest.clone())
-            .or_default()
-            .push(index);
-        by_name.entry(cheat.name.clone()).or_default().push(index);
-    }
-    for indices in by_record.values() {
-        for (offset, index) in indices.iter().skip(1).enumerate() {
-            let cheat = &cheats[*index];
-            findings.push(BsFreeDedupFinding {
-                kind: BsFreeDedupFindingKind::DuplicateRecord,
-                cheat_upstream_id: cheat.upstream_id,
-                cheat_name: cheat.name.clone(),
-                relates_to: indices.first().map(|i| cheats[*i].upstream_id.to_string()),
-                detail: format!(
-                    "the exact same BSFree record appears again (occurrence {}); only the first is ever installed",
-                    offset + 2
-                ),
-            });
-        }
-    }
-    for (digest, indices) in &by_body {
-        if indices.len() > 1 {
-            for index in indices.iter().skip(1) {
-                let cheat = &cheats[*index];
-                findings.push(BsFreeDedupFinding {
-                    kind: BsFreeDedupFindingKind::DuplicateBody,
-                    cheat_upstream_id: cheat.upstream_id,
-                    cheat_name: cheat.name.clone(),
-                    relates_to: indices
-                        .first()
-                        .map(|i| format!("{} ({})", cheats[*i].name, cheats[*i].upstream_id)),
-                    detail: "a different BSFree label carries the same code body; the labels are variants, not independent cheats"
-                        .to_string(),
-                });
-            }
-        }
-        let _ = digest;
-    }
-    for (name, indices) in &by_name {
-        let mut bodies = indices
-            .iter()
-            .map(|i| cheats[*i].canonical_digest.clone())
-            .collect::<Vec<_>>();
-        bodies.sort();
-        bodies.dedup();
-        if bodies.len() > 1 {
-            for index in indices {
-                let cheat = &cheats[*index];
-                findings.push(BsFreeDedupFinding {
-                    kind: BsFreeDedupFindingKind::DuplicateNameConflict,
-                    cheat_upstream_id: cheat.upstream_id,
-                    cheat_name: cheat.name.clone(),
-                    relates_to: None,
-                    detail: format!(
-                        "the BSFree game contains multiple cheats named {:?} with different bodies; \
-                         these are conflicts, not independent cheats",
-                        name
-                    ),
-                });
-            }
-        }
-    }
-
-    // Pass B: output-level against the destination.
-    let installed_gecko = installed_bodies(destination, true);
-    let installed_ar = installed_bodies(destination, false);
-    let installed_names_gecko = installed_names(destination, true);
-    let installed_names_ar = installed_names(destination, false);
-
-    for cheat in cheats {
-        let target_gecko = cheat.code_format == BsFreeGameCubeCodeFormat::GeckoEquivalent;
-        let (same_section_bodies, other_section_bodies) = if target_gecko {
-            (&installed_gecko, &installed_ar)
-        } else {
-            (&installed_ar, &installed_gecko)
-        };
-        let dolphin_name = bsfree_dolphin_code_name(cheat);
-
-        if let Some((existing_name, _)) = same_section_bodies
-            .iter()
-            .find(|(_, lines)| **lines == cheat.code_lines)
-        {
-            let kind = if *existing_name == dolphin_name {
-                BsFreeDedupFindingKind::AlreadyInstalled
-            } else {
-                BsFreeDedupFindingKind::AlreadyInstalledDifferentName
-            };
-            findings.push(BsFreeDedupFinding {
-                kind,
-                cheat_upstream_id: cheat.upstream_id,
-                cheat_name: cheat.name.clone(),
-                relates_to: Some(existing_name.clone()),
-                detail: if *existing_name == dolphin_name {
-                    "the same code is already installed under this name; re-installing is a no-op".to_string()
-                } else {
-                    format!("an identical code is already installed under {:?}; it will not be installed a second time", existing_name)
-                },
-            });
-            continue;
-        }
-
-        if let Some((existing_name, _)) = other_section_bodies
-            .iter()
-            .find(|(_, lines)| **lines == cheat.code_lines)
-        {
-            findings.push(BsFreeDedupFinding {
-                kind: BsFreeDedupFindingKind::CrossSectionCollision,
-                cheat_upstream_id: cheat.upstream_id,
-                cheat_name: cheat.name.clone(),
-                relates_to: Some(existing_name.clone()),
-                detail: format!(
-                    "the same hex-pair body is already installed in the other Dolphin section under {:?}; \
-                     the two engines interpret these bytes differently, so this is reported for review and not applied",
-                    existing_name
-                ),
-            });
-            continue;
-        }
-
-        let same_section_has_name = if target_gecko {
-            installed_names_gecko.contains(&dolphin_name)
-        } else {
-            installed_names_ar.contains(&dolphin_name)
-        };
-        // A name collision is a conflict regardless of which section it sits
-        // in: two same-named codes with different bodies in the two Dolphin
-        // engines would both be enableable, and silently enabling one of them
-        // must never happen. Body-equal cases already returned above, so any
-        // same name here is necessarily a different body.
-        let other_section_has_name = if target_gecko {
-            installed_names_ar.contains(&dolphin_name)
-        } else {
-            installed_names_gecko.contains(&dolphin_name)
-        };
-        if same_section_has_name || other_section_has_name {
-            findings.push(BsFreeDedupFinding {
-                kind: BsFreeDedupFindingKind::SameLabelDifferentBody,
-                cheat_upstream_id: cheat.upstream_id,
-                cheat_name: cheat.name.clone(),
-                relates_to: Some(dolphin_name.clone()),
-                detail: format!(
-                    "a code named {:?} is already installed (in {} the {}) with a different body; \
-                     EmuWiz will not overwrite it",
-                    dolphin_name,
-                    if same_section_has_name {
-                        "same"
-                    } else {
-                        "other"
-                    },
-                    if target_gecko {
-                        "Gecko section"
-                    } else {
-                        "ActionReplay section"
-                    }
-                ),
-            });
-        }
-    }
-
-    findings
-}
-
-/// Maps existing destination `[Gecko]`/`[ActionReplay]` code names to their
-/// canonical line bodies, so a name lookup is a `BTreeMap`.
-fn installed_bodies(document: &DolphinIniDocument, gecko: bool) -> Vec<(String, Vec<String>)> {
-    let codes = if gecko {
-        &document.gecko_codes
-    } else {
-        &document.action_replay_codes
-    };
-    codes
-        .iter()
-        .map(|code| (code.name.clone(), code.lines.clone()))
-        .collect()
-}
-
-fn installed_names(document: &DolphinIniDocument, gecko: bool) -> Vec<String> {
-    let codes = if gecko {
-        &document.gecko_codes
-    } else {
-        &document.action_replay_codes
-    };
-    codes.iter().map(|code| code.name.clone()).collect()
+    let views: Vec<&dyn DolphinCheat> = cheats
+        .into_iter()
+        .map(|cheat| cheat as &dyn DolphinCheat)
+        .collect();
+    analyze_dolphin_duplicates(&views, destination)
 }
 
 /// A BSFree GameCube cheat selection that reuses the existing
@@ -1281,10 +1018,6 @@ fn strip_region_markers(value: &str) -> String {
         }
     }
     without_markers
-}
-
-fn hex_sha256(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 #[cfg(test)]

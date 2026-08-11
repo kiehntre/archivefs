@@ -19,6 +19,7 @@
 mod adapter;
 mod bsfree;
 mod bsfree_gamecube;
+mod bsfree_wii;
 mod cheat_cache_lock;
 mod cheat_cache_maintenance;
 mod cheat_candidates;
@@ -36,6 +37,8 @@ mod cheat_sources;
 mod cht_document;
 mod destination_safety;
 mod dolphin_cheat_catalogue;
+mod dolphin_code;
+mod dolphin_dedup;
 mod dolphin_gecko_install_plan;
 mod dolphin_gecko_provider;
 mod dolphin_local;
@@ -105,6 +108,15 @@ pub use bsfree_gamecube::{
     bsfree_gamecube_cheats, bsfree_gamecube_load_confirmed, bsfree_gamecube_match,
     bsfree_gamecube_search, build_bsfree_gamecube_install_preview, classify_bsfree_gamecube_cheat,
     stage_bsfree_gamecube_install,
+};
+pub use bsfree_wii::{
+    BSFREE_WII_PROVIDER_LABEL, BsFreeStagedWiiInstall, BsFreeWiiCheat, BsFreeWiiCheatSelection,
+    BsFreeWiiCodeFormat, BsFreeWiiDedupFinding, BsFreeWiiDedupFindingKind, BsFreeWiiError,
+    BsFreeWiiErrorKind, BsFreeWiiInstallPreview, BsFreeWiiInstallPreviewRequest, BsFreeWiiMatch,
+    BsFreeWiiSearchOutcome, BsFreeWiiSearchStatus, BsFreeWiiSelectionEntry,
+    analyze_bsfree_wii_duplicates, bsfree_cheat_as_wii, bsfree_dolphin_wii_code_name,
+    bsfree_wii_cheats, bsfree_wii_load_confirmed, bsfree_wii_match, bsfree_wii_search,
+    build_bsfree_wii_install_preview, classify_bsfree_wii_cheat, stage_bsfree_wii_install,
 };
 pub use cheat_cache_maintenance::{
     CHEAT_CACHE_MAINTENANCE_SCHEMA_VERSION, CachePruneDisposition, CachePruneEntryKind,
@@ -237,6 +249,9 @@ pub use dolphin_cheat_catalogue::{
     load_dolphin_catalogue, load_dolphin_catalogue_update_state, lookup_dolphin_catalogue,
     rebuild_dolphin_catalogue_index_with_transport, remove_dolphin_catalogue,
     resolve_dolphin_gecko_lookup,
+};
+pub use dolphin_dedup::{
+    DolphinCheat, DolphinDedupFinding, DolphinDedupFindingKind, analyze_dolphin_duplicates,
 };
 pub use dolphin_gecko_install_plan::{
     DolphinCandidate, DolphinCandidateBlockedReason, DolphinCandidateEvidence,

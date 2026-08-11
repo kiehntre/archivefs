@@ -253,6 +253,89 @@ fn same_name_different_body_is_a_conflict() {
 }
 
 #[test]
+fn identical_effective_writes_never_become_a_false_gamecube_conflict() {
+    // Two byte-identical 32-bit writes to the same address: this is caught
+    // as DuplicateBody (source-level), and must never additionally surface
+    // as ConflictingMemoryWrite - the values genuinely agree.
+    let cheats = vec![
+        classify_bsfree_gamecube_cheat(&named_cheat(1, "Infinite Health", "042318AC 3B8003E7")),
+        classify_bsfree_gamecube_cheat(&named_cheat(2, "999 HP", "042318AC 3B8003E7")),
+    ];
+    let findings = analyze_bsfree_gamecube_duplicates(&cheats, &empty_ini());
+    assert!(
+        !findings
+            .iter()
+            .any(|f| f.kind == BsFreeDedupFindingKind::ConflictingMemoryWrite),
+        "identical writes must never be reported as a memory conflict: {findings:?}"
+    );
+}
+
+#[test]
+fn a_gamecube_write8_fill_repeat_count_cannot_falsely_block_an_unrelated_cheat() {
+    // `0024CD50 00000302` is a Write8 fill (byte 0x02 repeated across
+    // 0x8024CD50..=0x8024CD53). An unrelated cheat at a genuinely different,
+    // non-overlapping address must not be affected by the fill's raw,
+    // un-masked second word - before the fix this line's derived "value"
+    // was the raw word 0x00000302, which does not equal any other code's
+    // value by construction and could never have falsely matched, but the
+    // real risk was the opposite direction (a genuine overlap going
+    // undetected); this proves the fill itself introduces no spurious
+    // finding against something it never touches.
+    let cheats = vec![
+        classify_bsfree_gamecube_cheat(&named_cheat(1, "Clear Flags", "0024CD50 00000302")),
+        classify_bsfree_gamecube_cheat(&named_cheat(2, "Unrelated Cheat", "042319AC 00000001")),
+    ];
+    let findings = analyze_bsfree_gamecube_duplicates(&cheats, &empty_ini());
+    assert!(
+        !findings
+            .iter()
+            .any(|f| f.kind == BsFreeDedupFindingKind::ConflictingMemoryWrite),
+        "a fill write must not conflict with an unrelated, non-overlapping address: \
+         {findings:?}"
+    );
+}
+
+#[test]
+fn a_gamecube_write8_fill_range_conflicts_with_a_genuinely_overlapping_write() {
+    // The same fill as above, but this time a second cheat writes a
+    // different byte inside the filled range (0x8024CD52, the third byte of
+    // the fill) - a real, provable conflict that must be caught and must
+    // block selection.
+    let cheats = vec![
+        classify_bsfree_gamecube_cheat(&named_cheat(1, "Clear Flags", "0024CD50 00000302")),
+        classify_bsfree_gamecube_cheat(&named_cheat(2, "Set Flag Three", "0024CD52 00000099")),
+    ];
+    let findings = analyze_bsfree_gamecube_duplicates(&cheats, &empty_ini());
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.kind == BsFreeDedupFindingKind::ConflictingMemoryWrite),
+        "a genuinely overlapping write inside a fill range must conflict: {findings:?}"
+    );
+    assert!(BsFreeDedupFindingKind::ConflictingMemoryWrite.blocks_selection());
+}
+
+#[test]
+fn a_gamecube_overlapping_write_of_a_different_width_is_detected_as_a_conflict() {
+    // A 32-bit write of 0xAABBCCDD at 0x80001000 places byte 0xCC at
+    // 0x80001002 (big-endian). A separate 8-bit write of a different byte
+    // at that address overlaps and disagrees, despite neither the address
+    // nor the size matching exactly.
+    let cheats = vec![
+        classify_bsfree_gamecube_cheat(&named_cheat(1, "Full HP And Ammo", "04001000 AABBCCDD")),
+        classify_bsfree_gamecube_cheat(&named_cheat(2, "Broken Overlap", "00001002 00000011")),
+    ];
+    let findings = analyze_bsfree_gamecube_duplicates(&cheats, &empty_ini());
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.kind == BsFreeDedupFindingKind::ConflictingMemoryWrite),
+        "an overlapping write of a different width with a different byte must conflict: \
+         {findings:?}"
+    );
+}
+
+#[test]
 fn two_records_converting_to_identical_gecko_output_are_deduplicated() {
     // Both are pure 04 writes; both become byte-identical Gecko codes even
     // though their BSFree labels differ. The second must be deduplicated.

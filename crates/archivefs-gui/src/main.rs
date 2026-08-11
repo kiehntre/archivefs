@@ -48,40 +48,43 @@ use archivefs_core::patch_manager::{
     BsFreeGameCubeCodeFormat, BsFreeGameCubeError, BsFreeGameCubeErrorKind,
     BsFreeGameCubeInstallPreviewRequest, BsFreeGameCubeMatch, BsFreeGameCubeSearchOutcome,
     BsFreeGameCubeSearchStatus, BsFreeGameSearchRequest, BsFreeGameSearchResult, BsFreePaths,
-    BsFreeSourceStatus, CheatCandidate, CheatCandidateArchive, CheatCandidateClassification,
-    CheatCandidateList, CheatCandidateOptions, CheatCatalogueStatus, CheatDestinationRequest,
-    CheatInstallPlanError, CheatInstallPreviewRequest, CheatProviderSourceState, CheatSelection,
-    CheatSourceCancellation, CheatSourceError, CheatSourceFetchOptions, CheatSourceFetchResult,
-    CheatSourceFetchStatus, CheatSourceFreshness, CheatSourceList, CheatSourceListEntry,
-    CheatSourceProgress, CheatSourceProgressPhase, CheatSourceProgressReporter,
-    DeviceFormatCompatibility, DolphinCatalogue, DolphinCatalogueError, DolphinCatalogueErrorKind,
+    BsFreeSourceStatus, BsFreeWiiCheat, BsFreeWiiCheatSelection, BsFreeWiiCodeFormat,
+    BsFreeWiiDedupFinding, BsFreeWiiError, BsFreeWiiErrorKind, BsFreeWiiInstallPreviewRequest,
+    BsFreeWiiMatch, BsFreeWiiSearchOutcome, BsFreeWiiSearchStatus, CheatCandidate,
+    CheatCandidateArchive, CheatCandidateClassification, CheatCandidateList, CheatCandidateOptions,
+    CheatCatalogueStatus, CheatDestinationRequest, CheatInstallPlanError,
+    CheatInstallPreviewRequest, CheatProviderSourceState, CheatSelection, CheatSourceCancellation,
+    CheatSourceError, CheatSourceFetchOptions, CheatSourceFetchResult, CheatSourceFetchStatus,
+    CheatSourceFreshness, CheatSourceList, CheatSourceListEntry, CheatSourceProgress,
+    CheatSourceProgressPhase, CheatSourceProgressReporter, DeviceFormatCompatibility,
+    DolphinCatalogue, DolphinCatalogueError, DolphinCatalogueErrorKind,
     DolphinCatalogueFetchOptions, DolphinCatalogueFetchResult, DolphinCatalogueLoad,
-    DolphinCatalogueUpdateCheck, DolphinGameIniInventory, DolphinGeckoLookupResult,
-    DolphinInstallPlanError, DolphinInstallPreviewRequest, DolphinInstallationType,
-    DolphinMatchState, DolphinProfile, DolphinProfileDiscovery, DolphinProfileDiscoveryRoots,
-    DolphinProfileScope, DolphinProviderCodeSelection, DolphinSettingsDirectoryState,
-    EmulatorProfileCandidate, EmulatorProfileSelectReason, EmulatorProfileSelection,
-    GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE, GameCubeCheatSelection, GameCubeCodeFormat,
-    GameCubeGameHackingInstallPreviewRequest, GameCubeGameIdentity, GameCubeInstallPlanError,
-    GameCubeInstallPlanErrorKind, GameHackingErrorKind, GameHackingFetchOptions, GameHackingGame,
-    GameHackingGameCubeCheat, GameHackingGameCubeFetchOptions, GameHackingGameCubeGame,
-    GameHackingGameCubeMatchCandidate, GameHackingGameCubeMatchStatus,
-    GameHackingGameCubeMatchStrength, GameHackingGameCubeProvider, GameHackingMatchCandidate,
-    GameHackingMatchStatus, GameHackingProvider, GameHackingWiiCheat, GameHackingWiiGame,
-    GameHackingWiiMatch, GameHackingWiiMatchCandidate, GameHackingWiiMatchStatus,
-    GameHackingWiiMatchStrength, GameHackingWiiProvider, GeckoProviderFetchOptions,
-    GeckoProviderFetchResult, GeckoProviderFetchStatus, GeckoProviderQuery,
-    HttpsCheatSourceTransport, ImportSourceKind, ImportTrustState, LoadedCandidate,
-    LoadedDolphinDestination, LoadedXeniaDestination, LocalSafetyScanningState, PageRequest,
-    Pcsx2CheatCandidate, Pcsx2CheatSelection, Pcsx2GameIdentity, Pcsx2InstallPlanError,
-    Pcsx2InstallPreviewRequest, Pcsx2InstallationType, Pcsx2MatchState, Pcsx2PatchCategory,
-    Pcsx2PatchDirectoryState, Pcsx2PnachInventory, Pcsx2Profile, Pcsx2ProfileDiscovery,
-    Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope, PreviewAdapter, PreviewDestinationState,
-    PreviewEligibility, PreviewIdentity, PreviewIdentityKind, PreviewIdentityState,
-    PreviewMatchStrength, PreviewSourceItem, PreviewState, ProviderGameMatchConfidence,
-    ReadOnlyCheatCatalogue, RememberedEmulatorProfile, ResolvedCheatDestination,
-    RetroArchCheatLibraryInspection, RetroArchCheatLibraryState, RetroArchCheatSetupDiscovery,
-    RetroArchLocalCheatMatchState, RetroArchMaterializationError,
+    DolphinCatalogueUpdateCheck, DolphinDedupFinding, DolphinGameIniInventory,
+    DolphinGeckoLookupResult, DolphinInstallPlanError, DolphinInstallPreviewRequest,
+    DolphinInstallationType, DolphinMatchState, DolphinProfile, DolphinProfileDiscovery,
+    DolphinProfileDiscoveryRoots, DolphinProfileScope, DolphinProviderCodeSelection,
+    DolphinSettingsDirectoryState, EmulatorProfileCandidate, EmulatorProfileSelectReason,
+    EmulatorProfileSelection, GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE, GameCubeCheatSelection,
+    GameCubeCodeFormat, GameCubeGameHackingInstallPreviewRequest, GameCubeGameIdentity,
+    GameCubeInstallPlanError, GameCubeInstallPlanErrorKind, GameHackingErrorKind,
+    GameHackingFetchOptions, GameHackingGame, GameHackingGameCubeCheat,
+    GameHackingGameCubeFetchOptions, GameHackingGameCubeGame, GameHackingGameCubeMatchCandidate,
+    GameHackingGameCubeMatchStatus, GameHackingGameCubeMatchStrength, GameHackingGameCubeProvider,
+    GameHackingMatchCandidate, GameHackingMatchStatus, GameHackingProvider, GameHackingWiiCheat,
+    GameHackingWiiGame, GameHackingWiiMatch, GameHackingWiiMatchCandidate,
+    GameHackingWiiMatchStatus, GameHackingWiiMatchStrength, GameHackingWiiProvider,
+    GeckoProviderFetchOptions, GeckoProviderFetchResult, GeckoProviderFetchStatus,
+    GeckoProviderQuery, HttpsCheatSourceTransport, ImportSourceKind, ImportTrustState,
+    LoadedCandidate, LoadedDolphinDestination, LoadedXeniaDestination, LocalSafetyScanningState,
+    PageRequest, Pcsx2CheatCandidate, Pcsx2CheatSelection, Pcsx2GameIdentity,
+    Pcsx2InstallPlanError, Pcsx2InstallPreviewRequest, Pcsx2InstallationType, Pcsx2MatchState,
+    Pcsx2PatchCategory, Pcsx2PatchDirectoryState, Pcsx2PnachInventory, Pcsx2Profile,
+    Pcsx2ProfileDiscovery, Pcsx2ProfileDiscoveryRoots, Pcsx2ProfileScope, PreviewAdapter,
+    PreviewDestinationState, PreviewEligibility, PreviewIdentity, PreviewIdentityKind,
+    PreviewIdentityState, PreviewMatchStrength, PreviewSourceItem, PreviewState,
+    ProviderGameMatchConfidence, ReadOnlyCheatCatalogue, RememberedEmulatorProfile,
+    ResolvedCheatDestination, RetroArchCheatLibraryInspection, RetroArchCheatLibraryState,
+    RetroArchCheatSetupDiscovery, RetroArchLocalCheatMatchState, RetroArchMaterializationError,
     RetroArchMaterializationErrorKind, RetroArchMaterializationRequest,
     RetroArchMaterializedPreview, SharedAdapterWriteSupport, SharedApplyConfirmation,
     SharedApplyOptions, SharedApplyResult, SharedApplyStatus, SharedHistoryReport,
@@ -92,8 +95,9 @@ use archivefs_core::patch_manager::{
     XeniaCandidateCompatibility, XeniaCandidateOutcome, XeniaInstallPlanError,
     XeniaInstallPreviewRequest, XeniaPatchSelection, XeniaProfile, XeniaProfileDiscovery,
     XeniaProfileDiscoveryRoots, adapter_write_support, bsfree_gamecube_load_confirmed,
-    bsfree_gamecube_search, build_bsfree_gamecube_install_preview, build_cheat_candidates,
-    build_cheat_install_preview, build_dolphin_install_preview,
+    bsfree_gamecube_search, bsfree_wii_load_confirmed, bsfree_wii_search,
+    build_bsfree_gamecube_install_preview, build_bsfree_wii_install_preview,
+    build_cheat_candidates, build_cheat_install_preview, build_dolphin_install_preview,
     build_gamecube_gamehacking_install_preview, build_pcsx2_cheat_candidates,
     build_pcsx2_install_preview, build_pcsx2_legacy_migration_preview, build_shared_preview,
     build_shared_transaction_plan, build_wii_gamehacking_install_preview, build_xenia_candidates,
@@ -116,9 +120,10 @@ use archivefs_core::patch_manager::{
     remove_local_bsfree_source, require_dolphin_managed_gamehacking_verification,
     resolve_cheat_destination, resolve_dolphin_gecko_lookup, select_dolphin_profile,
     select_emulator_profile, selected_pcsx2_managed_cheats, set_bsfree_enabled,
-    stage_bsfree_gamecube_install, stage_dolphin_provider_ini, stage_gamecube_gamehacking_install,
-    stage_gamecube_gamehacking_removal, stage_generated_cheat_file, stage_pcsx2_pnach,
-    stage_xenia_patch_file, validate_installed_bsfree_source,
+    stage_bsfree_gamecube_install, stage_bsfree_wii_install, stage_dolphin_provider_ini,
+    stage_gamecube_gamehacking_install, stage_gamecube_gamehacking_removal,
+    stage_generated_cheat_file, stage_pcsx2_pnach, stage_xenia_patch_file,
+    validate_installed_bsfree_source,
 };
 #[cfg(test)]
 use archivefs_core::patch_manager::{
@@ -7801,6 +7806,9 @@ impl ArchiveFsApp {
             bsfree_gamecube: CheatStepResource::NotLoaded,
             bsfree_gamecube_cancellation: None,
             bsfree_gamecube_generation: 0,
+            bsfree_wii: CheatStepResource::NotLoaded,
+            bsfree_wii_cancellation: None,
+            bsfree_wii_generation: 0,
             selected_dolphin_profile_id,
             dolphin_explicit_root: String::new(),
             dolphin_inventory_profile_id: None,
@@ -8017,6 +8025,8 @@ impl ArchiveFsApp {
                 pcsx2_generated: None,
                 gamecube_gamehacking_generated: None,
                 bsfree_gamecube_generated: None,
+
+                bsfree_wii_generated: None,
             }));
             context.request_repaint();
         });
@@ -8510,6 +8520,8 @@ impl ArchiveFsApp {
                 pcsx2_generated: None,
                 gamecube_gamehacking_generated: None,
                 bsfree_gamecube_generated: None,
+
+                bsfree_wii_generated: None,
             },
             Err(error) => {
                 self.history.record(HistoryEntry::new(
@@ -8530,6 +8542,8 @@ impl ArchiveFsApp {
                     pcsx2_generated: None,
                     gamecube_gamehacking_generated: None,
                     bsfree_gamecube_generated: None,
+
+                    bsfree_wii_generated: None,
                 }
             }
         };
@@ -8795,6 +8809,8 @@ impl ArchiveFsApp {
                 pcsx2_generated: None,
                 gamecube_gamehacking_generated: None,
                 bsfree_gamecube_generated: None,
+
+                bsfree_wii_generated: None,
             },
             Err(error) => {
                 self.history.record(HistoryEntry::new(
@@ -8815,6 +8831,8 @@ impl ArchiveFsApp {
                     pcsx2_generated: None,
                     gamecube_gamehacking_generated: None,
                     bsfree_gamecube_generated: None,
+
+                    bsfree_wii_generated: None,
                 }
             }
         };
@@ -8965,6 +8983,8 @@ impl ArchiveFsApp {
                     pcsx2_generated: None,
                     gamecube_gamehacking_generated: None,
                     bsfree_gamecube_generated: None,
+
+                    bsfree_wii_generated: None,
                 },
                 Err(error) => CheatPreviewResponse {
                     key: worker_key,
@@ -8976,6 +8996,8 @@ impl ArchiveFsApp {
                     pcsx2_generated: None,
                     gamecube_gamehacking_generated: None,
                     bsfree_gamecube_generated: None,
+
+                    bsfree_wii_generated: None,
                 },
             };
             let _ = sender.send(Ok(message));
@@ -9088,6 +9110,12 @@ impl ArchiveFsApp {
             .or_else(|| {
                 response
                     .bsfree_gamecube_generated
+                    .as_ref()
+                    .map(|generated| generated.staging_root.clone())
+            })
+            .or_else(|| {
+                response
+                    .bsfree_wii_generated
                     .as_ref()
                     .map(|generated| generated.staging_root.clone())
             })
@@ -10228,6 +10256,8 @@ impl ArchiveFsApp {
                     profile,
                 }),
                 bsfree_gamecube_generated: None,
+
+                bsfree_wii_generated: None,
             },
             Err(error) => {
                 self.history.record(HistoryEntry::new(
@@ -10248,6 +10278,8 @@ impl ArchiveFsApp {
                     pcsx2_generated: None,
                     gamecube_gamehacking_generated: None,
                     bsfree_gamecube_generated: None,
+
+                    bsfree_wii_generated: None,
                 }
             }
         };
@@ -10355,6 +10387,8 @@ impl ArchiveFsApp {
                     profile,
                 }),
                 bsfree_gamecube_generated: None,
+
+                bsfree_wii_generated: None,
             },
             Err(error) => {
                 self.history.record(HistoryEntry::new(
@@ -10375,6 +10409,8 @@ impl ArchiveFsApp {
                     pcsx2_generated: None,
                     gamecube_gamehacking_generated: None,
                     bsfree_gamecube_generated: None,
+
+                    bsfree_wii_generated: None,
                 }
             }
         };
@@ -10618,6 +10654,7 @@ impl ArchiveFsApp {
                     skipped_duplicates: staged.skipped_duplicates,
                     skipped_unselectable: staged.skipped_unselectable,
                 }),
+                bsfree_wii_generated: None,
             },
             Err(error) => {
                 self.history.record(HistoryEntry::new(
@@ -10638,6 +10675,271 @@ impl ArchiveFsApp {
                     pcsx2_generated: None,
                     gamecube_gamehacking_generated: None,
                     bsfree_gamecube_generated: None,
+
+                    bsfree_wii_generated: None,
+                }
+            }
+        };
+        let Some(workflow) = self.cheat_workflow.as_mut() else {
+            return;
+        };
+        workflow.preview_request = Some(key);
+        workflow.preview = CheatStepResource::Ready(message);
+        workflow.transaction = CheatTransactionState::Idle;
+        workflow.transaction_notice = None;
+        self.review_cheat_apply();
+    }
+
+    /// Searches the local BSFree catalogue for a Wii game matching the given
+    /// title, gated on the archive's verified Dolphin Wii Game ID. The shipped
+    /// BSFree snapshot contains no Wii rows, so this normally resolves to
+    /// `NoMatch`; the path is implemented so it activates if Wii data is
+    /// loaded.
+    fn start_bsfree_wii_search(&mut self, context: egui::Context, search_title: String) {
+        let Some((archive_path, game_id, region, platform_ok)) =
+            self.cheat_workflow.as_ref().and_then(|workflow| {
+                let identity = wii_identity_for_workflow(workflow)?;
+                Some((
+                    workflow.archive_path.clone(),
+                    identity.dolphin_game_id.clone()?,
+                    identity.region.clone(),
+                    workflow.platform.as_deref() == Some("Wii"),
+                ))
+            })
+        else {
+            return;
+        };
+        if !platform_ok {
+            return;
+        }
+        let generation = self
+            .cheat_workflow
+            .as_ref()
+            .map(|workflow| workflow.bsfree_wii_generation.saturating_add(1))
+            .unwrap_or(1);
+        let (sender, receiver) = mpsc::channel();
+        let Some(workflow) = self.cheat_workflow.as_mut() else {
+            return;
+        };
+        if let Some(previous) = workflow.bsfree_wii_cancellation.take() {
+            previous.store(true, Ordering::Relaxed);
+        }
+        workflow.bsfree_wii_generation = generation;
+        workflow.bsfree_wii_cancellation = Some(Arc::new(AtomicBool::new(false)));
+        workflow.bsfree_wii = CheatStepResource::Loading { receiver };
+        self.history.record(HistoryEntry::new(
+            ActivityAction::CheatSourceRetrieval,
+            Some(archive_path),
+            ActivityOutcome::Started,
+            "Searching the local BSFree Archive for this Wii game.".to_string(),
+        ));
+        thread::spawn(move || {
+            let result = (|| -> Result<BsFreeWiiGuiState, String> {
+                let catalogue = open_installed_bsfree_catalogue()?;
+                let outcome =
+                    bsfree_wii_search(&catalogue, &search_title, &game_id, region.as_deref())
+                        .map_err(|error| error.to_string())?;
+                Ok(bsfree_wii_gui_state_from_outcome(outcome, search_title))
+            })();
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
+    /// Loads the classified cheats for a BSFree Wii game the user explicitly
+    /// confirmed from the search candidates.
+    fn start_bsfree_wii_confirm(&mut self, context: egui::Context, upstream_uid: i64) {
+        let Some((archive_path, _game_id, _region, archive_title, platform_ok)) =
+            self.cheat_workflow.as_ref().and_then(|workflow| {
+                let identity = wii_identity_for_workflow(workflow)?;
+                Some((
+                    workflow.archive_path.clone(),
+                    identity.dolphin_game_id.clone()?,
+                    identity.region.clone(),
+                    workflow.display_name.clone(),
+                    workflow.platform.as_deref() == Some("Wii"),
+                ))
+            })
+        else {
+            return;
+        };
+        if !platform_ok {
+            return;
+        }
+        let generation = self
+            .cheat_workflow
+            .as_ref()
+            .map(|workflow| workflow.bsfree_wii_generation.saturating_add(1))
+            .unwrap_or(1);
+        let (sender, receiver) = mpsc::channel();
+        let Some(workflow) = self.cheat_workflow.as_mut() else {
+            return;
+        };
+        if let Some(previous) = workflow.bsfree_wii_cancellation.take() {
+            previous.store(true, Ordering::Relaxed);
+        }
+        workflow.bsfree_wii_generation = generation;
+        workflow.bsfree_wii_cancellation = Some(Arc::new(AtomicBool::new(false)));
+        workflow.bsfree_wii = CheatStepResource::Loading { receiver };
+        self.history.record(HistoryEntry::new(
+            ActivityAction::CheatSourceRetrieval,
+            Some(archive_path),
+            ActivityOutcome::Started,
+            "Loading the confirmed BSFree Wii game's cheats.".to_string(),
+        ));
+        thread::spawn(move || {
+            let result = (|| -> Result<BsFreeWiiGuiState, String> {
+                let catalogue = open_installed_bsfree_catalogue()?;
+                let cheats = bsfree_wii_load_confirmed(&catalogue, upstream_uid)
+                    .map_err(|error| error.to_string())?;
+                Ok(bsfree_wii_gui_state_from_matched(
+                    upstream_uid,
+                    &archive_title,
+                    cheats,
+                ))
+            })();
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
+    fn update_bsfree_wii_cheat_selection(&mut self, index: usize, selected: bool) {
+        let Some(workflow) = self.cheat_workflow.as_mut() else {
+            return;
+        };
+        let CheatStepResource::Ready(state) = &mut workflow.bsfree_wii else {
+            return;
+        };
+        if !state.selection.set_selected(index, selected) {
+            return;
+        }
+        workflow.preview = CheatStepResource::NotLoaded;
+        workflow.preview_request = None;
+        workflow.transaction = CheatTransactionState::Idle;
+        workflow.transaction_notice = None;
+    }
+
+    fn update_bsfree_wii_cheat_selection_all(&mut self, selected: bool) {
+        let Some(workflow) = self.cheat_workflow.as_mut() else {
+            return;
+        };
+        let CheatStepResource::Ready(state) = &mut workflow.bsfree_wii else {
+            return;
+        };
+        if selected {
+            state.selection.select_all();
+        } else {
+            state.selection.clear_all();
+        }
+        workflow.preview = CheatStepResource::NotLoaded;
+        workflow.preview_request = None;
+        workflow.transaction = CheatTransactionState::Idle;
+        workflow.transaction_notice = None;
+    }
+
+    /// BSFree Wii Stage: stages the selected supported cheats into the real
+    /// Dolphin GameSettings file through the shared Wii adapter and builds its
+    /// shared install preview, exactly like the GameCube path. Synchronous.
+    fn start_bsfree_wii_install_preview(&mut self) {
+        let Some(staging_root) = default_generated_dolphin_gamehacking_staging_root(false).ok()
+        else {
+            return;
+        };
+        let Some(workflow) = self.cheat_workflow.as_ref() else {
+            return;
+        };
+        let CheatStepResource::Ready(state) = &workflow.bsfree_wii else {
+            return;
+        };
+        let Some(game) = state.game.clone() else {
+            return;
+        };
+        let Some(profile) = self.gamecube_gamehacking_profile() else {
+            self.history.record(HistoryEntry::new(
+                ActivityAction::CheatPreview,
+                Some(workflow.archive_path.clone()),
+                ActivityOutcome::Rejected,
+                "BSFree Wii install preview blocked: the selected Dolphin profile is no longer eligible.",
+            ));
+            return;
+        };
+        let game_id = game.archive_game_id.clone();
+        let configuration_path = profile.configuration_path.clone();
+        let cheats = state.cheats.clone();
+        let selection = state.selection.clone();
+        let archive_path = workflow.archive_path.clone();
+        let key = cheat_preview_key(workflow);
+        let response = (|| {
+            let destination =
+                load_dolphin_destination(&configuration_path, &game_id).map_err(|failure| {
+                    BsFreeWiiError {
+                        kind: BsFreeWiiErrorKind::SelectionInvalid,
+                        cheat_name: None,
+                        detail: failure.to_string(),
+                    }
+                })?;
+            let staged = stage_bsfree_wii_install(
+                &staging_root,
+                &format!("{game_id}.ini"),
+                &destination.document,
+                destination.existed,
+                &cheats,
+                &selection,
+            )?;
+            let request = BsFreeWiiInstallPreviewRequest {
+                selected_archive: archive_path.clone(),
+                configuration_path: configuration_path.clone(),
+                game_id: game_id.clone(),
+                revision: None,
+                staged: staged.staged.clone(),
+            };
+            let preview = build_bsfree_wii_install_preview(&request)?;
+            Ok::<_, BsFreeWiiError>((preview, staged))
+        })();
+        let message = match response {
+            Ok((preview, staged)) => CheatPreviewResponse {
+                key: key.clone(),
+                outcome: CheatPreviewOutcome::Ready(preview.report),
+                materialized: None,
+                generated: None,
+                dolphin_generated: None,
+                xenia_generated: None,
+                pcsx2_generated: None,
+                gamecube_gamehacking_generated: None,
+                bsfree_gamecube_generated: None,
+                bsfree_wii_generated: Some(GeneratedBsFreeWiiInstall {
+                    staging_root,
+                    staged: staged.staged,
+                    profile,
+                    findings: staged.findings,
+                    skipped_duplicates: staged.skipped_duplicates,
+                    skipped_unselectable: staged.skipped_unselectable,
+                }),
+            },
+            Err(error) => {
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::CheatPreview,
+                    Some(archive_path),
+                    ActivityOutcome::Failed,
+                    format!("BSFree Wii install preview failed: {}", error.detail),
+                ));
+                CheatPreviewResponse {
+                    key: key.clone(),
+                    outcome: CheatPreviewOutcome::Failed(
+                        CheatPreviewFailure::BsFreeGameCubeInstallPlan(BsFreeGameCubeError {
+                            kind: BsFreeGameCubeErrorKind::PreviewFailed,
+                            cheat_name: error.cheat_name,
+                            detail: error.detail,
+                        }),
+                    ),
+                    materialized: None,
+                    generated: None,
+                    dolphin_generated: None,
+                    xenia_generated: None,
+                    pcsx2_generated: None,
+                    gamecube_gamehacking_generated: None,
+                    bsfree_gamecube_generated: None,
+                    bsfree_wii_generated: None,
                 }
             }
         };
@@ -10782,6 +11084,8 @@ impl ArchiveFsApp {
                     }),
                     gamecube_gamehacking_generated: None,
                     bsfree_gamecube_generated: None,
+
+                    bsfree_wii_generated: None,
                 }
             }
             Err(failure) => {
@@ -10812,6 +11116,8 @@ impl ArchiveFsApp {
                     pcsx2_generated: None,
                     gamecube_gamehacking_generated: None,
                     bsfree_gamecube_generated: None,
+
+                    bsfree_wii_generated: None,
                 }
             }
         };
@@ -14237,6 +14543,27 @@ impl ArchiveFsApp {
                         }
                         Some(CheatWorkflowAction::InstallSelectedBsFreeGameCube) => {
                             self.start_bsfree_gamecube_install_preview();
+                        }
+                        Some(CheatWorkflowAction::FetchBsFreeWii { search_title }) => {
+                            self.start_bsfree_wii_search(context.clone(), search_title);
+                        }
+                        Some(CheatWorkflowAction::ConfirmBsFreeWiiMatch { upstream_uid }) => {
+                            self.start_bsfree_wii_confirm(context.clone(), upstream_uid);
+                        }
+                        Some(CheatWorkflowAction::ToggleBsFreeWiiCheatSelected {
+                            index,
+                            selected,
+                        }) => {
+                            self.update_bsfree_wii_cheat_selection(index, selected);
+                        }
+                        Some(CheatWorkflowAction::SelectAllBsFreeWiiCheats) => {
+                            self.update_bsfree_wii_cheat_selection_all(true);
+                        }
+                        Some(CheatWorkflowAction::ClearAllBsFreeWiiCheats) => {
+                            self.update_bsfree_wii_cheat_selection_all(false);
+                        }
+                        Some(CheatWorkflowAction::InstallSelectedBsFreeWii) => {
+                            self.start_bsfree_wii_install_preview();
                         }
                         Some(CheatWorkflowAction::RescanDolphinProfiles) => {
                             self.start_dolphin_profile_scan(context.clone());
@@ -22361,6 +22688,12 @@ struct CheatWorkflowState {
     bsfree_gamecube: CheatStepResource<BsFreeGameCubeGuiState>,
     bsfree_gamecube_cancellation: Option<Arc<AtomicBool>>,
     bsfree_gamecube_generation: u64,
+    /// BSFree Wii coverage: the same optional local SQLite source, matched by
+    /// platform + title to the archive's verified Dolphin Wii Game ID. Only
+    /// the verified hex-pair subset is installable.
+    bsfree_wii: CheatStepResource<BsFreeWiiGuiState>,
+    bsfree_wii_cancellation: Option<Arc<AtomicBool>>,
+    bsfree_wii_generation: u64,
     selected_dolphin_profile_id: Option<String>,
     /// An optional additional Dolphin configuration directory to scan,
     /// typed by the user - covers portable/AppImage installs, which have
@@ -22591,6 +22924,20 @@ struct GeneratedBsFreeGameCubeInstall {
     skipped_unselectable: Vec<String>,
 }
 
+/// The BSFree Wii equivalent of [`GeneratedBsFreeGameCubeInstall`]: the staged
+/// Dolphin GameSettings INI (produced by the shared Wii adapter) plus the
+/// dedup/conflict findings. The staged artifact type is the same, because both
+/// platforms write the same Dolphin `GameSettings` structure.
+#[derive(Clone)]
+struct GeneratedBsFreeWiiInstall {
+    staging_root: PathBuf,
+    staged: StagedGameCubeIni,
+    profile: DolphinProfile,
+    findings: Vec<BsFreeWiiDedupFinding>,
+    skipped_duplicates: Vec<String>,
+    skipped_unselectable: Vec<String>,
+}
+
 /// The Xenia equivalent of `GeneratedDolphinInstall`: the exact chosen
 /// candidate document, staged as a real merged `.patch.toml`.
 #[derive(Clone)]
@@ -22651,6 +22998,22 @@ struct BsFreeGameCubeGuiState {
     analysis: Vec<BsFreeDedupFinding>,
     /// Editable search title, pre-filled with the archive's title. A different
     /// search re-runs the bounded local BSFree query.
+    search_title: String,
+}
+
+/// BSFree Wii coverage inside Cheats & Mods, mirroring the GameCube state.
+/// Only the verified hex-pair subset is selectable; every other BSFree Wii
+/// record (encrypted, unverified device, malformed) stays browse-only.
+struct BsFreeWiiGuiState {
+    status: BsFreeWiiSearchStatus,
+    detail: String,
+    candidates: Vec<BsFreeWiiMatch>,
+    game: Option<BsFreeWiiMatch>,
+    cheats: Vec<BsFreeWiiCheat>,
+    selection: BsFreeWiiCheatSelection,
+    /// Destination-based duplicate/conflict analysis, computed once per fetch
+    /// against the real Dolphin GameSettings file.
+    analysis: Vec<BsFreeWiiDedupFinding>,
     search_title: String,
 }
 
@@ -22857,6 +23220,9 @@ struct CheatPreviewResponse {
     /// kept distinct so the two sources never cross-talk in the shared
     /// review/apply/result UI.
     bsfree_gamecube_generated: Option<GeneratedBsFreeGameCubeInstall>,
+    /// Present only for the BSFree Archive Wii install path - the same shape
+    /// as the GameCube one, routed through the shared Wii/Dolphin adapter.
+    bsfree_wii_generated: Option<GeneratedBsFreeWiiInstall>,
 }
 
 enum CheatPreviewWork {
@@ -23836,6 +24202,23 @@ enum CheatWorkflowAction {
     SelectAllBsFreeGameCubeCheats,
     ClearAllBsFreeGameCubeCheats,
     InstallSelectedBsFreeGameCube,
+    /// BSFree Archive Wii coverage: search the optional local SQLite database
+    /// for the selected archive's Wii game (bounded, read-only).
+    FetchBsFreeWii {
+        search_title: String,
+    },
+    /// Confirm one of several BSFree Wii search candidates and load its
+    /// classified cheats.
+    ConfirmBsFreeWiiMatch {
+        upstream_uid: i64,
+    },
+    ToggleBsFreeWiiCheatSelected {
+        index: usize,
+        selected: bool,
+    },
+    SelectAllBsFreeWiiCheats,
+    ClearAllBsFreeWiiCheats,
+    InstallSelectedBsFreeWii,
 }
 
 const MODS_UNAVAILABLE_BODY: &str = "This workspace is reserved for future verified emulator-specific adapters, including patches, texture packs, widescreen fixes, and frame-rate patches. No mod workflow is available yet.";
@@ -24813,6 +25196,9 @@ fn show_dolphin_workflow(
     }
     if workflow.platform.as_deref() == Some("GameCube") {
         action = show_bsfree_gamecube(ui, workflow).or(action);
+    }
+    if workflow.platform.as_deref() == Some("Wii") {
+        action = show_bsfree_wii(ui, workflow).or(action);
     }
     action
 }
@@ -28364,6 +28750,281 @@ fn show_bsfree_gamecube(
     action
 }
 
+/// Per-cheat status for the BSFree Wii list, using the destination-based
+/// analysis computed when the search completed. The finding vocabulary is the
+/// shared generalized one, so the states ("Ready", "Already installed",
+/// "Conflict", "Browse only") are identical to the GameCube list.
+fn bsfree_wii_cheat_status(
+    cheat: &BsFreeWiiCheat,
+    analysis: &[BsFreeWiiDedupFinding],
+) -> (&'static str, widgets::StatusTone) {
+    if !cheat.code_format.is_installable() {
+        return ("Browse only", widgets::StatusTone::Pending);
+    }
+    let findings = analysis
+        .iter()
+        .filter(|finding| finding.cheat_upstream_id == cheat.upstream_id)
+        .collect::<Vec<_>>();
+    if findings.iter().any(|finding| {
+        matches!(
+            finding.kind,
+            BsFreeDedupFindingKind::AlreadyInstalled
+                | BsFreeDedupFindingKind::AlreadyInstalledDifferentName
+        )
+    }) {
+        return ("Already installed", widgets::StatusTone::Info);
+    }
+    if findings
+        .iter()
+        .any(|finding| finding.kind.blocks_selection())
+    {
+        return ("Conflict", widgets::StatusTone::Blocked);
+    }
+    ("Ready", widgets::StatusTone::Success)
+}
+
+/// Concise browse-only reason for an unsupported/malformed BSFree Wii code.
+fn bsfree_wii_browse_only_reason(code_format: BsFreeWiiCodeFormat) -> &'static str {
+    match code_format {
+        BsFreeWiiCodeFormat::GeckoEquivalent | BsFreeWiiCodeFormat::ActionReplayNative => {
+            "Supported by Dolphin."
+        }
+        BsFreeWiiCodeFormat::Unsupported => {
+            "Browse only — this code contains an Action Replay command Dolphin refuses to run."
+        }
+        BsFreeWiiCodeFormat::Malformed => {
+            "Browse only — this code is encrypted, malformed, or from an unverified Wii device."
+        }
+    }
+}
+
+/// The BSFree Wii section in Cheats & Mods. Mirrors `show_bsfree_gamecube`;
+/// only the verified hex-pair subset is selectable, and identity is the
+/// archive's verified Dolphin Wii Game ID.
+fn show_bsfree_wii(
+    ui: &mut egui::Ui,
+    workflow: &mut CheatWorkflowState,
+) -> Option<CheatWorkflowAction> {
+    let mut action = None;
+    ui.add_space(theme::SECTION_GAP);
+    widgets::section_header(
+        ui,
+        "BSFree Archive",
+        Some(
+            "An optional historical cheat database. Only verified Wii hex-pair \
+             codes can be installed with Dolphin; encrypted and unverified formats \
+             remain browse only.",
+        ),
+    );
+
+    if bsfree_transaction_active(workflow) {
+        match &workflow.transaction {
+            CheatTransactionState::Applying { .. } => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Installing selected cheats…");
+                });
+                return action;
+            }
+            CheatTransactionState::Result { result, .. } => {
+                return show_bsfree_install_result(ui, workflow, result);
+            }
+            CheatTransactionState::Idle | CheatTransactionState::Review { .. } => {}
+        }
+    }
+
+    let identity_ready = wii_identity_for_workflow(workflow)
+        .is_some_and(|identity| identity.verified_game_id().is_some());
+    let profile_selected = workflow.selected_dolphin_profile_id.is_some();
+
+    match &mut workflow.bsfree_wii {
+        CheatStepResource::NotLoaded => {
+            if identity_ready {
+                let search_title = workflow.display_name.clone();
+                action = Some(CheatWorkflowAction::FetchBsFreeWii { search_title });
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Searching BSFree Archive for this game…");
+                });
+            } else {
+                widgets::status_badge(ui, "Game identity incomplete", widgets::StatusTone::Blocked);
+                ui.label(
+                    "EmuWiz needs a verified Dolphin Wii Game ID before it can search BSFree.",
+                );
+            }
+        }
+        CheatStepResource::Loading { .. } => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Reading the local BSFree database…");
+            });
+        }
+        CheatStepResource::Failed(message) => {
+            widgets::banner(
+                ui,
+                "BSFree Archive unavailable",
+                message,
+                widgets::StatusTone::Warning,
+            );
+        }
+        CheatStepResource::Ready(state) => {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Search title:");
+                ui.add(egui::TextEdit::singleline(&mut state.search_title).desired_width(280.0));
+                if ui
+                    .add_enabled(identity_ready, egui::Button::new("Search BSFree"))
+                    .clicked()
+                {
+                    action = Some(CheatWorkflowAction::FetchBsFreeWii {
+                        search_title: state.search_title.trim().to_string(),
+                    });
+                }
+            });
+            ui.weak(&state.detail);
+
+            match state.status {
+                BsFreeWiiSearchStatus::Candidates => {
+                    for candidate in &state.candidates {
+                        widgets::card(ui, |ui| {
+                            ui.strong(&candidate.matched_bsfree_title);
+                            ui.label(format!(
+                                "Version: {} · BSFree game UID {}",
+                                candidate
+                                    .matched_bsfree_version
+                                    .as_deref()
+                                    .unwrap_or("not supplied"),
+                                candidate.matched_bsfree_game_upstream_uid
+                            ));
+                            ui.weak(&candidate.region_evidence);
+                            if widgets::action_button(
+                                ui,
+                                "Use this game",
+                                widgets::ActionStyle::Primary,
+                                true,
+                            )
+                            .clicked()
+                            {
+                                action = Some(CheatWorkflowAction::ConfirmBsFreeWiiMatch {
+                                    upstream_uid: candidate.matched_bsfree_game_upstream_uid,
+                                });
+                            }
+                        });
+                    }
+                }
+                BsFreeWiiSearchStatus::NoMatch => {
+                    ui.weak(
+                        "No BSFree Wii records match. The shipped BSFree catalogue contains no \
+                         Wii rows; GameHacking.org remains the Wii cheat source.",
+                    );
+                }
+                BsFreeWiiSearchStatus::Matched => {
+                    if let Some(game) = &state.game {
+                        widgets::card(ui, |ui| {
+                            ui.strong(&game.matched_bsfree_title);
+                            ui.label(format!(
+                                "Matched for: {} · Game ID {}",
+                                game.archive_title, game.archive_game_id
+                            ));
+                            ui.weak(&game.region_evidence);
+                            ui.weak(
+                                "Matched by platform and title. BSFree carries no verified game \
+                                 revision, so review the cheats before applying.",
+                            );
+                        });
+                    }
+                    for (position, cheat) in state.cheats.iter().enumerate() {
+                        let entry = state
+                            .selection
+                            .entries
+                            .iter()
+                            .find(|entry| entry.index == position)
+                            .cloned();
+                        let (status_label, tone) = bsfree_wii_cheat_status(cheat, &state.analysis);
+                        widgets::card(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                if let Some(entry) = &entry
+                                    && entry.selectable
+                                {
+                                    let mut selected = entry.selected;
+                                    if ui.checkbox(&mut selected, &cheat.name).changed() {
+                                        action = Some(
+                                            CheatWorkflowAction::ToggleBsFreeWiiCheatSelected {
+                                                index: entry.index,
+                                                selected,
+                                            },
+                                        );
+                                    }
+                                } else {
+                                    ui.strong(&cheat.name);
+                                }
+                                widgets::status_badge(ui, status_label, tone);
+                            });
+                            if let Some(author) = &cheat.author {
+                                ui.label(format!("Author: {author}"));
+                            }
+                            if let Some(note) = &cheat.note {
+                                ui.label(format!("Notes: {note}"));
+                            }
+                            if entry.is_none_or(|entry| !entry.selectable) {
+                                ui.weak(bsfree_wii_browse_only_reason(cheat.code_format));
+                            }
+                            ui.collapsing("Code", |ui| {
+                                for line in &cheat.code_lines {
+                                    ui.monospace(line);
+                                }
+                            });
+                        });
+                    }
+                    let selected_count = state.selection.selected_count();
+                    ui.horizontal_wrapped(|ui| {
+                        if widgets::action_button(
+                            ui,
+                            "Select all supported",
+                            widgets::ActionStyle::Quiet,
+                            state.selection.selectable_count() > 0,
+                        )
+                        .clicked()
+                        {
+                            action = Some(CheatWorkflowAction::SelectAllBsFreeWiiCheats);
+                        }
+                        if widgets::action_button(
+                            ui,
+                            "Clear selection",
+                            widgets::ActionStyle::Quiet,
+                            selected_count > 0,
+                        )
+                        .clicked()
+                        {
+                            action = Some(CheatWorkflowAction::ClearAllBsFreeWiiCheats);
+                        }
+                        if matches!(workflow.transaction, CheatTransactionState::Idle)
+                            && widgets::action_button(
+                                ui,
+                                format!("Install {selected_count} cheats"),
+                                widgets::ActionStyle::Primary,
+                                state.selection.can_apply()
+                                    && profile_selected
+                                    && matches!(workflow.transaction, CheatTransactionState::Idle),
+                            )
+                            .clicked()
+                        {
+                            action = Some(CheatWorkflowAction::InstallSelectedBsFreeWii);
+                        }
+                    });
+                    if !profile_selected {
+                        ui.weak("Choose an eligible Dolphin profile to enable installation.");
+                    }
+                }
+            }
+        }
+    }
+
+    if matches!(workflow.transaction, CheatTransactionState::Review { .. }) {
+        action = show_bsfree_review_card(ui, workflow).or(action);
+    }
+    action
+}
+
 /// Per-cheat status for the BSFree list, using the destination-based analysis
 /// computed when the search completed. Never exposes raw converter terminology
 /// by default.
@@ -28421,9 +29082,46 @@ fn show_bsfree_review_card(
     let CheatStepResource::Ready(response) = &workflow.preview else {
         return action;
     };
-    let Some(generated) = &response.bsfree_gamecube_generated else {
-        return action;
+    // Both the GameCube and Wii BSFree flows render through this card; the
+    // staged artifact, profile, findings and skipped lists have the same
+    // shape (both write the same Dolphin GameSettings structure), so the card
+    // binds whichever source produced the preview.
+    let matched_title_gc = match &workflow.bsfree_gamecube {
+        CheatStepResource::Ready(state) => state
+            .game
+            .as_ref()
+            .map(|game| game.matched_bsfree_title.clone()),
+        _ => None,
     };
+    let matched_title_wii = match &workflow.bsfree_wii {
+        CheatStepResource::Ready(state) => state
+            .game
+            .as_ref()
+            .map(|game| game.matched_bsfree_title.clone()),
+        _ => None,
+    };
+    let (staged, profile, findings, skipped_duplicates, skipped_unselectable, matched_title) =
+        match &response.bsfree_gamecube_generated {
+            Some(generated) => (
+                &generated.staged,
+                &generated.profile,
+                &generated.findings,
+                &generated.skipped_duplicates,
+                &generated.skipped_unselectable,
+                matched_title_gc,
+            ),
+            None => match &response.bsfree_wii_generated {
+                Some(generated) => (
+                    &generated.staged,
+                    &generated.profile,
+                    &generated.findings,
+                    &generated.skipped_duplicates,
+                    &generated.skipped_unselectable,
+                    matched_title_wii,
+                ),
+                None => return action,
+            },
+        };
     let CheatTransactionState::Review {
         plan,
         replacement_approved,
@@ -28432,15 +29130,8 @@ fn show_bsfree_review_card(
     else {
         return action;
     };
-    let matched_title = match &workflow.bsfree_gamecube {
-        CheatStepResource::Ready(state) => state
-            .game
-            .as_ref()
-            .map(|game| game.matched_bsfree_title.clone()),
-        _ => None,
-    };
     widgets::card(ui, |ui| {
-        let count = generated.staged.affected.len();
+        let count = staged.affected.len();
         ui.strong(format!(
             "Apply {count} cheat{s}?",
             s = if count == 1 { "" } else { "s" }
@@ -28454,8 +29145,7 @@ fn show_bsfree_review_card(
         }
         ui.label(format!(
             "Selected Dolphin executable: {}",
-            generated
-                .profile
+            profile
                 .resolved
                 .emulator_executable
                 .as_deref()
@@ -28464,11 +29154,11 @@ fn show_bsfree_review_card(
         ));
         ui.label(format!(
             "GameSettings directory: {}",
-            generated.profile.game_settings_path.display()
+            profile.game_settings_path.display()
         ));
         ui.label(format!(
             "Staging artifact (not destination): {}",
-            generated.staged.path.display()
+            staged.path.display()
         ));
         for entry in &plan.entries {
             ui.label(format!(
@@ -28476,7 +29166,7 @@ fn show_bsfree_review_card(
                 entry.destination_root.display, entry.destination_relative_path.display
             ));
         }
-        for cheat in &generated.staged.affected {
+        for cheat in &staged.affected {
             ui.label(format!(
                 "{} → [{}]",
                 cheat.name,
@@ -28487,8 +29177,7 @@ fn show_bsfree_review_card(
                 }
             ));
         }
-        let installed: Vec<&BsFreeDedupFinding> = generated
-            .findings
+        let installed: Vec<&DolphinDedupFinding> = findings
             .iter()
             .filter(|finding| {
                 matches!(
@@ -28508,8 +29197,7 @@ fn show_bsfree_review_card(
                     .join(", ")
             ));
         }
-        let conflicts: Vec<&BsFreeDedupFinding> = generated
-            .findings
+        let conflicts: Vec<&DolphinDedupFinding> = findings
             .iter()
             .filter(|finding| finding.kind.blocks_selection())
             .collect();
@@ -28523,16 +29211,16 @@ fn show_bsfree_review_card(
                     .join(", ")
             ));
         }
-        if !generated.skipped_unselectable.is_empty() {
+        if !skipped_unselectable.is_empty() {
             ui.label(format!(
                 "Unsupported (excluded): {}",
-                generated.skipped_unselectable.join(", ")
+                skipped_unselectable.join(", ")
             ));
         }
-        if !generated.skipped_duplicates.is_empty() {
+        if !skipped_duplicates.is_empty() {
             ui.label(format!(
                 "Skipped duplicates: {}",
-                generated.skipped_duplicates.join(", ")
+                skipped_duplicates.join(", ")
             ));
         }
         let replacement_required = plan.entries.iter().any(|entry| {
@@ -28588,6 +29276,21 @@ fn show_bsfree_install_result(
                             .collect::<Vec<_>>(),
                         generated.skipped_unselectable.clone(),
                     )
+                })
+                .or_else(|| {
+                    response.bsfree_wii_generated.as_ref().map(|generated| {
+                        (
+                            generated.staged.affected.len(),
+                            generated.skipped_duplicates.clone(),
+                            generated
+                                .findings
+                                .iter()
+                                .filter(|finding| finding.kind.blocks_selection())
+                                .map(|finding| finding.cheat_name.clone())
+                                .collect::<Vec<_>>(),
+                            generated.skipped_unselectable.clone(),
+                        )
+                    })
                 })
                 .unwrap_or_default(),
             _ => Default::default(),
@@ -28802,6 +29505,51 @@ fn bsfree_gui_state_from_outcome(
     }
 }
 
+fn bsfree_wii_gui_state_from_outcome(
+    outcome: BsFreeWiiSearchOutcome,
+    search_title: String,
+) -> BsFreeWiiGuiState {
+    let cheats = outcome.cheats;
+    let selection = BsFreeWiiCheatSelection::from_cheats(&cheats, &parse_dolphin_ini(""));
+    BsFreeWiiGuiState {
+        status: outcome.status,
+        detail: outcome.detail,
+        candidates: outcome.candidates,
+        game: outcome.game,
+        cheats,
+        selection,
+        analysis: Vec::new(),
+        search_title,
+    }
+}
+
+fn bsfree_wii_gui_state_from_matched(
+    upstream_uid: i64,
+    archive_title: &str,
+    cheats: Vec<BsFreeWiiCheat>,
+) -> BsFreeWiiGuiState {
+    let selection = BsFreeWiiCheatSelection::from_cheats(&cheats, &parse_dolphin_ini(""));
+    BsFreeWiiGuiState {
+        status: BsFreeWiiSearchStatus::Matched,
+        detail: "Matched BSFree Wii game; review the cheats before applying.".to_string(),
+        candidates: Vec::new(),
+        game: Some(BsFreeWiiMatch {
+            archive_title: archive_title.to_string(),
+            archive_game_id: String::new(),
+            matched_bsfree_game_upstream_uid: upstream_uid,
+            matched_bsfree_title: archive_title.to_string(),
+            matched_bsfree_version: None,
+            region_evidence: String::new(),
+            requires_review: true,
+            detail: "confirmed BSFree Wii match".to_string(),
+        }),
+        cheats,
+        selection,
+        analysis: Vec::new(),
+        search_title: archive_title.to_string(),
+    }
+}
+
 fn wii_identity_for_workflow(workflow: &CheatWorkflowState) -> Option<WiiGameIdentity> {
     let report = ready_game_identity(workflow)?;
     Some(WiiGameIdentity::from_report(
@@ -28811,13 +29559,15 @@ fn wii_identity_for_workflow(workflow: &CheatWorkflowState) -> Option<WiiGameIde
 }
 
 /// Whether the current shared transaction/preview belongs to the BSFree
-/// GameCube flow rather than the GameHacking.org flow. The two sources share
-/// one `workflow.transaction`; only the source whose preview artifact is
-/// present renders the applying/result/review states.
+/// GameCube or Wii flow rather than the GameHacking.org flow. The sources
+/// share one `workflow.transaction`; only the source whose preview artifact
+/// is present renders the applying/result/review states.
 fn bsfree_transaction_active(workflow: &CheatWorkflowState) -> bool {
     matches!(
         &workflow.preview,
-        CheatStepResource::Ready(response) if response.bsfree_gamecube_generated.is_some()
+        CheatStepResource::Ready(response)
+            if response.bsfree_gamecube_generated.is_some()
+                || response.bsfree_wii_generated.is_some()
     )
 }
 
@@ -44553,6 +45303,9 @@ mod tests {
             bsfree_gamecube: CheatStepResource::NotLoaded,
             bsfree_gamecube_cancellation: None,
             bsfree_gamecube_generation: 0,
+            bsfree_wii: CheatStepResource::NotLoaded,
+            bsfree_wii_cancellation: None,
+            bsfree_wii_generation: 0,
             selected_dolphin_profile_id: None,
             dolphin_explicit_root: String::new(),
             dolphin_inventory_profile_id: None,
@@ -47502,6 +48255,8 @@ $Instant Growth [Nayr]\n";
             pcsx2_generated: None,
             gamecube_gamehacking_generated: None,
             bsfree_gamecube_generated: None,
+
+            bsfree_wii_generated: None,
         });
 
         app.update_dolphin_code_selection(|selection| {
@@ -47838,6 +48593,8 @@ $Instant Growth [Nayr]\n";
                 pcsx2_generated: None,
                 gamecube_gamehacking_generated: None,
                 bsfree_gamecube_generated: None,
+
+                bsfree_wii_generated: None,
             }))
             .unwrap();
         app.poll_cheat_workflow(&egui::Context::default());
@@ -49240,6 +49997,8 @@ $Instant Growth [Nayr]\n";
             pcsx2_generated: None,
             gamecube_gamehacking_generated: None,
             bsfree_gamecube_generated: None,
+
+            bsfree_wii_generated: None,
         });
         let ctx = egui::Context::default();
         let mut clipboard = InMemoryClipboard::default();
@@ -49277,6 +50036,8 @@ $Instant Growth [Nayr]\n";
             pcsx2_generated: None,
             gamecube_gamehacking_generated: None,
             bsfree_gamecube_generated: None,
+
+            bsfree_wii_generated: None,
         });
         let ctx = egui::Context::default();
         let mut clipboard = InMemoryClipboard::default();
@@ -50534,6 +51295,9 @@ $Instant Growth [Nayr]\n";
             bsfree_gamecube: CheatStepResource::NotLoaded,
             bsfree_gamecube_cancellation: None,
             bsfree_gamecube_generation: 0,
+            bsfree_wii: CheatStepResource::NotLoaded,
+            bsfree_wii_cancellation: None,
+            bsfree_wii_generation: 0,
             selected_dolphin_profile_id: None,
             dolphin_explicit_root: String::new(),
             dolphin_inventory_profile_id: None,
@@ -66749,6 +67513,9 @@ $Instant Growth [Nayr]\n";
             bsfree_gamecube: CheatStepResource::NotLoaded,
             bsfree_gamecube_cancellation: None,
             bsfree_gamecube_generation: 0,
+            bsfree_wii: CheatStepResource::NotLoaded,
+            bsfree_wii_cancellation: None,
+            bsfree_wii_generation: 0,
             selected_dolphin_profile_id: None,
             dolphin_explicit_root: String::new(),
             dolphin_inventory_profile_id: None,
@@ -67015,6 +67782,191 @@ $Instant Growth [Nayr]\n";
         (output, action)
     }
 
+    fn bsfree_wii_gui_cheat(
+        id: i64,
+        name: &str,
+        format: BsFreeWiiCodeFormat,
+        code: &str,
+    ) -> BsFreeWiiCheat {
+        BsFreeWiiCheat {
+            upstream_id: id,
+            name: name.to_string(),
+            author: None,
+            note: None,
+            section: None,
+            code_format: format,
+            code_lines: vec![code.to_string()],
+            canonical_digest: String::new(),
+        }
+    }
+
+    fn bsfree_wii_gui_matched_state(cheats: Vec<BsFreeWiiCheat>) -> BsFreeWiiGuiState {
+        let selection = BsFreeWiiCheatSelection::from_cheats(&cheats, &parse_dolphin_ini(""));
+        BsFreeWiiGuiState {
+            status: BsFreeWiiSearchStatus::Matched,
+            detail: "Matched BSFree Wii game \"Test Game\"; review the cheats before applying."
+                .to_string(),
+            candidates: Vec::new(),
+            game: Some(BsFreeWiiMatch {
+                archive_title: "Test Game".to_string(),
+                archive_game_id: "R3HX6Z".to_string(),
+                matched_bsfree_game_upstream_uid: 42,
+                matched_bsfree_title: "Test Game".to_string(),
+                matched_bsfree_version: None,
+                region_evidence: "archive region is PAL".to_string(),
+                requires_review: true,
+                detail: "fixture".to_string(),
+            }),
+            cheats: cheats.clone(),
+            selection,
+            analysis: Vec::new(),
+            search_title: "Test Game".to_string(),
+        }
+    }
+
+    fn render_bsfree_wii_section(
+        workflow: &mut CheatWorkflowState,
+    ) -> (egui::FullOutput, Option<CheatWorkflowAction>) {
+        let ctx = egui::Context::default();
+        let mut action = None;
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                action = show_bsfree_wii(ui, workflow);
+            });
+        });
+        (output, action)
+    }
+
+    /// Renders `show_bsfree_wii` at a compact window width, so the beginner
+    /// flow is proven usable on narrow screens.
+    fn render_bsfree_wii_at_width(
+        workflow: &mut CheatWorkflowState,
+        width: f32,
+    ) -> egui::FullOutput {
+        let ctx = egui::Context::default();
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 2000.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = show_bsfree_wii(ui, workflow);
+                });
+            },
+        )
+    }
+
+    #[test]
+    fn bsfree_wii_section_uses_beginner_states_and_keeps_browse_only_honest() {
+        let mut workflow = CheatWorkflowState {
+            archive_path: PathBuf::from("/roms/wii.iso"),
+            display_name: "Test Game".to_string(),
+            normalized_name: "testgame".to_string(),
+            platform: Some("Wii".to_string()),
+            region: None,
+            source_root: PathBuf::from("/roms"),
+            size_bytes: None,
+            adapter: CheatEmulatorAdapter::Dolphin,
+            identity_request: None,
+            identity: CheatStepResource::NotLoaded,
+            preview_request: None,
+            preview: CheatStepResource::NotLoaded,
+            transaction: CheatTransactionState::Idle,
+            transaction_notice: None,
+            selected_profile_id: None,
+            selected_pcsx2_profile_id: None,
+            pcsx2_inventory_profile_id: None,
+            pcsx2_inventory: CheatStepResource::NotLoaded,
+            pcsx2_gamehacking: CheatStepResource::NotLoaded,
+            gamecube_gamehacking: CheatStepResource::NotLoaded,
+            gamecube_gamehacking_request: None,
+            gamecube_gamehacking_cancellation: None,
+            gamecube_gamehacking_generation: 0,
+            gamecube_gamehacking_blocked: false,
+            bsfree_gamecube: CheatStepResource::NotLoaded,
+            bsfree_gamecube_cancellation: None,
+            bsfree_gamecube_generation: 0,
+            bsfree_wii: CheatStepResource::Ready(bsfree_wii_gui_matched_state(vec![
+                bsfree_wii_gui_cheat(
+                    1,
+                    "Infinite Health",
+                    BsFreeWiiCodeFormat::GeckoEquivalent,
+                    "042318AC 3B8003E7",
+                ),
+                bsfree_wii_gui_cheat(
+                    2,
+                    "Encrypted",
+                    BsFreeWiiCodeFormat::Malformed,
+                    "XR7M-X292-DZ418",
+                ),
+            ])),
+            bsfree_wii_cancellation: None,
+            bsfree_wii_generation: 0,
+            selected_dolphin_profile_id: Some("profile".to_string()),
+            dolphin_explicit_root: String::new(),
+            dolphin_inventory_profile_id: None,
+            dolphin_inventory: CheatStepResource::NotLoaded,
+            dolphin_provider_request: None,
+            dolphin_provider: CheatStepResource::NotLoaded,
+            dolphin_provider_selection: None,
+            dolphin_destination_error: None,
+            dolphin_local_lookup: DolphinLocalLookupState::NotAttempted,
+            dolphin_profile_selection: None,
+            dolphin_profile_choice: None,
+            dolphin_details_open: false,
+            dolphin_show_exact_changes: false,
+            selected_xenia_profile_id: None,
+            xenia_explicit_root: String::new(),
+            xenia_provider_request: None,
+            xenia_provider: CheatStepResource::NotLoaded,
+            xenia_selected_candidate_index: None,
+            xenia_selection: None,
+            xenia_destination_error: None,
+            xenia_profile_selection: None,
+            xenia_profile_choice: None,
+            xenia_details_open: false,
+            xenia_show_exact_changes: false,
+            source_mode: CheatSourceMode::ArchiveFsTrustedCatalogue,
+            existing_library_profile_id: None,
+            existing_library: CheatStepResource::NotLoaded,
+            source_list: CheatStepResource::NotLoaded,
+            source_fetch: CheatStepResource::NotLoaded,
+            selected_source_id: None,
+            fetch_force_refresh: false,
+            candidates: CheatStepResource::NotLoaded,
+            candidates_request: None,
+            candidate_query: String::new(),
+            candidate_selection: None,
+            candidate_load_error: None,
+        };
+        let (output, _action) = render_bsfree_wii_section(&mut workflow);
+
+        assert!(
+            rendered_text_contains(&output, "verified Wii hex-pair"),
+            "the section must state the verified-subset rule"
+        );
+        assert!(rendered_text_contains(&output, "Infinite Health"));
+        assert!(rendered_text_contains(&output, "Ready"));
+        assert!(rendered_text_contains(&output, "Encrypted"));
+        assert!(rendered_text_contains(
+            &output,
+            "Browse only — this code is encrypted, malformed, or from an unverified Wii device."
+        ));
+        assert!(
+            !rendered_text_contains(&output, "GeckoEquivalent"),
+            "raw converter terminology must stay hidden by default"
+        );
+
+        // Compact width stays usable and the states are unchanged.
+        let compact = render_bsfree_wii_at_width(&mut workflow, 480.0);
+        assert!(rendered_text_contains(&compact, "Infinite Health"));
+        assert!(rendered_text_contains(&compact, "Browse only"));
+    }
+
     /// Renders the generic BSFree browser with the given platform context.
     fn render_bsfree_browser(
         manager: &BsFreeManagerState,
@@ -67134,6 +68086,8 @@ $Instant Growth [Nayr]\n";
             pcsx2_generated: None,
             gamecube_gamehacking_generated: None,
             bsfree_gamecube_generated: Some(bsfree_generated_fixture(profile)),
+
+            bsfree_wii_generated: None,
         }
     }
 

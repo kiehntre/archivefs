@@ -2,17 +2,19 @@ use std::path::PathBuf;
 
 use archivefs_core::patch_manager::{
     BsFreeCatalogue, BsFreeDownloadOptions, BsFreeGameCubeCheatSelection, BsFreeGameCubeCodeFormat,
-    BsFreeGameCubeInstallPreviewRequest, BsFreeGameSearchRequest, BsFreePaths,
+    BsFreeGameCubeInstallPreviewRequest, BsFreeGameSearchRequest, BsFreePaths, BsFreeWiiCheat,
+    BsFreeWiiCheatSelection, BsFreeWiiCodeFormat, BsFreeWiiInstallPreviewRequest,
     HttpsCheatSourceTransport, PageRequest, ReadOnlyCheatCatalogue, SharedApplyConfirmation,
     SharedApplyOptions, SharedRollbackConfirmation, SharedRollbackOptions, bsfree_gamecube_cheats,
-    build_bsfree_gamecube_install_preview, build_shared_transaction_plan,
-    classify_bsfree_gamecube_cheat, default_bsfree_source_root, default_shared_backup_root,
-    default_shared_history_root, download_bsfree_database, execute_shared_apply,
-    execute_shared_rollback, generate_shared_operation_id, import_local_bsfree_database,
-    inspect_bsfree_source, load_dolphin_destination, managed_names, parse_dolphin_ini,
-    preview_shared_rollback, remove_local_bsfree_source,
-    require_dolphin_managed_gamehacking_verification, set_bsfree_enabled,
-    stage_bsfree_gamecube_install, validate_installed_bsfree_source,
+    bsfree_wii_cheats, build_bsfree_gamecube_install_preview, build_bsfree_wii_install_preview,
+    build_shared_transaction_plan, classify_bsfree_gamecube_cheat, classify_bsfree_wii_cheat,
+    default_bsfree_source_root, default_shared_backup_root, default_shared_history_root,
+    download_bsfree_database, execute_shared_apply, execute_shared_rollback,
+    generate_shared_operation_id, import_local_bsfree_database, inspect_bsfree_source,
+    load_dolphin_destination, managed_names, parse_dolphin_ini, preview_shared_rollback,
+    remove_local_bsfree_source, require_dolphin_managed_gamehacking_verification,
+    set_bsfree_enabled, stage_bsfree_gamecube_install, stage_bsfree_wii_install,
+    validate_installed_bsfree_source,
 };
 
 pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
@@ -111,20 +113,25 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
                 .ok_or("BSFree upstream game UID was not found")?;
             let cheats = catalogue.cheats(upstream_uid, page)?;
             let gamecube = game.system.archivefs_platform_id.as_deref() == Some("GameCube");
+            let wii = game.system.archivefs_platform_id.as_deref() == Some("Wii");
             let installable_count = cheats
                 .rows
                 .iter()
                 .filter(|cheat| {
-                    gamecube
+                    (gamecube
                         && classify_bsfree_gamecube_cheat(cheat)
                             .code_format
-                            .is_installable()
+                            .is_installable())
+                        || (wii
+                            && classify_bsfree_wii_cheat(cheat)
+                                .code_format
+                                .is_installable())
                 })
                 .count();
             let cheat_capabilities = cheats
                 .rows
                 .iter()
-                .map(|cheat| cheat_capability(cheat, gamecube))
+                .map(|cheat| cheat_capability(cheat, gamecube, wii))
                 .collect::<Vec<_>>();
             #[derive(Debug, serde::Serialize)]
             struct Output<G, C> {
@@ -141,10 +148,12 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
                 &Output {
                     provider: "BSFree Archive",
                     browse_only: installable_count == 0,
-                    install_capability: if gamecube {
-                        "Some GameCube codes can be installed via Dolphin (Gecko or Action Replay); \
-                         unsupported formats remain browse-only"
-                            .to_string()
+                    install_capability: if gamecube || wii {
+                        format!(
+                            "Some {} codes can be installed via Dolphin (Gecko or Action Replay); \
+                             unsupported formats remain browse-only",
+                            if gamecube { "GameCube" } else { "Wii" }
+                        )
                     } else {
                         "No EmuWiz adapter can install codes for this platform; browse-only"
                             .to_string()
@@ -164,8 +173,14 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         "gamecube-apply" => {
             gamecube_preview_or_apply(&paths, &mut args, json, true)?;
         }
-        "gamecube-rollback" => {
-            gamecube_rollback(&mut args, json)?;
+        "wii-preview" => {
+            wii_preview_or_apply(&paths, &mut args, json, false)?;
+        }
+        "wii-apply" => {
+            wii_preview_or_apply(&paths, &mut args, json, true)?;
+        }
+        "gamecube-rollback" | "wii-rollback" => {
+            bsfree_rollback(&mut args, json)?;
         }
         _ => return Err(format!("unknown BSFree command {command:?}").into()),
     }
@@ -187,33 +202,80 @@ struct CheatCapability {
 fn cheat_capability(
     cheat: &archivefs_core::patch_manager::BsFreeCheat,
     gamecube: bool,
+    wii: bool,
 ) -> CheatCapability {
-    let classified = gamecube.then(|| classify_bsfree_gamecube_cheat(cheat));
-    let format = classified.as_ref().map(|cheat| cheat.code_format);
+    let classified = if gamecube {
+        Some(CheatCapabilityFormat::GameCube(
+            classify_bsfree_gamecube_cheat(cheat).code_format,
+        ))
+    } else if wii {
+        Some(CheatCapabilityFormat::Wii(
+            classify_bsfree_wii_cheat(cheat).code_format,
+        ))
+    } else {
+        None
+    };
     let installable = classified
         .as_ref()
-        .is_some_and(|cheat| cheat.code_format.is_installable());
-    let capability = match format {
-        Some(BsFreeGameCubeCodeFormat::GeckoEquivalent) => {
+        .is_some_and(|classified| classified.is_installable());
+    let capability = match classified {
+        Some(CheatCapabilityFormat::GameCube(BsFreeGameCubeCodeFormat::GeckoEquivalent))
+        | Some(CheatCapabilityFormat::Wii(BsFreeWiiCodeFormat::GeckoEquivalent)) => {
             "installable via Dolphin (Gecko, byte-identical)".to_string()
         }
-        Some(BsFreeGameCubeCodeFormat::ActionReplayNative) => {
+        Some(CheatCapabilityFormat::GameCube(BsFreeGameCubeCodeFormat::ActionReplayNative))
+        | Some(CheatCapabilityFormat::Wii(BsFreeWiiCodeFormat::ActionReplayNative)) => {
             "installable via Dolphin (Action Replay, verbatim)".to_string()
         }
-        Some(BsFreeGameCubeCodeFormat::Unsupported) => {
+        Some(CheatCapabilityFormat::GameCube(BsFreeGameCubeCodeFormat::Unsupported))
+        | Some(CheatCapabilityFormat::Wii(BsFreeWiiCodeFormat::Unsupported)) => {
             "browse-only: contains an Action Replay command Dolphin refuses to run".to_string()
         }
-        Some(BsFreeGameCubeCodeFormat::Malformed) => {
-            "browse-only: not a well-formed hex-pair code".to_string()
+        Some(CheatCapabilityFormat::GameCube(BsFreeGameCubeCodeFormat::Malformed))
+        | Some(CheatCapabilityFormat::Wii(BsFreeWiiCodeFormat::Malformed)) => {
+            "browse-only: not a well-formed hex-pair code (or unverified device)".to_string()
         }
         None => "reference only: no EmuWiz adapter for this platform/format".to_string(),
     };
+    let format = classified.as_ref().map(|classified| match classified {
+        CheatCapabilityFormat::GameCube(format) => *format,
+        // The Wii and GameCube enums carry the identical variant set and
+        // serialize to the same snake_case strings; map for the shared output
+        // type so the JSON shape stays stable.
+        CheatCapabilityFormat::Wii(BsFreeWiiCodeFormat::GeckoEquivalent) => {
+            BsFreeGameCubeCodeFormat::GeckoEquivalent
+        }
+        CheatCapabilityFormat::Wii(BsFreeWiiCodeFormat::ActionReplayNative) => {
+            BsFreeGameCubeCodeFormat::ActionReplayNative
+        }
+        CheatCapabilityFormat::Wii(BsFreeWiiCodeFormat::Unsupported) => {
+            BsFreeGameCubeCodeFormat::Unsupported
+        }
+        CheatCapabilityFormat::Wii(BsFreeWiiCodeFormat::Malformed) => {
+            BsFreeGameCubeCodeFormat::Malformed
+        }
+    });
     CheatCapability {
         upstream_id: cheat.upstream_id,
         name: cheat.name.clone(),
         format,
         installable,
         capability,
+    }
+}
+
+/// Which platform a BSFree cheat was classified for in `cheat_capability`.
+enum CheatCapabilityFormat {
+    GameCube(BsFreeGameCubeCodeFormat),
+    Wii(BsFreeWiiCodeFormat),
+}
+
+impl CheatCapabilityFormat {
+    fn is_installable(&self) -> bool {
+        match self {
+            Self::GameCube(format) => format.is_installable(),
+            Self::Wii(format) => format.is_installable(),
+        }
     }
 }
 
@@ -434,13 +496,224 @@ fn gamecube_preview_or_apply(
     Ok(())
 }
 
-/// `gamecube-rollback`: previews and (with `--confirm`) executes the shared
-/// rollback for a BSFree GameCube apply journal.
-fn gamecube_rollback(args: &mut Vec<String>, json: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let journal = take_path(args, "--journal")?
-        .ok_or("gamecube-rollback requires --journal <operation-journal-json>")?;
+/// Shared implementation of `wii-preview` and `wii-apply`. Mirrors
+/// `gamecube_preview_or_apply` exactly, routing through the BSFree Wii
+/// classifier and the existing Wii GameHacking adapter. The selected
+/// archive's verified Dolphin Wii Game ID is the identity gate; nothing
+/// here writes an emulator file directly.
+fn wii_preview_or_apply(
+    paths: &BsFreePaths,
+    args: &mut Vec<String>,
+    json: bool,
+    apply: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let archive = take_path(args, "--archive")?
+        .ok_or("wii preview/apply requires --archive <selected-game-path>")?;
+    let game_id = take_value(args, "--game-id")?
+        .ok_or("wii preview/apply requires --game-id <six-character Game ID>")?;
+    let revision = take_u16(args, "--revision")?;
     let configuration_path = take_path(args, "--configuration-path")?
-        .ok_or("gamecube-rollback requires --configuration-path <dolphin-profile-config>")?;
+        .ok_or("wii preview/apply requires --configuration-path <dolphin-profile-config>")?;
+    let upstream_uid = take_i64(args, "--bsfree-game")?
+        .ok_or("wii preview/apply requires --bsfree-game <upstream UID>")?;
+    let staging_root = take_path(args, "--staging-root")?
+        .ok_or("wii preview/apply requires --staging-root <managed-staging-dir>")?;
+    let history_root = match take_path(args, "--history-root")? {
+        Some(path) => path,
+        None => default_shared_history_root().map_err(|failure| failure.detail)?,
+    };
+    let backup_root = match take_path(args, "--backup-root")? {
+        Some(path) => path,
+        None => default_shared_backup_root().map_err(|failure| failure.detail)?,
+    };
+    let select = take_value(args, "--select")?;
+    let select_all = take_flag(args, "--select-all");
+    let confirmed = take_flag(args, "--confirm");
+    let title = take_value(args, "--title")?;
+    reject_extra(args, if apply { "wii-apply" } else { "wii-preview" })?;
+
+    if game_id.len() != 6
+        || !game_id
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+    {
+        return Err("game-id must be an exact six-character Dolphin Game ID".into());
+    }
+
+    let catalogue = BsFreeCatalogue::open_installed(paths)?;
+    let game = catalogue
+        .game(upstream_uid)?
+        .ok_or("BSFree upstream game UID was not found")?;
+    if game.system.archivefs_platform_id.as_deref() != Some("Wii") {
+        return Err(format!(
+            "BSFree game {:?} is not a Wii game (system {:?}); only verified Wii codes can be \
+             installed via Dolphin, and this game is browse-only",
+            game.name, game.system.name
+        )
+        .into());
+    }
+    if let Some(title) = title
+        && !normalize_cli_title(&title).is_empty()
+        && normalize_cli_title(&title) != normalize_cli_title(&game.name)
+    {
+        return Err(format!(
+            "selected BSFree game {:?} does not match the archive title {:?}; refusing to apply \
+             cheats for the wrong game. Review the search candidates and pick the exact BSFree game",
+            game.name, title
+        )
+        .into());
+    }
+
+    let cheats: Vec<BsFreeWiiCheat> = bsfree_wii_cheats(&catalogue, upstream_uid)?;
+    let destination = load_dolphin_destination(&configuration_path, &game_id)?;
+    let mut selection = BsFreeWiiCheatSelection::from_cheats(&cheats, &destination.document);
+    if select_all {
+        selection.select_all();
+    } else if let Some(select) = select {
+        for token in select
+            .split(',')
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+        {
+            let id = token.parse::<i64>().map_err(|error| {
+                format!("--select value {token:?} is not a numeric code ID: {error}")
+            })?;
+            let index = cheats
+                .iter()
+                .position(|cheat| cheat.upstream_id == id)
+                .ok_or_else(|| {
+                    format!("selected BSFree code ID {id} is not in this game's cheat list")
+                })?;
+            if !selection.set_selected(index, true) {
+                return Err(format!(
+                    "selected BSFree code ID {id} is not installable (browse-only format)"
+                )
+                .into());
+            }
+        }
+    } else {
+        return Err("wii preview/apply requires --select <id,id,...> or --select-all".into());
+    }
+    if selection.selected_count() == 0 {
+        return Err("no installable cheats were selected".into());
+    }
+
+    let file_name = format!("{game_id}.ini");
+    let staged = stage_bsfree_wii_install(
+        &staging_root,
+        &file_name,
+        &destination.document,
+        destination.existed,
+        &cheats,
+        &selection,
+    )
+    .map_err(|error| error.to_string())?;
+
+    let preview = build_bsfree_wii_install_preview(&BsFreeWiiInstallPreviewRequest {
+        selected_archive: archive.clone(),
+        configuration_path: configuration_path.clone(),
+        game_id: game_id.clone(),
+        revision,
+        staged: staged.staged.clone(),
+    })
+    .map_err(|error| error.to_string())?;
+
+    let mut plan = build_shared_transaction_plan(
+        &preview.report,
+        "bsfree-wii",
+        "Dolphin GameSettings",
+        &staging_root,
+    )
+    .map_err(|failure| failure.detail)?;
+    let staged_source = preview
+        .report
+        .entries
+        .first()
+        .and_then(|entry| entry.source_path.clone())
+        .ok_or("preview produced no staged source")?;
+    let staged_text = std::fs::read_to_string(&staged_source)?;
+    require_dolphin_managed_gamehacking_verification(
+        &mut plan,
+        managed_names(&parse_dolphin_ini(&staged_text))
+            .into_iter()
+            .collect(),
+    )
+    .map_err(|failure| failure.detail)?;
+
+    let operation_id = generate_shared_operation_id();
+    let timestamp = now_unix_seconds();
+    let will_apply = apply && confirmed;
+    let options = SharedApplyOptions {
+        dry_run: !will_apply,
+        confirmation: will_apply.then(|| SharedApplyConfirmation {
+            plan_id: plan.plan_id.clone(),
+            general_approved: true,
+            replacement_approved: true,
+        }),
+        operation_id: operation_id.clone(),
+        timestamp_unix_seconds: timestamp,
+        current_context: plan.context.clone(),
+        history_root,
+        backup_root,
+    };
+    let result = execute_shared_apply(&plan, &options);
+
+    #[derive(Debug, serde::Serialize)]
+    struct Output {
+        provider: &'static str,
+        operation: &'static str,
+        applied: bool,
+        game_title: String,
+        bsfree_game_uid: i64,
+        game_id: String,
+        platform: &'static str,
+        destination: String,
+        selected_cheats: Vec<String>,
+        findings: Vec<archivefs_core::patch_manager::BsFreeWiiDedupFinding>,
+        skipped_duplicates: Vec<String>,
+        skipped_unselectable: Vec<String>,
+        report: archivefs_core::patch_manager::SharedPreviewReport,
+        journal_status: String,
+        journal_path: Option<String>,
+        operation_id: String,
+    }
+    render(
+        &Output {
+            provider: "BSFree Archive",
+            operation: if will_apply { "apply" } else { "preview" },
+            applied: will_apply,
+            game_title: game.name.clone(),
+            bsfree_game_uid: upstream_uid,
+            game_id: game_id.clone(),
+            platform: "Wii",
+            destination: configuration_path.display().to_string(),
+            selected_cheats: selection
+                .entries
+                .iter()
+                .filter(|entry| entry.selected)
+                .map(|entry| entry.name.clone())
+                .collect(),
+            findings: staged.findings,
+            skipped_duplicates: staged.skipped_duplicates,
+            skipped_unselectable: staged.skipped_unselectable,
+            report: preview.report,
+            journal_status: format!("{:?}", result.journal.status),
+            journal_path: result.journal_path.map(|path| path.display().to_string()),
+            operation_id,
+        },
+        json,
+    )?;
+    Ok(())
+}
+
+/// `gamecube-rollback`/`wii-rollback`: previews and (with `--confirm`)
+/// executes the shared rollback for a BSFree apply journal. Platform-agnostic:
+/// the journal records the exact destination that must be restored.
+fn bsfree_rollback(args: &mut Vec<String>, json: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let journal = take_path(args, "--journal")?
+        .ok_or("bsfree-rollback requires --journal <operation-journal-json>")?;
+    let configuration_path = take_path(args, "--configuration-path")?
+        .ok_or("bsfree-rollback requires --configuration-path <dolphin-profile-config>")?;
     let backup_root = match take_path(args, "--backup-root")? {
         Some(path) => path,
         None => default_shared_backup_root().map_err(|failure| failure.detail)?,
@@ -450,7 +723,7 @@ fn gamecube_rollback(args: &mut Vec<String>, json: bool) -> Result<(), Box<dyn s
         None => default_shared_history_root().map_err(|failure| failure.detail)?,
     };
     let confirmed = take_flag(args, "--confirm");
-    reject_extra(args, "gamecube-rollback")?;
+    reject_extra(args, "bsfree-rollback")?;
 
     let preview = preview_shared_rollback(&journal, &configuration_path, &backup_root);
     if !preview.available && !confirmed {
@@ -661,7 +934,7 @@ mod tests {
                 archivefs_core::patch_manager::DeviceFormatCompatibility::PotentiallyConvertible,
             truncated_fields: Vec::new(),
         };
-        let capability = cheat_capability(&gamecube, true);
+        let capability = cheat_capability(&gamecube, true, false);
         assert!(capability.installable);
         assert!(capability.capability.contains("Dolphin"));
 
@@ -682,7 +955,7 @@ mod tests {
                 archivefs_core::patch_manager::DeviceFormatCompatibility::PotentiallyConvertible,
             truncated_fields: Vec::new(),
         };
-        let capability = cheat_capability(&ps2, false);
+        let capability = cheat_capability(&ps2, false, false);
         assert!(!capability.installable);
         assert_eq!(
             capability.capability,
@@ -698,10 +971,13 @@ mod tests {
             .unwrap();
         assert!(source.contains("\"gamecube-preview\" =>"));
         assert!(source.contains("\"gamecube-apply\" =>"));
-        assert!(source.contains("\"gamecube-rollback\" =>"));
+        assert!(source.contains("\"gamecube-rollback\" | \"wii-rollback\" =>"));
+        assert!(source.contains("\"wii-preview\" =>"));
+        assert!(source.contains("\"wii-apply\" =>"));
         // The provider must route through the existing adapter + shared apply,
         // never write an emulator file directly.
         assert!(source.contains("stage_bsfree_gamecube_install("));
+        assert!(source.contains("stage_bsfree_wii_install("));
         assert!(source.contains("execute_shared_apply("));
         assert!(source.contains("execute_shared_rollback("));
     }
