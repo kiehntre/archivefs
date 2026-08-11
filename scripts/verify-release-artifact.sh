@@ -93,6 +93,15 @@ expected_modes = {
     f"{root}/CHANGELOG.md": 0o644,
     f"{root}/LICENSE": 0o644,
     f"{root}/config.toml.example": 0o644,
+    f"{root}/assets/": 0o755,
+    f"{root}/assets/branding/": 0o755,
+    f"{root}/assets/linux/": 0o755,
+    f"{root}/assets/linux/io.github.kiehntre.emuwiz.desktop.in": 0o644,
+    f"{root}/assets/branding/emuwiz-logo-32.png": 0o644,
+    f"{root}/assets/branding/emuwiz-logo-64.png": 0o644,
+    f"{root}/assets/branding/emuwiz-logo-128.png": 0o644,
+    f"{root}/assets/branding/emuwiz-logo-256.png": 0o644,
+    f"{root}/assets/branding/emuwiz-logo-512.png": 0o644,
 }
 
 with tarfile.open(archive, "r:gz") as bundle:
@@ -108,9 +117,9 @@ with tarfile.open(archive, "r:gz") as bundle:
         names.add(name)
         if name not in expected_modes:
             raise SystemExit(f"unexpected archive member: {name}")
-        if name == f"{root}/":
+        if name.endswith("/"):
             if not member.isdir():
-                raise SystemExit("bundle root is not a directory")
+                raise SystemExit(f"release directory member is not a directory: {name}")
         elif not member.isfile():
             raise SystemExit(f"release member is not a regular file: {name}")
         if member.uid != 0 or member.gid != 0:
@@ -134,6 +143,88 @@ PY
 
 PAYLOAD="$EXTRACT_ROOT/$EXPECTED_ROOT"
 [[ -d "$PAYLOAD" ]] || release_die "expected extracted root missing: $EXPECTED_ROOT"
+
+# The installer payload must contain the exact approved source assets, not
+# lookalikes with the same names. Validate the PNG structure first, and
+# independently of the byte-identity check below, so a structurally invalid
+# or corrupted PNG is always rejected by the format parser itself rather
+# than only by the (necessarily earlier-short-circuiting) identity check -
+# otherwise the parser below would never actually be exercised.
+if command -v desktop-file-validate >/dev/null 2>&1; then
+    DESKTOP_VALIDATION_COPY="$TEMP_ROOT/io.github.kiehntre.emuwiz.desktop"
+    cp -- "$PAYLOAD/assets/linux/io.github.kiehntre.emuwiz.desktop.in" \
+        "$DESKTOP_VALIDATION_COPY"
+    desktop-file-validate "$DESKTOP_VALIDATION_COPY"
+else
+    release_note "desktop-file-validate unavailable; canonical desktop template comparison still passed"
+fi
+
+python3 - "$REPO_ROOT" "$PAYLOAD" <<'PY'
+import binascii
+import pathlib
+import struct
+import sys
+import zlib
+
+repo, payload = map(pathlib.Path, sys.argv[1:])
+desktop_rel = pathlib.Path("assets/linux/io.github.kiehntre.emuwiz.desktop.in")
+if (payload / desktop_rel).read_bytes() != (repo / desktop_rel).read_bytes():
+    raise SystemExit("release desktop entry differs from the canonical template")
+
+for size in (32, 64, 128, 256, 512):
+    relative = pathlib.Path(f"assets/branding/emuwiz-logo-{size}.png")
+    data = (payload / relative).read_bytes()
+    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise SystemExit(f"invalid PNG signature: {relative}")
+    offset = 8
+    ihdr = None
+    compressed = bytearray()
+    saw_iend = False
+    while offset < len(data):
+        if offset + 12 > len(data):
+            raise SystemExit(f"truncated PNG chunk: {relative}")
+        length = struct.unpack(">I", data[offset : offset + 4])[0]
+        kind = data[offset + 4 : offset + 8]
+        end = offset + 12 + length
+        if end > len(data):
+            raise SystemExit(f"truncated PNG payload: {relative}")
+        chunk = data[offset + 8 : offset + 8 + length]
+        expected_crc = struct.unpack(">I", data[offset + 8 + length : end])[0]
+        actual_crc = binascii.crc32(kind + chunk) & 0xFFFFFFFF
+        if actual_crc != expected_crc:
+            raise SystemExit(f"PNG CRC mismatch: {relative}")
+        if kind == b"IHDR":
+            ihdr = chunk
+        elif kind == b"IDAT":
+            compressed.extend(chunk)
+        elif kind == b"IEND":
+            saw_iend = True
+            if end != len(data):
+                raise SystemExit(f"trailing data after PNG IEND: {relative}")
+        offset = end
+    if ihdr is None or len(ihdr) != 13 or not saw_iend:
+        raise SystemExit(f"incomplete PNG structure: {relative}")
+    width, height, depth, colour, compression, filtering, interlace = struct.unpack(
+        ">IIBBBBB", ihdr
+    )
+    if (width, height) != (size, size):
+        raise SystemExit(f"wrong PNG dimensions for {relative}: {width}x{height}")
+    if (depth, colour, compression, filtering, interlace) != (8, 6, 0, 0, 0):
+        raise SystemExit(f"icon is not non-interlaced 8-bit RGBA: {relative}")
+    try:
+        pixels = zlib.decompress(compressed)
+    except zlib.error as error:
+        raise SystemExit(f"invalid PNG image data for {relative}: {error}") from error
+    row_bytes = width * 4 + 1
+    if len(pixels) != row_bytes * height:
+        raise SystemExit(f"wrong decoded PNG data length: {relative}")
+    if any(pixels[row * row_bytes] > 4 for row in range(height)):
+        raise SystemExit(f"invalid PNG row filter: {relative}")
+    # Structural validity established above; now confirm it's the exact
+    # approved asset and not merely a well-formed lookalike.
+    if data != (repo / relative).read_bytes():
+        raise SystemExit(f"release icon differs from approved source: {relative}")
+PY
 
 EXPECTED_CLI="emuwiz-cli $VERSION"
 EXPECTED_GUI="emuwiz $VERSION"
@@ -171,7 +262,7 @@ patterns = [
 ]
 allowed_prefixes = (b"/build/source", b"/build/home", b"/build/cargo", b"/build/rustup")
 
-for path in sorted(root.iterdir()):
+for path in sorted(candidate for candidate in root.rglob("*") if candidate.is_file()):
     if path.name in {"emuwiz-cli", "emuwiz"}:
         data = subprocess.run(
             ["strings", "-a", str(path)], check=True, stdout=subprocess.PIPE

@@ -18,13 +18,15 @@ are currently `x86_64-linux` and `aarch64-linux`. The archive contains exactly
 one same-named root directory with:
 
 ```text
-archivefs-cli          0755
-archivefs-gui          0755
-install.sh             0755
-README.md              0644
-CHANGELOG.md           0644
-LICENSE                0644
-config.toml.example    0644
+emuwiz-cli                                                   0755
+emuwiz                                                       0755
+install.sh                                                   0755
+README.md                                                    0644
+CHANGELOG.md                                                 0644
+LICENSE                                                      0644
+config.toml.example                                         0644
+assets/linux/io.github.kiehntre.emuwiz.desktop.in            0644
+assets/branding/emuwiz-logo-{32,64,128,256,512}.png          0644
 ```
 
 Every tar member has numeric UID/GID `0:0`. Entries are name-sorted, timestamps
@@ -83,9 +85,11 @@ scripts/verify-release-artifact.sh \
 
 The verifier checks the checksum filename and record, exact root layout,
 required and unexpected files, file types, modes, numeric ownership, path
-traversal, extracted path containment, credential-shaped strings, maintainer
-paths, common build paths, and both binary versions. It returns non-zero on any
-failure.
+traversal, extracted path containment, the exact approved desktop/icon assets,
+PNG structure and dimensions, credential-shaped strings, maintainer paths,
+common build paths, and both binary versions. It returns non-zero on any
+failure. The desktop template is also checked with `desktop-file-validate` when
+that optional command is available.
 
 Its negative regression suite uses generated fixtures and must also pass:
 
@@ -95,8 +99,9 @@ scripts/test-release-artifact-verifier.sh \
 ```
 
 This proves rejection of a bad checksum, unexpected member, traversal path,
-unsafe executable mode, and embedded maintainer path. It never extracts an
-unvalidated member.
+unsafe executable mode, embedded maintainer path, missing or substituted icon,
+malformed PNG, malformed desktop entry, and a duplicate tar member. It never
+extracts an unvalidated member.
 
 ## Reproducibility
 

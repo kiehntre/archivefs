@@ -1,7 +1,7 @@
 # EmuWiz
 
 <p align="center">
-  <img src="docs/assets/branding/emuwiz-logo-256.png"
+  <img src="assets/branding/emuwiz-logo-256.png"
        alt="EmuWiz logo"
        width="220">
 </p>

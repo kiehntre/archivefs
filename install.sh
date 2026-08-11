@@ -15,6 +15,20 @@ set -eu
 
 program_name="install.sh"
 default_bin_dir="$HOME/.local/bin"
+if [ -n "${XDG_DATA_HOME:-}" ]; then
+    case "$XDG_DATA_HOME" in
+        /*) data_home="$XDG_DATA_HOME" ;;
+        *)
+            printf '%s: warning: ignoring relative XDG_DATA_HOME; using %s/.local/share\n' \
+                "$program_name" "$HOME" >&2
+            data_home="$HOME/.local/share"
+            ;;
+    esac
+else
+    data_home="$HOME/.local/share"
+fi
+desktop_id="io.github.kiehntre.emuwiz"
+desktop_file="$data_home/applications/$desktop_id.desktop"
 # EmuWiz config directory, with legacy ArchiveFS reuse: an existing
 # `~/.config/archivefs` is honoured so pre-rename settings keep loading;
 # a fresh install uses `~/.config/emuwiz`. This mirrors the application's
@@ -38,9 +52,8 @@ Options:
   --prefix PATH   Install the binaries into PATH instead of the default
                   ($default_bin_dir). The directory is created if needed.
                   PATH should normally be an absolute path.
-  --uninstall     Remove emuwiz-cli and emuwiz from the install
-                  directory (default or --prefix PATH). Your config at
-                  $config_file is never touched.
+  --uninstall     Remove EmuWiz binaries, its desktop entry and application
+                  icons. Your config at $config_file is never touched.
   --help          Show this help and exit.
 
 Without --uninstall, this script:
@@ -49,17 +62,19 @@ Without --uninstall, this script:
      with a clear message if neither is found.
   2. Copies emuwiz-cli and emuwiz into the install directory
      and makes sure they are executable.
-  3. Creates $config_dir if it does not exist.
-  4. Copies config.toml.example to $config_file, but only if that file
+  3. Installs one EmuWiz desktop launcher and its approved application icons
+     below $data_home.
+  4. Creates $config_dir if it does not exist.
+  5. Copies config.toml.example to $config_file, but only if that file
      does not already exist. An existing config is never overwritten.
-  5. If a new config was just written and this script is running
+  6. If a new config was just written and this script is running
      interactively, optionally prompts for one archive source folder to
      add via 'emuwiz-cli source add'. Leave blank to skip - source
      folders are never required at install time, and more can always be
      added later from the Sources page in the GUI or the CLI. Never
      offered for an existing config, and never offered for a
      non-interactive install.
-  6. Checks whether ratarmount is on PATH and prints installation
+  7. Checks whether ratarmount is on PATH and prints installation
      guidance if it is not (EmuWiz uses it to mount archives).
 EOF
 }
@@ -67,6 +82,28 @@ EOF
 fail() {
     printf '%s: %s\n' "$program_name" "$*" >&2
     exit 1
+}
+
+warn() {
+    printf '%s: warning: %s\n' "$program_name" "$*" >&2
+}
+
+# remove_owned_path PATH - removes a single EmuWiz-owned file or symlink
+# during --uninstall, tracking removed_any. If something unexpected (e.g. a
+# directory) occupies the path, this warns and leaves it in place instead of
+# letting `rm -f`'s non-"missing file" failure abort the rest of the
+# uninstall under `set -e`.
+remove_owned_path() {
+    path=$1
+    if [ -d "$path" ] && [ ! -L "$path" ]; then
+        warn "expected a file at $path but found a directory; leaving it in place"
+        return 0
+    fi
+    if [ -e "$path" ] || [ -L "$path" ]; then
+        rm -f -- "$path"
+        printf 'Removed %s\n' "$path"
+        removed_any=1
+    fi
 }
 
 bin_dir="$default_bin_dir"
@@ -110,12 +147,11 @@ if [ "$do_uninstall" -eq 1 ]; then
     removed_any=0
     # Removes the new EmuWiz binaries and the legacy ArchiveFS aliases.
     for name in emuwiz emuwiz-gui emuwiz-cli archivefs-cli archivefs-gui; do
-        target="$bin_dir/$name"
-        if [ -e "$target" ] || [ -L "$target" ]; then
-            rm -f -- "$target"
-            printf 'Removed %s\n' "$target"
-            removed_any=1
-        fi
+        remove_owned_path "$bin_dir/$name"
+    done
+    remove_owned_path "$desktop_file"
+    for size in 32 64 128 256 512; do
+        remove_owned_path "$data_home/icons/hicolor/${size}x${size}/apps/$desktop_id.png"
     done
     if [ "$removed_any" -eq 0 ]; then
         printf 'Nothing to uninstall in %s\n' "$bin_dir"
@@ -167,7 +203,16 @@ if [ -n "$missing" ]; then
     fail "missing required binaries in $src_dir:$missing"
 fi
 
+desktop_template="$script_dir/assets/linux/$desktop_id.desktop.in"
+branding_dir="$script_dir/assets/branding"
+[ -f "$desktop_template" ] || fail "desktop entry template is missing: $desktop_template"
+for size in 32 64 128 256 512; do
+    [ -f "$branding_dir/emuwiz-logo-$size.png" ] || \
+        fail "approved application icon is missing: $branding_dir/emuwiz-logo-$size.png"
+done
+
 mkdir -p -- "$bin_dir"
+bin_dir=$(CDPATH= cd -- "$bin_dir" && pwd -P) || fail "could not resolve install prefix: $bin_dir"
 cp -f -- "$src_cli" "$bin_dir/emuwiz-cli"
 chmod +x -- "$bin_dir/emuwiz-cli"
 cp -f -- "$src_gui" "$bin_dir/emuwiz"
@@ -179,6 +224,66 @@ ln -sf -- emuwiz "$bin_dir/emuwiz-gui"
 ln -sf -- emuwiz "$bin_dir/archivefs-gui"
 printf 'Installed emuwiz-cli and emuwiz to %s (source: %s)\n' "$bin_dir" "$src_mode"
 printf 'Aliases emuwiz-gui, archivefs-cli and archivefs-gui still work.\n'
+
+# Desktop Entry Exec values have their own quoting rules. Reject line breaks,
+# encode literal percent signs so they cannot become field codes, and escape
+# the four characters that are special inside a double-quoted argument.
+#
+# Backslash is doubled to *four* backslashes, not two: a Desktop Entry
+# string-type value (Exec included) is first run through the format's
+# generic backslash-unescape pass (which recognises only \\, \s, \n, \t,
+# \r) before the Exec-specific quoting rules below are ever applied to it.
+# That generic pass collapses "\\" down to one "\" before an Exec parser
+# sees it, so to have *one* backslash survive as the Exec-quoted escape
+# sequence "\\" (which itself decodes to one literal backslash), the file
+# must contain "\\\\". Two backslashes here would collapse to a single
+# stray "\" that desktop-file-validate then folds into whatever character
+# follows it, breaking quote tracking for the rest of the value - which is
+# exactly what upstream desktop-file-utils' own parser documents in
+# src/validate.c above handle_exec_key().
+case "$bin_dir/emuwiz" in
+    *'
+'*) fail "the install prefix cannot contain a line break" ;;
+esac
+desktop_exec=$(printf '%s' "$bin_dir/emuwiz" | sed \
+    -e 's/\\/\\\\\\\\/g' \
+    -e 's/"/\\"/g' \
+    -e 's/`/\\`/g' \
+    -e 's/\$/\\$/g' \
+    -e 's/%/%%/g')
+desktop_exec="\"$desktop_exec\""
+
+mkdir -p -- "$data_home/applications"
+# mktemp creates the file itself (no pre-existing path, so nothing to
+# follow if an attacker pre-planted a symlink at a predictable name).
+desktop_tmp=$(mktemp -- "$data_home/applications/.$desktop_id.XXXXXX.desktop") ||
+    fail "could not create a temporary file for the desktop entry"
+while IFS= read -r line || [ -n "$line" ]; do
+    if [ "$line" = 'Exec=@EMUWIZ_EXEC@' ]; then
+        printf 'Exec=%s\n' "$desktop_exec"
+    else
+        printf '%s\n' "$line"
+    fi
+done <"$desktop_template" >"$desktop_tmp"
+chmod 0644 "$desktop_tmp"
+if command -v desktop-file-validate >/dev/null 2>&1; then
+    desktop-file-validate "$desktop_tmp" || {
+        rm -f -- "$desktop_tmp"
+        fail "rendered desktop entry failed desktop-file-validate"
+    }
+fi
+mv -f -- "$desktop_tmp" "$desktop_file"
+
+for size in 32 64 128 256 512; do
+    icon_dir="$data_home/icons/hicolor/${size}x${size}/apps"
+    mkdir -p -- "$icon_dir"
+    icon_tmp=$(mktemp -- "$icon_dir/.$desktop_id.XXXXXX.png") ||
+        fail "could not create a temporary file for the $size pixel icon"
+    cp -- "$branding_dir/emuwiz-logo-$size.png" "$icon_tmp"
+    chmod 0644 "$icon_tmp"
+    mv -f -- "$icon_tmp" "$icon_dir/$desktop_id.png"
+done
+printf 'Installed the EmuWiz desktop launcher and application icons below %s.\n' "$data_home"
 
 mkdir -p -- "$config_dir"
 wrote_new_config=0
