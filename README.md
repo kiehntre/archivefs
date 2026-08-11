@@ -1,5 +1,3 @@
-<img width="1024" height="559" alt="emuwiz-banner" src="https://github.com/user-attachments/assets/aa1816c0-316c-4c1b-986e-ba7c14bae9c5" />
-
 # EmuWiz
 
 <p align="center">
