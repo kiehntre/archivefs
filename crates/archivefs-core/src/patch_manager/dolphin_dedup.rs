@@ -23,11 +23,14 @@
 //! # Conflicting memory writes
 //!
 //! In addition to the original findings, the analyser detects two *different,
-//! differently-labelled* cheats that both write to the same memory address and
-//! size with different values ([`DolphinDedupFindingKind::ConflictingMemoryWrite`]).
-//! Only provable direct writes (see `dolphin_code::derive_memory_operations`)
-//! participate; pointer/conditional/master bodies never do, because their
-//! target addresses cannot be proven. This finding blocks selection.
+//! differently-labelled* cheats whose provable writes touch an overlapping
+//! byte range with a different effective byte value somewhere in that overlap
+//! ([`DolphinDedupFindingKind::ConflictingMemoryWrite`]) - not only an exact
+//! `(address, size)` match, so a 32-bit write and an 8-bit write into the
+//! middle of it are still compared. Only provable direct writes (see
+//! `dolphin_code::derive_memory_operations`) participate; pointer/conditional/
+//! master bodies never do, because their target addresses cannot be proven.
+//! This finding blocks selection.
 
 use std::collections::BTreeMap;
 
@@ -330,11 +333,15 @@ pub fn analyze_dolphin_duplicates(
         }
     }
 
-    // Conflicting memory writes: two *different* cheats that both write to the
-    // same address+size with a different value. Only provable direct writes
-    // count; the same cheat writing to itself is excluded by pairing only
-    // distinct cheats. This never deduplicates by title - it keys on the
-    // provable write target, exactly the opposite of display-name identity.
+    // Conflicting memory writes: two *different* cheats whose provable direct
+    // writes touch an overlapping byte range with a different effective byte
+    // value somewhere in that overlap. Only provable direct writes count;
+    // the same cheat writing to itself is excluded by pairing only distinct
+    // cheats. Writes of different widths are compared by actual byte range,
+    // not by requiring an exact `(address, size)` match, so e.g. a 32-bit
+    // write and an 8-bit write into the middle of it are still checked. This
+    // never deduplicates by title - it keys on the provable write target,
+    // exactly the opposite of display-name identity.
     for (index, cheat) in cheats.iter().enumerate() {
         let operations = cheat.memory_operations();
         if operations.is_empty() {
@@ -344,33 +351,32 @@ pub fn analyze_dolphin_duplicates(
             if cheat.upstream_id() == other.upstream_id() {
                 continue;
             }
-            for own in &operations {
-                let other_operations = other.memory_operations();
-                let conflicting = other_operations.iter().find(|candidate| {
-                    candidate.address == own.address && candidate.size == own.size
+            let other_operations = other.memory_operations();
+            if other_operations.is_empty() {
+                continue;
+            }
+            let conflict = operations.iter().find_map(|own| {
+                other_operations
+                    .iter()
+                    .find_map(|candidate| conflicting_overlap_byte(own, candidate))
+            });
+            if let Some((address, own_byte, other_byte)) = conflict {
+                findings.push(DolphinDedupFinding {
+                    kind: DolphinDedupFindingKind::ConflictingMemoryWrite,
+                    cheat_upstream_id: cheat.upstream_id(),
+                    cheat_name: cheat.name().to_string(),
+                    relates_to: Some(format!("{} ({})", other.name(), other.upstream_id())),
+                    detail: format!(
+                        "{:?} and {:?} both write to address 0x{:08X} with different \
+                         effective byte values (0x{:02X} vs 0x{:02X}); enabling both would \
+                         race, so this is blocked and must be resolved explicitly",
+                        cheat.name(),
+                        other.name(),
+                        address,
+                        own_byte,
+                        other_byte,
+                    ),
                 });
-                if let Some(candidate) = conflicting
-                    && candidate.value != own.value
-                {
-                    findings.push(DolphinDedupFinding {
-                        kind: DolphinDedupFindingKind::ConflictingMemoryWrite,
-                        cheat_upstream_id: cheat.upstream_id(),
-                        cheat_name: cheat.name().to_string(),
-                        relates_to: Some(format!("{} ({})", other.name(), other.upstream_id())),
-                        detail: format!(
-                            "{:?} and {:?} both write to 0x{:08X} ({} bytes) with different \
-                             values (0x{:08X} vs 0x{:08X}); enabling both would race, so this \
-                             is blocked and must be resolved explicitly",
-                            cheat.name(),
-                            other.name(),
-                            own.address,
-                            own.size,
-                            own.value,
-                            candidate.value
-                        ),
-                    });
-                    break;
-                }
             }
         }
     }
@@ -391,6 +397,50 @@ pub fn analyze_dolphin_duplicates(
     }
 
     findings
+}
+
+/// The address and differing byte values, if any, where two provable direct
+/// writes' byte ranges overlap and disagree.
+///
+/// Compares the actual `[address, address + size)` byte ranges rather than
+/// requiring an exact `(address, size)` match, so a 32-bit write and an
+/// 8-bit write into the middle of it are still checked. Conservative: two
+/// overlapping writes are only ever treated as compatible when *every* byte
+/// in the overlap is provably identical - the moment one differs, that byte
+/// is returned immediately. Byte order is big-endian throughout, matching
+/// how Dolphin's MMU stores an Action Replay write's value on the console's
+/// own big-endian PowerPC memory (the most significant byte of the value
+/// lands at the lowest address).
+fn conflicting_overlap_byte(
+    own: &MemoryOperation,
+    other: &MemoryOperation,
+) -> Option<(u32, u8, u8)> {
+    let own_end = own.address.saturating_add(u32::from(own.size));
+    let other_end = other.address.saturating_add(u32::from(other.size));
+    let overlap_start = own.address.max(other.address);
+    let overlap_end = own_end.min(other_end);
+    let mut address = overlap_start;
+    while address < overlap_end {
+        let own_byte = effective_byte_at(own, address)?;
+        let other_byte = effective_byte_at(other, address)?;
+        if own_byte != other_byte {
+            return Some((address, own_byte, other_byte));
+        }
+        address += 1;
+    }
+    None
+}
+
+/// The single big-endian byte `write` places at `address`, or `None` if
+/// `address` falls outside `write`'s `[address, address + size)` range.
+fn effective_byte_at(write: &MemoryOperation, address: u32) -> Option<u8> {
+    let offset = address.checked_sub(write.address)?;
+    let size = u32::from(write.size);
+    if offset >= size {
+        return None;
+    }
+    let shift = 8 * (size - 1 - offset);
+    Some(((write.value >> shift) & 0xFF) as u8)
 }
 
 /// Maps existing destination `[Gecko]`/`[ActionReplay]` code names to their
@@ -525,6 +575,81 @@ mod tests {
                 .iter()
                 .any(|finding| finding.kind == DolphinDedupFindingKind::DuplicateBody),
             "identical body under a different name is a duplicate body: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn overlapping_writes_of_different_widths_with_a_differing_byte_are_a_conflict() {
+        // A 32-bit write of 0xAABBCCDD at 0x80001000 places byte 0xCC at
+        // 0x80001002 (big-endian: MSB at the lowest address). A separate
+        // 8-bit write of 0x11 at that same address disagrees with it, even
+        // though the two writes have neither the same address nor the same
+        // size.
+        let destination = empty_destination();
+        let cheats = [
+            cheat(1, "Full HP And Ammo", "04001000 AABBCCDD", true),
+            cheat(2, "Broken Overlap", "00001002 00000011", true),
+        ];
+        let views: Vec<&dyn DolphinCheat> = cheats
+            .iter()
+            .map(|cheat| cheat as &dyn DolphinCheat)
+            .collect();
+        let findings = analyze_dolphin_duplicates(&views, &destination);
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.kind == DolphinDedupFindingKind::ConflictingMemoryWrite),
+            "a 32-bit write and an overlapping 8-bit write with a different byte must \
+             conflict even though address and size both differ: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn overlapping_writes_of_different_widths_with_an_identical_byte_are_not_a_conflict() {
+        // Same overlap as above, but the 8-bit write places the exact same
+        // byte (0xCC) the 32-bit write already places at 0x80001002 - the
+        // overlapping byte is provably identical, so this must not be
+        // flagged.
+        let destination = empty_destination();
+        let cheats = [
+            cheat(1, "Full HP And Ammo", "04001000 AABBCCDD", true),
+            cheat(2, "Redundant Overlap", "00001002 000000CC", true),
+        ];
+        let views: Vec<&dyn DolphinCheat> = cheats
+            .iter()
+            .map(|cheat| cheat as &dyn DolphinCheat)
+            .collect();
+        let findings = analyze_dolphin_duplicates(&views, &destination);
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.kind == DolphinDedupFindingKind::ConflictingMemoryWrite),
+            "an overlapping write that agrees on every shared byte is not a conflict: \
+             {findings:?}"
+        );
+    }
+
+    #[test]
+    fn a_write8_fill_range_conflicts_with_a_separate_write_inside_it() {
+        // `0024CD50 00000302` fills 0x8024CD50..=0x8024CD53 with byte 0x02
+        // (repeat count 3). A separate 8-bit write of 0x99 at 0x8024CD52 -
+        // the third byte of that fill - must be detected as a conflict even
+        // though it is not the fill code's own base address.
+        let destination = empty_destination();
+        let cheats = [
+            cheat(1, "Clear Flags", "0024CD50 00000302", true),
+            cheat(2, "Set Flag Three", "0024CD52 00000099", true),
+        ];
+        let views: Vec<&dyn DolphinCheat> = cheats
+            .iter()
+            .map(|cheat| cheat as &dyn DolphinCheat)
+            .collect();
+        let findings = analyze_dolphin_duplicates(&views, &destination);
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.kind == DolphinDedupFindingKind::ConflictingMemoryWrite),
+            "a separate write inside an expanded Write8 fill range must conflict: {findings:?}"
         );
     }
 

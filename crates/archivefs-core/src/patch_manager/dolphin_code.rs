@@ -170,6 +170,19 @@ pub struct MemoryOperation {
 /// is excluded rather than guessed at. An empty result means "no provable
 /// direct writes" - such a code can never be the subject of a conflicting
 /// write finding.
+///
+/// `Write8`/`Write16` are Dolphin's "RAM write and fill" subtype
+/// (`Subtype_RamWriteAndFill` in `ActionReplay.cpp`): the low 8/16 bits of
+/// the second word are the value actually written, and the *upper* bits are
+/// a repeat count - the same value is written to `repeat + 1` consecutive
+/// addresses (stepping by 1 byte for `Write8`, 2 bytes for `Write16`). Each
+/// repetition becomes its own [`MemoryOperation`] with the masked, effective
+/// value - never the raw, un-masked second word, which for a nonzero repeat
+/// count is not itself a valid 8/16-bit value. Address arithmetic uses
+/// wrapping addition to mirror Dolphin's own unsigned 32-bit address math
+/// rather than panicking on overflow. `Write32`/`WriteFloat` have no fill
+/// behaviour in Dolphin - always exactly one write of the full 32-bit word -
+/// and are unaffected by this.
 pub fn derive_memory_operations(lines: &[String]) -> Vec<MemoryOperation> {
     let mut operations = Vec::new();
     for line in lines {
@@ -181,24 +194,46 @@ pub fn derive_memory_operations(lines: &[String]) -> Vec<MemoryOperation> {
         let (Some(first), Some(second)) = (tokens.first(), tokens.get(1)) else {
             continue;
         };
-        let (Ok(word), Ok(value)) = (
+        let (Ok(word), Ok(data)) = (
             u32::from_str_radix(first, 16),
             u32::from_str_radix(second, 16),
         ) else {
             continue;
         };
         let gcaddr = word & 0x01FF_FFFF;
-        let size = match family {
-            ArLineFamily::Write8 => 1,
-            ArLineFamily::Write16 => 2,
-            ArLineFamily::Write32 | ArLineFamily::WriteFloat => 4,
-            _ => continue,
-        };
-        operations.push(MemoryOperation {
-            address: gcaddr | 0x8000_0000,
-            size,
-            value,
-        });
+        let base_address = gcaddr | 0x8000_0000;
+        match family {
+            ArLineFamily::Write8 => {
+                let value = data & 0xFF;
+                let repeat = data >> 8;
+                for offset in 0..=repeat {
+                    operations.push(MemoryOperation {
+                        address: base_address.wrapping_add(offset),
+                        size: 1,
+                        value,
+                    });
+                }
+            }
+            ArLineFamily::Write16 => {
+                let value = data & 0xFFFF;
+                let repeat = data >> 16;
+                for index in 0..=repeat {
+                    operations.push(MemoryOperation {
+                        address: base_address.wrapping_add(index.wrapping_mul(2)),
+                        size: 2,
+                        value,
+                    });
+                }
+            }
+            ArLineFamily::Write32 | ArLineFamily::WriteFloat => {
+                operations.push(MemoryOperation {
+                    address: base_address,
+                    size: 4,
+                    value: data,
+                });
+            }
+            _ => {}
+        }
     }
     operations
 }
@@ -239,6 +274,102 @@ mod tests {
                 size: 1,
                 value: 0x3F,
             }]
+        );
+    }
+
+    #[test]
+    fn a_write8_repeat_count_expands_into_one_operation_per_byte_with_the_masked_value() {
+        // Dolphin's Subtype_RamWriteAndFill: low byte 0x02 is the value,
+        // upper 24 bits (0x000003) are "3 additional repeats", so the byte
+        // is written to 4 consecutive addresses starting at 0x8024CD50. The
+        // raw second word (0x00000302) must never appear as `value` - only
+        // the masked, effective byte.
+        let ops = derive_memory_operations(&["0024CD50 00000302".to_string()]);
+        assert_eq!(
+            ops,
+            vec![
+                MemoryOperation {
+                    address: 0x8024_CD50,
+                    size: 1,
+                    value: 0x02,
+                },
+                MemoryOperation {
+                    address: 0x8024_CD51,
+                    size: 1,
+                    value: 0x02,
+                },
+                MemoryOperation {
+                    address: 0x8024_CD52,
+                    size: 1,
+                    value: 0x02,
+                },
+                MemoryOperation {
+                    address: 0x8024_CD53,
+                    size: 1,
+                    value: 0x02,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_write16_repeat_count_expands_into_one_operation_per_halfword_with_the_masked_value() {
+        // Low 16 bits 0x0055 is the value, upper 16 bits (0x0002) is "2
+        // additional repeats" at 2-byte strides, so 3 halfword writes at
+        // 0x8024CD50, 0x8024CD52, 0x8024CD54.
+        let ops = derive_memory_operations(&["0224CD50 00020055".to_string()]);
+        assert_eq!(
+            ops,
+            vec![
+                MemoryOperation {
+                    address: 0x8024_CD50,
+                    size: 2,
+                    value: 0x0055,
+                },
+                MemoryOperation {
+                    address: 0x8024_CD52,
+                    size: 2,
+                    value: 0x0055,
+                },
+                MemoryOperation {
+                    address: 0x8024_CD54,
+                    size: 2,
+                    value: 0x0055,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn write8_repeat_steps_correctly_across_the_top_of_the_25_bit_address_field() {
+        // gcaddr is masked to 25 bits before the physical `| 0x8000_0000` is
+        // applied, so the largest representable base address is
+        // 0x81FFFFFF; stepping through a repeat count here must land on the
+        // exact expected addresses without panicking (address arithmetic
+        // uses wrapping addition throughout, matching Dolphin's own
+        // unsigned 32-bit math, even though this specific input cannot
+        // reach a genuine u32 wraparound given the 25-bit address mask and
+        // the 24-bit maximum repeat count for Write8).
+        let ops = derive_memory_operations(&["01FFFFFE 00000201".to_string()]);
+        assert_eq!(
+            ops,
+            vec![
+                MemoryOperation {
+                    address: 0x81FF_FFFE,
+                    size: 1,
+                    value: 0x01,
+                },
+                MemoryOperation {
+                    address: 0x81FF_FFFF,
+                    size: 1,
+                    value: 0x01,
+                },
+                MemoryOperation {
+                    address: 0x8200_0000,
+                    size: 1,
+                    value: 0x01,
+                },
+            ]
         );
     }
 
