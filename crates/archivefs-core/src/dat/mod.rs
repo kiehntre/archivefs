@@ -33,6 +33,7 @@
 //! - Unknown status values are preserved rather than discarded.
 
 pub mod audit;
+pub mod classification;
 pub mod hash;
 pub mod index;
 pub mod limits;

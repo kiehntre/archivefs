@@ -166,6 +166,7 @@ impl RomOrganisationPageState {
         let plan = build_organisation_plan(&OrganisationPlanRequest {
             master_root: &master_root,
             mode: self.mode,
+            content_policy: archivefs_core::dat::classification::ContentSelectionPolicy::AllEntries,
             candidates: &candidates,
             slug_for_platform: &|platform| slug_map.get(platform).cloned(),
             generation: self.plan_generation,
@@ -378,6 +379,8 @@ fn build_candidates(
             source_path: source.clone(),
             resolution,
             canonical_name: canonical_name_for(source, cache),
+            content_classification: None,
+            original_metadata: Default::default(),
         });
     }
     Some(candidates)

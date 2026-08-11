@@ -35,6 +35,7 @@ use super::model::{
     ClonePolicy, LanguageId, LanguagePreference, MAX_POLICY_PREFERENCE_LEN, PolicyField,
     PolicyScope, RegionId, RevisionPolicy,
 };
+use crate::dat::classification::ContentSelectionPolicy;
 use crate::dat::sources::DatSourceRegistry;
 
 // ---------------------------------------------------------------------------
@@ -60,6 +61,7 @@ pub struct EffectiveDatPolicy {
     /// The canonical platform id this policy is resolved for, or `None` for
     /// the global scope.
     pub platform: Option<String>,
+    pub content_selection: ContentSelectionPolicy,
     pub region_preferences: Vec<RegionId>,
     pub language_preferences: Vec<LanguagePreference>,
     pub revision_policy: RevisionPolicy,
@@ -94,6 +96,14 @@ pub fn resolve(
         Some(list) => parse_regions(list),
         None => parse_regions(config.region_preferences.as_deref().unwrap_or_default()),
     };
+    let content_selection = match platform_override.and_then(|o| o.content_selection.as_ref()) {
+        Some(value) => ContentSelectionPolicy::parse(value).unwrap_or_default(),
+        None => config
+            .content_selection
+            .as_deref()
+            .and_then(ContentSelectionPolicy::parse)
+            .unwrap_or_default(),
+    };
     let language_preferences = match platform_override.and_then(|o| o.language_preferences.as_ref())
     {
         Some(list) => parse_languages(list),
@@ -118,6 +128,10 @@ pub fn resolve(
 
     let scope_of = BTreeMap::from([
         (
+            PolicyField::Content,
+            scope_for(&platform_override, |o| o.content_selection.is_some()),
+        ),
+        (
             PolicyField::Region,
             scope_for(&platform_override, |o| o.region_preferences.is_some()),
         ),
@@ -137,6 +151,7 @@ pub fn resolve(
 
     EffectiveDatPolicy {
         platform: canonical_platform.map(str::to_string),
+        content_selection,
         region_preferences,
         language_preferences,
         revision_policy,
@@ -231,6 +246,17 @@ pub struct PolicyProblem {
 pub fn validate_policy_config(config: &DatPolicyConfig) -> Vec<PolicyProblem> {
     let mut problems = Vec::new();
 
+    if let Some(value) = config.content_selection.as_deref()
+        && ContentSelectionPolicy::parse(value).is_none()
+    {
+        problems.push(PolicyProblem {
+            field: PolicyField::Content,
+            message: format!(
+                "unknown content selection '{value}'; kept as written, All entries applies"
+            ),
+        });
+    }
+
     validate_preference_list(
         config.region_preferences.as_deref(),
         PolicyField::Region,
@@ -285,6 +311,16 @@ pub fn validate_policy_config(config: &DatPolicyConfig) -> Vec<PolicyProblem> {
                 &mut problems,
                 |value| RegionId::parse(value).is_some(),
             );
+            if let Some(value) = override_.content_selection.as_deref()
+                && ContentSelectionPolicy::parse(value).is_none()
+            {
+                problems.push(PolicyProblem {
+                    field: PolicyField::Content,
+                    message: format!(
+                        "unknown content selection '{value}' for platform '{platform_id}'; kept as written, All entries applies"
+                    ),
+                });
+            }
             validate_preference_list(
                 override_.language_preferences.as_deref(),
                 PolicyField::Language,
@@ -782,6 +818,7 @@ mod tests {
                 .map(|list| list.into_iter().map(str::to_string).collect()),
             revision_policy: revision.map(str::to_string),
             clone_policy: clone.map(str::to_string),
+            content_selection: None,
             platforms: None,
             unknown_fields: toml::Table::new(),
         }

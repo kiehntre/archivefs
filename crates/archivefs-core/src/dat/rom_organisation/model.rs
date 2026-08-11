@@ -20,6 +20,10 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::dat::classification::{
+    ContentSelectionPolicy, DatContentClassification, DatOriginalMetadata,
+};
+
 /// How a game's file should be organised.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -88,6 +92,8 @@ pub struct OrganisationPlanEntry {
     /// The canonical RomM-compatible platform slug, when a mapping exists.
     pub slug: Option<String>,
     pub mode: OrganisationMode,
+    pub content_classification: Option<DatContentClassification>,
+    pub original_metadata: DatOriginalMetadata,
     pub status: OrganisationStatus,
     /// Why the entry is Blocked / Unsupported / Conflict, when it is.
     pub reason: Option<String>,
@@ -99,6 +105,8 @@ pub struct OrganisationPlan {
     /// The configured canonical ROM root (never hard-coded).
     pub master_root: PathBuf,
     pub mode: OrganisationMode,
+    pub content_policy: ContentSelectionPolicy,
+    pub classifier_version: String,
     /// Bumped whenever the plan is (re)built; apply rejects a stale plan.
     pub generation: u64,
     pub entries: Vec<OrganisationPlanEntry>,

@@ -171,10 +171,13 @@ pub fn revalidate_organisation_plan(
             source_path: entry.source_path.clone(),
             resolution: live_resolution_for(&database, &entry.source_path, plan.generation),
             canonical_name: canonical_name_for(&entry.source_path),
+            content_classification: entry.content_classification.clone(),
+            original_metadata: entry.original_metadata.clone(),
         };
         let re_plan = build_organisation_plan(&OrganisationPlanRequest {
             master_root: &plan.master_root,
             mode: plan.mode,
+            content_policy: plan.content_policy,
             candidates: std::slice::from_ref(&candidate),
             slug_for_platform,
             generation: plan.generation,
