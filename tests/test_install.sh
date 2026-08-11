@@ -79,6 +79,55 @@ assert_contains() {
     esac
 }
 
+# decode_desktop_exec EXEC_LINE - decodes an "Exec=..." Desktop Entry line
+# and prints the resulting literal string. Mirrors the two-layer escaping a
+# real consumer (e.g. desktop-file-utils' handle_exec_key()) applies: first
+# the format's generic string-value unescape (only "\\" -> "\" matters
+# here), THEN the Exec-specific quoted-argument unescape (\", \`, \$, \\,
+# and %% -> %). Used to prove the value install.sh writes round-trips back
+# to the exact original path, not just that it looks plausible.
+decode_desktop_exec() {
+    python3 - "$1" <<'PY'
+import sys
+
+line = sys.argv[1]
+assert line.startswith('Exec=')
+raw = line[len("Exec=") :]
+
+# Layer 1: generic Desktop Entry string-value unescape.
+layer1 = []
+i = 0
+while i < len(raw):
+    if raw[i] == "\\" and i + 1 < len(raw) and raw[i + 1] == "\\":
+        layer1.append("\\")
+        i += 2
+        continue
+    layer1.append(raw[i])
+    i += 1
+layer1 = "".join(layer1)
+
+assert layer1.startswith('"') and layer1.endswith('"'), layer1
+inner = layer1[1:-1]
+
+# Layer 2: Exec quoted-argument unescape.
+out = []
+i = 0
+while i < len(inner):
+    char = inner[i]
+    if char == "\\" and i + 1 < len(inner) and inner[i + 1] in '"`$\\':
+        out.append(inner[i + 1])
+        i += 2
+        continue
+    if char == "%" and i + 1 < len(inner) and inner[i + 1] == "%":
+        out.append("%")
+        i += 2
+        continue
+    out.append(char)
+    i += 1
+sys.stdout.write("".join(out))
+PY
+}
+
 # make_bundle DIR - populates DIR with a fake extracted release bundle:
 # install.sh, stub emuwiz-cli/emuwiz, config.toml.example.
 make_bundle() {
@@ -184,6 +233,91 @@ assert_files_equal "reinstall leaves icon content stable" "$work/icon.before" \
     "$data_home/icons/hicolor/256x256/apps/io.github.kiehntre.emuwiz.png"
 rm -rf -- "$work"
 
+echo "=== test: Exec value round-trips a prefix with shell-special characters ==="
+work=$(mktemp -d)
+make_bundle "$work/bundle"
+home="$work/home"
+mkdir -p -- "$home"
+weird_name='weird $dollar `backtick` "quote" back\slash %percent'
+bin_dir="$work/$weird_name"
+
+assert_success "install with a shell-special-character prefix succeeds" \
+    env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir"
+desktop_file="$home/.local/share/applications/io.github.kiehntre.emuwiz.desktop"
+exec_line=$(grep '^Exec=' "$desktop_file")
+decoded=$(decode_desktop_exec "$exec_line")
+if [ "$decoded" = "$bin_dir/emuwiz" ]; then
+    ok "Exec value decodes back to the exact original path"
+else
+    bad "Exec value decodes back to the exact original path (got: $decoded)"
+fi
+if command -v desktop-file-validate >/dev/null 2>&1; then
+    assert_success "desktop entry with special-character Exec passes desktop-file-validate" \
+        desktop-file-validate "$desktop_file"
+else
+    printf 'SKIP - desktop-file-validate is unavailable\n'
+fi
+rm -rf -- "$work"
+
+echo "=== test: an install prefix containing a line break is rejected ==="
+work=$(mktemp -d)
+make_bundle "$work/bundle"
+home="$work/home"
+mkdir -p -- "$home"
+newline=$(printf 'a\nb')
+bin_dir="$work/pre${newline}post"
+mkdir -p -- "$bin_dir"
+
+assert_failure "install rejects a prefix containing a line break" \
+    env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir"
+assert_no_such_path "no desktop entry was written for the rejected install" \
+    "$home/.local/share/applications/io.github.kiehntre.emuwiz.desktop"
+rm -rf -- "$work"
+
+echo "=== test: a relative XDG_DATA_HOME falls back to ~/.local/share ==="
+work=$(mktemp -d)
+make_bundle "$work/bundle"
+home="$work/home"
+mkdir -p -- "$home"
+bin_dir="$work/bin"
+
+warn=$(env HOME="$home" XDG_DATA_HOME="relative/data" \
+    sh "$work/bundle/install.sh" --prefix "$bin_dir" 2>&1 1>/dev/null)
+assert_contains "relative XDG_DATA_HOME triggers a warning" "$warn" \
+    "ignoring relative XDG_DATA_HOME"
+assert_file_exists "desktop entry falls back to the default data home" \
+    "$home/.local/share/applications/io.github.kiehntre.emuwiz.desktop"
+rm -rf -- "$work"
+
+echo "=== test: install replaces a pre-existing symlink instead of writing through it ==="
+work=$(mktemp -d)
+make_bundle "$work/bundle"
+home="$work/home"
+mkdir -p -- "$home/.local/share/applications" \
+    "$home/.local/share/icons/hicolor/256x256/apps"
+bin_dir="$work/bin"
+
+canary="$work/canary"
+printf 'canary contents\n' >"$canary"
+ln -s -- "$canary" "$home/.local/share/applications/io.github.kiehntre.emuwiz.desktop"
+ln -s -- "$canary" \
+    "$home/.local/share/icons/hicolor/256x256/apps/io.github.kiehntre.emuwiz.png"
+
+assert_success "install succeeds when the destination paths are pre-existing symlinks" \
+    env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir"
+canary_content=$(cat "$canary")
+if [ "$canary_content" = "canary contents" ]; then
+    ok "symlink target was replaced, not written through"
+else
+    bad "symlink target was replaced, not written through (canary was modified)"
+fi
+if [ -L "$home/.local/share/applications/io.github.kiehntre.emuwiz.desktop" ]; then
+    bad "desktop entry symlink was replaced with a regular file"
+else
+    ok "desktop entry symlink was replaced with a regular file"
+fi
+rm -rf -- "$work"
+
 echo "=== test: an existing legacy config directory is reused ==="
 work=$(mktemp -d)
 make_bundle "$work/bundle"
@@ -286,6 +420,37 @@ assert_file_exists "unrelated icon is untouched" \
 assert_file_exists "config.toml survives uninstall" "$home/.config/emuwiz/config.toml"
 assert_success "uninstalling again is a no-op, not an error" \
     env HOME="$home" sh "$work/bundle/install.sh" --uninstall --prefix "$bin_dir"
+rm -rf -- "$work"
+
+echo "=== test: uninstall keeps going when an owned path is a directory ==="
+work=$(mktemp -d)
+make_bundle "$work/bundle"
+home="$work/home"
+mkdir -p -- "$home"
+bin_dir="$work/bin"
+
+env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" >/dev/null
+# Something has occupied the desktop entry's path with a directory instead
+# of the file install.sh wrote there (broken package state, another tool,
+# a prior crashed run, etc).
+rm -f -- "$home/.local/share/applications/io.github.kiehntre.emuwiz.desktop"
+mkdir -p -- "$home/.local/share/applications/io.github.kiehntre.emuwiz.desktop"
+
+warn=$(env HOME="$home" sh "$work/bundle/install.sh" --uninstall --prefix "$bin_dir" 2>&1 1>/dev/null)
+ok "uninstall did not abort when the desktop entry path is a directory"
+assert_contains "uninstall warns about the unexpected directory" "$warn" \
+    "found a directory"
+assert_no_such_path "emuwiz-cli is still removed despite the desktop-entry collision" \
+    "$bin_dir/emuwiz-cli"
+for size in 32 64 128 256 512; do
+    assert_no_such_path "$size pixel icon is still removed despite the desktop-entry collision" \
+        "$home/.local/share/icons/hicolor/${size}x${size}/apps/io.github.kiehntre.emuwiz.png"
+done
+if [ -d "$home/.local/share/applications/io.github.kiehntre.emuwiz.desktop" ]; then
+    ok "the colliding directory itself was left in place"
+else
+    bad "the colliding directory itself was left in place"
+fi
 rm -rf -- "$work"
 
 echo "=== test: fails clearly when required binaries are missing ==="

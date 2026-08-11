@@ -40,10 +40,13 @@ printf '%064d  %s\n' 0 "$ARCHIVE_NAME" >"$TEMP_ROOT/bad-checksum/$ARCHIVE_NAME.s
 expect_failure bad-checksum "$TEMP_ROOT/bad-checksum/$ARCHIVE_NAME"
 
 python3 - "$TEMP_ROOT" "$ARCHIVE_NAME" "$BUNDLE_NAME" "$VERSION" "$REPO_ROOT" <<'PY'
+import binascii
 import io
 import pathlib
+import struct
 import sys
 import tarfile
+import zlib
 
 output_root = pathlib.Path(sys.argv[1])
 archive_name, bundle_name, version = sys.argv[2:5]
@@ -133,10 +136,53 @@ def missing_icon(members):
         if not item[0].name.endswith("/assets/branding/emuwiz-logo-64.png")
     ]
 
+def png_chunks(data):
+    offset = 8
+    chunks = []
+    while offset < len(data):
+        length = struct.unpack(">I", data[offset : offset + 4])[0]
+        kind = data[offset + 4 : offset + 8]
+        end = offset + 12 + length
+        chunks.append((kind, data[offset + 8 : offset + 8 + length]))
+        offset = end
+    return chunks
+
+def png_chunk_bytes(kind, payload):
+    return (
+        struct.pack(">I", len(payload))
+        + kind
+        + payload
+        + struct.pack(">I", binascii.crc32(kind + payload) & 0xFFFFFFFF)
+    )
+
+def repack_png_with_one_pixel_changed(data):
+    # Produces a *structurally valid* PNG - correct signature, CRCs, IHDR,
+    # and decodable IDAT - that differs from the approved source by exactly
+    # one decoded pixel byte. This is what actually exercises the
+    # verifier's "differs from approved source" identity check; a bit-flip
+    # on the raw file bytes (the previous approach) usually just corrupts
+    # the IEND CRC and gets rejected by PNG structural validation instead,
+    # never reaching the identity check it's meant to test.
+    chunks = png_chunks(data)
+    compressed = b"".join(payload for kind, payload in chunks if kind == b"IDAT")
+    pixels = bytearray(zlib.decompress(compressed))
+    pixels[-1] ^= 0x01  # last byte of the last row: never a filter byte
+    new_idat = png_chunk_bytes(b"IDAT", zlib.compress(bytes(pixels), 9))
+    rebuilt = bytearray(b"\x89PNG\r\n\x1a\n")
+    replaced_idat = False
+    for kind, payload in chunks:
+        if kind == b"IDAT":
+            if not replaced_idat:
+                rebuilt += new_idat
+                replaced_idat = True
+            continue
+        rebuilt += png_chunk_bytes(kind, payload)
+    return bytes(rebuilt)
+
 def substituted_icon(members):
     for position, (member, data) in enumerate(members):
         if member.name.endswith("/assets/branding/emuwiz-logo-128.png"):
-            replacement = data[:-1] + bytes([data[-1] ^ 0x01])
+            replacement = repack_png_with_one_pixel_changed(data)
             member.size = len(replacement)
             members[position] = (member, replacement)
             return
@@ -150,6 +196,17 @@ def malformed_png(members):
             members[position] = (member, replacement)
             return
     raise RuntimeError("256px icon member missing")
+
+def duplicate_member(members):
+    for member, data in members:
+        if member.name.endswith("/emuwiz-cli"):
+            duplicate_info = tarfile.TarInfo(member.name)
+            duplicate_info.mode = member.mode
+            duplicate_info.uid = duplicate_info.gid = 0
+            duplicate_info.size = member.size
+            members.append((duplicate_info, data))
+            return
+    raise RuntimeError("emuwiz-cli member missing")
 
 def malformed_desktop(members):
     for position, (member, data) in enumerate(members):
@@ -168,9 +225,10 @@ write_case("missing-icon", missing_icon)
 write_case("substituted-icon", substituted_icon)
 write_case("malformed-png", malformed_png)
 write_case("malformed-desktop", malformed_desktop)
+write_case("duplicate-member", duplicate_member)
 PY
 
-for label in unexpected traversal bad-mode privacy-leak missing-icon substituted-icon malformed-png malformed-desktop; do
+for label in unexpected traversal bad-mode privacy-leak missing-icon substituted-icon malformed-png malformed-desktop duplicate-member; do
     archive="$TEMP_ROOT/$label/$ARCHIVE_NAME"
     write_checksum "$archive"
     expect_failure "$label" "$archive"

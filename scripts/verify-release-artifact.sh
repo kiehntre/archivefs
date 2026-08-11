@@ -145,8 +145,20 @@ PAYLOAD="$EXTRACT_ROOT/$EXPECTED_ROOT"
 [[ -d "$PAYLOAD" ]] || release_die "expected extracted root missing: $EXPECTED_ROOT"
 
 # The installer payload must contain the exact approved source assets, not
-# lookalikes with the same names. Validate the PNG structure as well so a
-# corrupted canonical checkout cannot produce a superficially matching bundle.
+# lookalikes with the same names. Validate the PNG structure first, and
+# independently of the byte-identity check below, so a structurally invalid
+# or corrupted PNG is always rejected by the format parser itself rather
+# than only by the (necessarily earlier-short-circuiting) identity check -
+# otherwise the parser below would never actually be exercised.
+if command -v desktop-file-validate >/dev/null 2>&1; then
+    DESKTOP_VALIDATION_COPY="$TEMP_ROOT/io.github.kiehntre.emuwiz.desktop"
+    cp -- "$PAYLOAD/assets/linux/io.github.kiehntre.emuwiz.desktop.in" \
+        "$DESKTOP_VALIDATION_COPY"
+    desktop-file-validate "$DESKTOP_VALIDATION_COPY"
+else
+    release_note "desktop-file-validate unavailable; canonical desktop template comparison still passed"
+fi
+
 python3 - "$REPO_ROOT" "$PAYLOAD" <<'PY'
 import binascii
 import pathlib
@@ -162,8 +174,6 @@ if (payload / desktop_rel).read_bytes() != (repo / desktop_rel).read_bytes():
 for size in (32, 64, 128, 256, 512):
     relative = pathlib.Path(f"assets/branding/emuwiz-logo-{size}.png")
     data = (payload / relative).read_bytes()
-    if data != (repo / relative).read_bytes():
-        raise SystemExit(f"release icon differs from approved source: {relative}")
     if not data.startswith(b"\x89PNG\r\n\x1a\n"):
         raise SystemExit(f"invalid PNG signature: {relative}")
     offset = 8
@@ -210,16 +220,11 @@ for size in (32, 64, 128, 256, 512):
         raise SystemExit(f"wrong decoded PNG data length: {relative}")
     if any(pixels[row * row_bytes] > 4 for row in range(height)):
         raise SystemExit(f"invalid PNG row filter: {relative}")
+    # Structural validity established above; now confirm it's the exact
+    # approved asset and not merely a well-formed lookalike.
+    if data != (repo / relative).read_bytes():
+        raise SystemExit(f"release icon differs from approved source: {relative}")
 PY
-
-if command -v desktop-file-validate >/dev/null 2>&1; then
-    DESKTOP_VALIDATION_COPY="$TEMP_ROOT/io.github.kiehntre.emuwiz.desktop"
-    cp -- "$PAYLOAD/assets/linux/io.github.kiehntre.emuwiz.desktop.in" \
-        "$DESKTOP_VALIDATION_COPY"
-    desktop-file-validate "$DESKTOP_VALIDATION_COPY"
-else
-    release_note "desktop-file-validate unavailable; canonical desktop template comparison still passed"
-fi
 
 EXPECTED_CLI="emuwiz-cli $VERSION"
 EXPECTED_GUI="emuwiz $VERSION"

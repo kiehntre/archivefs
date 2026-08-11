@@ -41035,6 +41035,22 @@ mod tests {
     }
 
     #[test]
+    fn desktop_entry_startup_wm_class_matches_the_linux_app_id() {
+        // egui-winit's `with_app_id` writes into winit's single shared
+        // `platform_specific.name` field, which the X11 backend also reads
+        // for WM_CLASS - so the X11 WM_CLASS this binary actually produces
+        // is LINUX_APP_ID, not any shorter alias. StartupWMClass in the
+        // desktop entry must match it exactly or launcher/taskbar grouping
+        // silently breaks on X11 desktops (XFCE, KDE/X11, GNOME/X11).
+        let template = include_str!("../../../assets/linux/io.github.kiehntre.emuwiz.desktop.in");
+        let expected = format!("StartupWMClass={LINUX_APP_ID}");
+        assert!(
+            template.lines().any(|line| line == expected),
+            "desktop entry template must contain {expected:?}"
+        );
+    }
+
+    #[test]
     fn log_level_prefers_emuwiz_over_the_legacy_variable() {
         use log::LevelFilter;
         assert_eq!(

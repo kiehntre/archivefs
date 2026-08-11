@@ -82,6 +82,19 @@ jobs:
       - name: Audit resolved dependencies
         run: cargo audit
 
+  install-script-tests:
+    name: Installer script tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # desktop-file-validate (from desktop-file-utils) is exercised by
+      # tests/test_install.sh; without it, those assertions silently skip
+      # and the desktop entry's Desktop Entry Specification syntax is
+      # never actually checked in CI.
+      - name: Install desktop-file-utils
+        run: sudo apt-get update && sudo apt-get install -y desktop-file-utils
+      - run: bash tests/test_install.sh
+
   release-artifact:
     name: Create canonical artifact
     runs-on: ubuntu-latest
@@ -94,6 +107,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: false
+      # See the comment on the install-script-tests job: without this,
+      # build-release.sh's and verify-release-artifact.sh's
+      # desktop-file-validate checks silently no-op in CI.
+      - name: Install desktop-file-utils
+        run: sudo apt-get update && sudo apt-get install -y desktop-file-utils
       - name: Build and internally verify artifact
         run: scripts/build-release.sh --output-dir "$RUNNER_TEMP/release"
       - name: Reject representative malformed artifacts
@@ -127,6 +145,8 @@ jobs:
         with:
           name: archivefs-release-candidate
           path: ${{ runner.temp }}/download
+      - name: Install desktop-file-utils
+        run: sudo apt-get update && sudo apt-get install -y desktop-file-utils
       - run: scripts/verify-release-artifact.sh "$RUNNER_TEMP/download/"*.tar.gz
 
   reproducibility:

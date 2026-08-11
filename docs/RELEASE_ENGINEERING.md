@@ -100,8 +100,8 @@ scripts/test-release-artifact-verifier.sh \
 
 This proves rejection of a bad checksum, unexpected member, traversal path,
 unsafe executable mode, embedded maintainer path, missing or substituted icon,
-malformed PNG, and malformed desktop entry. It never extracts an unvalidated
-member.
+malformed PNG, malformed desktop entry, and a duplicate tar member. It never
+extracts an unvalidated member.
 
 ## Reproducibility
 
