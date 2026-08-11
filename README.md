@@ -2,6 +2,12 @@
 
 # EmuWiz
 
+<p align="center">
+  <img src="docs/assets/branding/emuwiz-logo-256.png"
+       alt="EmuWiz logo"
+       width="220">
+</p>
+
 EmuWiz is a Linux-first, local-first tool for browsing, mounting,
 inspecting, validating, and organizing archived collections you already
 have - games, software, media, documents, or other preservation material -
