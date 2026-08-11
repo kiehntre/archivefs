@@ -13,6 +13,8 @@ script_dir=$(CDPATH= cd -- "$script_dir" && pwd)
 repo_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
 install_sh="$repo_root/install.sh"
 config_example="$repo_root/config.toml.example"
+branding_assets="$repo_root/assets/branding"
+desktop_assets="$repo_root/assets/linux"
 
 [ -f "$install_sh" ] || { printf 'test_install.sh: cannot find %s\n' "$install_sh" >&2; exit 1; }
 [ -f "$config_example" ] || { printf 'test_install.sh: cannot find %s\n' "$config_example" >&2; exit 1; }
@@ -86,6 +88,9 @@ make_bundle() {
     printf '#!/bin/sh\necho fake-gui\n' >"$1/emuwiz"
     chmod +x -- "$1/emuwiz-cli" "$1/emuwiz"
     cp -- "$config_example" "$1/config.toml.example"
+    mkdir -p -- "$1/assets"
+    cp -R -- "$branding_assets" "$1/assets/branding"
+    cp -R -- "$desktop_assets" "$1/assets/linux"
 }
 
 # make_workspace DIR - populates DIR with a fake workspace checkout:
@@ -98,6 +103,9 @@ make_workspace() {
     printf '#!/bin/sh\necho ws-gui\n' >"$1/target/release/emuwiz"
     chmod +x -- "$1/target/release/emuwiz-cli" "$1/target/release/emuwiz"
     cp -- "$config_example" "$1/config.toml.example"
+    mkdir -p -- "$1/assets"
+    cp -R -- "$branding_assets" "$1/assets/branding"
+    cp -R -- "$desktop_assets" "$1/assets/linux"
 }
 
 echo "=== test: --help exits 0 and prints usage ==="
@@ -119,12 +127,61 @@ assert_executable "archivefs-cli legacy alias installed" "$bin_dir/archivefs-cli
 assert_executable "emuwiz installed and executable" "$bin_dir/emuwiz"
 assert_executable "emuwiz-gui alias installed" "$bin_dir/emuwiz-gui"
 assert_executable "archivefs-gui legacy alias installed" "$bin_dir/archivefs-gui"
+desktop_file="$home/.local/share/applications/io.github.kiehntre.emuwiz.desktop"
+assert_file_exists "desktop entry installed" "$desktop_file"
+desktop_content=$(cat "$desktop_file")
+assert_contains "desktop entry names the stable icon" "$desktop_content" \
+    "Icon=io.github.kiehntre.emuwiz"
+assert_contains "desktop entry uses the absolute canonical binary" "$desktop_content" \
+    "Exec=\"$bin_dir/emuwiz\""
+for size in 32 64 128 256 512; do
+    installed_icon="$home/.local/share/icons/hicolor/${size}x${size}/apps/io.github.kiehntre.emuwiz.png"
+    assert_files_equal "$size pixel application icon is the approved asset" \
+        "$branding_assets/emuwiz-logo-$size.png" "$installed_icon"
+done
+if command -v desktop-file-validate >/dev/null 2>&1; then
+    assert_success "installed desktop entry passes desktop-file-validate" \
+        desktop-file-validate "$desktop_file"
+else
+    printf 'SKIP - desktop-file-validate is unavailable\n'
+fi
 
 assert_file_exists "config.toml created" "$home/.config/emuwiz/config.toml"
 assert_files_equal "config.toml matches config.toml.example" \
     "$config_example" "$home/.config/emuwiz/config.toml"
 cli_out=$("$bin_dir/emuwiz-cli")
 assert_contains "installed emuwiz-cli runs (bundle stub)" "$cli_out" "fake-cli"
+rm -rf -- "$work"
+
+echo "=== test: custom XDG data home and a prefix containing spaces ==="
+work=$(mktemp -d)
+make_bundle "$work/bundle"
+home="$work/home"
+data_home="$work/custom data"
+bin_dir="$work/prefix with spaces/bin"
+mkdir -p -- "$home"
+
+assert_success "install with custom XDG data home and spaced prefix succeeds" \
+    env HOME="$home" XDG_DATA_HOME="$data_home" \
+    sh "$work/bundle/install.sh" --prefix "$bin_dir"
+desktop_file="$data_home/applications/io.github.kiehntre.emuwiz.desktop"
+desktop_content=$(cat "$desktop_file")
+assert_contains "spaced absolute executable is quoted in desktop entry" "$desktop_content" \
+    "Exec=\"$bin_dir/emuwiz\""
+assert_file_exists "custom XDG data home receives icons" \
+    "$data_home/icons/hicolor/512x512/apps/io.github.kiehntre.emuwiz.png"
+assert_no_such_path "default data home is not used when XDG_DATA_HOME is set" \
+    "$home/.local/share/applications/io.github.kiehntre.emuwiz.desktop"
+
+cp -- "$desktop_file" "$work/desktop.before"
+cp -- "$data_home/icons/hicolor/256x256/apps/io.github.kiehntre.emuwiz.png" \
+    "$work/icon.before"
+assert_success "reinstall is idempotent" \
+    env HOME="$home" XDG_DATA_HOME="$data_home" \
+    sh "$work/bundle/install.sh" --prefix "$bin_dir"
+assert_files_equal "reinstall leaves desktop content stable" "$work/desktop.before" "$desktop_file"
+assert_files_equal "reinstall leaves icon content stable" "$work/icon.before" \
+    "$data_home/icons/hicolor/256x256/apps/io.github.kiehntre.emuwiz.png"
 rm -rf -- "$work"
 
 echo "=== test: an existing legacy config directory is reused ==="
@@ -193,7 +250,7 @@ kept=$(cat "$home/.config/emuwiz/config.toml")
 assert_contains "existing config content is preserved" "$kept" "$marker"
 rm -rf -- "$work"
 
-echo "=== test: uninstall removes only the installed binaries, keeps config ==="
+echo "=== test: uninstall precisely removes owned binaries and desktop assets ==="
 work=$(mktemp -d)
 make_bundle "$work/bundle"
 home="$work/home"
@@ -203,6 +260,10 @@ bin_dir="$work/bin"
 env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" >/dev/null
 # A file install.sh did not create must survive uninstall untouched.
 printf 'unrelated\n' >"$bin_dir/some-other-tool"
+mkdir -p -- "$home/.local/share/applications" \
+    "$home/.local/share/icons/hicolor/64x64/apps"
+printf 'unrelated desktop\n' >"$home/.local/share/applications/unrelated.desktop"
+printf 'unrelated icon\n' >"$home/.local/share/icons/hicolor/64x64/apps/unrelated.png"
 
 assert_success "uninstall succeeds" \
     env HOME="$home" sh "$work/bundle/install.sh" --uninstall --prefix "$bin_dir"
@@ -211,7 +272,17 @@ assert_no_such_path "archivefs-cli removed" "$bin_dir/archivefs-cli"
 assert_no_such_path "emuwiz removed" "$bin_dir/emuwiz"
 assert_no_such_path "emuwiz-gui alias removed" "$bin_dir/emuwiz-gui"
 assert_no_such_path "archivefs-gui alias removed" "$bin_dir/archivefs-gui"
+assert_no_such_path "EmuWiz desktop entry removed" \
+    "$home/.local/share/applications/io.github.kiehntre.emuwiz.desktop"
+for size in 32 64 128 256 512; do
+    assert_no_such_path "$size pixel EmuWiz application icon removed" \
+        "$home/.local/share/icons/hicolor/${size}x${size}/apps/io.github.kiehntre.emuwiz.png"
+done
 assert_file_exists "unrelated file in bin dir is untouched" "$bin_dir/some-other-tool"
+assert_file_exists "unrelated desktop entry is untouched" \
+    "$home/.local/share/applications/unrelated.desktop"
+assert_file_exists "unrelated icon is untouched" \
+    "$home/.local/share/icons/hicolor/64x64/apps/unrelated.png"
 assert_file_exists "config.toml survives uninstall" "$home/.config/emuwiz/config.toml"
 assert_success "uninstalling again is a no-op, not an error" \
     env HOME="$home" sh "$work/bundle/install.sh" --uninstall --prefix "$bin_dir"

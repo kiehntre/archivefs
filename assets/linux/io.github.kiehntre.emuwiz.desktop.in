@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=EmuWiz
+Exec=@EMUWIZ_EXEC@
+Icon=io.github.kiehntre.emuwiz
+Terminal=false
+Categories=Game;Utility;
+StartupWMClass=emuwiz
+SingleMainWindow=true

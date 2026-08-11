@@ -691,6 +691,19 @@ fn resolve_log_level(emuwiz: Option<String>, legacy: Option<String>) -> log::Lev
         .unwrap_or(log::LevelFilter::Info)
 }
 
+const LINUX_APP_ID: &str = "io.github.kiehntre.emuwiz";
+const APP_ICON_PNG: &[u8] = include_bytes!("../../../assets/branding/emuwiz-logo-256.png");
+
+fn app_icon() -> Option<egui::IconData> {
+    match eframe::icon_data::from_png_bytes(APP_ICON_PNG) {
+        Ok(icon) => Some(icon),
+        Err(error) => {
+            log::warn!("could not decode the embedded EmuWiz application icon: {error}");
+            None
+        }
+    }
+}
+
 fn main() -> eframe::Result<()> {
     init_logging();
     let arguments = std::env::args().collect::<Vec<_>>();
@@ -706,8 +719,14 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1100.0, 720.0])
+        .with_app_id(LINUX_APP_ID);
+    if let Some(icon) = app_icon() {
+        viewport = viewport.with_icon(icon);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1100.0, 720.0]),
+        viewport,
         ..Default::default()
     };
 
@@ -40997,6 +41016,22 @@ mod tests {
             gui_version_line(),
             format!("emuwiz {}", env!("CARGO_PKG_VERSION"))
         );
+    }
+
+    #[test]
+    fn embedded_application_icon_is_the_approved_256_pixel_rgba_asset() {
+        let icon = app_icon().expect("approved embedded application icon must decode");
+        assert_eq!((icon.width, icon.height), (256, 256));
+        assert_eq!(icon.rgba.len(), 256 * 256 * 4);
+        assert_eq!(
+            APP_ICON_PNG,
+            include_bytes!("../../../assets/branding/emuwiz-logo-256.png")
+        );
+    }
+
+    #[test]
+    fn linux_application_id_is_stable() {
+        assert_eq!(LINUX_APP_ID, "io.github.kiehntre.emuwiz");
     }
 
     #[test]

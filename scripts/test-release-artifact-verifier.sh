@@ -39,14 +39,15 @@ cp "$VALID_ARTIFACT" "$TEMP_ROOT/bad-checksum/$ARCHIVE_NAME"
 printf '%064d  %s\n' 0 "$ARCHIVE_NAME" >"$TEMP_ROOT/bad-checksum/$ARCHIVE_NAME.sha256"
 expect_failure bad-checksum "$TEMP_ROOT/bad-checksum/$ARCHIVE_NAME"
 
-python3 - "$TEMP_ROOT" "$ARCHIVE_NAME" "$BUNDLE_NAME" "$VERSION" <<'PY'
+python3 - "$TEMP_ROOT" "$ARCHIVE_NAME" "$BUNDLE_NAME" "$VERSION" "$REPO_ROOT" <<'PY'
 import io
 import pathlib
 import sys
 import tarfile
 
 output_root = pathlib.Path(sys.argv[1])
-archive_name, bundle_name, version = sys.argv[2:]
+archive_name, bundle_name, version = sys.argv[2:5]
+repo_root = pathlib.Path(sys.argv[5])
 
 def base_members():
     cli = f"#!/bin/sh\nprintf '%s\\n' 'emuwiz-cli {version}'\n".encode()
@@ -59,12 +60,25 @@ def base_members():
         "CHANGELOG.md": (0o644, b"Release fixture\n"),
         "LICENSE": (0o644, b"MIT fixture\n"),
         "config.toml.example": (0o644, b"mount_dir = '/tmp/archivefs'\n"),
+        "assets/linux/io.github.kiehntre.emuwiz.desktop.in": (
+            0o644,
+            (repo_root / "assets/linux/io.github.kiehntre.emuwiz.desktop.in").read_bytes(),
+        ),
     }
+    for size in (32, 64, 128, 256, 512):
+        relative = f"assets/branding/emuwiz-logo-{size}.png"
+        values[relative] = (0o644, (repo_root / relative).read_bytes())
     root_info = tarfile.TarInfo(bundle_name)
     root_info.type = tarfile.DIRTYPE
     root_info.mode = 0o755
     root_info.uid = root_info.gid = 0
     members = [(root_info, None)]
+    for directory in ("assets", "assets/branding", "assets/linux"):
+        info = tarfile.TarInfo(f"{bundle_name}/{directory}")
+        info.type = tarfile.DIRTYPE
+        info.mode = 0o755
+        info.uid = info.gid = 0
+        members.append((info, None))
     for name, (mode, data) in values.items():
         info = tarfile.TarInfo(f"{bundle_name}/{name}")
         info.mode = mode
@@ -113,13 +127,50 @@ def privacy_leak(members):
             return
     raise RuntimeError("README member missing")
 
+def missing_icon(members):
+    members[:] = [
+        item for item in members
+        if not item[0].name.endswith("/assets/branding/emuwiz-logo-64.png")
+    ]
+
+def substituted_icon(members):
+    for position, (member, data) in enumerate(members):
+        if member.name.endswith("/assets/branding/emuwiz-logo-128.png"):
+            replacement = data[:-1] + bytes([data[-1] ^ 0x01])
+            member.size = len(replacement)
+            members[position] = (member, replacement)
+            return
+    raise RuntimeError("128px icon member missing")
+
+def malformed_png(members):
+    for position, (member, data) in enumerate(members):
+        if member.name.endswith("/assets/branding/emuwiz-logo-256.png"):
+            replacement = b"not a png"
+            member.size = len(replacement)
+            members[position] = (member, replacement)
+            return
+    raise RuntimeError("256px icon member missing")
+
+def malformed_desktop(members):
+    for position, (member, data) in enumerate(members):
+        if member.name.endswith("/assets/linux/io.github.kiehntre.emuwiz.desktop.in"):
+            replacement = data.replace(b"Type=Application", b"Type=Broken")
+            member.size = len(replacement)
+            members[position] = (member, replacement)
+            return
+    raise RuntimeError("desktop member missing")
+
 write_case("unexpected", unexpected)
 write_case("traversal", traversal)
 write_case("bad-mode", bad_mode)
 write_case("privacy-leak", privacy_leak)
+write_case("missing-icon", missing_icon)
+write_case("substituted-icon", substituted_icon)
+write_case("malformed-png", malformed_png)
+write_case("malformed-desktop", malformed_desktop)
 PY
 
-for label in unexpected traversal bad-mode privacy-leak; do
+for label in unexpected traversal bad-mode privacy-leak missing-icon substituted-icon malformed-png malformed-desktop; do
     archive="$TEMP_ROOT/$label/$ARCHIVE_NAME"
     write_checksum "$archive"
     expect_failure "$label" "$archive"
