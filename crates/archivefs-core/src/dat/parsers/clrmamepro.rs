@@ -14,6 +14,7 @@
 use std::fs;
 use std::path::Path;
 
+use super::super::classification::{DatContentClassification, DatOriginalMetadata};
 use super::super::hash::{normalise_crc32, normalise_md5, normalise_sha1, normalise_sha256};
 use super::super::limits::DatLimits;
 use super::super::model::{
@@ -602,6 +603,8 @@ fn emit_game(
             manufacturer: None,
             source_file: None,
             comment: None,
+            original_metadata: DatOriginalMetadata::default(),
+            content_classification: DatContentClassification::unknown(),
         });
     }
     Ok(())

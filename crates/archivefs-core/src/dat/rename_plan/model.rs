@@ -21,6 +21,10 @@
 
 use std::path::PathBuf;
 
+use crate::dat::classification::{
+    ContentSelectionPolicy, DatContentClassification, DatOriginalMetadata,
+};
+
 /// The kind of filesystem object a proposal would, in a future stage,
 /// hypothetically rename. Planning itself only ever calls `symlink_metadata`
 /// on it and never follows a link.
@@ -68,6 +72,11 @@ pub enum ProposalState {
     /// No canonical name could be derived (path traversal, empty name, or the
     /// source file is no longer present).
     Blocked,
+    /// Confidently non-game content is not selected by Games only.
+    ExcludedByContentPolicy,
+    /// Classification is Unknown, so restrictive mode requires review and
+    /// cannot produce an actionable rename.
+    UnclassifiedContent,
 }
 
 impl ProposalState {
@@ -79,6 +88,8 @@ impl ProposalState {
             Self::Conflict => "Conflict",
             Self::Unsupported => "Unsupported",
             Self::Blocked => "Blocked",
+            Self::ExcludedByContentPolicy => "Not selected by Games only",
+            Self::UnclassifiedContent => "Unknown content — review needed",
         }
     }
 
@@ -185,6 +196,9 @@ pub struct RenameProposal {
     /// The policy explanations that led here (e.g. "preferred region matched
     /// (Europe)", "source priority 20 outranked source priority 100").
     pub explanations: Vec<String>,
+    pub content_policy: ContentSelectionPolicy,
+    pub content_classification: DatContentClassification,
+    pub original_metadata: DatOriginalMetadata,
     pub state: ProposalState,
     /// What object the proposal describes on disk.
     pub object_kind: SourceObjectKind,
@@ -225,6 +239,8 @@ pub struct RenamePlanCounts {
     pub conflicts: usize,
     pub unsupported: usize,
     pub blocked: usize,
+    pub excluded_by_content_policy: usize,
+    pub unclassified_content: usize,
     pub total: usize,
 }
 
@@ -242,6 +258,8 @@ impl RenamePlanCounts {
                 ProposalState::Conflict => counts.conflicts += 1,
                 ProposalState::Unsupported => counts.unsupported += 1,
                 ProposalState::Blocked => counts.blocked += 1,
+                ProposalState::ExcludedByContentPolicy => counts.excluded_by_content_policy += 1,
+                ProposalState::UnclassifiedContent => counts.unclassified_content += 1,
             }
         }
         counts
@@ -261,6 +279,8 @@ pub struct RenamePlan {
     pub scan_root: String,
     pub platform: Option<String>,
     pub platform_display: Option<String>,
+    pub content_policy: ContentSelectionPolicy,
+    pub classifier_version: String,
     /// Deterministic order: by source path, then proposed name.
     pub proposals: Vec<RenameProposal>,
     pub counts: RenamePlanCounts,

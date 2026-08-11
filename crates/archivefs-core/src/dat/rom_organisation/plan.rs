@@ -16,6 +16,9 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::dat::classification::{
+    ContentEligibility, ContentSelectionPolicy, DatContentClassification, DatOriginalMetadata,
+};
 use crate::dat::rename_apply::preflight::is_safe_basename;
 use crate::dat::rename_plan::derive_proposed_basename;
 use crate::platform::identity::PlatformIdentityResolution;
@@ -34,12 +37,15 @@ pub struct OrganisationCandidate {
     /// basename when absent, which keeps the name stable and only moves the
     /// file into the platform directory.
     pub canonical_name: Option<String>,
+    pub content_classification: Option<DatContentClassification>,
+    pub original_metadata: DatOriginalMetadata,
 }
 
 /// Everything the planner needs to build one plan.
 pub struct OrganisationPlanRequest<'a> {
     pub master_root: &'a Path,
     pub mode: OrganisationMode,
+    pub content_policy: ContentSelectionPolicy,
     pub candidates: &'a [OrganisationCandidate],
     /// Resolves a canonical platform id to its canonical RomM-compatible slug.
     /// The only acceptable source for folder names; nothing is derived from
@@ -73,6 +79,8 @@ pub fn build_organisation_plan(request: &OrganisationPlanRequest<'_>) -> Organis
     OrganisationPlan {
         master_root: request.master_root.to_path_buf(),
         mode: request.mode,
+        content_policy: request.content_policy,
+        classifier_version: crate::dat::classification::CLASSIFIER_VERSION.to_string(),
         generation: request.generation,
         entries,
     }
@@ -101,6 +109,8 @@ fn plan_entry(
         platform_source: String::new(),
         slug: None,
         mode,
+        content_classification: candidate.content_classification.clone(),
+        original_metadata: candidate.original_metadata.clone(),
         status: OrganisationStatus::Blocked,
         reason: Some(reason.to_string()),
     };
@@ -114,10 +124,33 @@ fn plan_entry(
             platform_source: source.to_string(),
             slug: None,
             mode,
+            content_classification: candidate.content_classification.clone(),
+            original_metadata: candidate.original_metadata.clone(),
             status: OrganisationStatus::Unsupported,
             reason: Some(reason.to_string()),
         }
     };
+
+    if request.content_policy == ContentSelectionPolicy::GamesOnly {
+        let classification = candidate
+            .content_classification
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(DatContentClassification::unknown);
+        match request.content_policy.eligibility(&classification) {
+            ContentEligibility::Selected => {}
+            ContentEligibility::ExcludedNonGame => {
+                return blocked(
+                    "Games only does not select content confidently classified as non-game",
+                );
+            }
+            ContentEligibility::NeedsReview => {
+                return blocked(
+                    "this entry's content classification is Unknown; Games only never organises it automatically",
+                );
+            }
+        }
+    }
 
     // Object kind decides mode eligibility (and whether the file may move at all).
     let kind = match object_kind {
@@ -259,6 +292,8 @@ fn plan_entry(
         platform_source,
         slug,
         mode,
+        content_classification: candidate.content_classification.clone(),
+        original_metadata: candidate.original_metadata.clone(),
         status: if already_organised {
             OrganisationStatus::AlreadyOrganised
         } else {

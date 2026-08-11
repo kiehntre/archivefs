@@ -1497,6 +1497,71 @@ fn an_audit_finds_an_exact_match_and_reports_what_is_absent() {
 }
 
 #[test]
+fn games_only_keeps_the_full_catalogue_and_audit_semantics() {
+    use crate::dat::classification::ContentSelectionPolicy;
+    use crate::dat::policy::{DatPolicyConfig, resolve};
+
+    let dir = temp();
+    let dat = write(
+        dir.path(),
+        "classified.dat",
+        r#"<datafile><header><name>No-Intro Classified Fixture</name></header>
+<game name="Game" category="Games"><rom name="game.bin" size="4" sha1="a94a8fe5ccb19ba61c4c0873d391e987982fbbd3"/></game>
+<game name="Demo" category="Demos"><rom name="demo.bin" size="5" sha1="1111111111111111111111111111111111111111"/></game>
+<game name="Unspecified"><rom name="unknown.bin" size="6" sha1="2222222222222222222222222222222222222222"/></game></datafile>"#,
+    );
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    std::fs::write(roms.join("game.bin"), SUPER_BIN_CONTENTS).unwrap();
+    let base = DatAuditRequest {
+        source_id: "fixture".to_string(),
+        source_display_name: "Fixture".to_string(),
+        dat_path: dat,
+        dat_kind: DatSourceKind::File,
+        scan_root: roms,
+        limits: DatLimits::default(),
+        policy: None,
+        platform: None,
+    };
+    let cancel = no_cancel();
+    let all = run_dat_audit(&base, &TrustedRoots::none(), &cancel, &|_| {}).unwrap();
+    let mut restrictive_request = base.clone();
+    restrictive_request.policy = Some(resolve(
+        &DatPolicyConfig {
+            content_selection: Some("games_only".to_string()),
+            ..Default::default()
+        },
+        None,
+        Vec::new(),
+    ));
+    let games_only = run_dat_audit(
+        &restrictive_request,
+        &TrustedRoots::none(),
+        &cancel,
+        &|_| {},
+    )
+    .unwrap();
+
+    assert_eq!(all.catalogue_entries, 3);
+    assert_eq!(games_only.catalogue_entries, 3);
+    assert_eq!(
+        all.report, games_only.report,
+        "selection never changes audit"
+    );
+    assert_eq!(games_only.content.catalogue.total, 3);
+    assert_eq!(games_only.content.catalogue.games, 1);
+    assert_eq!(games_only.content.catalogue.non_game, 1);
+    assert_eq!(games_only.content.catalogue.unknown, 1);
+    assert_eq!(games_only.content.catalogue.selected, 1);
+    assert_eq!(games_only.content.catalogue.excluded_non_game, 1);
+    assert_eq!(games_only.content.catalogue.needs_review, 1);
+    assert_eq!(
+        games_only.content.selection,
+        ContentSelectionPolicy::GamesOnly
+    );
+}
+
+#[test]
 fn an_audit_makes_no_change_to_the_files_it_reads() {
     // The guarantee the whole feature rests on: an audit is a read. Not a
     // rename, not a move, not a repair, and not a report written beside the

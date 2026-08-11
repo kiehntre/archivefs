@@ -397,6 +397,8 @@ mod tests {
                 manufacturer: None,
                 source_file: None,
                 comment: None,
+                original_metadata: Default::default(),
+                content_classification: Default::default(),
             }],
         };
         DatIndex::build(&dat)

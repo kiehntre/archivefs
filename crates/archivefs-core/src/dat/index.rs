@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 use serde::Serialize;
 
+use super::classification::{DatContentClassification, DatOriginalMetadata};
 use super::model::{DatChecksum, ParsedDat};
 
 /// A reference to one ROM in one game entry.
@@ -20,6 +21,8 @@ pub struct DatRomRef {
     pub rom_name: String,
     pub size_bytes: Option<u64>,
     pub checksums: Vec<DatChecksum>,
+    pub content_classification: DatContentClassification,
+    pub original_metadata: DatOriginalMetadata,
 }
 
 /// Index into a parsed DAT file, keyed by hash values.
@@ -55,6 +58,8 @@ impl DatIndex {
                     rom_name: rom.name.clone(),
                     size_bytes: rom.size_bytes,
                     checksums: rom.checksums(),
+                    content_classification: game.content_classification.clone(),
+                    original_metadata: game.original_metadata.clone(),
                 };
 
                 if let Some(ref crc) = rom.crc32 {
@@ -213,6 +218,8 @@ mod tests {
                     manufacturer: None,
                     source_file: None,
                     comment: None,
+                    original_metadata: Default::default(),
+                    content_classification: Default::default(),
                 },
                 DatGameEntry {
                     name: "Game Beta".into(),
@@ -236,6 +243,8 @@ mod tests {
                     manufacturer: None,
                     source_file: None,
                     comment: None,
+                    original_metadata: Default::default(),
+                    content_classification: Default::default(),
                 },
             ],
         }

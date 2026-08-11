@@ -8,6 +8,10 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
+use crate::dat::classification::{
+    CLASSIFIER_VERSION, ClassifierConfidence, ContentSelectionPolicy, DatContentClass,
+    DatContentClassification,
+};
 use crate::dat::rom_organisation::*;
 use crate::platform::identity::{
     PlatformIdentityConfidence, PlatformIdentityEvidence, PlatformIdentityResolution,
@@ -67,6 +71,8 @@ fn candidate(
         source_path,
         resolution,
         canonical_name: Some(name.to_string()),
+        content_classification: None,
+        original_metadata: Default::default(),
     }
 }
 
@@ -79,6 +85,7 @@ fn plan_for(
     build_organisation_plan(&OrganisationPlanRequest {
         master_root,
         mode,
+        content_policy: crate::dat::classification::ContentSelectionPolicy::AllEntries,
         candidates,
         slug_for_platform: &slug_for_platform,
         generation,
@@ -530,6 +537,8 @@ fn cross_filesystem_move_is_refused_without_mutation() {
         source_path: source_file.clone(),
         resolution: resolved("PSP", PlatformIdentitySource::Romm),
         canonical_name: Some("Game.iso".to_string()),
+        content_classification: None,
+        original_metadata: Default::default(),
     };
     let plan = plan_for(&master, OrganisationMode::MoveRealFile, &[cand], 1);
     let journal = dir.path().join("journal");
@@ -862,6 +871,8 @@ fn symlink_object_move_preserves_the_target_text_and_never_dereferences() {
         source_path: link.clone(),
         resolution: resolved("PSP", PlatformIdentitySource::Romm),
         canonical_name: Some("Game.iso".to_string()),
+        content_classification: None,
+        original_metadata: Default::default(),
     };
     let plan = plan_for(
         &master,
@@ -921,6 +932,8 @@ fn move_real_file_mode_rejects_a_symlink_source() {
         source_path: link.clone(),
         resolution: resolved("PSP", PlatformIdentitySource::Romm),
         canonical_name: Some("Game.iso".to_string()),
+        content_classification: None,
+        original_metadata: Default::default(),
     };
     let plan = plan_for(&master, OrganisationMode::MoveRealFile, &[cand], 1);
     assert_eq!(plan.entries[0].status, OrganisationStatus::Blocked);
@@ -938,6 +951,8 @@ fn broken_symlink_object_may_be_moved_with_target_text_preserved() {
         source_path: link.clone(),
         resolution: resolved("PSP", PlatformIdentitySource::Romm),
         canonical_name: Some("Game.iso".to_string()),
+        content_classification: None,
+        original_metadata: Default::default(),
     };
     let plan = plan_for(
         &master,
@@ -974,6 +989,8 @@ fn symlink_to_directory_is_unsupported() {
         source_path: link.clone(),
         resolution: resolved("PSP", PlatformIdentitySource::Romm),
         canonical_name: Some("Game.iso".to_string()),
+        content_classification: None,
+        original_metadata: Default::default(),
     };
     let plan = plan_for(&master, OrganisationMode::OrganiseSymlinkOnly, &[cand], 1);
     assert_eq!(
@@ -996,6 +1013,8 @@ fn a_directory_source_is_blocked() {
         source_path: rom_dir.clone(),
         resolution: resolved("PSP", PlatformIdentitySource::Romm),
         canonical_name: Some("GameFolder".to_string()),
+        content_classification: None,
+        original_metadata: Default::default(),
     };
     let plan = plan_for(&master, OrganisationMode::MoveRealFile, &[cand], 1);
     assert_eq!(plan.entries[0].status, OrganisationStatus::Blocked);
@@ -1085,6 +1104,8 @@ fn a_verified_canonical_name_produces_the_canonical_destination_filename() {
         source_path: source_path.clone(),
         resolution: resolved("PSP", PlatformIdentitySource::Romm),
         canonical_name: None,
+        content_classification: None,
+        original_metadata: Default::default(),
     };
     // Ugly source name + authoritative canonical name.
     cand.canonical_name = Some("Game (Europe).iso".to_string());
@@ -1115,6 +1136,8 @@ fn rename_in_place_proposes_a_rename_when_the_canonical_name_differs() {
         source_path: source_path.clone(),
         resolution: resolved("PSP", PlatformIdentitySource::Romm),
         canonical_name: None,
+        content_classification: None,
+        original_metadata: Default::default(),
     };
     cand.canonical_name = Some("Game (Europe).iso".to_string());
     let plan = plan_for(
@@ -1144,6 +1167,8 @@ fn move_mode_uses_the_canonical_filename() {
         source_path: source_path.clone(),
         resolution: resolved("Nintendo DS", PlatformIdentitySource::Romm),
         canonical_name: None,
+        content_classification: None,
+        original_metadata: Default::default(),
     };
     cand.canonical_name = Some("Sonic Rush (Europe).nds".to_string());
     let plan = plan_for(&master, OrganisationMode::MoveRealFile, &[cand], 1);
@@ -1165,6 +1190,8 @@ fn no_canonical_evidence_falls_back_to_the_source_basename() {
         source_path: source_path.clone(),
         resolution: resolved("PSP", PlatformIdentitySource::Romm),
         canonical_name: None,
+        content_classification: None,
+        original_metadata: Default::default(),
     };
     let plan = plan_for(&master, OrganisationMode::MoveRealFile, &[cand], 1);
     assert_eq!(
@@ -1188,6 +1215,8 @@ fn an_unverified_identity_never_supplies_an_authoritative_name() {
         source_path: source_path.clone(),
         resolution: PlatformIdentityResolution::Unknown { generation: 1 },
         canonical_name: Some("Trusted (USA).iso".to_string()),
+        content_classification: None,
+        original_metadata: Default::default(),
     };
     let plan = plan_for(&master, OrganisationMode::MoveRealFile, &[cand], 1);
     assert_eq!(plan.entries[0].status, OrganisationStatus::Blocked);
@@ -1473,6 +1502,8 @@ fn plan_from_live_db(
         source_path: file.to_path_buf(),
         resolution: resolution_from_db(db, file, generation),
         canonical_name: None,
+        content_classification: None,
+        original_metadata: Default::default(),
     };
     plan_for(&master, mode, &[cand], generation)
 }
@@ -1600,6 +1631,8 @@ fn a_changed_canonical_name_is_rejected_when_the_destination_changes() {
         source_path: source_file.clone(),
         resolution: resolution_from_db(&db, &source_file, 1),
         canonical_name: Some("Game (Europe).iso".to_string()),
+        content_classification: None,
+        original_metadata: Default::default(),
     };
     let plan = plan_for(&master, OrganisationMode::MoveRealFile, &[cand], 1);
     assert_eq!(
@@ -1649,4 +1682,76 @@ fn an_unchanged_live_identity_passes_revalidation() {
         &slug_for_platform,
     )
     .expect("an unchanged live identity must pass");
+}
+
+#[test]
+fn games_only_organisation_blocks_unknown_without_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let library = dir.path().join("library");
+    let master = dir.path().join("roms");
+    std::fs::create_dir_all(&library).unwrap();
+    let source = library.join("Game.iso");
+    std::fs::write(&source, b"data").unwrap();
+    let candidate = OrganisationCandidate {
+        source_path: source.clone(),
+        resolution: resolved("PSP", PlatformIdentitySource::Romm),
+        canonical_name: Some("Game (Europe).iso".to_string()),
+        content_classification: Some(DatContentClassification::unknown()),
+        original_metadata: Default::default(),
+    };
+    let plan = build_organisation_plan(&OrganisationPlanRequest {
+        master_root: &master,
+        mode: OrganisationMode::MoveRealFile,
+        content_policy: ContentSelectionPolicy::GamesOnly,
+        candidates: &[candidate],
+        slug_for_platform: &slug_for_platform,
+        generation: 1,
+    });
+    assert_eq!(plan.entries[0].status, OrganisationStatus::Blocked);
+    assert!(
+        plan.entries[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("Unknown")
+    );
+    assert!(source.exists());
+    assert!(!master.exists());
+}
+
+#[test]
+fn games_only_organisation_allows_confirmed_game_classes() {
+    for class in [
+        DatContentClass::Game,
+        DatContentClass::GameCompilation,
+        DatContentClass::RequiredMultidiscPart,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let library = dir.path().join("library");
+        let master = dir.path().join("roms");
+        std::fs::create_dir_all(&library).unwrap();
+        let source = library.join("Game.iso");
+        std::fs::write(&source, b"data").unwrap();
+        let candidate = OrganisationCandidate {
+            source_path: source,
+            resolution: resolved("PSP", PlatformIdentitySource::Romm),
+            canonical_name: Some("Game (Europe).iso".to_string()),
+            content_classification: Some(DatContentClassification {
+                class,
+                confidence: ClassifierConfidence::High,
+                evidence: Vec::new(),
+                classifier_version: CLASSIFIER_VERSION.to_string(),
+            }),
+            original_metadata: Default::default(),
+        };
+        let plan = build_organisation_plan(&OrganisationPlanRequest {
+            master_root: &master,
+            mode: OrganisationMode::MoveRealFile,
+            content_policy: ContentSelectionPolicy::GamesOnly,
+            candidates: &[candidate],
+            slug_for_platform: &slug_for_platform,
+            generation: 1,
+        });
+        assert_eq!(plan.entries[0].status, OrganisationStatus::Suggested);
+    }
 }

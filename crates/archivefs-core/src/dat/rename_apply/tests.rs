@@ -8,6 +8,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::*;
+use crate::dat::classification::{
+    ContentSelectionPolicy, DatContentClassification, DatOriginalMetadata,
+};
 use crate::dat::rename_plan::{
     ProposalState, RenamePlan, RenamePlanCounts, RenameProposal, SourceObjectKind,
 };
@@ -41,6 +44,9 @@ fn proposal(source: &str, current: &str, proposed: &str, state: ProposalState) -
         verdict_label: "Exact".to_string(),
         match_confident: true,
         explanations: Vec::new(),
+        content_policy: ContentSelectionPolicy::AllEntries,
+        content_classification: DatContentClassification::unknown(),
+        original_metadata: DatOriginalMetadata::default(),
         state,
         object_kind: SourceObjectKind::RegularFile,
         ambiguity_reason: None,
@@ -61,6 +67,8 @@ fn plan(proposals: Vec<RenameProposal>, generation: u64, scan_root: &Path) -> Re
         scan_root: scan_root.to_string_lossy().into_owned(),
         platform: None,
         platform_display: None,
+        content_policy: ContentSelectionPolicy::AllEntries,
+        classifier_version: crate::dat::classification::CLASSIFIER_VERSION.to_string(),
         proposals,
         counts,
         audited_total: counts.total,

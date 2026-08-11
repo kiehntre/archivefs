@@ -11,6 +11,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::classification::{DatContentClassification, DatOriginalMetadata};
+
 /// Which ecosystem a DAT file represents.
 ///
 /// Detection is best-effort, from metadata and naming conventions. The `Generic`
@@ -185,6 +187,12 @@ pub struct DatGameEntry {
     pub manufacturer: Option<String>,
     pub source_file: Option<String>,
     pub comment: Option<String>,
+    /// Structured upstream fields retained verbatim for technical review.
+    #[serde(default)]
+    pub original_metadata: DatOriginalMetadata,
+    /// Derived EmuWiz annotation. Never changes upstream identity semantics.
+    #[serde(default)]
+    pub content_classification: DatContentClassification,
 }
 
 impl DatGameEntry {
