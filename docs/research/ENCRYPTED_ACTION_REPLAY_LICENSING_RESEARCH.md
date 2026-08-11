@@ -3,8 +3,9 @@
 Status: research only. No code was changed, no branch/commit/PR was created.
 
 Scope: determine whether EmuWiz (MIT licensed) can legally and safely implement
-support for encrypted GameCube/Wii Action Replay (`XXXX-XXXX-XXXXX` base-31)
-codes while remaining MIT licensed.
+support for encrypted GameCube/Wii Action Replay (`XXXX-XXXX-XXXXX`, a
+base-32-style alphabet with typo-tolerant aliases) codes while remaining MIT
+licensed.
 
 > **Note on the referenced prior report.** The task referenced
 > `docs/research/ENCRYPTED_ACTION_REPLAY_RESEARCH.md` as existing research. That
@@ -137,10 +138,10 @@ AR decrypt was found** `[FACT — verified — absence of evidence]`.
 - **gc-linux.org SDload wiki**: publishes encrypted AR codes used to boot
   homebrew — usable as independent vectors `[FACT — verified]` (referenced in
   the thread).
-- **No independent formal specification of the cipher itself** (the base-31
-  text → binary mapping, the DES-variant scrambling, the seed derivation, or
-  the constants) was found outside source code `[FACT — verified — absence of
-  evidence]`.
+- **No independent formal specification of the cipher itself** (the
+  base-32-style text → binary mapping, the DES-variant scrambling, the seed
+  derivation, or the constants) was found outside source code
+  `[FACT — verified — absence of evidence]`.
 
 ### 4.3 Patents
 
@@ -324,7 +325,7 @@ Subject: GCNcrypt / GameCube Action Replay decrypt — licence & provenance
 >
 > I'm working on an MIT-licensed emulator-adjacent tool (EmuWiz) and I'm
 > researching the licensing of the encrypted GameCube/Wii Action Replay
-> (base-31 `XXXX-XXXX-XXXXX`) decryption scheme. The only implementations I
+> (base-32-style `XXXX-XXXX-XXXXX`) decryption scheme. The only implementations I
 > have found are GPL (Dolphin's `ARDecrypt.cpp`, which credits your GCNcrypt)
 > and your original freeware GCNcrypt, so I'd like to understand the
 > provenance before writing a fresh, MIT-native implementation.
