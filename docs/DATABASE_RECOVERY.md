@@ -40,7 +40,7 @@ extended `SQLITE_READONLY_ROLLBACK` result is reported as
 For a manual process check, use read-only commands such as:
 
 ```sh
-pgrep -a archivefs
+pgrep -af 'emuwiz|archivefs'
 lsof ~/.local/share/archivefs/*
 fuser ~/.local/share/archivefs/*
 ```
