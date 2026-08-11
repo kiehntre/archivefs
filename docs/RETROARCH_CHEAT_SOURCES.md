@@ -37,13 +37,13 @@ source requires review of ownership, licence, endpoint, layout, limits, and
 reproducibility.
 
 ```text
-archivefs retroarch-cheat-source-list [--cache-root <path>] [--json]
-archivefs retroarch-cheat-source-fetch <source-id> [--force-refresh] [--offline]
+emuwiz-cli retroarch-cheat-source-list [--cache-root <path>] [--json]
+emuwiz-cli retroarch-cheat-source-fetch <source-id> [--force-refresh] [--offline]
     [--expected-sha256 <hash>] [--cache-root <path>]
     [--max-download-bytes <bytes>] [--json]
-archivefs retroarch-cheat-source-inspect <source-id|snapshot-path> [--cache-root <path>] [--json]
-archivefs retroarch-cheat-setup --source <source-id> [retrieval/setup options]
-archivefs retroarch-cheat-setup <catalogue-path> [setup options]
+emuwiz-cli retroarch-cheat-source-inspect <source-id|snapshot-path> [--cache-root <path>] [--json]
+emuwiz-cli retroarch-cheat-setup --source <source-id> [retrieval/setup options]
+emuwiz-cli retroarch-cheat-setup <catalogue-path> [setup options]
 ```
 
 `--source` and a local positional catalogue are mutually exclusive. Retrieval
@@ -51,11 +51,11 @@ options are rejected for local paths. JSON never prompts, emits a versioned
 lower-snake-case result on stdout, and keeps prose diagnostics off stdout.
 
 ```text
-archivefs retroarch-cheat-source-list
-archivefs retroarch-cheat-source-fetch libretro-buildbot-cheats --json
-archivefs retroarch-cheat-source-inspect libretro-buildbot-cheats
-archivefs retroarch-cheat-setup --source libretro-buildbot-cheats --dry-run
-archivefs retroarch-cheat-setup --source libretro-buildbot-cheats --offline --yes
+emuwiz-cli retroarch-cheat-source-list
+emuwiz-cli retroarch-cheat-source-fetch libretro-buildbot-cheats --json
+emuwiz-cli retroarch-cheat-source-inspect libretro-buildbot-cheats
+emuwiz-cli retroarch-cheat-setup --source libretro-buildbot-cheats --dry-run
+emuwiz-cli retroarch-cheat-setup --source libretro-buildbot-cheats --offline --yes
 ```
 
 Setup shows source name/ID/URL, exact commit, fetch time, archive SHA-256, validation state,

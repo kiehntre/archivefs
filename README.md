@@ -109,9 +109,10 @@ user-facing version at
   directories, inspect bounded `GameSettings/*.ini` metadata, and retrieve
   exact-ID Gecko definitions from Dolphin's official upstream dataset.
   Verified Dolphin Game IDs and revisions bind the provider lookup and exact
-  destination. PCSX2 does not install content; Dolphin can install selected
-  validated Gecko definitions after preview and confirmation. Neither adapter
-  inspects arbitrary local imports; see
+  destination. PCSX2 can install selected, approved PNACH records after preview
+  and confirmation, but EmuWiz does not bundle an ordinary-cheat catalogue for
+  it. Dolphin can install selected validated Gecko definitions after preview and
+  confirmation. Neither adapter treats arbitrary local imports as trusted; see
   [`docs/CHEATS_MODS_SAFETY.md`](docs/CHEATS_MODS_SAFETY.md),
   [`docs/PCSX2_READONLY_ADAPTER.md`](docs/PCSX2_READONLY_ADAPTER.md),
   [`docs/DOLPHIN_READONLY_ADAPTER.md`](docs/DOLPHIN_READONLY_ADAPTER.md), and
@@ -125,8 +126,8 @@ user-facing version at
   non-preselected approval before replacing different existing content),
   verify the write, and record a journal entry. History & Logs can open that
   exact operation and preview/confirm its rollback. EmuWiz never
-  auto-applies. PCSX2 remains preview-only. Dolphin uses the same transaction
-  engine for selected external Gecko definitions, including rollback; see
+  auto-applies. PCSX2 and Dolphin use the same transaction engine for selected,
+  approved records, including rollback; see
   [`docs/RETROARCH_GUI_APPLY_HISTORY.md`](docs/RETROARCH_GUI_APPLY_HISTORY.md)
   and
   [`docs/SHARED_SAFE_APPLY_ROLLBACK.md`](docs/SHARED_SAFE_APPLY_ROLLBACK.md).
@@ -162,7 +163,9 @@ user-facing version at
 - Offers the optional **BSFree Archive** under Cheats → Sources. Download or
   local import is explicit; the historical third-party SQLite database is
   validated, stored immutably, and queried read-only/query-only with bounded
-  pagination. BSFree Stage 1 is browse-only and has no Install action.
+  pagination. Supported GameCube and verified Wii hex-pair codes can be
+  previewed and installed through the shared Dolphin transaction path after
+  explicit confirmation; unsupported and encrypted formats remain browse-only.
 - Supports an optional **RomM** server as an external identity source
   (`identity source romm ...`, and Sources → RomM in the GUI): configuration,
   bounded catalogue import, browsing, per-archive identity matching, and
@@ -184,8 +187,8 @@ user-facing version at
 
 - No automatic patch or cheat installation. Supported RetroArch, Dolphin,
   PCSX2, GameCube, Wii, and Xenia flows require an exact preview and explicit
-  confirmation, then use the verified transaction/History/Undo path. BSFree is
-  browse-only, and unsupported or ambiguous formats remain non-installable.
+  confirmation, then use the verified transaction/History/Undo path. Unsupported
+  or ambiguous formats, including encrypted BSFree codes, remain non-installable.
 - No broad multi-emulator support yet - PCSX2, RetroArch, Dolphin, and Xenia
   are the only emulators with patch/cheat workflows today, and EmuWiz never
   launches an emulator.
@@ -202,13 +205,13 @@ user-facing version at
 
 ## Install from a Release
 
-Prebuilt Linux binaries are published on the [Releases](https://github.com/kiehntre/archivefs/releases) page for tagged versions, for example `v0.5.0-alpha`. This is the quickest way to get running without building from source.
+Prebuilt Linux binaries are published on the [Releases](https://github.com/kiehntre/emuwiz/releases) page for tagged versions, for example `v0.5.0-alpha`. This is the quickest way to get running without building from source.
 
 1. Download the release tarball and its `SHA256SUMS` file, for example:
 
    ```sh
-   curl -LO https://github.com/kiehntre/archivefs/releases/download/v0.5.0-alpha/archivefs-v0.5.0-alpha-x86_64-linux.tar.gz
-   curl -LO https://github.com/kiehntre/archivefs/releases/download/v0.5.0-alpha/SHA256SUMS
+   curl -LO https://github.com/kiehntre/emuwiz/releases/download/v0.5.0-alpha/archivefs-v0.5.0-alpha-x86_64-linux.tar.gz
+   curl -LO https://github.com/kiehntre/emuwiz/releases/download/v0.5.0-alpha/SHA256SUMS
    ```
 
 2. Verify the tarball against the checksum file before extracting it:
@@ -337,7 +340,7 @@ cargo build --workspace
 The development binary will be at:
 
 ```sh
-target/debug/archivefs-cli
+target/debug/emuwiz-cli
 ```
 
 For regular local use, install it with Cargo:
@@ -364,8 +367,8 @@ EmuWiz also includes a desktop frontend built with `egui`/`eframe`. It scans in 
 Build and run it from the workspace root:
 
 ```sh
-cargo build -p archivefs-gui
-cargo run -p archivefs-gui
+cargo build -p archivefs-gui --bin emuwiz
+cargo run -p archivefs-gui --bin emuwiz
 ```
 
 The GUI uses the same `~/.config/emuwiz/config.toml` configuration and core scanning/catalogue logic as the CLI. Use **Refresh** to rescan after filesystem or mount-state changes.

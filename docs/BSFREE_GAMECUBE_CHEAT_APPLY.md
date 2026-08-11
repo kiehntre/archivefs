@@ -176,6 +176,7 @@ acquisition stays explicit (download or local import).
   but EmuWiz has no verified decryptor and therefore cannot inspect what
   they decode to; they stay browse-only rather than risking unknown content.
 - No Wii/Xbox 360 data exists in BSFree.
-- The GUI Cheats & Mods page does not yet offer a BSFree apply control; install
-  is available through `archivefs cheats source bsfree gamecube-apply` (and the
-  GUI's BSFree browser now states the honest per-code capability).
+- The GUI Cheats & Mods page offers selection and Install for supported codes;
+  it dispatches through the same preview/confirmation/apply backend documented
+  above. The equivalent CLI path is
+  `emuwiz-cli cheats source bsfree gamecube-apply`.

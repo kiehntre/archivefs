@@ -211,7 +211,7 @@ Automation does not replace desktop release QA. Before publishing:
    verifier;
 2. launch the extracted GUI on a supported desktop and complete the approved
    manual GUI checklist at normal desktop size and 1024×600;
-3. run `archivefs-cli doctor` using disposable configuration;
+3. run `emuwiz-cli doctor` using disposable configuration;
 4. exercise installation and rollback only with disposable emulator profiles;
 5. confirm no live ROM, production emulator profile, catalogue cache, database,
    or configuration is included or modified; and

@@ -15,7 +15,7 @@ Core project principles:
 
 ```text
                   +----------------------+
-                  |    archivefs-cli     |
+                  |     emuwiz-cli       |
                   | commands + printing  |
                   +----------+-----------+
                              |

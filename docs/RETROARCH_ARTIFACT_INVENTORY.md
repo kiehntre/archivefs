@@ -1,6 +1,6 @@
 # RetroArch Cheat and Patch Artifact Inventory
 
-`archivefs retroarch-patch-preview` includes a bounded, read-only inventory
+`emuwiz-cli retroarch-patch-preview` includes a bounded, read-only inventory
 of existing RetroArch cheat and soft-patch artifacts. It answers whether a
 previewed destination is empty or occupied and reports other supported files
 found in the same configured locations without installing, enabling, applying,
@@ -11,8 +11,8 @@ pass or a write-capable patch-manager phase. Human output follows the preview;
 JSON is available at `artifact_inventory`:
 
 ```console
-archivefs retroarch-patch-preview
-archivefs retroarch-patch-preview --json
+emuwiz-cli retroarch-patch-preview
+emuwiz-cli retroarch-patch-preview --json
 ```
 
 ## Scope
@@ -152,7 +152,7 @@ Any future mutation workflow remains separately gated by
 
 ## Related: external cheat catalogue matching
 
-`archivefs retroarch-cheat-catalogue` is a separate, independent read-only
+`emuwiz-cli retroarch-cheat-catalogue` is a separate, independent read-only
 command that matches an *external* local cheat catalogue source (not this
 inventory's own already-installed artifacts) against your catalogued games,
 reusing this inventory's destinations to answer whether a matched catalogue

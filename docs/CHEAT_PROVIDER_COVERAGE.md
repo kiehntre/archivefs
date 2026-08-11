@@ -26,15 +26,15 @@ coverage or gameplay claims.
 
 ## Read-only coverage command
 
-`archivefs-cli cheat-provider-coverage` audits at most 32 exact persisted
+`emuwiz-cli cheat-provider-coverage` audits at most 32 exact persisted
 archive IDs per run. It opens the library database read-only, bounded-inspects
 only those selected game files for identity, and reads existing local provider
 data. It does not scan the whole library and never installs, enables, copies,
 renames, or edits anything.
 
 ```sh
-archivefs-cli library-list --json
-archivefs-cli cheat-provider-coverage \
+emuwiz-cli library-list --json
+emuwiz-cli cheat-provider-coverage \
   --id 12 --id 34 \
   --retroarch-catalogue /path/to/existing/cht \
   --json

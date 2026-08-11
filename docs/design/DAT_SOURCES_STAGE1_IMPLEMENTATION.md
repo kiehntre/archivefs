@@ -181,7 +181,7 @@ the previous file exactly as it was — covered by
 
 ### 4.1 Registered-path policy (`dat::sources::validation::validate_dat_path`)
 
-A path typed once on the CLI (`archivefs-cli dat inspect <path>`) is
+A path typed once on the CLI (`emuwiz-cli dat inspect <path>`) is
 deliberately exempt from `safe_read`/`TrustedRoots`, per the existing
 rationale in `dat/parsers/mod.rs`: the person running the command chose it
 directly. A *registered* path is different — it is read again, unattended, on

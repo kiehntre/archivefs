@@ -148,7 +148,7 @@ without creating the managed directory. Category custom filenames
 (`console.png`, `handheld.png`, etc.) remain a supported manual fallback when
 placed in the managed folder and validated by Rescan.
 
-The same operations are available through `archivefs-cli platform-artwork`.
+The same operations are available through `emuwiz-cli platform-artwork`.
 No artwork command uses the network, database, ROM library, or emulator
 profiles. Removing or restoring default artwork removes only EmuWiz's
 normalised managed copy, never the source selected during import.

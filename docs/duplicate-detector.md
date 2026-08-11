@@ -197,7 +197,7 @@ Possible future integrations:
 - Add duplicate summary counts to stats or a dedicated duplicate command.
 - Add a duplicate warning field to an archive report.
 - Show whether an archive belongs to one or more duplicate groups.
-- Expose duplicate candidates in `archivefs info`.
+- Expose duplicate candidates in `emuwiz-cli info`.
 - Add a non-fatal health/status category such as `DuplicateCandidate` only after the semantics are clear.
 
 Any health/status integration should avoid implying that an archive is broken. Duplicate candidates may be valid alternate regions, revisions, or formats.

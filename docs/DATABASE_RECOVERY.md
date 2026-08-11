@@ -15,8 +15,8 @@ automatic.
 Run:
 
 ```sh
-archivefs database-check
-archivefs database-check --json
+emuwiz-cli database-check
+emuwiz-cli database-check --json
 ```
 
 The command opens only an existing regular file with SQLite's explicit

@@ -104,7 +104,7 @@ one place and `Error` in another:
   phrase — rather than a genuine permission or corruption problem, which
   never contains that wording.
 
-Net effect, verified with `archivefs doctor --findings` against a completely
+Net effect, verified with `emuwiz-cli doctor --findings` against a completely
 empty temporary `HOME`: **Critical: 0, Error: 0, Warning: 0** on a fresh
 install (all findings are `Info`). Pointing the same binary at a fixture with
 a syntactically invalid `config.toml` still reports real `Error` findings —
@@ -184,7 +184,7 @@ service, and never touch a real ROM collection. Two layers:
 - **Manual smoke test**: the release CLI binary run with `HOME`,
   `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, and `XDG_CACHE_HOME` all pointed at a
   freshly created `mktemp -d` tree (see the harness in the task brief this
-  branch implements). `archivefs-cli doctor --findings` against that tree
+  branch implements). `emuwiz-cli doctor --findings` against that tree
   reports zero `Error`/`Critical` findings and writes no file outside the
   temporary root; the same binary against a fixture with a malformed
   `config.toml` still reports real errors.

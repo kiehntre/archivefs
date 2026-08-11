@@ -6,7 +6,7 @@ abstraction is reused by the existing cheat/patch artifact inventory; see
 discovery itself remains concerned only with profiles, configured paths, cores,
 playlists, and AppImage evidence.
 
-`archivefs retroarch-environment` is a strictly read-only command that
+`emuwiz-cli retroarch-environment` is a strictly read-only command that
 discovers and reports the local RetroArch environment: which installation
 profiles exist, where their configuration lives, which of a fixed set of
 configured directories resolve and exist, and which cores (and core
@@ -210,7 +210,7 @@ filesystem tree before and after a discovery run.
 ## JSON contract
 
 ```
-archivefs retroarch-environment --json
+emuwiz-cli retroarch-environment --json
 ```
 
 Top level:
@@ -278,8 +278,8 @@ There is no `report_id` or snapshot fingerprint in this milestone.
 ## CLI
 
 ```
-archivefs retroarch-environment
-archivefs retroarch-environment --json
+emuwiz-cli retroarch-environment
+emuwiz-cli retroarch-environment --json
 ```
 
 No other flags exist (`--native`, `--flatpak`, `--config`, `--profile`,
