@@ -212,6 +212,7 @@ config/data compatibility paths, persisted identifiers, ownership markers,
 
 | Item | Current status on `5793d15` | Next action | Risk / type / size |
 |---|---|---|---|
+| Current product/docs truth | **DONE via #37:** current repository URLs, EmuWiz command examples, PCSX2/BSFree current-behavior claims, roadmap/current-main status, current release-engineering guidance and rename-audit repository-state wording were corrected. This does not claim that `SECURITY.md`, `docs/security.md` or historical/current-main `CHANGELOG.md` scope was resolved. | No active cleanup. Preserve historical/versioned evidence and compatibility identifiers. | **DONE**; docs/cleanup |
 | `SECURITY.md:31-58`, `docs/security.md` | Still says PCSX2 metadata is the only network use and mutation is future/read-only. | Rewrite the public boundary around actual opt-in network clients, confirmed mutation, tokens, caches, journals and rollback. | **MEDIUM**; docs/security; small |
 | Games-only B1 classifier version in `dat/classification.rs`, rename plan/apply and organisation transaction | Unchanged: plans record `CLASSIFIER_VERSION`; `RenameTransaction` and apply gates still enforce generation only. | Carry/enforce the reviewed version with conservative old-journal handling and no-mutation mismatch tests. | **HIGH**; implementation/compatibility/safety/tests; small |
 | Installer ownership in `install.sh` and `tests/test_install.sh` | Still unresolved and broader after #33. `remove_owned_path` is named as ownership-aware but checks only object kind/existence; foreign same-name files/symlinks can be overwritten or deleted. | Add manifest/content/symlink ownership proof, refuse or back up foreign targets, and support pre-manifest upgrades/uninstall. | **HIGH**; implementation/compatibility/safety/tests; medium |
@@ -280,8 +281,12 @@ stable so existing dependency references remain traceable.
 
 #### PR 1 — Reconcile current-main product and repository documentation — DONE
 
-Merged as #37. No further action; historical/versioned claims and compatibility
-identifiers remain deliberately preserved.
+Merged as #37. It corrected current repository URLs, EmuWiz command examples,
+PCSX2/BSFree current-behavior claims, roadmap/current-main status, current
+release-engineering guidance and rename-audit repository-state wording. It did
+not resolve the separate `SECURITY.md`/`docs/security.md` item or claim to clean
+up historical/current-main `CHANGELOG.md` scope. Historical/versioned evidence
+and compatibility identifiers remain deliberately preserved.
 
 #### PR 2 — Bring the public security description up to current behavior
 
