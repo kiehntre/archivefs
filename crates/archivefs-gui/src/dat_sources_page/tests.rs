@@ -3988,6 +3988,24 @@ fn begin_review_shows_the_read_only_old_to_new_pairs() {
 }
 
 #[test]
+fn stale_classifier_plan_shows_regenerate_message_and_does_not_rename() {
+    let (_fixture, roms, mut page) = page_with_apply_plan(1);
+    page.rename_plan.as_mut().unwrap().classifier_version = "superseded-classifier".to_string();
+    approve_all(&mut page);
+
+    page.apply(DatSourcesPageAction::BeginApplyReview);
+
+    assert_eq!(
+        page.view().rename_apply.apply_error.as_deref(),
+        Some(
+            "Rename plan is stale because classification rules changed. Regenerate the plan before applying."
+        )
+    );
+    assert!(roms.join("game0.bin").exists());
+    assert!(!roms.join("Game 0 (Europe).bin").exists());
+}
+
+#[test]
 fn a_large_batch_requires_the_typed_confirmation() {
     let (_fixture, roms, mut page) = page_with_apply_plan(9);
     approve_all(&mut page);
@@ -4084,6 +4102,9 @@ fn an_interrupted_transaction_is_offered_for_recovery_and_never_auto_resumes() {
     let tx = archivefs_core::dat::rename_apply::RenameTransaction {
         transaction_id: "interrupted-test".to_string(),
         plan_generation: 1,
+        classifier_version: Some(
+            archivefs_core::dat::classification::CLASSIFIER_VERSION.to_string(),
+        ),
         created_at_unix: 1,
         source_scan_root: "/tmp/roms".to_string(),
         state: archivefs_core::dat::rename_apply::TransactionState::Applying,
