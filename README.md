@@ -237,6 +237,8 @@ From inside the extracted directory, run the installer:
 
 This installs `emuwiz-cli` and `emuwiz` into `~/.local/bin` (override the location with `--prefix PATH`), creates `~/.config/emuwiz`, and copies `config.toml.example` to `config.toml` there - but only if a config does not already exist; an existing config is never touched. An existing `~/.config/archivefs` from before the rename is still honoured, so pre-rename settings keep loading. The `emuwiz-gui` alias and legacy `archivefs-cli`/`archivefs-gui` names are installed too. It uses no `sudo` and does not modify your shell startup files. It also checks whether `ratarmount` is on `PATH` and prints installation guidance if it is not. It is safe to run again later (for example after upgrading to a newer release tarball).
 
+The installer records what it installed in a small ownership file under `$XDG_DATA_HOME/emuwiz-installer/` and only ever replaces or removes files it can prove it owns. If a binary, alias, desktop entry, or icon it would install already exists at that path but doesn't look like EmuWiz's own (a different program, a hand-edited file, an unrelated symlink), it leaves that path untouched, prints a warning, and exits non-zero instead of overwriting it. Re-run with `--replace-foreign` to move the conflicting file aside (as a `.foreign-backup.<pid>` copy next to it) and install over it. The very first run against an install made before this ownership tracking existed will treat its own previously-installed binaries the same way - a one-time `--replace-foreign` re-run picks up where it left off.
+
 Edit `source_folders` and `mount_root` in `~/.config/emuwiz/config.toml`, then run `emuwiz-cli doctor` (see the PATH note below if that command is not found).
 
 To remove what it installed (your config is left in place):
@@ -245,7 +247,7 @@ To remove what it installed (your config is left in place):
 ./install.sh --uninstall
 ```
 
-Pass the same `--prefix PATH` to `--uninstall` if you installed to a non-default location. Run `./install.sh --help` for the full list of options.
+Uninstall only removes assets it can prove it owns; anything it can't (for the same reasons as above) is left in place with a warning, and uninstall keeps going rather than aborting. Pass the same `--prefix PATH` to `--uninstall` if you installed to a non-default location. Run `./install.sh --help` for the full list of options.
 
 **PATH note:** the installer never edits shell startup files, so if `~/.local/bin` is not already on your `PATH`, add it yourself - for example add this line to `~/.bashrc` or `~/.zshrc`, then restart your shell (or `source` that file):
 
