@@ -171,6 +171,19 @@ desktop_rel = pathlib.Path("assets/linux/io.github.kiehntre.emuwiz.desktop.in")
 if (payload / desktop_rel).read_bytes() != (repo / desktop_rel).read_bytes():
     raise SystemExit("release desktop entry differs from the canonical template")
 
+# install.sh is packaged as a verbatim `install -m 0755` copy of the
+# repository's own script (see scripts/build-release.sh), never templated
+# or generated - so, exactly like the desktop entry above, the shipped
+# copy must be byte-identical to the canonical source. install.sh is the
+# one part of this archive that runs arbitrary logic with the invoking
+# user's own privileges (no sudo, but full access to their files) before
+# any other verification in this script has a chance to run, so this
+# check exists specifically to catch a mismatched, tampered, or
+# accidentally-stale installer shipped in an otherwise-valid archive.
+installer_rel = pathlib.Path("install.sh")
+if (payload / installer_rel).read_bytes() != (repo / installer_rel).read_bytes():
+    raise SystemExit("release install.sh differs from the canonical script in the repository")
+
 for size in (32, 64, 128, 256, 512):
     relative = pathlib.Path(f"assets/branding/emuwiz-logo-{size}.png")
     data = (payload / relative).read_bytes()

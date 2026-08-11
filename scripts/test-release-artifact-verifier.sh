@@ -58,7 +58,7 @@ def base_members():
     values = {
         "emuwiz-cli": (0o755, cli),
         "emuwiz": (0o755, gui),
-        "install.sh": (0o755, b"#!/bin/sh\nexit 0\n"),
+        "install.sh": (0o755, (repo_root / "install.sh").read_bytes()),
         "README.md": (0o644, b"EmuWiz release fixture\n"),
         "CHANGELOG.md": (0o644, b"Release fixture\n"),
         "LICENSE": (0o644, b"MIT fixture\n"),
@@ -217,6 +217,15 @@ def malformed_desktop(members):
             return
     raise RuntimeError("desktop member missing")
 
+def tampered_installer(members):
+    for position, (member, data) in enumerate(members):
+        if member.name.endswith("/install.sh"):
+            replacement = data + b"\n# a single appended byte is enough to fail byte-identity\n"
+            member.size = len(replacement)
+            members[position] = (member, replacement)
+            return
+    raise RuntimeError("install.sh member missing")
+
 write_case("unexpected", unexpected)
 write_case("traversal", traversal)
 write_case("bad-mode", bad_mode)
@@ -225,14 +234,25 @@ write_case("missing-icon", missing_icon)
 write_case("substituted-icon", substituted_icon)
 write_case("malformed-png", malformed_png)
 write_case("malformed-desktop", malformed_desktop)
+write_case("tampered-installer", tampered_installer)
 write_case("duplicate-member", duplicate_member)
 PY
 
-for label in unexpected traversal bad-mode privacy-leak missing-icon substituted-icon malformed-png malformed-desktop duplicate-member; do
+for label in unexpected traversal bad-mode privacy-leak missing-icon substituted-icon malformed-png malformed-desktop tampered-installer duplicate-member; do
     archive="$TEMP_ROOT/$label/$ARCHIVE_NAME"
     write_checksum "$archive"
     expect_failure "$label" "$archive"
 done
 [[ ! -e "$TEMP_ROOT/escape" ]] || release_die "path traversal fixture escaped extraction"
+
+# tampered-installer specifically must fail for install.sh byte-identity -
+# every other fixture above tampers with something that fails earlier
+# structural checks first, so a generic "the verifier rejected it" alone
+# wouldn't distinguish this from a fixture that happened to be caught for
+# an unrelated reason.
+grep -q 'release install.sh differs from the canonical script in the repository' \
+    "$TEMP_ROOT/tampered-installer.out" ||
+    release_die "tampered-installer fixture was rejected for the wrong reason (expected the install.sh byte-identity check to fire): $(cat "$TEMP_ROOT/tampered-installer.out")"
+release_note "tampered-installer fixture rejected specifically for install.sh byte-identity"
 
 release_note "artifact verifier negative tests passed"
