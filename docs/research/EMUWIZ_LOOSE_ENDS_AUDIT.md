@@ -3,10 +3,9 @@
 Audit date: 2026-08-11. Original code baseline: `origin/main` at
 `f7c450cad3b89207251dd3b2b4747af1f1e01d42` (merge of PR #29), refreshed
 against `7c8d6ea1891d4bd32bcdb0716ff7d998ec08ed83` (merge of PR #33), and
-refreshed again against `5c41d99f3af85569ef0393edfd33ecde5b4eb582` (merge
-of PR #36, landed immediately after PR #34). This remains a read-only
-audit; the only workspace changes across every pass are edits to this
-report.
+refreshed again against `5793d15a413a24751463186fac1ca5a8db4c6554` (merge
+of PR #37, after PRs #34 and #36). This remains a read-only audit; the only
+workspace changes across every pass are edits to this report.
 
 **Only the "Cleanup execution plan — current" section at the end of this
 report is current guidance.** The sections above it are the original
@@ -14,8 +13,9 @@ report is current guidance.** The sections above it are the original
 why, but they were superseded rather than re-verified by the later passes.
 Several of their specific claims no longer hold — PR #33 described as
 unmerged, no archive-aware research preserved anywhere, and a ranked
-P0/P1/P2 board, top-5 actions and blockers list that predate #33/#34/#36 —
-so read everything before the final section as history, not as a task
+P0/P1/P2 board, top-5 actions and blockers list that predate #33/#34/#36,
+plus product/repository documentation claims resolved by #37 — so read
+everything before the final section as history, not as a task
 list. A full pre-#33 planning snapshot and its own PR-state table
 previously sat between the executive summary and the final section; it
 added nothing not already carried, more accurately, by the current section
@@ -125,20 +125,20 @@ symlinks/public files are refused, values are redacted, redirects are refused,
 and tests exercise header-only use. No token-handling follow-up is recommended
 without new evidence.
 
-## Cleanup execution plan — current (refreshed after #33, #34, #36)
+## Cleanup execution plan — current (refreshed through #37)
 
-Baseline: `origin/main` at `5c41d99f3af85569ef0393edfd33ecde5b4eb582` (merge
-of PR #36, landed immediately after PR #34's merge). This supersedes both
-the original 2026-08-11 findings above and the first refresh (against
-`7c8d6ea1891d4bd32bcdb0716ff7d998ec08ed83`, merge of PR #33) — this is the
-only section that reflects current `main`, and the only one that should be
-treated as a task list.
+Baseline: `origin/main` at `5793d15a413a24751463186fac1ca5a8db4c6554`
+(merge of PR #37, after PRs #34 and #36). This supersedes the original
+2026-08-11 findings above and every earlier refresh. This is the only section
+that reflects current `main`, and the only one that should be treated as a task
+list.
 
-Live open PRs relevant to this audit are #30 (encrypted Action Replay
-licensing research, still an open draft) and #32 (ImgBot, open,
-non-draft). #27 (compatibility-rename research) has been **closed** as
-superseded. #34 (archive-aware DAT verification research) and #36 (its CHD
-companion) are **merged**. No other open research PR relevant to this
+Live open PRs relevant to this audit are #35 (this draft audit), #30
+(encrypted Action Replay licensing research, still an open draft) and #32
+(ImgBot, open, non-draft). #27 (compatibility-rename research) is **closed** as
+superseded. #33 (desktop/icon/install/release), #34 (archive-aware DAT
+verification research), #36 (CHD companion research) and #37 (current EmuWiz
+documentation truth) are **merged**. No other open research PR relevant to this
 audit's scope was found.
 
 ### What PR #33 resolved
@@ -174,8 +174,7 @@ therefore remains active and now covers the landed desktop assets too.
 
 ### What PR #34 and #36 resolved
 
-The following are **DONE** on current `main` as of
-`5c41d99f3af85569ef0393edfd33ecde5b4eb582`:
+The following are **DONE** on current `main`:
 
 - `docs/research/ARCHIVE_AWARE_DAT_VERIFICATION_RESEARCH.md` (#34, merged at
   `91109cb5e46c27bc97f7d6a9439025647a74e129`) is a reviewed, citation-backed
@@ -198,25 +197,32 @@ The following are **DONE** on current `main` as of
   hashing, NES normalization, and the CHD adapter are all still **not
   started** on `main`. See PR 8/PR 9 in the active queue below.
 
+### What PR #37 resolved
+
+The current product/repository documentation cleanup is **DONE** on current
+`main`. PR #37 corrected living repository and release links, EmuWiz command
+examples, README behavior claims, roadmap state, adapter/BSFree guidance and the
+rename audit. It deliberately preserved Cargo/package names, executable aliases,
+config/data compatibility paths, persisted identifiers, ownership markers,
+`archivefs-v*` artifacts and historical/versioned evidence.
+
 ### Refreshed ranked cleanup board
 
 #### P0 — before the next major feature
 
-| Item | Current status on `5c41d99` | Next action | Risk / type / size |
+| Item | Current status on `5793d15` | Next action | Risk / type / size |
 |---|---|---|---|
-| Current product/docs truth: `README.md:73,112-128,162-188,205-211`, `CHANGELOG.md:98-99`, `ROADMAP.md:197,224-225,268-274`, `docs/ADAPTER_SUPPORT_MATRIX.md`, `docs/BSFREE_GAMECUBE_CHEAT_APPLY.md`, `docs/reviews/EMUWIZ_RENAME_AUDIT.md:31`, `docs/RELEASE_ENGINEERING.md:214` | Still stale. Old repo URLs, PCSX2/BSFree behavior claims, roadmap state and `archivefs-cli doctor` living guidance remain unless a separate current-docs PR addresses them. | One current-main documentation reconciliation PR. Preserve historical release notes and compatibility examples. | **LOW**; docs/cleanup; small |
 | `SECURITY.md:31-58`, `docs/security.md` | Still says PCSX2 metadata is the only network use and mutation is future/read-only. | Rewrite the public boundary around actual opt-in network clients, confirmed mutation, tokens, caches, journals and rollback. | **MEDIUM**; docs/security; small |
 | Games-only B1 classifier version in `dat/classification.rs`, rename plan/apply and organisation transaction | Unchanged: plans record `CLASSIFIER_VERSION`; `RenameTransaction` and apply gates still enforce generation only. | Carry/enforce the reviewed version with conservative old-journal handling and no-mutation mismatch tests. | **HIGH**; implementation/compatibility/safety/tests; small |
 | Installer ownership in `install.sh` and `tests/test_install.sh` | Still unresolved and broader after #33. `remove_owned_path` is named as ownership-aware but checks only object kind/existence; foreign same-name files/symlinks can be overwritten or deleted. | Add manifest/content/symlink ownership proof, refuse or back up foreign targets, and support pre-manifest upgrades/uninstall. | **HIGH**; implementation/compatibility/safety/tests; medium |
-| Open-PR/research close-out (#30/#32) | #27 closed, #34/#36 merged — no action needed on any of those. #30 and #32 remain open. | Preserve-or-close #30 with YELLOW intact; close #32 unless separately justified. | **LOW**; review/cleanup |
+| Open-PR/research close-out (#30/#32/#35) | #27 closed and #33/#34/#36/#37 merged. #30, #32 and this audit PR #35 remain open. | Preserve-or-close #30 with YELLOW intact; close #32 unless separately justified; review #35 against this baseline. | **LOW**; review/cleanup |
 
 #### P1 — soon
 
-| Item | Current status on `5c41d99` | Next action | Risk / type / size |
+| Item | Current status on `5793d15` | Next action | Risk / type / size |
 |---|---|---|---|
 | ZIP-member DAT verification | Audit still hashes outer files; #34's research is merged but unimplemented. | Implement bounded ZIP Stored/Deflate member evidence per #34's P0 plan. | **HIGH**; implementation/safety/tests; medium |
 | NES normalization | No raw-first iNES/headerless normalization exists. | Separate PR after the evidence model is stable; never rewrite source bytes. | **HIGH**; implementation/compatibility/tests; medium |
-| CHD verification | No CHD reader/adapter exists; #36's research is merged but unimplemented. | Implement per #36's P0 plan (header identity + streaming integrity, no extraction), as a container adapter inside #34's pipeline, not a parallel engine. | **HIGH**; implementation/safety/tests; medium |
 | Wrong-platform-folder DAT diagnostic | Adjacent platform conflicts exist, but no general exact-DAT-versus-folder finding. | Add a read-only, provenance-rich diagnostic; never auto-move. | **MEDIUM**; implementation/tests; medium |
 | Games-only B2 TOSEC/multidisc | Individual strict tokens are retained, but grouping/completeness/atomicity remain absent. | Research/design PR after B1; implementation remains deferred. | **HIGH**; research first; small research / large implementation |
 | Filesystem mutation and compatibility integration tests | PR #33 improved installer/desktop fixtures, not DAT cross-device, interruption, old-journal or mixed-state coverage. | Add bounded Linux integration tests after B1 and installer contracts settle. | **HIGH**; tests/compatibility/safety; medium |
@@ -232,6 +238,9 @@ The following are **DONE** on current `main` as of
   snapshot contains no Wii rows.
 - B2 multidisc implementation remains deferred until a grouping/completeness
   design is accepted.
+- CHD implementation remains deferred as a separate feature workstream. PR #36
+  preserves the research; it does not create an active cleanup dependency or
+  authorize implementation.
 - 7z/RAR member verification, new cheat/mod adapters, browse-only-format write
   support, egui modernization, GUI information-architecture redesign and
   catalogue performance work remain separate evidence-led workstreams.
@@ -243,6 +252,7 @@ The following are **DONE** on current `main` as of
 - PR #34's archive-aware DAT verification research and PR #36's CHD
   companion research are landed (see "What PR #34 and #36 resolved" above);
   implementation itself remains open work (P1 table above, PR 8/PR 9 below).
+- PR #37's current EmuWiz product/repository documentation cleanup is landed.
 - PR #27 is closed as superseded.
 - Approved EmuWiz branding and Games-only P0 remain landed.
 - `archivefs-v*` release artifact naming is an intentional enforced
@@ -254,37 +264,24 @@ The following are **DONE** on current `main` as of
   stale/historical comments, not open defects. "Later" in installer prompts,
   rollback guidance, retry copy and cache docs is ordinary user wording, not a
   deferred engineering item.
-- No genuinely stale live GUI/CLI `ArchiveFS` product label was found. Current
-  repository URLs and one living release command are docs drift; other hits are
-  compatibility/history/ownership/package identifiers.
+- Current repository URLs and living commands now use EmuWiz. Remaining
+  ArchiveFS names are compatibility/history/ownership/package identifiers and
+  must not be mass-renamed.
 - RomM token handling and the completed DAT rename/organisation engines have no
   new #33/#34/#36-related loose end.
 
 ### Revised active cleanup queue
 
-There are **11 active reviewable PR-sized jobs, plus 1 done** (PR 5, below —
-superseded by #34/#36's merge), down from 13 originally. The old release
-artifact naming ADR (previous PR 12) is obsolete because #33 deliberately
-codified and tests `archivefs-v*`. The old combined "installer ownership +
-desktop integration" proposal is obsolete in that form: desktop integration is
-done, while the narrower ownership-safety job remains. PR numbering is kept
-stable rather than renumbered after removing completed items, so the
-dependency references in PR 8/PR 9 below stay correct.
+There are **10 active reviewable PR-sized jobs, plus 2 done** (PRs 1 and 5
+below), down from 13 originally. The old release artifact naming ADR is obsolete
+because #33 deliberately codified and tests `archivefs-v*`. Desktop integration
+is done, while the narrower ownership-safety job remains. PR numbering stays
+stable so existing dependency references remain traceable.
 
-#### PR 1 — Reconcile current-main product and repository documentation
+#### PR 1 — Reconcile current-main product and repository documentation — DONE
 
-- **Scope/files:** correct living behavior and URLs in `README.md`,
-  `CHANGELOG.md`, `ROADMAP.md`, `docs/ADAPTER_SUPPORT_MATRIX.md`,
-  `docs/BSFREE_GAMECUBE_CHEAT_APPLY.md`,
-  `docs/reviews/EMUWIZ_RENAME_AUDIT.md`, and the living CLI command in
-  `docs/RELEASE_ENGINEERING.md`.
-- **Dependencies/risk:** none; **LOW**, docs/cleanup, small.
-- **Out of scope:** security policy, historical release notes,
-  `archivefs-v*`, aliases, crate/package names and behavior changes.
-- **Tests/review:** link check, documentation-claim tests where appropriate,
-  code-evidence review.
-- **Agent:** **DeepSeek** with maintainer verification.
-- **Why first:** every later agent needs truthful current-main guidance.
+Merged as #37. No further action; historical/versioned claims and compatibility
+identifiers remain deliberately preserved.
 
 #### PR 2 — Bring the public security description up to current behavior
 
@@ -444,8 +441,8 @@ Do not perform any item without a fresh clean/merged/open-PR check.
   need no further preservation action.
 - The former PR #33 branch `feature/emuwiz-linux-desktop-icon` is merged and
   no longer owns the primary worktree; it, along with the merged #34/#36
-  research branches, are normal branch-deletion candidates after confirming
-  no follow-up commit exists.
+  research branches and #37's `cleanup/docs-emuwiz-truth`, is a normal
+  branch-deletion candidate after confirming no follow-up commit exists.
 - Mark dated reviews superseded rather than deleting historical evidence.
 - Prior passes of this audit also recorded specific worktree/build-output
   and remote-branch cleanup candidates (missing worktree registrations,
@@ -453,7 +450,7 @@ Do not perform any item without a fresh clean/merged/open-PR check.
   That host-state inventory was not re-verified for this pass; re-run a
   fresh `git branch -r --merged origin/main` / worktree listing before
   acting on it rather than trusting the earlier numbers, and protect every
-  currently open PR head (#30, #32) regardless of what any earlier count
+  currently open PR head (#30, #32, #35) regardless of what any earlier count
   said.
 
 ### Do not touch — refreshed compatibility surfaces
@@ -479,8 +476,8 @@ Do not perform any item without a fresh clean/merged/open-PR check.
 
 ### Final refreshed recommendations
 
-- **Recommended next cleanup PR:** PR 1, current-main product/repository docs and
-  URL truth.
+- **Recommended next cleanup PR:** PR 2, public security documentation aligned
+  with current network, mutation, journal and rollback behavior.
 - **Recommended next reliability/feature PR:** PR 8, bounded ZIP-member DAT
   verification — #34's research is merged, so this can proceed directly with
   no remaining research-preservation blocker.
@@ -489,28 +486,30 @@ Do not perform any item without a fresh clean/merged/open-PR check.
   normalization (PR 9) now that #34/#36 are merged; (3) encrypted AR
   provenance/licensing review (#30). B2 design should also receive Claude
   review before implementation.
-- **Top 3 jobs for DeepSeek:** (1) PR 1 docs/URL reconciliation; (2) prepare the
-  narrow Wayland/beginner manual QA matrix for PR 12; (3) none outstanding on
-  #27 — it is already closed.
+- **Top 3 jobs for DeepSeek:** (1) prepare the narrow Wayland/beginner manual QA
+  matrix for PR 12; (2) inventory #32's asset changes against approved bytes for
+  a maintainer close decision; (3) inventory merged branch/worktree cleanup
+  candidates without deleting them.
 - **Best next job for Codex:** PR 3, B1 classifier-version enforcement, followed
   by PR 11's compatibility/mutation regression suite after the schema settles.
 - **Previously proposed PRs now obsolete:** the release-artifact naming ADR
   (old PR 12) and any standalone desktop/icon/app-ID/release-payload
   implementation are obsolete because of #33. The research-review PR (PR 5)
-  is obsolete because of #34/#36's merge. The old combined
+  is obsolete because of #34/#36's merge, and the current-product-docs PR (PR 1)
+  is complete via #37. The old combined
   installer+desktop proposal is obsolete as a combined scope; only the
   ownership-safety half remains. The old GUI QA scope's app-ID/icon/X11
   asset checks are done and should not be repeated.
 
-### New top 5 actions
+### Current top 5 actions
 
-1. Correct current-main product/docs/repository URL drift.
-2. Correct the public security boundary documentation.
-3. Enforce B1 classifier versions across rename and organisation transactions.
-4. Make landed binary/alias/desktop/icon install and uninstall ownership-safe.
-5. Triage remaining research/asset PRs: #34/#36 already merged and #27
-   already closed need no action; preserve-or-close #30 with YELLOW intact;
-   close #32 unless explicitly justified.
+1. Correct the public security boundary documentation.
+2. Enforce B1 classifier versions across rename and organisation transactions.
+3. Make landed binary/alias/desktop/icon install and uninstall ownership-safe.
+4. Preserve-or-close #30 with YELLOW intact and close #32 unless separately
+   justified.
+5. Add the read-only wrong-platform-folder diagnostic, then implement bounded
+   ZIP-member evidence against merged #34 research.
 
 ### Current blockers
 
@@ -519,9 +518,8 @@ Do not perform any item without a fresh clean/merged/open-PR check.
 - PCSX2 ordinary downloadable cheats: licensed, immutable provider evidence.
 - BSFree Wii real coverage: no Wii rows in the current admissible snapshot.
 - B2 implementation: no accepted set identity/completeness/atomicity contract.
-- Archive-aware/CHD implementation is **not** blocked on research anymore —
-  #34 and #36 are merged. The remaining blocker is simply that
-  implementation (bounded ZIP-member hashing, NES normalization, the CHD
-  adapter) has not been written yet; see PR 8/PR 9 above.
+- Archive-aware and CHD research preservation is **not** a blocker anymore:
+  #34 and #36 are merged. ZIP/NES implementation remains PR 8/PR 9 work; CHD
+  implementation is a separate deferred feature workstream.
 - Some live filesystem/Wayland QA requires suitable environments and legally
   redistributable fixtures.
