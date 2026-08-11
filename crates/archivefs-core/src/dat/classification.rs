@@ -234,10 +234,22 @@ fn classify_entry(
     source_name: Option<&str>,
     game: &DatGameEntry,
 ) -> DatContentClassification {
-    // An explicit recognized field wins regardless of container ecosystem.
-    // Generic formats gain no meaning merely from being Logiqx/ClrMamePro,
-    // but a field that the actual import carries is evidence in its own right.
-    if let Some(classification) = classify_structured(&game.original_metadata) {
+    // A structured field's meaning is not universal: the same attribute name
+    // (`category`, `type`, `content_type`) is used by different real-world DAT
+    // generators/curation tools for genuinely different things - No-Intro's
+    // own exports carry these with an established, EmuWiz-recognized meaning,
+    // but the identical field names are also widely reused elsewhere for
+    // genre tagging, release-type tagging, or device/driver metadata that has
+    // nothing to do with game-vs-non-game content. Trusting the field
+    // uniformly - "if the import carries it, it's evidence" - lets that
+    // unrelated meaning leak into a confident Game/NonGame verdict. Only the
+    // ecosystem(s) whose structured-field semantics are actually established
+    // may use this path; every other ecosystem falls through to whatever
+    // ecosystem-specific evidence follows (TOSEC's source-category naming
+    // convention) or, absent that, stays Unknown.
+    if ecosystem == DatEcosystem::NoIntro
+        && let Some(classification) = classify_structured(&game.original_metadata)
+    {
         return classification;
     }
 
@@ -284,6 +296,14 @@ fn classify_entry(
     DatContentClassification::unknown()
 }
 
+/// Reads `category`/`type`/`content_type` as game/non-game evidence.
+///
+/// Callers must gate this on ecosystem themselves: these field *names* are
+/// reused across the DAT ecosystem for unrelated purposes (genre tagging,
+/// release-type tagging, device/driver metadata), so this function has no
+/// way to tell a trustworthy value from a coincidentally-matching one. Only
+/// call it where the field's meaning for that specific ecosystem is actually
+/// established - currently that is No-Intro only. See `classify_entry`.
 fn classify_structured(metadata: &DatOriginalMetadata) -> Option<DatContentClassification> {
     for key in ["category", "type", "content_type"] {
         let Some(raw) = metadata.fields.get(key) else {
@@ -573,8 +593,14 @@ mod tests {
         }
     }
 
+    /// `category`/`type`/`content_type` are the exact same field *names*
+    /// No-Intro uses with an established meaning - but generic Logiqx/
+    /// ClrMamePro has no such established convention (the same names are
+    /// widely reused elsewhere for genre or release-type tagging), so this
+    /// ecosystem must never treat them as game/non-game evidence, however
+    /// the value happens to read. See `classify_structured`'s doc comment.
     #[test]
-    fn generic_logiqx_uses_an_explicit_recognized_category_but_never_the_title() {
+    fn generic_logiqx_never_trusts_a_structured_category_field_even_when_present() {
         let mut parsed = dat(
             DatEcosystem::GenericLogiqx,
             "Unbranded catalogue",
@@ -587,13 +613,110 @@ mod tests {
         classify_catalogue(&mut parsed);
         assert_eq!(
             parsed.games[0].content_classification.class,
-            DatContentClass::Game
+            DatContentClass::Unknown,
+            "an unscoped ecosystem must never promote on a structured field's say-so"
+        );
+        // The raw value stays available for technical review even though it
+        // was not trusted for classification.
+        assert_eq!(
+            parsed.games[0].original_metadata.fields["category"],
+            "Games"
+        );
+    }
+
+    /// Adversarial case 1: a genre-style `category` value ("Utilities") on a
+    /// generic Logiqx entry must not be read as a non-game verdict - EmuWiz
+    /// has no established meaning for this field in this ecosystem, so a
+    /// genuinely non-game-*shaped* value must land exactly where an
+    /// unrecognized value does: Unknown, never a confident `NonGame`.
+    #[test]
+    fn generic_logiqx_category_utilities_does_not_become_non_game() {
+        let mut parsed = dat(
+            DatEcosystem::GenericLogiqx,
+            "Unbranded catalogue",
+            &["Some Entry"],
+        );
+        parsed.games[0]
+            .original_metadata
+            .fields
+            .insert("category".into(), "Utilities".into());
+        classify_catalogue(&mut parsed);
+        assert_eq!(
+            parsed.games[0].content_classification.class,
+            DatContentClass::Unknown,
+            "a genre-shaped category value must not falsely classify NonGame"
         );
         assert_eq!(
-            parsed.games[0].content_classification.evidence[0]
-                .original_value
-                .as_deref(),
-            Some("Games")
+            ContentSelectionPolicy::GamesOnly.eligibility(&parsed.games[0].content_classification),
+            ContentEligibility::NeedsReview,
+            "Games only must send this to review, never silently exclude it"
+        );
+    }
+
+    /// Adversarial case 2: a `type` value that reads exactly like the safe
+    /// keyword ("Games") on a generic Logiqx entry must not be read as a
+    /// game verdict either - the same field name has no established meaning
+    /// in this ecosystem, so this must land at Unknown just like any other
+    /// unrecognized value, never a confident `Game`.
+    #[test]
+    fn generic_logiqx_type_games_does_not_become_game() {
+        let mut parsed = dat(
+            DatEcosystem::GenericLogiqx,
+            "Unbranded catalogue",
+            &["Some Entry"],
+        );
+        parsed.games[0]
+            .original_metadata
+            .fields
+            .insert("type".into(), "Games".into());
+        classify_catalogue(&mut parsed);
+        assert_eq!(
+            parsed.games[0].content_classification.class,
+            DatContentClass::Unknown,
+            "a type value that merely reads \"Games\" must not falsely classify Game"
+        );
+        assert_eq!(
+            ContentSelectionPolicy::GamesOnly.eligibility(&parsed.games[0].content_classification),
+            ContentEligibility::NeedsReview
+        );
+    }
+
+    /// Adversarial case 3: conflicting structured fields on the same entry
+    /// (`category` reads as a game keyword, `type` reads as a non-game
+    /// keyword) must resolve deterministically. For an ecosystem with no
+    /// established field semantics the deterministic, documented answer is
+    /// the same as for any other unrecognized/untrusted input: Unknown -
+    /// EmuWiz never has to arbitrate between two untrusted, disagreeing
+    /// signals because neither one is trusted evidence to begin with.
+    #[test]
+    fn generic_logiqx_conflicting_structured_fields_deterministically_stay_unknown() {
+        let mut parsed = dat(
+            DatEcosystem::GenericLogiqx,
+            "Unbranded catalogue",
+            &["Some Entry"],
+        );
+        parsed.games[0]
+            .original_metadata
+            .fields
+            .insert("category".into(), "Games".into());
+        parsed.games[0]
+            .original_metadata
+            .fields
+            .insert("type".into(), "Application".into());
+        classify_catalogue(&mut parsed);
+        assert_eq!(
+            parsed.games[0].content_classification.class,
+            DatContentClass::Unknown,
+            "disagreeing untrusted fields must not be arbitrated into a confident verdict"
+        );
+        // Both raw values stay available for technical review, unresolved.
+        assert_eq!(
+            parsed.games[0].original_metadata.fields["category"],
+            "Games"
+        );
+        assert_eq!(
+            parsed.games[0].original_metadata.fields["type"],
+            "Application"
         );
     }
 
