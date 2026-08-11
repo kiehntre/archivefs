@@ -46,6 +46,8 @@ pub fn build_organisation_transaction(
     approved_sources: &BTreeSet<String>,
     generation: u64,
 ) -> Result<RenameTransaction, String> {
+    crate::dat::rename_apply::executor::validate_classifier_version(Some(&plan.classifier_version))
+        .map_err(|error| error.to_string())?;
     if generation != plan.generation {
         return Err(format!(
             "the organisation plan is stale (generation {}; current {generation}); regenerate it",
@@ -104,6 +106,7 @@ pub fn build_organisation_transaction(
             crate::dat::sources::now_unix(),
         ),
         plan_generation: plan.generation,
+        classifier_version: Some(plan.classifier_version.clone()),
         created_at_unix: crate::dat::sources::now_unix(),
         source_scan_root: plan.master_root.to_string_lossy().into_owned(),
         state: TransactionState::Planned,
@@ -246,6 +249,9 @@ pub fn apply_organisation_transaction(
     mode: OrganisationMode,
     master_root: &Path,
 ) -> Result<ApplyOutcome, ApplyError> {
+    crate::dat::rename_apply::executor::validate_classifier_version(
+        transaction.classifier_version.as_deref(),
+    )?;
     if cancel.load(std::sync::atomic::Ordering::Relaxed) {
         return Err(ApplyError::Cancelled);
     }

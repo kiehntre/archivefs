@@ -295,6 +295,7 @@ mod tests {
         RenameTransaction {
             transaction_id: "1-0".to_string(),
             plan_generation: 3,
+            classifier_version: Some(crate::dat::classification::CLASSIFIER_VERSION.to_string()),
             created_at_unix: 10,
             source_scan_root: "/tmp/roms".to_string(),
             state,
@@ -356,12 +357,13 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_field_defaults_to_planned() {
+    fn an_older_journal_without_classifier_version_decodes_as_unsupported() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("x.json");
         std::fs::write(&path, r#"{"transaction_id":"x","plan_generation":0,"created_at_unix":0,"source_scan_root":"","entries":[]}"#).unwrap();
         let loaded = read_journal(&path).unwrap();
         assert_eq!(loaded.state, TransactionState::Planned);
+        assert_eq!(loaded.classifier_version, None);
         assert!(loaded.entries.is_empty());
     }
 

@@ -49,6 +49,12 @@ pub enum ApplyError {
     NothingApproved,
     /// The plan is stale (its generation no longer matches the current one).
     StalePlan { plan: u64, current: u64 },
+    /// The plan was generated with different (or unknown) classification
+    /// rules and must be regenerated before it can be applied.
+    StaleClassifierVersion {
+        plan: Option<String>,
+        current: String,
+    },
     /// One or more entries failed preflight and the batch is in AbortAll mode.
     HardConflicts(Vec<(PathBuf, Vec<String>)>),
     /// The transaction id could not name a journal file.
@@ -68,6 +74,10 @@ impl std::fmt::Display for ApplyError {
             Self::StalePlan { plan, current } => write!(
                 f,
                 "the plan is stale (generation {plan}, current {current}); run a fresh audit"
+            ),
+            Self::StaleClassifierVersion { .. } => write!(
+                f,
+                "Rename plan is stale because classification rules changed. Regenerate the plan before applying."
             ),
             Self::HardConflicts(conflicts) => {
                 write!(f, "preflight found {} hard conflict(s)", conflicts.len())
@@ -99,6 +109,7 @@ pub fn build_transaction(
     approved_paths: &BTreeSet<String>,
     current_generation: u64,
 ) -> Result<RenameTransaction, ApplyError> {
+    validate_classifier_version(Some(&plan.classifier_version))?;
     if plan.generation != current_generation {
         return Err(ApplyError::StalePlan {
             plan: plan.generation,
@@ -112,6 +123,7 @@ pub fn build_transaction(
     Ok(RenameTransaction {
         transaction_id: new_transaction_id(crate::dat::sources::now_unix()),
         plan_generation: plan.generation,
+        classifier_version: Some(plan.classifier_version.clone()),
         created_at_unix: crate::dat::sources::now_unix(),
         source_scan_root: plan.scan_root.clone(),
         state: TransactionState::Planned,
@@ -207,6 +219,7 @@ pub struct ApplyExecution<'a> {
 
 /// Applies a prebuilt transaction. This is the only place a rename happens.
 pub fn apply_transaction(execution: &mut ApplyExecution<'_>) -> Result<ApplyOutcome, ApplyError> {
+    validate_classifier_version(execution.transaction.classifier_version.as_deref())?;
     if cancelled(execution.cancel) {
         return Err(ApplyError::Cancelled);
     }
@@ -356,6 +369,21 @@ pub fn apply_transaction(execution: &mut ApplyExecution<'_>) -> Result<ApplyOutc
         transaction: transaction.clone(),
         summary,
     })
+}
+
+/// Rejects plans whose classification provenance is missing or differs from
+/// the current classifier. This check is intentionally performed before any
+/// journal write or filesystem mutation.
+pub(crate) fn validate_classifier_version(plan_version: Option<&str>) -> Result<(), ApplyError> {
+    let current = crate::dat::classification::CLASSIFIER_VERSION;
+    if plan_version == Some(current) {
+        Ok(())
+    } else {
+        Err(ApplyError::StaleClassifierVersion {
+            plan: plan_version.map(str::to_string),
+            current: current.to_string(),
+        })
+    }
 }
 
 /// The mutation window: the no-clobber rename and the filesystem confirmation.
