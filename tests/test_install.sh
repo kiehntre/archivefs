@@ -19,6 +19,23 @@ desktop_assets="$repo_root/assets/linux"
 [ -f "$install_sh" ] || { printf 'test_install.sh: cannot find %s\n' "$install_sh" >&2; exit 1; }
 [ -f "$config_example" ] || { printf 'test_install.sh: cannot find %s\n' "$config_example" >&2; exit 1; }
 
+# fake_ratarmount_dir - a scratch directory on PATH holding a no-op
+# `ratarmount` executable, prepended to PATH only for the handful of tests
+# below that assert stderr is completely empty. Those tests are about
+# ownership/foreign-collision warnings, not about whether ratarmount
+# happens to be installed on whatever machine runs this suite - without
+# this, they fail in CI (no ratarmount on PATH there) even though nothing
+# about ownership behavior is wrong. This does not suppress or mask
+# install.sh's real ratarmount warning: it makes ratarmount genuinely
+# "found" for that one invocation, exactly like a real install would see
+# on a machine that has it, which is exactly the "warns when ratarmount is
+# not on PATH" test elsewhere in this file already covers from the other
+# direction.
+fake_ratarmount_dir=$(mktemp -d)
+trap 'rm -rf -- "$fake_ratarmount_dir"' EXIT
+printf '#!/bin/sh\nexit 0\n' >"$fake_ratarmount_dir/ratarmount"
+chmod +x -- "$fake_ratarmount_dir/ratarmount"
+
 pass_count=0
 fail_count=0
 
@@ -602,7 +619,8 @@ mkdir -p -- "$home"
 bin_dir="$work/bin"
 
 env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" >/dev/null
-reinstall_err=$(env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" 2>&1 1>/dev/null)
+reinstall_err=$(env HOME="$home" PATH="$fake_ratarmount_dir:$PATH" \
+    sh "$work/bundle/install.sh" --prefix "$bin_dir" 2>&1 1>/dev/null)
 if [ -z "$reinstall_err" ]; then
     ok "reinstall against a matching manifest produces no warnings"
 else
@@ -846,7 +864,8 @@ assert_contains "v1 binary runs the v1 stub" "$v1_out" "fake-cli"
 printf '#!/bin/sh\necho fake-cli-v2\n' >"$work/bundle/emuwiz-cli"
 chmod +x -- "$work/bundle/emuwiz-cli"
 
-v2_err=$(env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" 2>&1 1>/dev/null)
+v2_err=$(env HOME="$home" PATH="$fake_ratarmount_dir:$PATH" \
+    sh "$work/bundle/install.sh" --prefix "$bin_dir" 2>&1 1>/dev/null)
 if [ -z "$v2_err" ]; then
     ok "upgrading to v2 content is recognised as a legitimate reinstall (no foreign warning)"
 else
@@ -858,7 +877,8 @@ assert_contains "binary now runs the v2 stub" "$v2_out" "fake-cli-v2"
 # A further reinstall against the NEW (v2) recorded digest must also be silent -
 # proving the manifest was actually refreshed to the new content's digest,
 # not left pointing at v1's.
-v2_again_err=$(env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" 2>&1 1>/dev/null)
+v2_again_err=$(env HOME="$home" PATH="$fake_ratarmount_dir:$PATH" \
+    sh "$work/bundle/install.sh" --prefix "$bin_dir" 2>&1 1>/dev/null)
 if [ -z "$v2_again_err" ]; then
     ok "manifest was refreshed to the v2 digest (a further v2 reinstall is silent)"
 else
@@ -1553,7 +1573,8 @@ env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" --replace-fore
 # A complete, untouched, valid manifest round-trips silently - the
 # baseline every mutation above is measured against.
 cp -- "$work/pristine-manifest" "$manifest"
-complete_err=$(env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" 2>&1 1>/dev/null) || true
+complete_err=$(env HOME="$home" PATH="$fake_ratarmount_dir:$PATH" \
+    sh "$work/bundle/install.sh" --prefix "$bin_dir" 2>&1 1>/dev/null) || true
 if [ -z "$complete_err" ]; then
     ok "a complete, valid, unmutated manifest is accepted and produces no warnings"
 else
