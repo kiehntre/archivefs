@@ -2232,4 +2232,147 @@ mod tests {
         let path = write_archive_bytes(dir.path(), "varint.7z", &[], &h);
         let _ = preflight(&path, &ArchiveLimits::default());
     }
+
+    // ------------------------------------------------------------------
+    // Regressions for parser-divergence and coder-graph defects found by
+    // reading the `sevenz-rust` 0.6.1 source (see sevenz_preflight docs).
+    // ------------------------------------------------------------------
+
+    const K_EMPTY_STREAM: u8 = 0x0E;
+    const K_EMPTY_FILE: u8 = 0x0F;
+    const K_M_TIME: u8 = 0x14;
+
+    /// Header prologue: pack info with `pack_streams` streams of `pack_size`,
+    /// then the caller appends its own unpack info.
+    fn pack_info(pack_sizes: &[u64]) -> Vec<u8> {
+        let mut h = Vec::new();
+        h.push(K_HEADER);
+        h.push(K_MAIN_STREAMS_INFO);
+        h.push(K_PACK_INFO);
+        uvarint(0, &mut h); // pack_pos
+        uvarint(pack_sizes.len() as u64, &mut h);
+        h.push(K_SIZE);
+        for &size in pack_sizes {
+            uvarint(size, &mut h);
+        }
+        h.push(K_END);
+        h
+    }
+
+    #[test]
+    fn empty_stream_vector_is_a_plain_bit_vector_not_all_or_bits() {
+        // `kEmptyStream` has NO leading all-defined byte (7zFormat.txt), and
+        // `sevenz-rust` reads it as a plain bit vector. Reading it as
+        // all-or-bits made the probe see "every file is empty" for any payload
+        // whose first byte is non-zero, so this archive passed the
+        // stream-count reconciliation while `read_files_info` went on to index
+        // `sub_streams_info.crcs[0]` on an empty vector and panic.
+        let dir = tempdir().unwrap();
+        let mut h = pack_info(&[0]);
+        h.push(K_UNPACK_INFO);
+        h.push(K_FOLDER);
+        uvarint(1, &mut h); // one folder
+        h.push(0); // external
+        uvarint(1, &mut h); // one coder
+        h.push(0x01); // simple, id_size = 1
+        h.push(0x00); // COPY
+        h.push(K_CODERS_UNPACK_SIZE);
+        uvarint(0, &mut h);
+        h.push(K_END);
+        h.push(K_SUB_STREAMS_INFO);
+        h.push(K_NUM_UNPACK_STREAM);
+        uvarint(0, &mut h); // the folder declares zero sub-streams
+        h.push(K_END);
+        h.push(K_END);
+        h.push(K_FILES_INFO);
+        uvarint(2, &mut h); // two files
+        h.push(K_EMPTY_STREAM);
+        uvarint(1, &mut h);
+        h.push(0x80); // file 0 empty, file 1 HAS a stream
+        h.push(K_END);
+        h.push(K_END);
+        let path = write_archive_bytes(dir.path(), "emptybits.7z", &[], &h);
+
+        // One stream-bearing file against zero declared sub-streams.
+        let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::dat::archive::sevenz_preflight::PreflightRefusal::Malformed {
+                    detail: "file count inconsistent with stream sizes"
+                }
+            ),
+            "unexpected refusal: {err:?}"
+        );
+
+        // End to end: the decoder must never be constructed for this archive.
+        let trusted = trusted_for(dir.path());
+        let before = READER_NEW_CALLS.load(Ordering::Relaxed);
+        let err =
+            SevenZArchiveSource::open(&path, &trusted, ArchiveLimits::default(), &TEST_NO_CANCEL)
+                .unwrap_err();
+        assert!(matches!(err, ArchiveMemberSourceError::Corrupt { .. }));
+        assert_eq!(READER_NEW_CALLS.load(Ordering::Relaxed), before);
+    }
+
+    #[test]
+    fn empty_file_property_without_empty_stream_is_refused() {
+        // `kEmptyFile` is sized by the empty-stream count, so it is only
+        // meaningful after `kEmptyStream`; upstream errors out too.
+        let dir = tempdir().unwrap();
+        let mut h = pack_info(&[]);
+        h.push(K_END);
+        h.push(K_FILES_INFO);
+        uvarint(1, &mut h);
+        h.push(K_EMPTY_FILE);
+        uvarint(1, &mut h);
+        h.push(0x00);
+        h.push(K_END);
+        h.push(K_END);
+        let path = write_archive_bytes(dir.path(), "emptyfile.7z", &[], &h);
+        let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::dat::archive::sevenz_preflight::PreflightRefusal::Malformed {
+                    detail: "kEmptyStream must precede kEmptyFile/kAnti"
+                }
+            ),
+            "unexpected refusal: {err:?}"
+        );
+    }
+
+    #[test]
+    fn timestamp_property_is_parsed_structurally_not_skipped_by_declared_size() {
+        // `sevenz-rust` ignores the declared size of kMTime and parses it
+        // structurally, so a lying size would desynchronise a probe that
+        // skipped by size. Here the size lies (0) but the payload is a real
+        // all-defined kMTime record; the probe must consume it and still find
+        // the two terminators.
+        let dir = tempdir().unwrap();
+        let mut h = pack_info(&[1]);
+        h.push(K_UNPACK_INFO);
+        h.push(K_FOLDER);
+        uvarint(1, &mut h);
+        h.push(0);
+        uvarint(1, &mut h);
+        h.push(0x01);
+        h.push(0x00); // COPY
+        h.push(K_CODERS_UNPACK_SIZE);
+        uvarint(8, &mut h);
+        h.push(K_END);
+        h.push(K_END);
+        h.push(K_FILES_INFO);
+        uvarint(1, &mut h);
+        h.push(K_M_TIME);
+        uvarint(0, &mut h); // declared size lies
+        h.push(0x01); // all times defined
+        h.push(0x00); // external = 0
+        h.extend_from_slice(&[0; 8]); // one 64-bit timestamp
+        h.push(K_END);
+        h.push(K_END);
+        let path = write_archive_bytes(dir.path(), "mtime.7z", &[], &h);
+        let info = preflight(&path, &ArchiveLimits::default()).unwrap();
+        assert_eq!(info.member_count, 1);
+    }
 }

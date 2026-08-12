@@ -55,6 +55,10 @@ const K_EMPTY_STREAM: u8 = 0x0E;
 const K_EMPTY_FILE: u8 = 0x0F;
 const K_ANTI: u8 = 0x10;
 const K_NAME: u8 = 0x11;
+const K_C_TIME: u8 = 0x12;
+const K_A_TIME: u8 = 0x13;
+const K_M_TIME: u8 = 0x14;
+const K_WIN_ATTRIBUTES: u8 = 0x15;
 const K_START_POS: u8 = 0x18;
 const K_ENCODED_HEADER: u8 = 0x17;
 
@@ -706,6 +710,24 @@ fn parse_sub_streams_info(
 /// its panic-prone paths (zero-sized K_NAME, count/size index mismatches).
 ///
 /// Consumes the property records up to and including the FilesInfo `K_END`.
+///
+/// # Byte-for-byte parity with `sevenz-rust`
+///
+/// Every property is consumed exactly as `Archive::read_files_info` consumes
+/// it, so both parsers stay in lockstep and the checks below apply to the very
+/// bytes the decoder will act on. In particular:
+///
+/// - `kEmptyStream`/`kEmptyFile`/`kAnti` are **plain** bit vectors (7zFormat.txt),
+///   *not* "all-or-bits" vectors: they have no leading all-defined byte. Reading
+///   them as all-or-bits consumes one extra byte and inverts the meaning of the
+///   first payload byte, which desynchronises this probe from the decoder — and
+///   a mis-counted empty-stream vector is exactly what lets a hostile archive
+///   drive `sub_streams_info.crcs[non_empty_file_counter]` out of bounds.
+/// - `kEmptyFile`/`kAnti` are sized by the number of *empty-stream* files, not
+///   by `num_files`, and `kEmptyStream` must precede them.
+/// - the timestamp/attribute properties are parsed structurally (all-or-bits +
+///   external flag + fixed-width values) rather than skipped by their declared
+///   size, because the decoder ignores the declared size for them.
 fn parse_files_info(
     cursor: &mut HeaderCursor<'_>,
     num_files: usize,
@@ -724,10 +746,24 @@ fn parse_files_info(
         let size = cursor.read_varint()?;
         match property {
             K_EMPTY_STREAM => {
-                empty_stream = Some(read_all_or_bits(cursor, num_files, cancel)?);
+                empty_stream = Some(read_bits(cursor, num_files, cancel)?);
             }
             K_EMPTY_FILE | K_ANTI => {
-                read_all_or_bits(cursor, num_files, cancel)?;
+                // Sized by the empty-stream count, and only legal after
+                // kEmptyStream (the decoder errors out otherwise).
+                let Some(bits) = empty_stream.as_ref() else {
+                    return Err(PreflightRefusal::Malformed {
+                        detail: "kEmptyStream must precede kEmptyFile/kAnti",
+                    });
+                };
+                let empty_count = bits.iter().filter(|&&bit| bit).count();
+                read_bits(cursor, empty_count, cancel)?;
+            }
+            K_C_TIME | K_A_TIME | K_M_TIME => {
+                parse_defined_values(cursor, num_files, 8, cancel)?;
+            }
+            K_WIN_ATTRIBUTES => {
+                parse_defined_values(cursor, num_files, 4, cancel)?;
             }
             K_NAME => {
                 if size == 0 {
@@ -771,6 +807,30 @@ fn parse_files_info(
         return Err(PreflightRefusal::Malformed {
             detail: "file count inconsistent with stream sizes",
         });
+    }
+    Ok(())
+}
+
+/// Consumes a timestamp/attribute property exactly as `sevenz-rust` does: an
+/// all-or-bits "defined" vector, an external flag (which must be 0), then
+/// `value_bytes` for every file whose bit is set.
+fn parse_defined_values(
+    cursor: &mut HeaderCursor<'_>,
+    num_files: usize,
+    value_bytes: u64,
+    cancel: &AtomicBool,
+) -> Result<(), PreflightRefusal> {
+    let defined = read_all_or_bits(cursor, num_files, cancel)?;
+    let external = cursor.read_u8()?;
+    if external != 0 {
+        return Err(PreflightRefusal::Malformed {
+            detail: "external time/attribute property is unsupported",
+        });
+    }
+    for set in defined {
+        if set {
+            cursor.skip(value_bytes)?;
+        }
     }
     Ok(())
 }
@@ -1034,8 +1094,7 @@ impl<'a> HeaderCursor<'a> {
     }
 }
 
-/// `read_all_or_bits`: a leading "all" flag byte, else one bit per 8-bit
-/// mask, MSB-first.
+/// `read_all_or_bits`: a leading "all" flag byte, else a plain bit vector.
 fn read_all_or_bits(
     cursor: &mut HeaderCursor<'_>,
     size: usize,
@@ -1045,6 +1104,17 @@ fn read_all_or_bits(
     if all != 0 {
         return Ok(vec![true; size]);
     }
+    read_bits(cursor, size, cancel)
+}
+
+/// A plain bit vector: one bit per item, MSB-first within each byte, with no
+/// leading all-defined flag. This is the encoding 7zFormat.txt specifies for
+/// `kEmptyStream`, `kEmptyFile` and `kAnti`.
+fn read_bits(
+    cursor: &mut HeaderCursor<'_>,
+    size: usize,
+    cancel: &AtomicBool,
+) -> Result<Vec<bool>, PreflightRefusal> {
     let mut out = Vec::with_capacity(size);
     let mut mask = 0_u32;
     let mut cache = 0_u32;
