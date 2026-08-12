@@ -64,8 +64,27 @@ quick-xml = { version = "0.41", default-features = false }
 # codec feature (deflate/bzip2/lzma/zstd/aes-crypto/...) is enabled here;
 # see the `[dev-dependencies]` entry below for why tests need more.
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
+# Experimental 7z archive-member reader (POST-ALPHA-1.1, zero production
+# callers). `sevenz-rust` is pure Rust, Apache-2.0. The production build
+# deliberately enables NO optional features: no writer (`compress`), no
+# `bzip2`, and no `aes256`. Encrypted 7z headers/members therefore surface as
+# `UnsupportedCompressionMethod("AES256SHA256")` at decode time, which this
+# reader maps to an explicit Encrypted refusal. (Upstream's `aes256` feature
+# also cannot compile without `compress` — see its use of
+# `lzma_rust::CountingWriter`.) The `zstd` feature is not exposed by
+# sevenz-rust 0.6.1 at all, so zstd-coded members are always refused. This
+# dependency is inert: nothing in shipped code calls into `dat::archive` yet
+# (see docs/research/SEVEN_Z_RAR_ARCHIVE_VERIFICATION_RESEARCH.md §12).
+sevenz-rust = { version = "0.6.1", default-features = false }
 
 [dev-dependencies]
+# Same crate, fuller feature set: only test fixtures need to *write* 7z
+# files (solid, encrypted, multi-member) to exercise the read-only reader
+# against real archives. Cargo unifies features for one crate across
+# `[dependencies]`/`[dev-dependencies]` only within a build that includes
+# both (`cargo test`) - a plain `cargo build --release` never links the
+# writer or the AES code.
+sevenz-rust = { version = "0.6.1", features = ["compress", "aes256"] }
 # Same crate, fuller feature set: only test fixtures need to *write* zip
 # files (including a deflated and a password-encrypted one) to exercise
 # the read-only inspector against real archives. Cargo unifies features
