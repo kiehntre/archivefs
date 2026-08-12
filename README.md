@@ -304,7 +304,7 @@ Manual installation remains available if you would rather control each step your
 
    `emuwiz` needs a running Linux desktop session (X11 or Wayland) with the usual runtime graphics libraries present - it will not open a window over a bare SSH session or on a headless server with no desktop environment.
 
-Archive mounts created by EmuWiz are always read-only; it never modifies files in your configured `source_folders`.
+Archive mounts created by EmuWiz are always read-only. Source folders are read-only by default; files are changed only by explicitly confirmed rename/apply operations.
 
 ### Upgrade from v0.6 development builds
 

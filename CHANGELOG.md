@@ -119,9 +119,9 @@ installation, upgrade, and validation guidance.
 
 ### Dependency security
 
-- Updated `quick-xml` (a build-time-only transitive dependency of the Wayland
-  protocol scanner, never used on game or catalogue data at runtime) from
-  0.39.4 to 0.41.0, resolving RUSTSEC-2026-0195 and RUSTSEC-2026-0194 (#3).
+- Updated `quick-xml`, which is used at runtime by `archivefs-core` to parse
+  Logiqx DAT/catalogue XML, from 0.39.4 to 0.41.0, resolving
+  RUSTSEC-2026-0195 and RUSTSEC-2026-0194 (#3).
   See [`docs/DEPENDENCY_SECURITY.md`](docs/DEPENDENCY_SECURITY.md) for the
   full advisory record.
 
@@ -409,10 +409,9 @@ tag peels to source commit `908c00da23303216cd28563a00b4ec835bc87207`.
 - Updated the `eframe`/`egui` GUI dependency family from 0.32.3 to 0.34.3,
   removing the unmaintained `ttf-parser`/`owned_ttf_parser`/`ab_glyph`
   font-parsing chain entirely (RUSTSEC-2026-0192).
-- Updated `quick-xml` (a build-time-only transitive dependency of the
-  Wayland protocol scanner, never used on game or catalogue data at
-  runtime) from 0.39.4 to 0.41.0, resolving RUSTSEC-2026-0195 and
-  RUSTSEC-2026-0194.
+- Updated `quick-xml`, which is used at runtime by `archivefs-core` to parse
+  Logiqx DAT/catalogue XML, from 0.39.4 to 0.41.0, resolving
+  RUSTSEC-2026-0195 and RUSTSEC-2026-0194.
 - Both online and cached `cargo audit` runs are clean with no advisory
   ignore added. See [`docs/DEPENDENCY_SECURITY.md`](docs/DEPENDENCY_SECURITY.md).
 
