@@ -35,12 +35,16 @@ the points this page corrects.
 
 - **Local-first, no telemetry.** EmuWiz does not send usage data, crash
   reports, or file information anywhere. Outbound network use is opt-in and
-  limited to explicit, user-invoked HTTPS-only fetches: PCSX2 patch
-  metadata (a single compiled-in endpoint), the RetroArch / Dolphin /
-  Xenia / GameHacking / BSFree metadata and cheat-catalogue retrievals, and
-  the RomM client for catalogue identity and artwork. Each fetch enforces
-  timeouts, response-size limits, and downloaded-content validation; see the
-  network and provider trust notes below.
+  explicit. Public catalogue, cheat, and provider retrievals - the PCSX2
+  patch-metadata fetch to a single compiled-in endpoint, and the RetroArch /
+  Dolphin / Xenia / GameHacking / BSFree metadata and cheat-catalogue
+  fetches - use HTTPS-only transport where the current code enforces that.
+  The RomM client is different: RomM is a separately configured local or
+  private service, and its endpoint may use HTTP or HTTPS only where the
+  endpoint/address policy permits approved loopback or private-LAN
+  destinations. Every fetch enforces timeouts, response-size limits, and
+  downloaded-content validation; see the network and provider trust notes
+  below.
 - **Archives are treated as untrusted input.** Filenames and archive
   contents may be attacker-controlled; mount-name generation and path
   handling are designed not to let an archive's name or internal paths
@@ -91,17 +95,27 @@ the points this page corrects.
   real directory; `XDG_DATA_HOME` itself is trusted as it already is for
   every other user data path. Note that install/uninstall do not lock
   against a concurrent same-user process; see the limitations below.
-- **Network and provider trust.** All outbound HTTP is HTTPS-only. The
-  PCSX2 metadata fetcher accepts only its compiled-in endpoint and refuses
-  every other URL before networking. The RomM client refuses or validates
-  redirects, caps response size, stores tokens with owner-only permissions,
-  and redacts them from logs and configuration; artwork fetches are limited
-  to RomM's own thumbnail URLs, never arbitrary scraper URLs. Downloaded
-  cheat archives are size- and entry-bounded, optionally hash-checked,
-  safely extracted into a staging area, validated with the local catalogue
-  parser, and atomically published. Provider content is trusted at the
-  HTTPS boundary plus structural validation; it is not cryptographically
-  attested as safe.
+- **Network and provider trust.** Public catalogue, cheat, and provider
+  transports are HTTPS-only where the current code enforces that (the PCSX2
+  metadata fetcher accepts only its compiled-in endpoint and refuses every
+  other URL before networking). RomM is a separately configured local or
+  private service: its endpoint policy allows HTTP or HTTPS, but only to
+  addresses approved as loopback or private LAN (RFC 1918 / IPv6
+  unique-local); the client refuses redirects, or validates them against the
+  same policy before any follow, caps response size, and limits artwork
+  fetches to RomM's own thumbnail URLs, never arbitrary scraper URLs.
+  Because RomM may be configured over HTTP, its bearer token is **not**
+  protected by TLS in transit in that case. RomM tokens are supplied by the
+  user as a token file: EmuWiz validates restrictive permissions (a token
+  file readable by others is refused), stores only the token-file path or
+  configuration reference rather than the value, and redacts token values
+  from serialization, diagnostics, and logging; it does not create or persist
+  a token file itself. Downloaded cheat archives are size- and
+  entry-bounded, optionally hash-checked, safely extracted into a staging
+  area, validated with the local catalogue parser, and atomically published.
+  Provider content is trusted at the transport boundary (HTTPS for public
+  retrievals; the approved local/private endpoint for RomM) plus structural
+  validation; it is not cryptographically attested as safe.
 
 ## Security-sensitive areas for contributors
 
@@ -130,8 +144,8 @@ these are expected rather than actionable bugs:
 - Protection against a same-user adversarial process racing the installer
   or mutation engine (install/uninstall take no lock against concurrent
   processes).
-- Integrity guarantees for upstream provider content beyond HTTPS and
-  structural validation: a compromised provider could deliver mislabeled
-  data, which EmuWiz bounds and validates but cannot certify.
+- Integrity guarantees for upstream provider content beyond the transport
+  boundary and structural validation: a compromised provider could deliver
+  mislabeled data, which EmuWiz bounds and validates but cannot certify.
 - Safe execution of EmuWiz as root or via sudo: the installer never uses
   sudo or any system-wide install path.
