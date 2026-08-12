@@ -2375,4 +2375,85 @@ mod tests {
         let info = preflight(&path, &ArchiveLimits::default()).unwrap();
         assert_eq!(info.member_count, 1);
     }
+
+    #[test]
+    fn cyclic_bind_pairs_are_refused() {
+        // Bind pairs (in 2 -> out 0), (in 3 -> out 2), (in 2 -> out 3) reuse
+        // input stream 2. `OrderedCoderIter` would then walk 0 -> 2 -> 3 -> 2
+        // -> 3 ... forever, allocating a new decoder on every step.
+        let dir = tempdir().unwrap();
+        let mut h = pack_info(&[0]);
+        h.push(K_UNPACK_INFO);
+        h.push(K_FOLDER);
+        uvarint(1, &mut h);
+        h.push(0);
+        uvarint(4, &mut h); // four simple COPY coders
+        for _ in 0..4 {
+            h.push(0x01);
+            h.push(0x00);
+        }
+        for (in_index, out_index) in [(2_u64, 0_u64), (3, 2), (2, 3)] {
+            uvarint(in_index, &mut h);
+            uvarint(out_index, &mut h);
+        }
+        h.push(K_CODERS_UNPACK_SIZE);
+        for _ in 0..4 {
+            uvarint(0, &mut h);
+        }
+        h.push(K_END);
+        h.push(K_END);
+        h.push(K_FILES_INFO);
+        uvarint(1, &mut h);
+        h.push(K_END);
+        h.push(K_END);
+        let path = write_archive_bytes(dir.path(), "cycle.7z", &[], &h);
+        let before = READER_NEW_CALLS.load(Ordering::Relaxed);
+        let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::dat::archive::sevenz_preflight::PreflightRefusal::Malformed {
+                    detail: "duplicate bind pair input index"
+                }
+            ),
+            "unexpected refusal: {err:?}"
+        );
+        assert_eq!(READER_NEW_CALLS.load(Ordering::Relaxed), before);
+    }
+
+    #[test]
+    fn duplicate_packed_stream_index_is_refused() {
+        let dir = tempdir().unwrap();
+        let mut h = pack_info(&[0, 0]);
+        h.push(K_UNPACK_INFO);
+        h.push(K_FOLDER);
+        uvarint(1, &mut h);
+        h.push(0);
+        uvarint(1, &mut h);
+        h.push(0x11); // not simple, id_size = 1
+        h.push(0x00); // COPY
+        uvarint(2, &mut h); // num_in
+        uvarint(1, &mut h); // num_out
+        uvarint(0, &mut h); // packed stream index 0...
+        uvarint(0, &mut h); // ...declared twice
+        h.push(K_CODERS_UNPACK_SIZE);
+        uvarint(0, &mut h);
+        h.push(K_END);
+        h.push(K_END);
+        h.push(K_FILES_INFO);
+        uvarint(1, &mut h);
+        h.push(K_END);
+        h.push(K_END);
+        let path = write_archive_bytes(dir.path(), "duppack.7z", &[], &h);
+        let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::dat::archive::sevenz_preflight::PreflightRefusal::Malformed {
+                    detail: "duplicate packed stream index"
+                }
+            ),
+            "unexpected refusal: {err:?}"
+        );
+    }
 }

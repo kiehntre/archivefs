@@ -553,6 +553,26 @@ fn parse_folder(
                 detail: "bind pair index out of range",
             });
         }
+        // 7zFormat.txt: a bind pair connects one coder output to one coder
+        // input, and every stream may take part in at most one bind pair. If a
+        // stream index is reused, `sevenz-rust`'s `OrderedCoderIter` (and the
+        // `get_in_stream`/`get_in_stream2` recursion) can walk a cycle: it
+        // follows out-index -> in-index forever, constructing and allocating a
+        // fresh decoder on every step. Distinct indices make the walk a simple
+        // path, so it always terminates.
+        if bind_pairs.iter().any(|&(existing, _)| existing == in_index) {
+            return Err(PreflightRefusal::Malformed {
+                detail: "duplicate bind pair input index",
+            });
+        }
+        if bind_pairs
+            .iter()
+            .any(|&(_, existing)| existing == out_index)
+        {
+            return Err(PreflightRefusal::Malformed {
+                detail: "duplicate bind pair output index",
+            });
+        }
         bind_pairs.push((in_index, out_index));
     }
     if total_in_streams < num_bind_pairs {
@@ -580,6 +600,18 @@ fn parse_folder(
             if index >= total_in_streams {
                 return Err(PreflightRefusal::Malformed {
                     detail: "packed stream index out of range",
+                });
+            }
+            // Each input stream is fed either by a bind pair or by exactly one
+            // packed stream — never both, and never twice.
+            if bind_pairs.iter().any(|&(in_index, _)| in_index == index) {
+                return Err(PreflightRefusal::Malformed {
+                    detail: "packed stream index is already bound",
+                });
+            }
+            if packed_streams.contains(&index) {
+                return Err(PreflightRefusal::Malformed {
+                    detail: "duplicate packed stream index",
                 });
             }
             packed_streams.push(index);
