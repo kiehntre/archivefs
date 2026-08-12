@@ -27,6 +27,18 @@
 //! Because that expansion cannot be bounded without decoding, the probe
 //! refuses every archive with an encoded header. This is a fail-closed
 //! experimental restriction; see the module doc of `sevenz.rs`.
+//!
+//! # The start-header CRC check is load-bearing
+//!
+//! `Archive::read` has a recovery path: when the stored start-header CRC is 0
+//! *and* the 20-byte start-header block is entirely zero, it abandons the
+//! start header and scans backwards from the end of the file for a `kHeader`/
+//! `kEncodedHeader` byte, then parses whatever it finds **with CRC
+//! verification disabled**. That would parse a region this probe never
+//! validated. It is unreachable today only because this probe validates the
+//! start-header CRC unconditionally and CRC-32 of twenty zero bytes is
+//! `0x0FD59B8D`, not 0 — so the all-zero start header is refused here first.
+//! Do not make that check conditional on a non-zero stored value.
 
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, Ordering};

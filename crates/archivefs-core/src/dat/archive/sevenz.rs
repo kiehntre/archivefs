@@ -24,6 +24,45 @@
 //! same limits against `sevenz-rust`'s parsed `Archive`, and member hashing
 //! re-enforces per-member and cumulative budgets while streaming.
 //!
+//! # Upstream advisories and the API surface this module may use
+//!
+//! `sevenz-rust` 0.6.1 carries two open RUSTSEC entries:
+//!
+//! - **RUSTSEC-2026-0245** (high): `decompress_impl` — the shared body of the
+//!   crate's `decompress*` convenience functions — does not validate member
+//!   paths, so a hostile archive can write outside the destination directory.
+//!   There is no patched release. This module is unaffected **because it never
+//!   extracts to disk**: it only uses `Archive`, `SevenZReader` and
+//!   `for_each_entries`, and hashes member bytes in memory. Nothing in this
+//!   crate may call `sevenz_rust::decompress`, `decompress_file`,
+//!   `decompress_with_password` or any other `de_funcs` entry point.
+//! - **RUSTSEC-2026-0246**: the crate is unmaintained. Upstream defects — such
+//!   as the out-of-bounds indexing that `sevenz_preflight` refuses on our
+//!   behalf — will not be fixed upstream, so the probe carries that burden
+//!   permanently.
+//!
+//! # Cancellation granularity
+//!
+//! Cancellation is cooperative and is observed:
+//!
+//! - before and during the header probe (per read chunk and in every
+//!   count-driven parse loop);
+//! - between members;
+//! - inside a member, before every 256 KiB chunk of *decoded output* (the
+//!   hashing and draining loops).
+//!
+//! It is **not** observed inside a single `Read::read` call into
+//! `sevenz-rust`: that call is a plain blocking function with no yield point,
+//! so the smallest uninterruptible unit is "decode until the next chunk of
+//! output is available". A folder whose packed stream decodes very slowly into
+//! very little output therefore stalls cancellation for as long as it takes to
+//! consume that folder's packed bytes — bounded by the archive's own size and
+//! by the compression-ratio, dictionary and solid-decode ceilings, but not by
+//! the cancellation flag. `SevenZReader::new` and the per-folder decoder-stack
+//! construction are likewise uninterruptible; both are bounded (at most
+//! `max_header_bytes` of header parsing and `max_aggregate_decoder_memory_bytes`
+//! of allocation) and neither decodes member data.
+//!
 //! # Nested members
 //!
 //! Nested-archive members are surfaced with metadata but never recursively
@@ -251,6 +290,13 @@ impl ArchiveMemberSource for SevenZArchiveSource {
                 // after every stream member and never match a cursor member.
                 return Ok(true);
             };
+            // KNOWN LIMITATION: `sevenz-rust`'s `calculate_stream_map` assigns
+            // a folder's file range as `[first_file_index, +num_sub_streams)`,
+            // so an empty-stream entry sitting *between* two stream members of
+            // the same folder shifts that window and hides the last member.
+            // The name check below turns that into a fail-closed `Corrupt`
+            // refusal rather than a silent mis-attribution, but it means such
+            // an archive is reported corrupt even though it is well-formed.
             if meta.name != entry.name() {
                 internal_error = Some(ArchiveMemberSourceError::Corrupt {
                     detail: format!("member order mismatch at index {cursor}"),
