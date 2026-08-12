@@ -28,10 +28,9 @@ push protection, are enabled on this repository.
 ## Current safety boundaries
 
 These are the security-relevant properties EmuWiz's design and tests
-currently rely on. See [`docs/security.md`](docs/security.md) for the full
-detail behind each of these; that document is itself being reconciled to
-current behavior in a separate follow-up, and is not yet authoritative on
-the points this page corrects.
+currently rely on. See [`docs/security.md`](docs/security.md) for the fuller
+architecture-level detail behind each of these, including the RomM
+endpoint policy and token-file handling summarized below.
 
 - **Local-first, no telemetry.** EmuWiz does not send usage data, crash
   reports, or file information anywhere. Outbound network use is opt-in and

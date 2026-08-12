@@ -167,6 +167,34 @@ and this document does not claim it is:
   fetch is explicitly triggered (scan, refresh, or an explicit lookup). See
   `crates/archivefs-cli/src/romm_identity.rs` and the `romm_*` GUI modules
   under `crates/archivefs-gui/src/`.
+- **RomM's endpoint is policy-restricted, not arbitrary.** Unlike the public
+  catalogue/cheat providers above, RomM is a separately configured local or
+  private service, and its URL is validated against a local-only endpoint
+  policy (`crates/archivefs-core/src/identity_source/net_policy.rs`) before
+  any request is made: only `http` or `https`, only to a host that resolves
+  entirely within loopback, RFC 1918, or IPv6 unique-local ranges (every
+  resolved address must be approved, closing the DNS-rebinding case), never
+  a known cloud-metadata address, and never a URL carrying embedded
+  credentials. The production HTTP client (`UreqTransport`) is built with
+  zero redirects; a redirect response is revalidated against the same
+  policy and reported as a refusal rather than followed, so a compromised or
+  misconfigured instance cannot redirect the bearer token to an
+  unapproved address. Because the policy allows RomM to be reached over
+  plain HTTP, a token sent to an HTTP endpoint has no TLS transport
+  protection for that request - this is a property of HTTP, not something
+  the client works around, and it is the reason the endpoint policy exists
+  to bound *where* HTTP is even reachable.
+- **RomM tokens are user-supplied and file-based, never inline config.**
+  A token is read from a file the user names with `--token-file` (or the GUI
+  equivalent); `load_token_file`
+  (`crates/archivefs-core/src/identity_source/settings.rs`) refuses a
+  missing file, a symlink, a non-regular file, an oversized file, and - on
+  Unix - a file with any group or world permission bit set, before ever
+  reading its contents. `RommSourceConfig` persists only the token file's
+  *path* (`token_path: Option<PathBuf>`); the token value itself is never
+  written into EmuWiz's own configuration. EmuWiz's production code paths
+  only ever read a token file the user already created themselves; nothing
+  in the CLI or GUI writes or creates one.
 - **Cheat/patch catalogue providers** (RetroArch catalogue, GameHacking.org
   for PS2/GameCube/Wii, BSFree Archive) perform certificate-validated HTTPS
   retrieval, bounded parsing, and provenance/hash recording of the fetched
