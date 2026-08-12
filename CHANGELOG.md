@@ -11,7 +11,101 @@ user-facing effect could not be confirmed from its message and diff alone,
 this file describes only what the code and history actually show, rather than
 guessing at intent, dates, or scope.
 
-## v0.7.0 (unreleased)
+## v0.7.1-alpha (unreleased)
+
+Stabilization release ("Alpha 1.1"). No new user-facing features; this
+release consolidates work merged on top of v0.7.0 into a single tagged,
+installable build and corrects stale documentation. See
+[`docs/releases/v0.7.1-alpha.md`](docs/releases/v0.7.1-alpha.md) for
+installation, upgrade, and validation guidance.
+
+### Added
+
+- Games-only DAT content policy: a safe, explicit filter that scopes
+  structured category/type/content_type trust to No-Intro DATs, with GUI
+  selection of the Games-only mode (#29).
+- Read-only DAT rename planning: builds a canonical-filename rename plan from
+  an audit and the effective matching policy, with collision and symlink
+  detection surfaced before anything is proposed for apply (#14).
+- Gated DAT rename apply: a durable, journal-backed transaction executor that
+  preflights the whole batch, journals it before any mutation, applies
+  approved entries one at a time with a no-clobber rename primitive, confirms
+  each rename against the filesystem, and supports rollback. Includes crash
+  recovery that reconciles in-flight transactions found on restart (#15).
+- Classifier-version enforcement on rename apply: a plan built under a
+  different classification-rules version is now rejected before any journal
+  write or mutation, with a "regenerate the plan" message instead of a silent
+  or partial apply (#39).
+- Installer ownership hardening: asset ownership is now tracked by SHA-256
+  content identity instead of mtime/pathname heuristics, with safer backups,
+  stricter manifest parsing (manifest content following the end marker is
+  rejected), and foreign-file-collision detection preserved across
+  `--replace-foreign` reruns (#38).
+- Linux desktop integration: an EmuWiz application icon and desktop launcher
+  entry (`io.github.kiehntre.emuwiz`) (#33).
+- Cheat source health surfaced in the Cheat Sources GUI, CLI `list`, and `info`
+  output, backed by a read-only cache probe (#16).
+- Platform identity enrichment from RomM and verified DAT evidence, with
+  conflict handling when an authoritative platform disagrees with a strong
+  independently-derived identity (#17).
+- Canonical ROM organisation into a user-configured master ROM root, including
+  a GUI page, CLI commands, and journaling that only records
+  actually-created platform directories (#18).
+- BSFree Wii verified-subset cheat install, generalising the existing Dolphin
+  dedup analysis to share the Wii pipeline (#28).
+
+### Changed
+
+- User-facing product naming changed from ArchiveFS to EmuWiz throughout the
+  GUI, CLI help text, and documentation. This is a display-name and
+  documentation change only: crate names, binary compatibility aliases,
+  `~/.config/archivefs` / `~/.local/share/archivefs` legacy paths,
+  `ARCHIVEFS_*` environment variables, and the `archivefs-v*` release
+  artifact naming scheme are unchanged and remain supported indefinitely
+  (#26, #37).
+- App-directory resolution now prefers EmuWiz's own XDG paths
+  (`~/.config/emuwiz`, `~/.local/share/emuwiz`) and transparently falls back
+  to the legacy ArchiveFS paths when only they exist; resolution is read-only
+  and never copies, moves, or overwrites data (#26).
+- Beta 1 visual language and UX pass: a consistent friendly primary visual
+  language, simplified beginner-gamer presentation, clearer Doctor/audit
+  diagnostics, and general beta-era UX cleanup (#19, #20, #22, #23).
+- Getting Started Home page: a task-oriented default view for first-run and
+  returning users (#10).
+- DAT diagnostics now classify severity, group repeated findings by type, and
+  show live audit context including duration and a shortened scan folder
+  (#12).
+- DAT matching policy is now persisted and user-configurable, with an
+  Effective Policy Summary shown in the GUI (#13).
+
+### Fixed
+
+- README's `--replace-foreign` description corrected to match actual backup
+  behavior.
+- `docs/security.md` reconciled with current shipped behavior: source
+  archives are described accurately (mount/inspection is read-only; DAT
+  rename/apply is a separate, explicitly-gated mutation path with preview,
+  classifier-version and generation checks, preflight, a durable journal, and
+  no-clobber renames), the config-path section now describes the EmuWiz-first
+  with legacy-fallback resolution instead of implying `~/.config/archivefs`
+  is the only location, and the document now acknowledges the network- and
+  config-writing behavior of the RomM, RetroArch, Dolphin, Xenia,
+  GameHacking, and BSFree provider/emulator-profile workflows.
+- README's release install walkthrough updated off the stale `v0.5.0-alpha`
+  example to the current release process.
+
+### Documentation
+
+- Extensive documentation reconciliation with current-main behavior,
+  including a loose-ends audit, EmuWiz reference cleanup, and quarantine of
+  stale pre-rename material (#35, #37).
+
+Note: archive-aware DAT verification, CHD verification, ZIP-member
+verification, NES header normalization, B2/split-archive grouping, explicit
+wrong-platform diagnostics, and 7z/RAR support remain research-only
+(`docs/research/`) and are **not** part of this release.
+
+## v0.7.0 (2026-08-01)
 
 This is the approved v0.7 release scope. See
 [`docs/releases/v0.7.0.md`](docs/releases/v0.7.0.md) for installation,

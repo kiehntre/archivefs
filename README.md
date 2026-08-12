@@ -21,12 +21,16 @@ replacement. See [Current limitations](#current-limitations) and
 [`ROADMAP.md`](ROADMAP.md#explicitly-out-of-scope-for-now) for the full,
 explicit list of what it deliberately does not do.
 
-**Release status:** the current release is `v0.7.0`. It adds
-the canonical 74-platform registry, evidence-based confidence, bounded Atari
-ST/Wii/PS2/GameCube identity, safer Dolphin profile resolution, PS2/GameCube/Wii
-GameHacking workflows, expanded Doctor diagnostics, and the optional browse-only
-BSFree Archive source. See
-[`docs/releases/v0.7.0.md`](docs/releases/v0.7.0.md) for the full release notes.
+**Release status:** the current release is `v0.7.1-alpha`, a stabilization
+release on top of `v0.7.0` with no new user-facing features. It adds Games-only
+DAT filtering, DAT rename planning/apply with journaling and rollback,
+classifier-version enforcement on apply, installer ownership hardening, and
+EmuWiz desktop integration, on top of v0.7.0's canonical 74-platform registry,
+evidence-based confidence, bounded Atari ST/Wii/PS2/GameCube identity, safer
+Dolphin profile resolution, PS2/GameCube/Wii GameHacking workflows, expanded
+Doctor diagnostics, and the optional browse-only BSFree Archive source. See
+[`docs/releases/v0.7.1-alpha.md`](docs/releases/v0.7.1-alpha.md) for the full
+release notes.
 
 ## Principles
 
@@ -205,13 +209,14 @@ user-facing version at
 
 ## Install from a Release
 
-Prebuilt Linux binaries are published on the [Releases](https://github.com/kiehntre/emuwiz/releases) page for tagged versions, for example `v0.5.0-alpha`. This is the quickest way to get running without building from source.
+Prebuilt Linux binaries are published on the [Releases](https://github.com/kiehntre/emuwiz/releases) page for tagged versions. Pick the tag you want from that page (for example the latest release) and set it as `VERSION` below - this is the quickest way to get running without building from source.
 
-1. Download the release tarball and its `SHA256SUMS` file, for example:
+1. Download the release tarball and its `SHA256SUMS` file, substituting the tag from the Releases page:
 
    ```sh
-   curl -LO https://github.com/kiehntre/emuwiz/releases/download/v0.5.0-alpha/archivefs-v0.5.0-alpha-x86_64-linux.tar.gz
-   curl -LO https://github.com/kiehntre/emuwiz/releases/download/v0.5.0-alpha/SHA256SUMS
+   VERSION=v0.7.1-alpha   # replace with the tag you picked from the Releases page
+   curl -LO https://github.com/kiehntre/emuwiz/releases/download/$VERSION/archivefs-$VERSION-x86_64-linux.tar.gz
+   curl -LO https://github.com/kiehntre/emuwiz/releases/download/$VERSION/SHA256SUMS
    ```
 
 2. Verify the tarball against the checksum file before extracting it:
@@ -223,8 +228,8 @@ Prebuilt Linux binaries are published on the [Releases](https://github.com/kiehn
 3. Extract it:
 
    ```sh
-   tar -xzf archivefs-v0.5.0-alpha-x86_64-linux.tar.gz
-   cd archivefs-v0.5.0-alpha-x86_64-linux
+   tar -xzf archivefs-$VERSION-x86_64-linux.tar.gz
+   cd archivefs-$VERSION-x86_64-linux
    ```
 
 ### Quick install
