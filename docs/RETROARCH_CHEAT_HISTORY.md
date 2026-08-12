@@ -11,11 +11,11 @@ Installs originating from a validated
 ID and are discovered normally without network access.
 
 ```console
-archivefs retroarch-cheat-history
-archivefs retroarch-cheat-history --journal-root /path/to/cheat-install-runs
-archivefs retroarch-cheat-history --json
-archivefs retroarch-cheat-inspect ~/.local/share/archivefs/cheat-install-runs/<run>.json
-archivefs retroarch-cheat-inspect ~/.local/share/archivefs/cheat-install-runs/<run>.json --json
+emuwiz-cli retroarch-cheat-history
+emuwiz-cli retroarch-cheat-history --journal-root /path/to/cheat-install-runs
+emuwiz-cli retroarch-cheat-history --json
+emuwiz-cli retroarch-cheat-inspect ~/.local/share/archivefs/cheat-install-runs/<run>.json
+emuwiz-cli retroarch-cheat-inspect ~/.local/share/archivefs/cheat-install-runs/<run>.json --json
 ```
 
 Both commands are strictly read-only. They do not install, remove, restore,

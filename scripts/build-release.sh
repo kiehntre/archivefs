@@ -129,6 +129,15 @@ for document in README.md CHANGELOG.md LICENSE config.toml.example; do
     [[ -f "$REPO_ROOT/$document" ]] || release_die "required release file missing: $document"
     install -m 0644 "$REPO_ROOT/$document" "$STAGE_ROOT/$document"
 done
+install -d -m 0755 "$STAGE_ROOT/assets/branding" "$STAGE_ROOT/assets/linux"
+install -m 0644 \
+    "$REPO_ROOT/assets/linux/io.github.kiehntre.emuwiz.desktop.in" \
+    "$STAGE_ROOT/assets/linux/io.github.kiehntre.emuwiz.desktop.in"
+for size in 32 64 128 256 512; do
+    install -m 0644 \
+        "$REPO_ROOT/assets/branding/emuwiz-logo-$size.png" \
+        "$STAGE_ROOT/assets/branding/emuwiz-logo-$size.png"
+done
 chmod 0755 "$STAGE_ROOT"
 
 release_note "creating deterministic archive $ARTIFACT"

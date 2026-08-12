@@ -52,6 +52,7 @@ pub mod evaluate;
 pub mod model;
 pub mod tags;
 
+pub use crate::dat::classification::ContentSelectionPolicy;
 pub use candidate::{DatCandidate, candidate_for_rom};
 pub use config::{DatPlatformPolicyConfig, DatPolicyConfig, default_dat_policy};
 pub use evaluate::{

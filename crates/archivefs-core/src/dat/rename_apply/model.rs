@@ -200,6 +200,11 @@ pub struct RenameTransaction {
     /// rollback re-check it against the current plan so a stale batch is
     /// never acted on.
     pub plan_generation: u64,
+    /// Classifier rules used to generate the reviewed plan. Older journals
+    /// decode this as `None` and may still be inspected or rolled back, but
+    /// must never be applied as though they used the current rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classifier_version: Option<String>,
     pub created_at_unix: u64,
     /// The folder the plan audited, for provenance only.
     pub source_scan_root: String,

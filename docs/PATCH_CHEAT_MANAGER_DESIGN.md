@@ -643,7 +643,7 @@ maintained by hand.
 
 ### RetroArch cheat installer (shipped, write-capable, first real execution)
 
-`archivefs retroarch-cheat-install` (`patch_manager::cheat_installer`; see
+`emuwiz-cli retroarch-cheat-install` (`patch_manager::cheat_installer`; see
 [`docs/RETROARCH_CHEAT_INSTALL.md`](RETROARCH_CHEAT_INSTALL.md)) is the
 first command in this codebase that actually creates a cheat file,
 replaces one with a verified backup, or writes a journal. It is a narrow,

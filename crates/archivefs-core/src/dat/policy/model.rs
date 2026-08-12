@@ -407,6 +407,7 @@ impl ClonePolicy {
 /// for the Effective Policy Summary's "source of this value" tags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PolicyField {
+    Content,
     Region,
     Language,
     Revision,
@@ -416,6 +417,7 @@ pub enum PolicyField {
 impl PolicyField {
     pub fn label(self) -> &'static str {
         match self {
+            Self::Content => "content selection",
             Self::Region => "region preference",
             Self::Language => "language preference",
             Self::Revision => "revision policy",

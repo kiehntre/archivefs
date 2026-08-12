@@ -60,11 +60,20 @@ influence what a file is called. The threats this stage guards against:
 | `Conflict` | A collision blocks the proposal (existing target, case-only, or two-proposals-one-target). | no |
 | `Unsupported` | No safe canonical name exists (extension/container mismatch, or a symlink source). | no |
 | `Blocked` | No canonical name could be derived (path traversal, empty name, missing source). | no |
+| `ExcludedByContentPolicy` | Games only confidently classified the matched entry as non-game. | no |
+| `UnclassifiedContent` | Games only found no trustworthy classification; manual review is required. | no |
 
 Every proposal carries: source path identity, current and proposed basenames,
 platform, DAT source, matched game/ROM names, match verdict and confidence,
 policy explanations, ambiguity reason, collision detail, blockers, extension
-status, sanitisation notes, object kind, and `actionable`.
+status, sanitisation notes, object kind, content classification/provenance,
+classifier version, and `actionable`.
+
+The rename planner receives content annotations from the completed full-catalogue
+audit. Under Games only it permits confirmed games, compilations, and required
+multidisc parts; confidently non-game entries and Unknown entries remain
+non-actionable. All entries preserves the prior behavior. Neither policy changes
+matching or the audit report.
 
 ## 5. Canonical filename derivation
 

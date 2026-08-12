@@ -46,6 +46,10 @@ use serde::Serialize;
 
 use super::{DatSourceKind, validation};
 use crate::dat::audit::{AuditReport, AuditVerdict, KnownFileEvidence, audit_files};
+use crate::dat::classification::{
+    ContentEligibility, ContentSelectionPolicy, DatContentClassification, DatContentSummary,
+    DatOriginalMetadata, summarize,
+};
 use crate::dat::index::{DatIndex, DatRomRef};
 use crate::dat::limits::DatLimits;
 use crate::dat::model::ParsedDat;
@@ -178,6 +182,9 @@ pub struct DatAuditOutcome {
     pub catalogue_names: Vec<String>,
     pub catalogue_entries: usize,
     pub catalogue_roms: usize,
+    /// Orthogonal content classification. It never changes `report` or its
+    /// counts; it controls only downstream selection eligibility.
+    pub content: DatAuditContentOutcome,
     /// DAT files in a folder source that did not parse and so contributed
     /// nothing to the index.
     pub unreadable_catalogues: Vec<String>,
@@ -192,6 +199,30 @@ pub struct DatAuditOutcome {
     /// The audited source's canonical platform id, when assigned and
     /// recognised. Provenance for consumers like the rename plan.
     pub platform: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct DatAuditContentOutcome {
+    pub selection: ContentSelectionPolicy,
+    pub catalogue: DatContentSummary,
+    /// Classification for matched local files. Unmatched files remain in the
+    /// ordinary audit report and are not assigned a fabricated content class.
+    pub matches: Vec<DatContentMatch>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DatContentMatch {
+    pub local_path: String,
+    pub candidates: Vec<DatContentCandidate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DatContentCandidate {
+    pub game_name: String,
+    pub rom_name: String,
+    pub classification: DatContentClassification,
+    pub eligibility: ContentEligibility,
+    pub original_metadata: DatOriginalMetadata,
 }
 
 impl DatAuditOutcome {
@@ -321,6 +352,12 @@ pub fn run_dat_audit(
     let index = DatIndex::build(&catalogue);
     let catalogue_entries = catalogue.source.entry_count;
     let catalogue_roms = catalogue.source.rom_count;
+    let content_selection = request
+        .policy
+        .as_ref()
+        .map(|policy| policy.content_selection)
+        .unwrap_or(ContentSelectionPolicy::AllEntries);
+    let catalogue_content = summarize(&catalogue.games, content_selection);
     // The parsed games are kept when a policy is supplied: the candidate
     // ranking needs each candidate's region/language/revision/parent metadata,
     // which only the game entries carry. Otherwise they are dropped so a
@@ -404,6 +441,7 @@ pub fn run_dat_audit(
     }
     on_progress(DatAuditProgress::Comparing { files: known.len() });
     let report = audit_files(&known, &index);
+    let content_matches = annotate_content_matches(&report, &known, &index, content_selection);
 
     // ---- 5. Annotate multi-candidate verdicts with the policy -------------
     // The policy only *ranks already valid candidates*: the audit's verdicts
@@ -428,6 +466,11 @@ pub fn run_dat_audit(
         catalogue_names,
         catalogue_entries,
         catalogue_roms,
+        content: DatAuditContentOutcome {
+            selection: content_selection,
+            catalogue: catalogue_content,
+            matches: content_matches,
+        },
         unreadable_catalogues,
         files_scanned: scan.files.len(),
         truncated: scan.truncated,
@@ -437,6 +480,63 @@ pub fn run_dat_audit(
         policy,
         platform: request.platform.clone(),
     })
+}
+
+fn annotate_content_matches(
+    report: &AuditReport,
+    known: &[KnownFileEvidence],
+    index: &DatIndex,
+    selection: ContentSelectionPolicy,
+) -> Vec<DatContentMatch> {
+    report
+        .entries
+        .iter()
+        .zip(known.iter())
+        .filter_map(|(entry, evidence)| {
+            let refs: Vec<DatRomRef> = match &entry.verdict {
+                AuditVerdict::Exact { .. } | AuditVerdict::ExactMultipleCandidates { .. } => {
+                    verified_candidate_refs(evidence, index)
+                }
+                AuditVerdict::Probable { .. } | AuditVerdict::ProbableMultipleCandidates { .. } => {
+                    evidence
+                        .crc32
+                        .as_deref()
+                        .map(|crc| {
+                            index
+                                .lookup_crc32(crc)
+                                .iter()
+                                .filter(|candidate| {
+                                    evidence
+                                        .size_bytes
+                                        .is_none_or(|size| candidate.size_bytes == Some(size))
+                                })
+                                .cloned()
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                }
+                AuditVerdict::FilenameOnly { .. } => {
+                    index.lookup_filename(&evidence.filename).to_vec()
+                }
+                AuditVerdict::Ambiguous { .. }
+                | AuditVerdict::NotInDat
+                | AuditVerdict::NoUsableEvidence => Vec::new(),
+            };
+            (!refs.is_empty()).then(|| DatContentMatch {
+                local_path: entry.local_path.clone(),
+                candidates: refs
+                    .into_iter()
+                    .map(|candidate| DatContentCandidate {
+                        game_name: candidate.game_name.clone(),
+                        rom_name: candidate.rom_name.clone(),
+                        eligibility: selection.eligibility(&candidate.content_classification),
+                        classification: candidate.content_classification.clone(),
+                        original_metadata: candidate.original_metadata.clone(),
+                    })
+                    .collect(),
+            })
+        })
+        .collect()
 }
 
 /// Builds the policy annotation for an audit.

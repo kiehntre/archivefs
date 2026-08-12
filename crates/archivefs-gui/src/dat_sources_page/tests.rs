@@ -2702,6 +2702,7 @@ fn minimal_outcome() -> DatAuditOutcome {
         bytes_hashed: 4,
         truncated: false,
         policy: None,
+        content: Default::default(),
         platform: None,
     }
 }
@@ -3312,16 +3313,83 @@ fn the_policy_section_and_summary_render_at_a_narrow_compact_width() {
     });
     let view = page.view();
     let mut ui_state = DatSourcesPageUi::default();
-    let output = render_at_width(&view, &mut ui_state, 700.0);
+    let output = render_at_width(&view, &mut ui_state, 420.0);
     assert!(rendered_text_contains(&output, "DAT matching policy"));
     assert!(rendered_text_contains(&output, "Preferred regions"));
     assert!(rendered_text_contains(&output, "Europe"));
     assert!(rendered_text_contains(&output, "Effective policy"));
+    assert!(rendered_text_contains(&output, "Show:"));
+    assert!(rendered_text_contains(&output, "All entries"));
+    assert!(rendered_text_contains(&output, GAMES_ONLY_EXPLANATION));
     assert!(rendered_text_contains(&output, "Platform: All platforms"));
     assert!(rendered_text_contains(
         &output,
         "Your files won't be renamed unless you approve it."
     ));
+}
+
+#[test]
+fn games_only_wording_is_beginner_facing_and_switching_is_reversible() {
+    let fixture = Fixture::new();
+    let mut page = fixture.page();
+    page.audit = Some(Box::new(minimal_outcome()));
+    assert_eq!(
+        page.view().policy.content_selection,
+        archivefs_core::dat::classification::ContentSelectionPolicy::AllEntries
+    );
+    page.apply(DatSourcesPageAction::SetContentSelection {
+        scope: None,
+        policy: archivefs_core::dat::classification::ContentSelectionPolicy::GamesOnly,
+    });
+    assert_eq!(
+        page.view().policy.content_selection,
+        archivefs_core::dat::classification::ContentSelectionPolicy::GamesOnly
+    );
+    assert!(
+        page.audit.is_none(),
+        "stale selection annotations are discarded"
+    );
+    page.apply(DatSourcesPageAction::SetContentSelection {
+        scope: None,
+        policy: archivefs_core::dat::classification::ContentSelectionPolicy::AllEntries,
+    });
+    assert_eq!(
+        page.view().policy.content_selection,
+        archivefs_core::dat::classification::ContentSelectionPolicy::AllEntries
+    );
+    assert!(GAMES_ONLY_EXPLANATION.contains("Unknown entries are kept for review"));
+}
+
+#[test]
+fn technical_content_view_preserves_evidence_original_metadata_and_version() {
+    use archivefs_core::dat::classification::{
+        CLASSIFIER_VERSION, ClassificationEvidence, ClassificationEvidenceKind,
+        ClassifierConfidence, DatContentClass, DatContentClassification, DatOriginalMetadata,
+    };
+    let mut metadata = DatOriginalMetadata::default();
+    metadata
+        .fields
+        .insert("category".to_string(), "Games".to_string());
+    let classification = DatContentClassification {
+        class: DatContentClass::Game,
+        confidence: ClassifierConfidence::High,
+        evidence: vec![ClassificationEvidence {
+            kind: ClassificationEvidenceKind::StructuredEntryMetadata,
+            field: Some("category".to_string()),
+            original_value: Some("Games".to_string()),
+            rule: "fixture.rule".to_string(),
+        }],
+        classifier_version: CLASSIFIER_VERSION.to_string(),
+    };
+    let view = super::content_technical_view(&classification, &metadata);
+    assert_eq!(view.classification, "Game");
+    assert_eq!(view.confidence, "High");
+    assert_eq!(view.classifier_version, CLASSIFIER_VERSION);
+    assert!(view.evidence.iter().any(|line| line.contains("Games")));
+    assert_eq!(
+        view.original_metadata,
+        vec![("category".to_string(), "Games".to_string())]
+    );
 }
 
 #[test]
@@ -3461,6 +3529,10 @@ fn plan_proposal(
         verdict_label: "Exact".to_string(),
         match_confident: true,
         explanations: vec!["preferred region matched (Europe)".to_string()],
+        content_policy: archivefs_core::dat::classification::ContentSelectionPolicy::AllEntries,
+        content_classification:
+            archivefs_core::dat::classification::DatContentClassification::unknown(),
+        original_metadata: Default::default(),
         state,
         object_kind: SourceObjectKind::RegularFile,
         ambiguity_reason: None,
@@ -3484,6 +3556,8 @@ fn page_with_plan(proposals: Vec<RenameProposal>) -> (Fixture, DatSourcesPageSta
         scan_root: "/tmp/roms".to_string(),
         platform: None,
         platform_display: None,
+        content_policy: archivefs_core::dat::classification::ContentSelectionPolicy::AllEntries,
+        classifier_version: archivefs_core::dat::classification::CLASSIFIER_VERSION.to_string(),
         proposals,
         counts,
         audited_total: 2,
@@ -3604,6 +3678,8 @@ fn review_decisions_never_touch_files() {
         scan_root: roms.to_string_lossy().into_owned(),
         platform: None,
         platform_display: None,
+        content_policy: archivefs_core::dat::classification::ContentSelectionPolicy::AllEntries,
+        classifier_version: archivefs_core::dat::classification::CLASSIFIER_VERSION.to_string(),
         proposals: vec![plan_proposal(
             file.to_string_lossy().as_ref(),
             "game.bin",
@@ -3647,6 +3723,8 @@ fn clearing_review_decisions_leaves_source_files_untouched() {
         scan_root: roms.to_string_lossy().into_owned(),
         platform: None,
         platform_display: None,
+        content_policy: archivefs_core::dat::classification::ContentSelectionPolicy::AllEntries,
+        classifier_version: archivefs_core::dat::classification::CLASSIFIER_VERSION.to_string(),
         proposals: vec![plan_proposal(
             file.to_string_lossy().as_ref(),
             "game.bin",
@@ -3839,6 +3917,8 @@ fn page_with_apply_plan(count: usize) -> (Fixture, PathBuf, DatSourcesPageState)
         scan_root: roms.to_string_lossy().into_owned(),
         platform: None,
         platform_display: None,
+        content_policy: archivefs_core::dat::classification::ContentSelectionPolicy::AllEntries,
+        classifier_version: archivefs_core::dat::classification::CLASSIFIER_VERSION.to_string(),
         proposals,
         counts,
         audited_total: counts.total,
@@ -3903,6 +3983,24 @@ fn begin_review_shows_the_read_only_old_to_new_pairs() {
     assert_eq!(review.rows[0].proposed_basename, "Game 0 (Europe).bin");
     assert_eq!(review.trusted_root.as_deref(), Some(roms.to_str().unwrap()));
     // Nothing has been renamed yet.
+    assert!(roms.join("game0.bin").exists());
+    assert!(!roms.join("Game 0 (Europe).bin").exists());
+}
+
+#[test]
+fn stale_classifier_plan_shows_regenerate_message_and_does_not_rename() {
+    let (_fixture, roms, mut page) = page_with_apply_plan(1);
+    page.rename_plan.as_mut().unwrap().classifier_version = "superseded-classifier".to_string();
+    approve_all(&mut page);
+
+    page.apply(DatSourcesPageAction::BeginApplyReview);
+
+    assert_eq!(
+        page.view().rename_apply.apply_error.as_deref(),
+        Some(
+            "Rename plan is stale because classification rules changed. Regenerate the plan before applying."
+        )
+    );
     assert!(roms.join("game0.bin").exists());
     assert!(!roms.join("Game 0 (Europe).bin").exists());
 }
@@ -4004,6 +4102,9 @@ fn an_interrupted_transaction_is_offered_for_recovery_and_never_auto_resumes() {
     let tx = archivefs_core::dat::rename_apply::RenameTransaction {
         transaction_id: "interrupted-test".to_string(),
         plan_generation: 1,
+        classifier_version: Some(
+            archivefs_core::dat::classification::CLASSIFIER_VERSION.to_string(),
+        ),
         created_at_unix: 1,
         source_scan_root: "/tmp/roms".to_string(),
         state: archivefs_core::dat::rename_apply::TransactionState::Applying,

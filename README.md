@@ -1,6 +1,10 @@
-<img width="1024" height="559" alt="emuwiz-banner" src="https://github.com/user-attachments/assets/aa1816c0-316c-4c1b-986e-ba7c14bae9c5" />
-
 # EmuWiz
+
+<p align="center">
+  <img src="assets/branding/emuwiz-logo-256.png"
+       alt="EmuWiz logo"
+       width="220">
+</p>
 
 EmuWiz is a Linux-first, local-first tool for browsing, mounting,
 inspecting, validating, and organizing archived collections you already
@@ -105,9 +109,10 @@ user-facing version at
   directories, inspect bounded `GameSettings/*.ini` metadata, and retrieve
   exact-ID Gecko definitions from Dolphin's official upstream dataset.
   Verified Dolphin Game IDs and revisions bind the provider lookup and exact
-  destination. PCSX2 does not install content; Dolphin can install selected
-  validated Gecko definitions after preview and confirmation. Neither adapter
-  inspects arbitrary local imports; see
+  destination. PCSX2 can install selected, approved PNACH records after preview
+  and confirmation, but EmuWiz does not bundle an ordinary-cheat catalogue for
+  it. Dolphin can install selected validated Gecko definitions after preview and
+  confirmation. Neither adapter treats arbitrary local imports as trusted; see
   [`docs/CHEATS_MODS_SAFETY.md`](docs/CHEATS_MODS_SAFETY.md),
   [`docs/PCSX2_READONLY_ADAPTER.md`](docs/PCSX2_READONLY_ADAPTER.md),
   [`docs/DOLPHIN_READONLY_ADAPTER.md`](docs/DOLPHIN_READONLY_ADAPTER.md), and
@@ -121,8 +126,8 @@ user-facing version at
   non-preselected approval before replacing different existing content),
   verify the write, and record a journal entry. History & Logs can open that
   exact operation and preview/confirm its rollback. EmuWiz never
-  auto-applies. PCSX2 remains preview-only. Dolphin uses the same transaction
-  engine for selected external Gecko definitions, including rollback; see
+  auto-applies. PCSX2 and Dolphin use the same transaction engine for selected,
+  approved records, including rollback; see
   [`docs/RETROARCH_GUI_APPLY_HISTORY.md`](docs/RETROARCH_GUI_APPLY_HISTORY.md)
   and
   [`docs/SHARED_SAFE_APPLY_ROLLBACK.md`](docs/SHARED_SAFE_APPLY_ROLLBACK.md).
@@ -158,7 +163,9 @@ user-facing version at
 - Offers the optional **BSFree Archive** under Cheats → Sources. Download or
   local import is explicit; the historical third-party SQLite database is
   validated, stored immutably, and queried read-only/query-only with bounded
-  pagination. BSFree Stage 1 is browse-only and has no Install action.
+  pagination. Supported GameCube and verified Wii hex-pair codes can be
+  previewed and installed through the shared Dolphin transaction path after
+  explicit confirmation; unsupported and encrypted formats remain browse-only.
 - Supports an optional **RomM** server as an external identity source
   (`identity source romm ...`, and Sources → RomM in the GUI): configuration,
   bounded catalogue import, browsing, per-archive identity matching, and
@@ -166,6 +173,10 @@ user-facing version at
   triggers a scan on it, or touches a ROM. Only loopback and private LAN
   addresses are accepted, and the access token is never printed, logged, or
   stored in config or cache JSON.
+- Keeps full preservation DAT catalogues authoritative for verification and
+  audit while offering a reversible **All entries / Games only** selection for
+  gamer-facing rename and organisation work. Unknown content remains visible
+  for review and is never acted on in Games-only mode.
 - Ships a desktop GUI (`emuwiz`) covering scanning, mounting, sources
   (including RomM and DAT/Cheat catalogue management), library views,
   duplicates, catalogue health, Cheats & Mods, Doctor, History & Logs, and
@@ -176,8 +187,8 @@ user-facing version at
 
 - No automatic patch or cheat installation. Supported RetroArch, Dolphin,
   PCSX2, GameCube, Wii, and Xenia flows require an exact preview and explicit
-  confirmation, then use the verified transaction/History/Undo path. BSFree is
-  browse-only, and unsupported or ambiguous formats remain non-installable.
+  confirmation, then use the verified transaction/History/Undo path. Unsupported
+  or ambiguous formats, including encrypted BSFree codes, remain non-installable.
 - No broad multi-emulator support yet - PCSX2, RetroArch, Dolphin, and Xenia
   are the only emulators with patch/cheat workflows today, and EmuWiz never
   launches an emulator.
@@ -194,13 +205,13 @@ user-facing version at
 
 ## Install from a Release
 
-Prebuilt Linux binaries are published on the [Releases](https://github.com/kiehntre/archivefs/releases) page for tagged versions, for example `v0.5.0-alpha`. This is the quickest way to get running without building from source.
+Prebuilt Linux binaries are published on the [Releases](https://github.com/kiehntre/emuwiz/releases) page for tagged versions, for example `v0.5.0-alpha`. This is the quickest way to get running without building from source.
 
 1. Download the release tarball and its `SHA256SUMS` file, for example:
 
    ```sh
-   curl -LO https://github.com/kiehntre/archivefs/releases/download/v0.5.0-alpha/archivefs-v0.5.0-alpha-x86_64-linux.tar.gz
-   curl -LO https://github.com/kiehntre/archivefs/releases/download/v0.5.0-alpha/SHA256SUMS
+   curl -LO https://github.com/kiehntre/emuwiz/releases/download/v0.5.0-alpha/archivefs-v0.5.0-alpha-x86_64-linux.tar.gz
+   curl -LO https://github.com/kiehntre/emuwiz/releases/download/v0.5.0-alpha/SHA256SUMS
    ```
 
 2. Verify the tarball against the checksum file before extracting it:
@@ -226,6 +237,8 @@ From inside the extracted directory, run the installer:
 
 This installs `emuwiz-cli` and `emuwiz` into `~/.local/bin` (override the location with `--prefix PATH`), creates `~/.config/emuwiz`, and copies `config.toml.example` to `config.toml` there - but only if a config does not already exist; an existing config is never touched. An existing `~/.config/archivefs` from before the rename is still honoured, so pre-rename settings keep loading. The `emuwiz-gui` alias and legacy `archivefs-cli`/`archivefs-gui` names are installed too. It uses no `sudo` and does not modify your shell startup files. It also checks whether `ratarmount` is on `PATH` and prints installation guidance if it is not. It is safe to run again later (for example after upgrading to a newer release tarball).
 
+The installer records what it installed in a small ownership file under `$XDG_DATA_HOME/emuwiz-installer/` and only ever replaces or removes files it can prove it owns. If a binary, alias, desktop entry, or icon it would install already exists at that path but doesn't look like EmuWiz's own (a different program, a hand-edited file, an unrelated symlink), it leaves that path untouched, prints a warning, and exits non-zero instead of overwriting it. Re-run with `--replace-foreign` to move the conflicting file aside instead: it goes into a freshly and securely created backup directory next to it (under its own original name), and the exact backup location is printed - nothing is ever deleted, only moved. The very first run against an install made before this ownership tracking existed will treat its own previously-installed binaries the same way - a one-time `--replace-foreign` re-run picks up where it left off.
+
 Edit `source_folders` and `mount_root` in `~/.config/emuwiz/config.toml`, then run `emuwiz-cli doctor` (see the PATH note below if that command is not found).
 
 To remove what it installed (your config is left in place):
@@ -234,7 +247,7 @@ To remove what it installed (your config is left in place):
 ./install.sh --uninstall
 ```
 
-Pass the same `--prefix PATH` to `--uninstall` if you installed to a non-default location. Run `./install.sh --help` for the full list of options.
+Uninstall only removes assets it can prove it owns; anything it can't (for the same reasons as above) is left in place with a warning, and uninstall keeps going rather than aborting. Pass the same `--prefix PATH` to `--uninstall` if you installed to a non-default location. Run `./install.sh --help` for the full list of options.
 
 **PATH note:** the installer never edits shell startup files, so if `~/.local/bin` is not already on your `PATH`, add it yourself - for example add this line to `~/.bashrc` or `~/.zshrc`, then restart your shell (or `source` that file):
 
@@ -329,7 +342,7 @@ cargo build --workspace
 The development binary will be at:
 
 ```sh
-target/debug/archivefs-cli
+target/debug/emuwiz-cli
 ```
 
 For regular local use, install it with Cargo:
@@ -356,8 +369,8 @@ EmuWiz also includes a desktop frontend built with `egui`/`eframe`. It scans in 
 Build and run it from the workspace root:
 
 ```sh
-cargo build -p archivefs-gui
-cargo run -p archivefs-gui
+cargo build -p archivefs-gui --bin emuwiz
+cargo run -p archivefs-gui --bin emuwiz
 ```
 
 The GUI uses the same `~/.config/emuwiz/config.toml` configuration and core scanning/catalogue logic as the CLI. Use **Refresh** to rescan after filesystem or mount-state changes.

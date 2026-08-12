@@ -48,7 +48,9 @@ pub fn parse_dat_file(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pa
     let size = metadata.len();
     if size == 0 {
         // Empty file: try ClrMamePro (produces empty result), Logiqx would error.
-        return parse_clrmamepro(path, limits);
+        let mut outcome = parse_clrmamepro(path, limits)?;
+        super::classification::classify_catalogue(&mut outcome.dat);
+        return Ok(outcome);
     }
     if size > limits.max_file_size {
         return Err(ParseError::FileTooLarge {
@@ -59,10 +61,12 @@ pub fn parse_dat_file(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pa
     }
 
     let detected = detect_format(path)?;
-    match detected {
+    let mut outcome = match detected {
         DatFormat::Logiqx => parse_logiqx(path, limits),
         DatFormat::ClrMamePro => parse_clrmamepro(path, limits),
-    }
+    }?;
+    super::classification::classify_catalogue(&mut outcome.dat);
+    Ok(outcome)
 }
 
 /// Reads the first few KB of a file and decides its DAT format.
@@ -114,6 +118,7 @@ pub fn detect_format(path: &Path) -> Result<DatFormat, ParseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dat::classification::DatContentClass;
 
     #[test]
     fn detect_logiqx_by_xml_declaration() {
@@ -149,5 +154,57 @@ mod tests {
         let path = dir.path().join("empty.dat");
         std::fs::write(&path, "").unwrap();
         assert_eq!(detect_format(&path).unwrap(), DatFormat::ClrMamePro);
+    }
+
+    #[test]
+    fn sanitized_no_intro_shape_uses_structured_category_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no-intro.dat");
+        std::fs::write(
+            &path,
+            r#"<datafile><header><name>No-Intro Example</name></header><game name="Example" category="Games"><rom name="example.bin" size="4" sha1="a94a8fe5ccb19ba61c4c0873d391e987982fbbd3"/></game></datafile>"#,
+        )
+        .unwrap();
+        let outcome = parse_dat_file(&path, DatLimits::default()).unwrap();
+        assert_eq!(
+            outcome.dat.games[0].content_classification.class,
+            DatContentClass::Game
+        );
+        assert_eq!(
+            outcome.dat.games[0].original_metadata.fields["category"],
+            "Games"
+        );
+    }
+
+    #[test]
+    fn sanitized_redump_shape_without_category_remains_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("redump.dat");
+        std::fs::write(
+            &path,
+            r#"<datafile><header><name>Redump Example</name></header><game name="Retail Disc"><rom name="disc.bin" size="4" sha1="a94a8fe5ccb19ba61c4c0873d391e987982fbbd3"/></game></datafile>"#,
+        )
+        .unwrap();
+        let outcome = parse_dat_file(&path, DatLimits::default()).unwrap();
+        assert_eq!(
+            outcome.dat.games[0].content_classification.class,
+            DatContentClass::Unknown
+        );
+    }
+
+    #[test]
+    fn sanitized_tosec_shape_classifies_from_the_set_category() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tosec.dat");
+        std::fs::write(
+            &path,
+            "clrmamepro (\n name \"TOSEC - Commodore Amiga - Games - ADF\"\n)\ngame (\n name \"Quest (Disk 1 of 2)\"\n rom ( name \"quest.adf\" size 4 crc 00000000 )\n)\n",
+        )
+        .unwrap();
+        let outcome = parse_dat_file(&path, DatLimits::default()).unwrap();
+        assert_eq!(
+            outcome.dat.games[0].content_classification.class,
+            DatContentClass::RequiredMultidiscPart
+        );
     }
 }

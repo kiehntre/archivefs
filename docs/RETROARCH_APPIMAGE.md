@@ -5,7 +5,7 @@ read-only existing-artifact inventory as native and Flatpak profiles; no
 AppImage is executed, mounted, or extracted for inventory. See
 [`RETROARCH_ARTIFACT_INVENTORY.md`](RETROARCH_ARTIFACT_INVENTORY.md).
 
-`archivefs retroarch-environment` also detects RetroArch installed as an
+`emuwiz-cli retroarch-environment` also detects RetroArch installed as an
 AppImage - the primary way many users, including the one this feature was
 built for, actually run RetroArch and other emulators on Linux. Detection
 is strictly read-only: it never executes, mounts, extracts, or FUSE-mounts
@@ -249,7 +249,7 @@ one for the same catalogue, without any separate plan-level version bump.
 
 ## CLI output
 
-`archivefs retroarch-environment`'s human output gains an "AppImage
+`emuwiz-cli retroarch-environment`'s human output gains an "AppImage
 candidates:" section per profile (only printed when non-empty), compact
 by design to match the rest of this command's style: each candidate's
 path, confidence, executable state, and a short configuration-association

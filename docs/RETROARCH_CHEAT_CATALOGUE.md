@@ -1,6 +1,6 @@
 # RetroArch External Cheat Catalogue Discovery and Matching
 
-`archivefs retroarch-cheat-catalogue <local-path>` discovers which cheats a
+`emuwiz-cli retroarch-cheat-catalogue <local-path>` discovers which cheats a
 **local** external catalogue source offers for your catalogued games, how
 confidently each offer matches a game you own, whether it is already
 installed, and - as of this milestone - exactly where it would go and what
@@ -9,9 +9,9 @@ overwritten by this command, now or in any earlier milestone.** Every
 `planned_action` in this document is a calculation only.
 
 ```console
-archivefs retroarch-cheat-catalogue /path/to/cheat-catalogue
-archivefs retroarch-cheat-catalogue /path/to/manifest.json --json
-archivefs retroarch-cheat-catalogue /path/to/cheat-catalogue --cheat-destination-root /tmp/isolated-preview-root
+emuwiz-cli retroarch-cheat-catalogue /path/to/cheat-catalogue
+emuwiz-cli retroarch-cheat-catalogue /path/to/manifest.json --json
+emuwiz-cli retroarch-cheat-catalogue /path/to/cheat-catalogue --cheat-destination-root /tmp/isolated-preview-root
 ```
 
 The local catalogue path is always required and always exact. EmuWiz
@@ -363,7 +363,7 @@ gated by [`PATCH_CHEAT_MANAGER_DESIGN.md`](PATCH_CHEAT_MANAGER_DESIGN.md).
 A separate, additive data model describes what such an execution would (or
 did) do - see [`RETROARCH_CHEAT_INSTALL_RESULT.md`](RETROARCH_CHEAT_INSTALL_RESULT.md).
 A real, write-capable executor now consumes that data model:
-`archivefs retroarch-cheat-install` - see
+`emuwiz-cli retroarch-cheat-install` - see
 [`RETROARCH_CHEAT_INSTALL.md`](RETROARCH_CHEAT_INSTALL.md). This command
 (`retroarch-cheat-catalogue`) remains unchanged and strictly read-only;
 nothing about the installer's implementation modified it.

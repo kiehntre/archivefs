@@ -98,6 +98,7 @@ fn dat_outcome(platform: Option<&str>, verdict: AuditVerdict) -> DatAuditOutcome
         bytes_hashed: 123,
         truncated: false,
         policy: None,
+        content: Default::default(),
         platform: platform.map(str::to_string),
     }
 }

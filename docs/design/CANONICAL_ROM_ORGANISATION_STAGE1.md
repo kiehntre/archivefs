@@ -10,7 +10,7 @@ root is configured.
 ## Master ROM root
 
 - Configured in `config.toml` as `master_rom_root = "/mnt/games/roms"` (core:
-  `Config.master_rom_root`, CLI: `archivefs-cli rom-organise set-master-root`).
+  `Config.master_rom_root`, CLI: `emuwiz-cli rom-organise set-master-root`).
 - Optional; `None` means organisation is not offered. Setting it never mutates.
 - Must be absolute and not a filesystem root; `..` is rejected. It is preserved
   by every other config writer.

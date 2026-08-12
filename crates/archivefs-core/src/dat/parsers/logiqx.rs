@@ -25,6 +25,7 @@ use quick_xml::Reader;
 use quick_xml::escape::{resolve_predefined_entity, unescape};
 use quick_xml::events::Event;
 
+use super::super::classification::{DatContentClassification, DatOriginalMetadata};
 use super::super::hash::{normalise_crc32, normalise_md5, normalise_sha1, normalise_sha256};
 use super::super::limits::DatLimits;
 use super::super::model::{
@@ -66,6 +67,7 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
     let mut current_game_name: Option<String> = None;
     let mut current_game_desc: Option<String> = None;
     let mut current_game_clone_of: Option<String> = None;
+    let mut current_game_metadata = DatOriginalMetadata::default();
     let mut current_roms: Vec<DatRomEntry> = Vec::new();
     let mut current_rom_name: Option<String> = None;
     let mut current_rom_size: Option<u64> = None;
@@ -130,6 +132,7 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                             &mut current_game_name,
                             &mut current_game_desc,
                             &mut current_game_clone_of,
+                            &mut current_game_metadata,
                             &mut current_roms,
                             &mut games,
                         );
@@ -167,6 +170,24 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                             )
                         });
                         current_game_desc = None;
+                        current_game_metadata = DatOriginalMetadata::default();
+                        for (key, attribute) in [
+                            ("category", b"category".as_slice()),
+                            ("type", b"type".as_slice()),
+                            ("content_type", b"content_type".as_slice()),
+                            ("media", b"media".as_slice()),
+                            ("release_type", b"release_type".as_slice()),
+                            ("archive_devstatus", b"archive_devstatus".as_slice()),
+                        ] {
+                            if let Some(value) = attr_str_opt(
+                                start_bytes,
+                                attribute,
+                                &mut warnings,
+                                limits.max_warnings,
+                            ) {
+                                current_game_metadata.fields.insert(key.to_string(), value);
+                            }
+                        }
                         current_roms = Vec::new();
                     }
                     "rom" => {
@@ -300,6 +321,15 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                                 Some(text.chars().take(limits.max_description_length).collect());
                         } else if !text.is_empty() {
                             current_game_desc = Some(text);
+                        }
+                    }
+                    "category" | "type" | "content_type" | "media" | "release_type"
+                    | "archive_devstatus"
+                        if in_game_element =>
+                    {
+                        let value = trimmed(&text_buf);
+                        if !value.is_empty() {
+                            current_game_metadata.fields.insert(tag, value);
                         }
                     }
                     "rom" => {
@@ -537,6 +567,7 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
         &mut current_game_name,
         &mut current_game_desc,
         &mut current_game_clone_of,
+        &mut current_game_metadata,
         &mut current_roms,
         &mut games,
     );
@@ -624,6 +655,7 @@ fn drop_current_game(
     name: &mut Option<String>,
     desc: &mut Option<String>,
     clone_of: &mut Option<String>,
+    metadata: &mut DatOriginalMetadata,
     roms: &mut Vec<DatRomEntry>,
     games: &mut Vec<DatGameEntry>,
 ) {
@@ -640,6 +672,8 @@ fn drop_current_game(
             manufacturer: None,
             source_file: None,
             comment: None,
+            original_metadata: std::mem::take(metadata),
+            content_classification: DatContentClassification::unknown(),
         });
     }
 }

@@ -8,6 +8,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::*;
+use crate::dat::classification::{
+    ContentSelectionPolicy, DatContentClassification, DatOriginalMetadata,
+};
 use crate::dat::rename_plan::{
     ProposalState, RenamePlan, RenamePlanCounts, RenameProposal, SourceObjectKind,
 };
@@ -41,6 +44,9 @@ fn proposal(source: &str, current: &str, proposed: &str, state: ProposalState) -
         verdict_label: "Exact".to_string(),
         match_confident: true,
         explanations: Vec::new(),
+        content_policy: ContentSelectionPolicy::AllEntries,
+        content_classification: DatContentClassification::unknown(),
+        original_metadata: DatOriginalMetadata::default(),
         state,
         object_kind: SourceObjectKind::RegularFile,
         ambiguity_reason: None,
@@ -61,6 +67,8 @@ fn plan(proposals: Vec<RenameProposal>, generation: u64, scan_root: &Path) -> Re
         scan_root: scan_root.to_string_lossy().into_owned(),
         platform: None,
         platform_display: None,
+        content_policy: ContentSelectionPolicy::AllEntries,
+        classifier_version: crate::dat::classification::CLASSIFIER_VERSION.to_string(),
         proposals,
         counts,
         audited_total: counts.total,
@@ -182,6 +190,10 @@ fn one_approved_safe_rename_applies() {
     .unwrap();
 
     assert_eq!(outcome.transaction.state, TransactionState::Applied);
+    assert_eq!(
+        outcome.transaction.classifier_version.as_deref(),
+        Some(crate::dat::classification::CLASSIFIER_VERSION)
+    );
     assert_eq!(outcome.summary.applied, 1);
     assert_eq!(outcome.summary.failed, 0);
     assert!(!source.exists());
@@ -320,6 +332,103 @@ fn a_stale_generation_is_rejected() {
     let error = build_transaction(&plan, &approved_of(&[&source]), 6).unwrap_err();
     assert!(matches!(error, ApplyError::StalePlan { .. }));
     assert!(source.exists());
+}
+
+#[test]
+fn a_changed_classifier_version_is_rejected_before_apply_without_filesystem_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let roms = dir.path().join("roms");
+    std::fs::create_dir_all(&roms).unwrap();
+    let source = write(&roms, "a.bin");
+    let journal = dir.path().join("journal");
+    std::fs::create_dir_all(&journal).unwrap();
+    let plan = plan(
+        vec![proposal(
+            source.to_str().unwrap(),
+            "a.bin",
+            "b.bin",
+            ProposalState::Suggested,
+        )],
+        1,
+        &roms,
+    );
+    let approved = approved_of(&[&source]);
+    let mut transaction = build_transaction(&plan, &approved, 1).unwrap();
+    transaction.classifier_version = Some("superseded-classifier".to_string());
+    let before = snapshot(dir.path());
+
+    let error = apply_exec(
+        transaction,
+        approved,
+        TrustedRoots::from_paths([&roms]),
+        &journal,
+        HardConflictMode::AbortAll,
+        &no_cancel(),
+        1,
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ApplyError::StaleClassifierVersion {
+            plan: Some(ref version),
+            ..
+        } if version == "superseded-classifier"
+    ));
+    assert_eq!(
+        snapshot(dir.path()),
+        before,
+        "no journal or rename was written"
+    );
+    assert!(source.exists());
+    assert!(!roms.join("b.bin").exists());
+}
+
+#[test]
+fn a_missing_classifier_version_is_rejected_before_apply_without_filesystem_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let roms = dir.path().join("roms");
+    std::fs::create_dir_all(&roms).unwrap();
+    let source = write(&roms, "a.bin");
+    let journal = dir.path().join("journal");
+    std::fs::create_dir_all(&journal).unwrap();
+    let plan = plan(
+        vec![proposal(
+            source.to_str().unwrap(),
+            "a.bin",
+            "b.bin",
+            ProposalState::Suggested,
+        )],
+        1,
+        &roms,
+    );
+    let approved = approved_of(&[&source]);
+    let mut transaction = build_transaction(&plan, &approved, 1).unwrap();
+    transaction.classifier_version = None;
+    let before = snapshot(dir.path());
+
+    let error = apply_exec(
+        transaction,
+        approved,
+        TrustedRoots::from_paths([&roms]),
+        &journal,
+        HardConflictMode::AbortAll,
+        &no_cancel(),
+        1,
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ApplyError::StaleClassifierVersion { plan: None, .. }
+    ));
+    assert_eq!(
+        snapshot(dir.path()),
+        before,
+        "no journal or rename was written"
+    );
+    assert!(source.exists());
+    assert!(!roms.join("b.bin").exists());
 }
 
 #[test]
@@ -939,6 +1048,7 @@ fn crash_after_journal_write_before_first_rename_is_recoverable() {
     let tx = RenameTransaction {
         transaction_id: "crash1".to_string(),
         plan_generation: 1,
+        classifier_version: Some(crate::dat::classification::CLASSIFIER_VERSION.to_string()),
         created_at_unix: 1,
         source_scan_root: "/tmp/roms".to_string(),
         state: TransactionState::Planned,
@@ -987,6 +1097,7 @@ fn crash_after_first_of_n_renames_is_recoverable() {
     let mut tx = RenameTransaction {
         transaction_id: "crash2".to_string(),
         plan_generation: 1,
+        classifier_version: Some(crate::dat::classification::CLASSIFIER_VERSION.to_string()),
         created_at_unix: 1,
         source_scan_root: "/tmp/roms".to_string(),
         state: TransactionState::Applying,
@@ -1040,6 +1151,7 @@ fn recovery_never_auto_resumes() {
     let tx = RenameTransaction {
         transaction_id: "nore".to_string(),
         plan_generation: 1,
+        classifier_version: Some(crate::dat::classification::CLASSIFIER_VERSION.to_string()),
         created_at_unix: 1,
         source_scan_root: "/tmp/roms".to_string(),
         state: TransactionState::Applying,
@@ -1932,6 +2044,7 @@ fn stress_crash_recovery_fixtures_are_detected() {
         let mut tx = RenameTransaction {
             transaction_id: "stress-recovery".to_string(),
             plan_generation: 1,
+            classifier_version: Some(crate::dat::classification::CLASSIFIER_VERSION.to_string()),
             created_at_unix: 1,
             source_scan_root: "/tmp/roms".to_string(),
             state: TransactionState::Applying,

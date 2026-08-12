@@ -15,6 +15,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::dat::audit::{AuditEntry, AuditVerdict};
+use crate::dat::classification::{
+    ContentEligibility, DatContentClassification, DatOriginalMetadata,
+};
 use crate::dat::rename_plan::collisions::{
     DirSiblings, detect_proposal_collisions, detect_target_collision,
 };
@@ -22,7 +25,7 @@ use crate::dat::rename_plan::derive::{DeriveOutcome, derive_proposed_basename};
 use crate::dat::rename_plan::model::{
     ProposalState, RenamePlan, RenamePlanCounts, RenameProposal, SourceObjectKind,
 };
-use crate::dat::sources::audit_run::{DatAuditOutcome, DatPolicyNote};
+use crate::dat::sources::audit_run::{DatAuditOutcome, DatContentMatch, DatPolicyNote};
 
 /// The identity a plan is built for. `generation` lets a caller reject a plan
 /// built for a stale audit generation.
@@ -74,6 +77,12 @@ pub fn build_rename_plan(
                 .collect()
         })
         .unwrap_or_default();
+    let content_by_path: HashMap<&str, &DatContentMatch> = outcome
+        .content
+        .matches
+        .iter()
+        .map(|note| (note.local_path.as_str(), note))
+        .collect();
 
     // The sibling index comes from the audit's own file list: every walked
     // file is in `report.entries`, so no second scan is needed to answer
@@ -96,6 +105,13 @@ pub fn build_rename_plan(
         .as_deref()
         .map(crate::platform::display_name_for)
         .map(str::to_string);
+    let proposal_context = ProposalContext {
+        content_policy: outcome.content.selection,
+        platform: outcome.platform.as_deref(),
+        platform_display: platform_display.as_deref(),
+        source_id: &outcome.source_id,
+        source_display_name: &outcome.source_display_name,
+    };
 
     let mut proposals: Vec<RenameProposal> = Vec::new();
     let mut verified_total = 0usize;
@@ -113,24 +129,21 @@ pub fn build_rename_plan(
         }
         verified_total += 1;
         let note = notes_by_path.get(entry.local_path.as_str()).copied();
+        let content = content_by_path.get(entry.local_path.as_str()).copied();
         let source_path = Path::new(&entry.local_path);
         match classify_object(source_path) {
             Some(object_kind) => proposals.push(derive_proposal(
                 entry,
                 note,
-                outcome.platform.as_deref(),
-                platform_display.clone(),
-                &outcome.source_id,
-                &outcome.source_display_name,
+                content,
+                &proposal_context,
                 object_kind,
             )),
             None => proposals.push(blocked_missing_source(
                 entry,
                 note,
-                outcome.platform.as_deref(),
-                platform_display.clone(),
-                &outcome.source_id,
-                &outcome.source_display_name,
+                content,
+                &proposal_context,
             )),
         }
     }
@@ -154,6 +167,8 @@ pub fn build_rename_plan(
         scan_root: outcome.scan_root.clone(),
         platform: outcome.platform.clone(),
         platform_display,
+        content_policy: outcome.content.selection,
+        classifier_version: crate::dat::classification::CLASSIFIER_VERSION.to_string(),
         proposals,
         counts,
         audited_total: outcome.report.summary.total,
@@ -179,16 +194,22 @@ fn classify_object(path: &Path) -> Option<SourceObjectKind> {
     }
 }
 
+struct ProposalContext<'a> {
+    content_policy: crate::dat::classification::ContentSelectionPolicy,
+    platform: Option<&'a str>,
+    platform_display: Option<&'a str>,
+    source_id: &'a str,
+    source_display_name: &'a str,
+}
+
 /// Derives one proposal from a verified audit entry, its policy resolution
 /// (when it has one), and the source's filesystem classification. Pure: no
 /// filesystem access beyond the caller-supplied `object_kind`.
 fn derive_proposal(
     entry: &AuditEntry,
     note: Option<&DatPolicyNote>,
-    platform: Option<&str>,
-    platform_display: Option<String>,
-    source_id: &str,
-    source_display_name: &str,
+    content_match: Option<&DatContentMatch>,
+    context: &ProposalContext<'_>,
     object_kind: SourceObjectKind,
 ) -> RenameProposal {
     let current_basename = entry.local_filename.clone();
@@ -243,6 +264,23 @@ fn derive_proposal(
     let mut proposed_basename: Option<String> = None;
     let mut extension_status = None;
     let mut sanitisation_notes: Vec<String> = Vec::new();
+    let content_candidate =
+        game_name
+            .as_deref()
+            .zip(rom_name.as_deref())
+            .and_then(|(game_name, rom_name)| {
+                content_match.and_then(|matched| {
+                    matched.candidates.iter().find(|candidate| {
+                        candidate.game_name == game_name && candidate.rom_name == rom_name
+                    })
+                })
+            });
+    let content_classification = content_candidate
+        .map(|candidate| candidate.classification.clone())
+        .unwrap_or_else(DatContentClassification::unknown);
+    let original_metadata = content_candidate
+        .map(|candidate| candidate.original_metadata.clone())
+        .unwrap_or_else(DatOriginalMetadata::default);
 
     match object_kind {
         SourceObjectKind::Symlink => {
@@ -261,6 +299,26 @@ fn derive_proposal(
             );
         }
         SourceObjectKind::RegularFile => {}
+    }
+
+    if state == ProposalState::Suggested && ambiguity_reason.is_none() {
+        match context.content_policy.eligibility(&content_classification) {
+            ContentEligibility::Selected => {}
+            ContentEligibility::ExcludedNonGame => {
+                state = ProposalState::ExcludedByContentPolicy;
+                blockers.push(
+                    "Games only does not select content confidently classified as non-game"
+                        .to_string(),
+                );
+            }
+            ContentEligibility::NeedsReview => {
+                state = ProposalState::UnclassifiedContent;
+                blockers.push(
+                    "this entry's content classification is Unknown; Games only never renames it automatically"
+                        .to_string(),
+                );
+            }
+        }
     }
 
     if state == ProposalState::Suggested {
@@ -296,15 +354,18 @@ fn derive_proposal(
         source_path: entry.local_path.clone().into(),
         current_basename,
         proposed_basename,
-        platform: platform.map(str::to_string),
-        platform_display,
-        source_id: source_id.to_string(),
-        source_display_name: source_display_name.to_string(),
+        platform: context.platform.map(str::to_string),
+        platform_display: context.platform_display.map(str::to_string),
+        source_id: context.source_id.to_string(),
+        source_display_name: context.source_display_name.to_string(),
         game_name,
         rom_name,
         verdict_label,
         match_confident,
         explanations,
+        content_policy: context.content_policy,
+        content_classification,
+        original_metadata,
         state,
         object_kind,
         ambiguity_reason,
@@ -321,18 +382,14 @@ fn derive_proposal(
 fn blocked_missing_source(
     entry: &AuditEntry,
     note: Option<&DatPolicyNote>,
-    platform: Option<&str>,
-    platform_display: Option<String>,
-    source_id: &str,
-    source_display_name: &str,
+    content_match: Option<&DatContentMatch>,
+    context: &ProposalContext<'_>,
 ) -> RenameProposal {
     let mut proposal = derive_proposal(
         entry,
         note,
-        platform,
-        platform_display,
-        source_id,
-        source_display_name,
+        content_match,
+        context,
         SourceObjectKind::RegularFile,
     );
     proposal.state = ProposalState::Blocked;
@@ -381,6 +438,9 @@ fn cancelled(cancel: &AtomicBool) -> bool {
 mod tests {
     use super::*;
     use crate::dat::audit::{AuditEntry, AuditReport, AuditSummary, AuditVerdict};
+    use crate::dat::classification::{
+        CLASSIFIER_VERSION, ClassifierConfidence, ContentSelectionPolicy, DatContentClass,
+    };
     use crate::dat::policy::candidate::DatCandidate;
     use crate::dat::policy::config::DatPolicyConfig;
     use crate::dat::policy::evaluate::{CandidateResolution, RankedCandidate};
@@ -389,7 +449,10 @@ mod tests {
         ClonePolicy, LanguageId, LanguagePreference, RegionId, RevisionPolicy,
     };
     use crate::dat::rename_plan::model::{CollisionKind, ExtensionStatus, ProposalState};
-    use crate::dat::sources::audit_run::{DatAuditPolicyOutcome, DatPolicyNote};
+    use crate::dat::sources::audit_run::{
+        DatAuditContentOutcome, DatAuditPolicyOutcome, DatContentCandidate, DatContentMatch,
+        DatPolicyNote,
+    };
     use std::path::Path;
 
     fn temp() -> tempfile::TempDir {
@@ -495,6 +558,7 @@ mod tests {
                 source_ordering: vec!["Source".to_string()],
                 notes,
             }),
+            content: Default::default(),
             platform,
         }
     }
@@ -517,6 +581,35 @@ mod tests {
 
     fn no_cancel() -> AtomicBool {
         AtomicBool::new(false)
+    }
+
+    fn set_content(
+        outcome: &mut DatAuditOutcome,
+        path: &Path,
+        rom_name: &str,
+        class: DatContentClass,
+        confidence: ClassifierConfidence,
+    ) {
+        let classification = DatContentClassification {
+            class,
+            confidence,
+            evidence: Vec::new(),
+            classifier_version: CLASSIFIER_VERSION.to_string(),
+        };
+        outcome.content = DatAuditContentOutcome {
+            selection: ContentSelectionPolicy::GamesOnly,
+            catalogue: Default::default(),
+            matches: vec![DatContentMatch {
+                local_path: path.to_string_lossy().into_owned(),
+                candidates: vec![DatContentCandidate {
+                    game_name: "Game".to_string(),
+                    rom_name: rom_name.to_string(),
+                    eligibility: ContentSelectionPolicy::GamesOnly.eligibility(&classification),
+                    classification,
+                    original_metadata: Default::default(),
+                }],
+            }],
+        };
     }
 
     /// A recursive `(relative path, inode, size, mtime, contents)` snapshot
@@ -849,6 +942,58 @@ mod tests {
             before, after,
             "planning must leave every path, inode identity, size, mtime and content unchanged"
         );
+    }
+
+    #[test]
+    fn games_only_never_renames_unknown_and_excludes_non_game_distinctly() {
+        for (class, confidence, expected) in [
+            (
+                DatContentClass::Unknown,
+                ClassifierConfidence::None,
+                ProposalState::UnclassifiedContent,
+            ),
+            (
+                DatContentClass::NonGame,
+                ClassifierConfidence::High,
+                ProposalState::ExcludedByContentPolicy,
+            ),
+        ] {
+            let dir = temp();
+            let file = write(dir.path(), "old.bin");
+            let entries = vec![entry_for(&file, "old.bin", exact("Game.bin"))];
+            let mut audited = outcome(dir.path(), entries, Vec::new(), None, false);
+            set_content(&mut audited, &file, "Game.bin", class, confidence);
+            let plan =
+                build_rename_plan(&audited, &RenamePlanContext { generation: 1 }, &no_cancel())
+                    .unwrap();
+            assert_eq!(plan.proposals[0].state, expected);
+            assert!(!plan.proposals[0].actionable);
+        }
+    }
+
+    #[test]
+    fn games_only_retains_compilations_and_required_multidisc_parts() {
+        for class in [
+            DatContentClass::GameCompilation,
+            DatContentClass::RequiredMultidiscPart,
+        ] {
+            let dir = temp();
+            let file = write(dir.path(), "old.bin");
+            let entries = vec![entry_for(&file, "old.bin", exact("Game.bin"))];
+            let mut audited = outcome(dir.path(), entries, Vec::new(), None, false);
+            set_content(
+                &mut audited,
+                &file,
+                "Game.bin",
+                class,
+                ClassifierConfidence::High,
+            );
+            let plan =
+                build_rename_plan(&audited, &RenamePlanContext { generation: 1 }, &no_cancel())
+                    .unwrap();
+            assert_eq!(plan.proposals[0].state, ProposalState::Suggested);
+            assert!(plan.proposals[0].actionable);
+        }
     }
 
     #[test]

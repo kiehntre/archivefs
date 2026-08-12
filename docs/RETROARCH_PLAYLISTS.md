@@ -7,7 +7,7 @@ not add a new playlist matching tier. See
 
 This milestone adds read-only discovery and parsing of RetroArch's own
 `.lpl` playlist files, and uses them as additional, stronger identity
-evidence for `archivefs retroarch-patch-preview`. It changes nothing
+evidence for `emuwiz-cli retroarch-patch-preview`. It changes nothing
 about how playlists themselves work: no playlist is ever created,
 repaired, or modified, and RetroArch's own playlist-writing behavior is
 untouched.
@@ -288,9 +288,9 @@ exactly as this milestone's own instructions anticipated.
 
 ## CLI
 
-No new top-level command was added. `archivefs retroarch-environment`
+No new top-level command was added. `emuwiz-cli retroarch-environment`
 gains one concise summary line per profile ("Playlists found: N (M total
-entries)"), not a full dump. `archivefs retroarch-patch-preview`'s human
+entries)"), not a full dump. `emuwiz-cli retroarch-patch-preview`'s human
 output shows playlist evidence only when present (playlist name, entry
 label, confidence, database name, core association) - it never dumps
 every playlist entry by default. JSON output carries the full structured

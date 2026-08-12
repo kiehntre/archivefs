@@ -194,11 +194,13 @@ These are implemented, tested, and in current use today:
 
 ## Current development
 
-The current workspace is the manually approved `v0.7.0` release branch.
-Direct-image discovery, canonical platform aliases, source platform assignment,
-platform-first navigation, Dolphin installation, and Xenia Canary patch support
-are integrated. Release publication is handled by the tag-only workflow; this
-roadmap does not imply that later feature work is part of v0.7.0.
+The current workspace is post-`v0.7.0` `main`; `v0.7.0` remains the latest
+published release. Direct-image discovery, canonical platform aliases, source
+platform assignment, platform-first navigation, Dolphin and supported BSFree
+installation, Xenia Canary patch support, Games-only DAT selection, and EmuWiz
+Linux desktop integration are present on `main`. Release publication is handled
+by the tag-only workflow; post-release work is not retroactively part of
+`v0.7.0`.
 
 The shared `patch_manager` orchestration layer (platform filtering,
 ambiguity heuristics, plan assembly in `patch_manager::mod`) remains
@@ -208,9 +210,9 @@ surface; see [`docs/PATCH_CHEAT_MANAGER_DESIGN.md`](docs/PATCH_CHEAT_MANAGER_DES
 RetroArch's preview and the Dolphin adapter both deliberately did not
 generalize or extend this layer - each shipped as its own independent
 module instead, since neither shape fit `EmulatorAdapter`'s
-PCSX2-patch-preview-specific design. Whether the newer PCSX2 Cheats &
-Mods adapter itself extends `EmulatorAdapter` or is likewise independent
-has not been separately confirmed here.
+PCSX2-patch-preview-specific design. The newer PCSX2 Cheats & Mods workflow is
+likewise independent of that original preview trait and feeds approved records
+into the shared preview/apply/rollback transaction path.
 
 Ongoing library inspection and catalogue-health improvements build on the
 archive inspector and `CatalogueHealthReport`. Documentation maintenance
@@ -221,8 +223,9 @@ the code as these areas change.
 
 Realistic, concrete next steps, in the recommended order below:
 
-1. **PCSX2 provider and safe PNACH merge** - remain read-only until
-   per-section selection and conservative merging are designed and reviewed.
+1. **PCSX2 provider content** - safe PNACH selection, preview, merge, apply, and
+   rollback are implemented; the remaining blocker is a separately licensed,
+   reviewed ordinary-cheat provider.
 2. **Performance profiling beyond smoke scale** - investigate larger
    catalogues only if measured traces identify a concrete bottleneck.
 3. **Mods work** - no general mod installation path exists yet.
@@ -265,13 +268,13 @@ scheduled:
 These are research directions only. None of them are promised, scheduled,
 or currently implemented in any form:
 
-- Integration with community cataloguing/verification sources such as
-  Redump, No-Intro, TOSEC, or MAME's DAT data, and metadata sources such as
-  ScreenScraper - purely as optional, opt-in, offline-safe enrichment,
-  consistent with the provider-pipeline principles in
+- Further optional catalogue/verification and metadata providers beyond the
+  current DAT and RomM source pipelines, where provenance and offline-safe
+  caching can meet the provider principles in
   [`docs/provider-pipeline.md`](docs/provider-pipeline.md).
-- Patch-metadata and artwork sources beyond the single PCSX2 endpoint used
-  today.
+- Further patch, cheat, and artwork providers beyond the currently reviewed
+  RetroArch, Dolphin, Xenia, GameHacking, BSFree, RomM, and local-artwork
+  sources.
 - Update/DLC awareness for preservation collections.
 - Preservation-format guidance (for example CHD, RVZ, WUA, CSO, alongside
   the ZIP/7z/RAR archives already supported) - guidance and detection only,

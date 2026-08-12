@@ -214,6 +214,7 @@ mod tests {
         RenameTransaction {
             transaction_id: "reconcile-test".to_string(),
             plan_generation: 1,
+            classifier_version: Some(crate::dat::classification::CLASSIFIER_VERSION.to_string()),
             created_at_unix: 1,
             source_scan_root: "/tmp/roms".to_string(),
             state: super::super::model::TransactionState::Applying,

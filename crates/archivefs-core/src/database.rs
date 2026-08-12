@@ -9090,6 +9090,7 @@ mod tests {
             bytes_hashed: archive.size_bytes.unwrap_or(0),
             truncated: false,
             policy: None,
+            content: Default::default(),
             platform: Some("PSP".to_string()),
         };
 

@@ -34,6 +34,11 @@ use serde::{Deserialize, Serialize};
 /// is no second policy document to drift.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DatPolicyConfig {
+    /// Which content is eligible for gamer-facing rename/organisation.
+    /// Matching and audit always use the complete catalogue regardless.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_selection: Option<String>,
+
     /// Preferred regions in order. Each entry is a canonical region id
     /// (`world`, `usa`, `japan`, `europe`, `other`). Empty = no preference.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -78,6 +83,9 @@ pub struct DatPolicyConfig {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DatPlatformPolicyConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_selection: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region_preferences: Option<Vec<String>>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -115,6 +123,7 @@ mod tests {
     #[test]
     fn policy_round_trips_through_toml() {
         let policy = DatPolicyConfig {
+            content_selection: Some("games_only".into()),
             region_preferences: Some(vec!["europe".into(), "usa".into()]),
             language_preferences: Some(vec!["en".into(), "multi".into()]),
             revision_policy: Some("latest_verified".into()),

@@ -16,7 +16,7 @@ Guided setup may also receive a validated local snapshot from the separate
 [trusted source retrieval layer](RETROARCH_CHEAT_SOURCES.md). The installer
 still receives a local path and never downloads a URL itself.
 
-`archivefs retroarch-cheat-install <local-path>` is the first
+`emuwiz-cli retroarch-cheat-install <local-path>` is the first
 write-capable command in the RetroArch cheat pipeline: it can actually
 create a cheat file, replace one with a verified backup, and write a
 journal of what happened. Every earlier command
@@ -25,9 +25,9 @@ strictly read-only and unchanged - nothing about this command's
 implementation modified that one.
 
 ```console
-archivefs retroarch-cheat-install /path/to/cheat-catalogue --cheat-destination-root ~/.config/retroarch/cheats --dry-run
-archivefs retroarch-cheat-install /path/to/cheat-catalogue --cheat-destination-root ~/.config/retroarch/cheats --yes
-archivefs retroarch-cheat-install /path/to/cheat-catalogue --cheat-destination-root ~/.config/retroarch/cheats --yes --replace-different --json
+emuwiz-cli retroarch-cheat-install /path/to/cheat-catalogue --cheat-destination-root ~/.config/retroarch/cheats --dry-run
+emuwiz-cli retroarch-cheat-install /path/to/cheat-catalogue --cheat-destination-root ~/.config/retroarch/cheats --yes
+emuwiz-cli retroarch-cheat-install /path/to/cheat-catalogue --cheat-destination-root ~/.config/retroarch/cheats --yes --replace-different --json
 ```
 
 ## Options

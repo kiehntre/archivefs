@@ -305,7 +305,7 @@ followed by model-aligned additions.
 
 **Priority context: this section closes a shipped user-control gap.** The nine
 registry entries (audit §2.2) and their enabled/priority preferences exist today
-but are reachable **only** from `archivefs cheat-source list | info | enable |
+but are reachable **only** from `emuwiz-cli cheat-source list | info | enable |
 disable | set-priority`. No GUI screen lists them. Per-platform overrides are
 worse: they are readable by the code but writable only by hand-editing
 `~/.config/archivefs/cheat_sources.toml`.
@@ -436,7 +436,7 @@ Not in milestone 1: trust display (3.5, needs a core field), revision policy
 - **Scope:** source-level. Distinct from per-platform participation (3.11).
 - **Plain-language effect:** "Enabled sources can be downloaded and used.
   Disabled sources are kept but not used."
-- **Existing equivalent:** `archivefs cheat-source enable|disable <id>`.
+- **Existing equivalent:** `emuwiz-cli cheat-source enable|disable <id>`.
 
 ### 3.7 Revision policy (cheat source)
 

@@ -7,7 +7,7 @@ absolute paths without revalidating them against the caller's destination root.
 
 This document covers `patch_manager::cheat_install_result` - stable,
 serializable Rust types and pure conversion logic describing what would
-happen, and now (via `archivefs retroarch-cheat-install`; see
+happen, and now (via `emuwiz-cli retroarch-cheat-install`; see
 [`RETROARCH_CHEAT_INSTALL.md`](RETROARCH_CHEAT_INSTALL.md)) what actually
 did happen, when a cheat from the
 [external cheat catalogue](RETROARCH_CHEAT_CATALOGUE.md) is installed.
@@ -217,7 +217,7 @@ This module - `cheat_install_result` - still does not, and never will:
 **A real, write-capable executor now exists and consumes this exact data
 model without redefining it**: see
 [`RETROARCH_CHEAT_INSTALL.md`](RETROARCH_CHEAT_INSTALL.md) for
-`archivefs retroarch-cheat-install` - the command that actually creates
+`emuwiz-cli retroarch-cheat-install` - the command that actually creates
 files, backups, and journals using [`CheatInstallRun`]/
 [`CheatInstallEntryResult`]/[`CheatInstallSummary`]/
 [`CheatInstallRunStatus`] as defined here, and

@@ -136,7 +136,7 @@ kept separate from `~/.config/archivefs/` (configuration) by the same convention
 project already follows.
 
 Timestamps are stored as `TEXT` in ISO-8601 UTC (`YYYY-MM-DDTHH:MM:SSZ`), matching the
-style already used for `Last modified` display in `archivefs info` output and being
+style already used for `Last modified` display in `emuwiz-cli info` output and being
 trivially human-readable when inspecting the database directly with the `sqlite3` CLI.
 File modification times are the one exception: they are stored as
 `INTEGER` Unix-epoch seconds, matching `ArchiveIndexEntry.modified_time_seconds:
@@ -251,7 +251,7 @@ Columns and optionality:
   separate values today.
 - `absolute_path_cached` and `file_name_cached` (required) are denormalized
   conveniences recomputed on every observation - `source_folders.path` joined with
-  `relative_path`, and the final path component - so that `archivefs-cli info`/
+  `relative_path`, and the final path component - so that `emuwiz-cli info`/
   `mount-one`-style lookups and GUI row rendering do not need a join plus a `PathBuf`
   concatenation on every read. They are a cache, not identity: if they and
   `relative_path` were ever to disagree (they should not, by construction), the FK'd
@@ -327,7 +327,7 @@ CREATE INDEX scan_runs_status ON scan_runs(status) WHERE status = 'running';
   to precisely the config state it used - reusing the existing fingerprint rather than
   inventing a second one.
 - The `archives_*`/`errors_count` counters (required, defaulted to 0) are filled in as
-  the scan proceeds and are what a future `archivefs-cli index-show` could report
+  the scan proceeds and are what a future `emuwiz-cli index-show` could report
   instead of (or alongside) a live freshness check.
 - `status` (required) is `'running' | 'completed' | 'failed' | 'interrupted'`.
   `'interrupted'` is never set by the scan itself - it is set by the *next* process to
@@ -602,7 +602,7 @@ The task's four candidate identity signals, and how this design uses them:
   the database" instead of "always do a full rescan and overwrite `index.json`" (see
   [section 4](#4-scan-lifecycle)). `index-show`/`index-find` become indexed queries
   against `archives` instead of reading and linearly searching a JSON file. The JSON
-  index and its documented `archivefs status/stats/info --json`
+  index and its documented `emuwiz-cli status/stats/info --json`
   contract ([`docs/json-api.md`](json-api.md)) are **not removed** - `index-build`
   can still write `index.json` as an optional export view generated from the query
   results, so any existing script or tooling parsing that file keeps working
@@ -671,7 +671,7 @@ The task's four candidate identity signals, and how this design uses them:
   (`library.db.corrupt-<timestamp>`), start a fresh one, let normal scanning
   repopulate it. No repair logic is designed or needed, specifically *because* of the
   "always rebuildable from the filesystem" goal.
-- **Safe deletion and rebuild.** A user (or a future `archivefs-cli` command) deleting
+- **Safe deletion and rebuild.** A user (or a future `emuwiz-cli` command) deleting
   `~/.local/share/archivefs/library.db` directly must be a supported, safe operation
   with no manual follow-up beyond running a scan again - this should be an explicit
   test case once implementation begins, not just an implied property.
