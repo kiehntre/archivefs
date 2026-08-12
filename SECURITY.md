@@ -10,7 +10,8 @@ If you find a security issue, please open a GitHub issue on this repository
 describing the problem, or contact the maintainer directly if the issue is
 sensitive enough that you would rather not describe it publicly first.
 There is no dedicated security mailing list or bug-bounty program at this
-stage.
+stage, and GitHub private vulnerability reporting is not currently enabled
+for this repository.
 
 Please include:
 
@@ -21,41 +22,86 @@ Please include:
 There is currently no formal disclosure timeline commitment, given this is a
 small, alpha-stage project - but reports will be looked at and, where
 confirmed, fixed and noted in `CHANGELOG.md` under a `Security` entry.
+Dependency security updates (Dependabot) and secret scanning, including
+push protection, are enabled on this repository.
 
 ## Current safety boundaries
 
 These are the security-relevant properties EmuWiz's design and tests
 currently rely on. See [`docs/security.md`](docs/security.md) for the full
-detail behind each of these.
+detail behind each of these; that document is itself being reconciled to
+current behavior in a separate follow-up, and is not yet authoritative on
+the points this page corrects.
 
-- **Local-first, no telemetry.** EmuWiz does not send usage data,
-  crash reports, or file information anywhere. The only network access in
-  the codebase today is the PCSX2 patch-metadata fetch
-  (`pcsx2-patch-preview`), which is an explicit, user-invoked, read-only
-  HTTPS request to a single compiled-in metadata endpoint.
+- **Local-first, no telemetry.** EmuWiz does not send usage data, crash
+  reports, or file information anywhere. Outbound network use is opt-in and
+  limited to explicit, user-invoked HTTPS-only fetches: PCSX2 patch
+  metadata (a single compiled-in endpoint), the RetroArch / Dolphin /
+  Xenia / GameHacking / BSFree metadata and cheat-catalogue retrievals, and
+  the RomM client for catalogue identity and artwork. Each fetch enforces
+  timeouts, response-size limits, and downloaded-content validation; see the
+  network and provider trust notes below.
 - **Archives are treated as untrusted input.** Filenames and archive
   contents may be attacker-controlled; mount-name generation and path
   handling are designed not to let an archive's name or internal paths
-  escape the configured mount area.
+  escape the configured mount area. Encrypted archives and encrypted
+  archive entries are refused outright rather than inspected or guessed,
+  and archive inspection is bounded by entry/member limits. DAT
+  verification of individual ZIP members, NES header normalization, and
+  CHD verification are designed but **not yet implemented**; the audit
+  currently hashes each outer file as-is.
+- **Verification is read-only.** Scanning, mounting, cataloguing,
+  duplicate detection, DAT verification, and library-view/patch-preview
+  operations all read archive metadata and filesystem state; none of them
+  rewrite a source archive file, and no verification path extracts or
+  writes an archive member to disk.
 - **Mounts and unmounts are scoped.** Mounts are only created under the
   configured `mount_root`; unmounts only ever target paths under it.
   Library View destinations may not overlap a configured source folder.
-- **Source archives are never modified.** Scanning, mounting, cataloguing,
-  duplicate detection, and library-view/patch-preview operations all read
-  archive metadata and filesystem state; none of them rewrite a source
-  archive file.
+- **Mutations are journaled and gated.** DAT rename apply and canonical
+  ROM organisation move files (or symlink objects) through a single gated
+  engine: a durable journal is written **before** any mutation, each entry
+  is re-preflighted immediately before its rename, the rename uses an
+  atomic no-clobber primitive, and interrupted transactions are reconciled
+  or rolled back. Plans carry a generation, and rename/organisation apply
+  refuses a plan whose generation is stale or whose classifier version is
+  missing or differs from the current rules - before any journal write or
+  filesystem mutation. Emulator cheat/patch installs write emulator-owned
+  config or data only after an explicit preview and confirmation.
 - **The persistent catalogue is additive, not authoritative for safety.**
   Mount, unmount, lazy-unmount, and cleanup code paths read live filesystem
   and mount state directly and do not depend on the SQLite catalogue being
   present, complete, or uncorrupted. See
   [ADR 0001](docs/adr/0001-persistent-library-database.md).
-- **The PCSX2 patch preview is read-only and non-executable.** It fetches
-  metadata into bounded memory and reports installation *candidates* - it
-  does not download patch artifacts, write files, or modify emulator
-  configuration. See
-  [`docs/PATCH_CHEAT_MANAGER_DESIGN.md`](docs/PATCH_CHEAT_MANAGER_DESIGN.md)
-  for the full trust model that any future artifact-downloading or
-  file-installing capability would need to satisfy before being enabled.
+- **Install and update ownership.** The installer records every path it
+  writes (the `emuwiz-cli` and `emuwiz` binaries, the legacy
+  `archivefs-cli` / `emuwiz-gui` / `archivefs-gui` alias symlinks, the
+  desktop entry, and the hicolor icons) in a user-scoped, versioned
+  manifest at `$XDG_DATA_HOME/emuwiz-installer/manifest`. Ownership of a
+  file slot is proven by the SHA-256 digest of its exact byte content (not
+  its name, timestamp, or inode); symlink slots are proven by their exact
+  target. The manifest uses a fixed, closed set of slot names - no path is
+  ever parsed out of it - and a fail-closed parser. A foreign file,
+  symlink, or directory occupying a destination is never overwritten or
+  deleted: install leaves it untouched with a warning (and exits non-zero),
+  or moves it aside into a freshly and securely created backup directory
+  with `--replace-foreign`. Uninstall removes only demonstrably-owned
+  assets and never touches a foreign path. The enforced trust boundary is
+  the final `emuwiz-installer` bookkeeping path component, which must be a
+  real directory; `XDG_DATA_HOME` itself is trusted as it already is for
+  every other user data path. Note that install/uninstall do not lock
+  against a concurrent same-user process; see the limitations below.
+- **Network and provider trust.** All outbound HTTP is HTTPS-only. The
+  PCSX2 metadata fetcher accepts only its compiled-in endpoint and refuses
+  every other URL before networking. The RomM client refuses or validates
+  redirects, caps response size, stores tokens with owner-only permissions,
+  and redacts them from logs and configuration; artwork fetches are limited
+  to RomM's own thumbnail URLs, never arbitrary scraper URLs. Downloaded
+  cheat archives are size- and entry-bounded, optionally hash-checked,
+  safely extracted into a staging area, validated with the local catalogue
+  parser, and atomically published. Provider content is trusted at the
+  HTTPS boundary plus structural validation; it is not cryptographically
+  attested as safe.
 
 ## Security-sensitive areas for contributors
 
@@ -67,8 +113,11 @@ call out the safety implications explicitly in your pull request:
 - Source-folder and Library-View destination overlap validation.
 - Anything that constructs a filesystem path from archive-supplied or
   remote-supplied data.
-- Anything that would add a new outbound network request, a new write path,
-  or a new place where downloaded content is trusted.
+- The installer's ownership manifest, parser, backup, or uninstall paths.
+- The rename/organisation journal, rollback, and generation or
+  classifier-version gates.
+- Token storage, redaction, or any new outbound network request, new write
+  path, or new place where downloaded content is trusted.
 
 ## Out of scope
 
@@ -78,3 +127,11 @@ these are expected rather than actionable bugs:
 - Malware/virus scanning of archive contents.
 - A sandboxed or containerized execution model.
 - A GUI-specific permission model beyond the same checks the CLI uses.
+- Protection against a same-user adversarial process racing the installer
+  or mutation engine (install/uninstall take no lock against concurrent
+  processes).
+- Integrity guarantees for upstream provider content beyond HTTPS and
+  structural validation: a compromised provider could deliver mislabeled
+  data, which EmuWiz bounds and validates but cannot certify.
+- Safe execution of EmuWiz as root or via sudo: the installer never uses
+  sudo or any system-wide install path.
