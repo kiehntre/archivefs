@@ -30,6 +30,7 @@ use std::sync::atomic::AtomicBool;
 pub mod hash;
 pub mod limits;
 pub mod sevenz;
+pub mod sevenz_preflight;
 
 /// One member's cryptographic hashes, computed over its decompressed bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,15 +65,22 @@ pub enum ArchiveMemberStatus {
 /// Format-neutral per-member evidence produced by an [`ArchiveMemberSource`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArchiveMemberEvidence {
-    /// The member's stored name (may contain archive-internal paths; it is
-    /// data, never a filesystem path).
+    /// The outer archive this member belongs to (display path or name), for
+    /// provenance. Set by the source at construction; stable across runs for
+    /// the same archive.
+    pub archive: String,
+    /// The member's stored name. Display-oriented: a future ZIP source must
+    /// supply a lossless representation of raw (possibly non-UTF-8) member
+    /// names rather than forcing a lossy conversion into this `String`.
     pub name: String,
     /// Position of this member in the source's deterministic enumeration.
     pub index: usize,
     /// The member's declared logical (uncompressed) size in bytes.
     pub logical_size: u64,
-    /// Whether the member name looks like a nested archive. Such members are
-    /// never opened.
+    /// Whether the member name looks like a nested archive. This is *evidence
+    /// about the member*, not a policy decision: the source never recursively
+    /// opens a member; consumers must not read a `NestedArchive` member's
+    /// content.
     pub is_nested_archive: bool,
     pub status: ArchiveMemberStatus,
     /// Present only when [`ArchiveMemberStatus::Verified`].
@@ -112,6 +120,10 @@ pub enum ArchiveMemberSourceError {
 /// enumerate members deterministically, stream each member's decompressed
 /// bytes into bounded hashes, and hand the evidence to `visit`. Returning
 /// `Ok(false)` from `visit` stops iteration early; `Err` aborts.
+///
+/// The trait is **object-safe** (`visit` is a `dyn` callback) so a future
+/// consumer can hold `Box<dyn ArchiveMemberSource>` without specialising on
+/// the concrete format.
 pub trait ArchiveMemberSource {
     /// A short, stable format name for diagnostics ("7z", "zip", "rar", …).
     fn archive_format(&self) -> &'static str;
@@ -125,13 +137,11 @@ pub trait ArchiveMemberSource {
     /// first member that cannot be verified, that member's evidence is
     /// emitted with a non-`Verified` status and iteration stops; later
     /// members are not evaluated.
-    fn verify_all<F>(
+    fn verify_all(
         &mut self,
         cancel: &AtomicBool,
-        visit: F,
-    ) -> Result<(), ArchiveMemberSourceError>
-    where
-        F: FnMut(ArchiveMemberEvidence) -> Result<bool, ArchiveMemberSourceError>;
+        visit: &mut dyn FnMut(ArchiveMemberEvidence) -> Result<bool, ArchiveMemberSourceError>,
+    ) -> Result<(), ArchiveMemberSourceError>;
 }
 
 #[cfg(test)]
@@ -145,6 +155,7 @@ mod tests {
         let _ = &cancel;
         assert!(
             ArchiveMemberEvidence {
+                archive: "a.7z".into(),
                 name: "a".into(),
                 index: 0,
                 logical_size: 1,
@@ -161,6 +172,7 @@ mod tests {
         );
         assert!(
             !ArchiveMemberEvidence {
+                archive: "a.7z".into(),
                 name: "a".into(),
                 index: 0,
                 logical_size: 1,
@@ -172,6 +184,14 @@ mod tests {
             }
             .is_verified()
         );
+    }
+
+    #[test]
+    fn trait_is_object_safe_for_future_dyn_use() {
+        // A future ZIP consumer may hold `Box<dyn ArchiveMemberSource>`; this
+        // compiles only if the trait is object-safe (no generic methods).
+        fn accept(_source: &dyn ArchiveMemberSource) {}
+        let _ = accept as fn(&dyn ArchiveMemberSource);
     }
 
     #[test]

@@ -1,32 +1,34 @@
 //! Bounded, read-only 7z member reading (POST-ALPHA-1.1, experimental).
 //!
 //! Implements [`super::ArchiveMemberSource`] for `.7z` using `sevenz-rust`
-//! (Apache-2.0, pure Rust). Everything is in-process and read-only:
+//! (Apache-2.0, pure Rust). Everything is in-process and read-only.
 //!
-//! - The outer file is opened through `safe_read`/`TrustedRoots` (never a bare
-//!   `File::open`).
-//! - The 7z header is parsed first; encrypted headers, unsupported versions,
-//!   multi-volume names, and corrupt headers are refused before any decode.
-//! - Structure-level limits (member count, per-member size, total logical
-//!   budget, **solid decode budget**, **decompression ratio**) are enforced
-//!   from header metadata **before** any content is decoded. These are derived
-//!   from `sevenz-rust`'s public `Archive`/`StreamMap`/`pack_sizes`/`files`
-//!   because its `Folder`/`Coder` internals are `pub(crate)` and unnameable
-//!   outside the crate.
-//! - Member streams are hashed in bounded chunks with per-chunk cancellation.
-//! - Nested-archive members are surfaced but never recursively opened.
+//! # Hostile-input ordering
 //!
-//! # Known limitation: dictionary pre-check
+//! Before `sevenz-rust` is ever constructed, a dedicated pre-decoder probe
+//! (`super::sevenz_preflight`) parses just enough of the 7z header to enforce
+//! hard resource ceilings: next-header size, file/folder/coder/pack-stream
+//! counts, LZMA/LZMA2 dictionary declarations, per-folder solid-decode budget,
+//! decompression ratio, and the cumulative logical-byte budget. Archives that
+//! declare hostile values — including any archive with an **encoded header**
+//! (whose expansion cannot be bounded) — are refused **before** any large
+//! allocation inside `sevenz-rust`, and cancellation is checked during the
+//! probe. The probe is deliberately not a complete decoder; it extracts only
+//! the resource-relevant facts.
 //!
-//! sevenz-rust 0.6.1 does **not** expose coder properties publicly
-//! (`Folder`/`Coder` are `pub(crate)`), so a sub-4 GiB dictionary cap cannot
-//! be enforced from the header through its public API. What is enforceable:
-//! the crate's own LZMA2 ceiling (`Error::MaxMemLimited`, `"Dictionary larger
-//! than 4 GiB"`) is mapped to a [`ArchiveMemberSourceError::RefusedLimits`]
-//! refusal at decode time, and the pure size-parsing helpers
-//! ([`lzma_dictionary_size`], [`lzma2_dictionary_size`]) are provided and
-//! tested as the intended mechanism for a later slice that either parses the
-//! header itself or lands an upstream API change.
+//! After preflight passes, `SevenZReader::new` runs with every
+//! attacker-controlled allocation already bounded by the configured limits
+//! (its next-header buffer is at most `max_header_bytes`; its file/folder/
+//! coder vectors are at most `max_members`; its decoder dictionaries are at
+//! most `max_dictionary_bytes`). A belt-and-braces revalidation re-checks the
+//! same limits against `sevenz-rust`'s parsed `Archive`, and member hashing
+//! re-enforces per-member and cumulative budgets while streaming.
+//!
+//! # Nested members
+//!
+//! Nested-archive members are surfaced with metadata but never recursively
+//! opened; they **count toward the cumulative logical-byte budget** even
+//! though their bytes are only drained, not hashed.
 //!
 //! # Zero production callers
 //!
@@ -48,10 +50,19 @@ use super::limits::{ARCHIVE_HASH_CHUNK_BYTES, ArchiveLimits};
 use super::{
     ArchiveMemberEvidence, ArchiveMemberSource, ArchiveMemberSourceError, ArchiveMemberStatus,
 };
+use crate::dat::archive::sevenz_preflight::{PreflightRefusal, preflight_sevenz};
 
 /// File extensions treated as "nested archive" member names. Members with one
 /// of these extensions are surfaced with metadata but never opened.
 const NESTED_ARCHIVE_EXTENSIONS: &[&str] = &["zip", "7z", "rar", "tar", "gz", "bz2", "xz", "zst"];
+
+/// Test-only count of `SevenZReader::new` constructions, so hostile-input
+/// tests can prove the preflight refused an archive before the upstream
+/// decoder was ever reached.
+#[cfg(test)]
+static READER_NEW_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Precomputed, deterministic member metadata (stream-bearing files in the
 /// archive's own order).
@@ -64,6 +75,7 @@ struct MemberMeta {
 
 /// A bounded, read-only `.7z` archive source.
 pub struct SevenZArchiveSource {
+    archive: String,
     reader: SevenZReader<std::fs::File>,
     members: Vec<MemberMeta>,
     limits: ArchiveLimits,
@@ -73,6 +85,7 @@ impl std::fmt::Debug for SevenZArchiveSource {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("SevenZArchiveSource")
+            .field("archive", &self.archive)
             .field("members", &self.members)
             .field("limits", &self.limits)
             .finish_non_exhaustive()
@@ -80,11 +93,18 @@ impl std::fmt::Debug for SevenZArchiveSource {
 }
 
 impl SevenZArchiveSource {
-    /// Opens `path` under `trusted` and validates the archive up to decode.
+    /// Opens `path` under `trusted`, preflights the header, and validates the
+    /// archive up to decode.
+    ///
+    /// The pre-decoder probe runs first and refuses hostile archives before
+    /// `sevenz-rust` performs any attacker-controlled allocation. `cancel` is
+    /// checked during the probe and can be shared with the later `verify_all`
+    /// pass.
     pub fn open(
         path: &Path,
         trusted: &TrustedRoots,
         limits: ArchiveLimits,
+        cancel: &AtomicBool,
     ) -> Result<Self, ArchiveMemberSourceError> {
         if is_multivolume_name(path) {
             return Err(ArchiveMemberSourceError::Unsupported {
@@ -96,9 +116,21 @@ impl SevenZArchiveSource {
                 detail: format!("read policy refused the archive: {error:?}"),
             })?;
         let len = safe.len();
-        let file = safe.into_file();
-        let reader = SevenZReader::new(file, len, Password::empty())
-            .map_err(|error| classify_error(&error))?;
+        let mut file = safe.into_file();
+
+        // Hard resource limits BEFORE sevenz-rust sees the archive.
+        preflight_sevenz(&mut file, len, &limits, cancel).map_err(map_preflight_refusal)?;
+
+        // The probe left the file position at the end of the next header;
+        // sevenz-rust reads the signature from the current position, so rewind.
+        use std::io::{Seek, SeekFrom};
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| ArchiveMemberSourceError::Open {
+                detail: format!("could not rewind the archive: {error:?}"),
+            })?;
+
+        let reader = construct_reader(file, len);
+        let reader = reader.map_err(|error| classify_error(&error))?;
 
         let members = collect_members(reader.archive());
         if members.len() > limits.max_members {
@@ -109,10 +141,81 @@ impl SevenZArchiveSource {
         validate_archive_structure(reader.archive(), &limits)?;
 
         Ok(Self {
+            archive: path.display().to_string(),
             reader,
             members,
             limits,
         })
+    }
+}
+
+/// Constructs the upstream reader, incrementing a test-only counter so
+/// hostile-input tests can assert the preflight refused an archive before the
+/// decoder was reached.
+fn construct_reader(
+    file: std::fs::File,
+    len: u64,
+) -> Result<SevenZReader<std::fs::File>, SevenZError> {
+    #[cfg(test)]
+    {
+        READER_NEW_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+    SevenZReader::new(file, len, Password::empty())
+}
+
+/// Maps a preflight refusal onto the archive-source error taxonomy.
+fn map_preflight_refusal(refusal: PreflightRefusal) -> ArchiveMemberSourceError {
+    match refusal {
+        PreflightRefusal::Cancelled => ArchiveMemberSourceError::Cancelled,
+        PreflightRefusal::EncodedHeader => ArchiveMemberSourceError::Unsupported {
+            detail: "encoded 7z header is not supported (its expansion cannot be bounded)"
+                .to_string(),
+        },
+        PreflightRefusal::NextHeaderTooLarge { .. }
+        | PreflightRefusal::TooManyFiles { .. }
+        | PreflightRefusal::TooManyFolders { .. }
+        | PreflightRefusal::TooManyCoders { .. }
+        | PreflightRefusal::TooManyPackStreams { .. }
+        | PreflightRefusal::PropertyBlobTooLarge { .. }
+        | PreflightRefusal::DictionaryTooLarge { .. }
+        | PreflightRefusal::SolidDecodeBudgetExceeded { .. }
+        | PreflightRefusal::CompressionRatioExceeded { .. }
+        | PreflightRefusal::LogicalBytesExceeded { .. }
+        | PreflightRefusal::MemberCountExceeded { .. }
+        | PreflightRefusal::ArithmeticOverflow => ArchiveMemberSourceError::RefusedLimits {
+            reason: refusal_reason(&refusal),
+        },
+        PreflightRefusal::BadSignature
+        | PreflightRefusal::UnsupportedVersion { .. }
+        | PreflightRefusal::Truncated
+        | PreflightRefusal::Malformed { .. } => ArchiveMemberSourceError::Corrupt {
+            detail: format!("{refusal:?}"),
+        },
+        PreflightRefusal::Io(detail) => ArchiveMemberSourceError::Corrupt { detail },
+    }
+}
+
+fn refusal_reason(refusal: &PreflightRefusal) -> &'static str {
+    match refusal {
+        PreflightRefusal::NextHeaderTooLarge { .. } => "next header size",
+        PreflightRefusal::TooManyFiles { .. }
+        | PreflightRefusal::TooManyFolders { .. }
+        | PreflightRefusal::TooManyCoders { .. }
+        | PreflightRefusal::TooManyPackStreams { .. } => "structural count",
+        PreflightRefusal::PropertyBlobTooLarge { .. } => "property blob",
+        PreflightRefusal::DictionaryTooLarge { .. } => "dictionary",
+        PreflightRefusal::SolidDecodeBudgetExceeded { .. } => "solid decode budget",
+        PreflightRefusal::CompressionRatioExceeded { .. } => "compression ratio",
+        PreflightRefusal::LogicalBytesExceeded { .. } => "total logical budget",
+        PreflightRefusal::MemberCountExceeded { .. } => "member count",
+        PreflightRefusal::ArithmeticOverflow => "arithmetic overflow",
+        PreflightRefusal::Cancelled
+        | PreflightRefusal::EncodedHeader
+        | PreflightRefusal::BadSignature
+        | PreflightRefusal::UnsupportedVersion { .. }
+        | PreflightRefusal::Truncated
+        | PreflightRefusal::Malformed { .. }
+        | PreflightRefusal::Io(_) => "preflight",
     }
 }
 
@@ -125,19 +228,17 @@ impl ArchiveMemberSource for SevenZArchiveSource {
         self.members.len()
     }
 
-    fn verify_all<F>(
+    fn verify_all(
         &mut self,
         cancel: &AtomicBool,
-        mut visit: F,
-    ) -> Result<(), ArchiveMemberSourceError>
-    where
-        F: FnMut(ArchiveMemberEvidence) -> Result<bool, ArchiveMemberSourceError>,
-    {
+        visit: &mut dyn FnMut(ArchiveMemberEvidence) -> Result<bool, ArchiveMemberSourceError>,
+    ) -> Result<(), ArchiveMemberSourceError> {
         let members: Vec<MemberMeta> = self.members.clone();
         let limits = self.limits;
+        let archive = self.archive.as_str();
         let reader = &mut self.reader;
         let mut cursor: usize = 0;
-        let mut total_hashed: u64 = 0;
+        let mut total_consumed: u64 = 0;
         let mut internal_error: Option<ArchiveMemberSourceError> = None;
 
         let result = reader.for_each_entries(|entry, stream| {
@@ -155,8 +256,15 @@ impl ArchiveMemberSource for SevenZArchiveSource {
             let index = cursor;
             cursor += 1;
 
+            // Empty members contribute nothing to any budget.
             if meta.logical_size == 0 {
-                return match visit(evidence(&meta, index, ArchiveMemberStatus::EmptyFile, None)) {
+                return match visit(evidence(
+                    archive,
+                    &meta,
+                    index,
+                    ArchiveMemberStatus::EmptyFile,
+                    None,
+                )) {
                     Ok(true) => Ok(true),
                     Ok(false) => Ok(false),
                     Err(error) => {
@@ -166,9 +274,38 @@ impl ArchiveMemberSource for SevenZArchiveSource {
                 };
             }
 
+            // The cumulative logical-byte budget covers every stream member -
+            // including nested ones, which are drained, never hashed.
+            let Some(consumed_after) = total_consumed.checked_add(meta.logical_size) else {
+                internal_error = Some(ArchiveMemberSourceError::RefusedLimits {
+                    reason: "total logical budget",
+                });
+                return Ok(false);
+            };
+            if consumed_after > limits.max_archive_logical_bytes {
+                let outcome = visit(evidence(
+                    archive,
+                    &meta,
+                    index,
+                    ArchiveMemberStatus::RefusedLimits {
+                        reason: "total logical budget",
+                    },
+                    None,
+                ));
+                return match outcome {
+                    Ok(_) => Ok(false),
+                    Err(error) => {
+                        internal_error = Some(error);
+                        Ok(false)
+                    }
+                };
+            }
+            total_consumed = consumed_after;
+
             if meta.is_nested {
                 if meta.logical_size > limits.max_member_logical_bytes {
                     let outcome = visit(evidence(
+                        archive,
                         &meta,
                         index,
                         ArchiveMemberStatus::RefusedLimits {
@@ -176,16 +313,17 @@ impl ArchiveMemberSource for SevenZArchiveSource {
                         },
                         None,
                     ));
-                    match outcome {
-                        Ok(_) => return Ok(false),
+                    return match outcome {
+                        Ok(_) => Ok(false),
                         Err(error) => {
                             internal_error = Some(error);
                             return Ok(false);
                         }
-                    }
+                    };
                 }
                 // Drain (bounded) so a solid block stays aligned; never hash or
-                // open the nested archive.
+                // open the nested archive. Its bytes already count toward the
+                // cumulative budget above.
                 if let Err(error) = drain_member(stream, meta.logical_size, cancel) {
                     internal_error = Some(match error {
                         MemberStreamError::Cancelled => ArchiveMemberSourceError::Cancelled,
@@ -201,6 +339,7 @@ impl ArchiveMemberSource for SevenZArchiveSource {
                     return Ok(false);
                 }
                 return match visit(evidence(
+                    archive,
                     &meta,
                     index,
                     ArchiveMemberStatus::NestedArchive,
@@ -217,6 +356,7 @@ impl ArchiveMemberSource for SevenZArchiveSource {
 
             if meta.logical_size > limits.max_member_logical_bytes {
                 let outcome = visit(evidence(
+                    archive,
                     &meta,
                     index,
                     ArchiveMemberStatus::RefusedLimits {
@@ -232,28 +372,12 @@ impl ArchiveMemberSource for SevenZArchiveSource {
                     }
                 };
             }
-            if total_hashed.saturating_add(meta.logical_size) > limits.max_archive_logical_bytes {
-                let outcome = visit(evidence(
-                    &meta,
-                    index,
-                    ArchiveMemberStatus::RefusedLimits {
-                        reason: "total logical budget",
-                    },
-                    None,
-                ));
-                return match outcome {
-                    Ok(_) => Ok(false),
-                    Err(error) => {
-                        internal_error = Some(error);
-                        Ok(false)
-                    }
-                };
-            }
 
             match hash_member_stream(stream, limits.max_member_logical_bytes, cancel) {
                 Ok(hashed) => {
-                    total_hashed = total_hashed.saturating_add(hashed.bytes_read);
+                    total_consumed = total_consumed.saturating_add(hashed.bytes_read);
                     match visit(evidence(
+                        archive,
                         &meta,
                         index,
                         ArchiveMemberStatus::Verified,
@@ -273,6 +397,7 @@ impl ArchiveMemberSource for SevenZArchiveSource {
                 }
                 Err(MemberStreamError::TooLarge { .. }) => {
                     let outcome = visit(evidence(
+                        archive,
                         &meta,
                         index,
                         ArchiveMemberStatus::RefusedLimits {
@@ -290,6 +415,7 @@ impl ArchiveMemberSource for SevenZArchiveSource {
                 }
                 Err(MemberStreamError::Io(detail)) => {
                     let outcome = visit(evidence(
+                        archive,
                         &meta,
                         index,
                         ArchiveMemberStatus::Corrupt { detail },
@@ -343,6 +469,7 @@ impl SevenZArchiveSource {
     fn evidence(&self, index: usize, status: ArchiveMemberStatus) -> ArchiveMemberEvidence {
         let meta = &self.members[index];
         ArchiveMemberEvidence {
+            archive: self.archive.clone(),
             name: meta.name.clone(),
             index,
             logical_size: meta.logical_size,
@@ -447,11 +574,21 @@ fn validate_archive_structure(
             .get(folder_index + 1)
             .copied()
             .unwrap_or(archive.pack_sizes.len());
-        let pack: u64 = archive
+        let pack_slice = archive
             .pack_sizes
             .get(pack_start..pack_end)
-            .map(|slice| slice.iter().sum())
-            .unwrap_or(0);
+            .ok_or_else(|| ArchiveMemberSourceError::Corrupt {
+                detail: "folder pack stream range out of bounds".to_string(),
+            })?;
+        // Checked summation of the folder's compressed bytes.
+        let mut pack: u64 = 0;
+        for &size in pack_slice {
+            pack = pack
+                .checked_add(size)
+                .ok_or(ArchiveMemberSourceError::RefusedLimits {
+                    reason: "arithmetic overflow",
+                })?;
+        }
 
         // Files owned by this folder: their declared sizes sum to the folder's
         // logical (unpacked) size.
@@ -473,7 +610,10 @@ fn validate_archive_structure(
                 (count + 1, sum.saturating_add(file.size))
             });
 
-        if pack > 0 && unpack / pack > limits.max_compression_ratio {
+        // Compression ratio, without lossy integer division, with explicit
+        // zero-compressed-size handling: any unpacked bytes from zero
+        // compressed bytes is unbounded amplification.
+        if unpack > 0 && (pack == 0 || ratio_exceeded(unpack, pack, limits.max_compression_ratio)) {
             return Err(ArchiveMemberSourceError::RefusedLimits {
                 reason: "compression ratio",
             });
@@ -490,35 +630,13 @@ fn validate_archive_structure(
     Ok(())
 }
 
-/// LZMA dictionary size from coder properties (`props[1..5]`, LE u32).
-///
-/// Kept pure and tested: the mechanism a later slice uses once coder
-/// properties are readable (see the module doc's known limitation). Currently
-/// unreachable from production because sevenz-rust 0.6.1 does not expose
-/// `Coder` publicly.
-#[allow(dead_code)]
-fn lzma_dictionary_size(properties: &[u8]) -> Result<u32, &'static str> {
-    let bytes = properties.get(1..5).ok_or("LZMA properties too short")?;
-    let mut buffer = [0_u8; 4];
-    buffer.copy_from_slice(bytes);
-    Ok(u32::from_le_bytes(buffer))
-}
-
-/// LZMA2 dictionary size from coder properties, mirroring sevenz-rust's own
-/// formula (dict bits → bytes).
-#[allow(dead_code)]
-fn lzma2_dictionary_size(properties: &[u8]) -> Result<u32, &'static str> {
-    let bits = 0xff & u32::from(*properties.first().ok_or("LZMA2 properties too short")?);
-    if (bits & (!0x3f)) != 0 {
-        return Err("Unsupported LZMA2 property bits");
+/// `unpack > pack * ratio`, computed without lossy integer division. An
+/// overflow in the multiplication is treated as exceeding the limit.
+fn ratio_exceeded(unpack: u64, pack: u64, ratio: u64) -> bool {
+    match pack.checked_mul(ratio) {
+        Some(limit) => unpack > limit,
+        None => true,
     }
-    if bits > 40 {
-        return Err("LZMA2 dictionary larger than 4 GiB");
-    }
-    if bits == 40 {
-        return Ok(0xFFFF_FFFF);
-    }
-    Ok((2 | (bits & 0x1)) << (bits / 2 + 11))
 }
 
 /// Reads and discards `limit` bytes from `reader`, checking cancellation per
@@ -549,12 +667,14 @@ fn drain_member<R: Read>(
 }
 
 fn evidence(
+    archive: &str,
     meta: &MemberMeta,
     index: usize,
     status: ArchiveMemberStatus,
     hashes: Option<super::ArchiveMemberHashes>,
 ) -> ArchiveMemberEvidence {
     ArchiveMemberEvidence {
+        archive: archive.to_string(),
         name: meta.name.clone(),
         index,
         logical_size: meta.logical_size,
@@ -572,20 +692,16 @@ mod tests {
 
     use super::*;
     use crate::safe_read::TrustedRoots;
-    use std::io::Write;
     use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
     use tempfile::tempdir;
 
     use sevenz_rust::{SevenZMethod, SevenZWriter};
 
+    static TEST_NO_CANCEL: AtomicBool = AtomicBool::new(false);
+
     fn trusted_for(root: &std::path::Path) -> TrustedRoots {
         TrustedRoots::from_paths(std::iter::once(root))
-    }
-
-    fn write_text(path: &std::path::Path, contents: &str) {
-        let mut file = std::fs::File::create(path).unwrap();
-        file.write_all(contents.as_bytes()).unwrap();
     }
 
     /// Builds a stream-bearing fixture entry. Field assignment is the only
@@ -615,16 +731,6 @@ mod tests {
         archive_path
     }
 
-    /// Writes a solid 7z (several members sharing one folder block) from a
-    /// temp source directory.
-    fn make_solid_archive(dir: &std::path::Path, source_dir: &std::path::Path) -> PathBuf {
-        let archive_path = dir.join("solid.7z");
-        let mut writer = SevenZWriter::new(std::fs::File::create(&archive_path).unwrap()).unwrap();
-        writer.push_source_path(source_dir, |_| true).unwrap();
-        writer.finish().unwrap();
-        archive_path
-    }
-
     /// Writes a password-encrypted 7z (encrypted header + encrypted content).
     fn make_encrypted_archive(dir: &std::path::Path, contents: &str) -> PathBuf {
         let archive_path = dir.join("encrypted.7z");
@@ -646,7 +752,7 @@ mod tests {
     ) -> Result<Vec<ArchiveMemberEvidence>, ArchiveMemberSourceError> {
         let cancel = AtomicBool::new(false);
         let mut out = Vec::new();
-        source.verify_all(&cancel, |evidence| {
+        source.verify_all(&cancel, &mut |evidence| {
             out.push(evidence);
             Ok(true)
         })?;
@@ -659,7 +765,8 @@ mod tests {
         let path = make_archive(dir.path(), &[("game.rom", "hello world")]);
         let trusted = trusted_for(dir.path());
         let mut source =
-            SevenZArchiveSource::open(&path, &trusted, ArchiveLimits::default()).unwrap();
+            SevenZArchiveSource::open(&path, &trusted, ArchiveLimits::default(), &TEST_NO_CANCEL)
+                .unwrap();
         assert_eq!(source.member_count(), 1);
         let evidence = collect(&mut source).unwrap();
         assert_eq!(evidence.len(), 1);
@@ -672,20 +779,19 @@ mod tests {
     #[test]
     fn multiple_members_enumerate_deterministically() {
         let dir = tempdir().unwrap();
-        let path = make_archive(
-            dir.path(),
-            &[("b.bin", "bbb"), ("a.rom", "aaa"), ("c.bin", "ccc")],
-        );
+        let path = make_archive(dir.path(), &[("b.bin", "bbb"), ("a.rom", "aaa")]);
         let trusted = trusted_for(dir.path());
         let mut source =
-            SevenZArchiveSource::open(&path, &trusted, ArchiveLimits::default()).unwrap();
-        assert_eq!(source.member_count(), 3);
+            SevenZArchiveSource::open(&path, &trusted, ArchiveLimits::default(), &TEST_NO_CANCEL)
+                .unwrap();
+        assert_eq!(source.member_count(), 2);
         let first = collect(&mut source).unwrap();
         let names: Vec<_> = first.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, vec!["b.bin", "a.rom", "c.bin"]);
+        assert_eq!(names, vec!["b.bin", "a.rom"]);
 
         let mut source2 =
-            SevenZArchiveSource::open(&path, &trusted, ArchiveLimits::default()).unwrap();
+            SevenZArchiveSource::open(&path, &trusted, ArchiveLimits::default(), &TEST_NO_CANCEL)
+                .unwrap();
         let second = collect(&mut source2).unwrap();
         assert_eq!(
             first, second,
@@ -695,15 +801,22 @@ mod tests {
 
     #[test]
     fn solid_archive_within_budget_hashes_every_member() {
+        // The sevenz-rust writer packs multi-file headers, which the preflight
+        // refuses (encoded-header expansion is unbounded). A hand-built solid
+        // archive with a plain header and COPY-compressed members is the legal
+        // fixture for the positive solid path.
         let dir = tempdir().unwrap();
-        let src = dir.path().join("src");
-        std::fs::create_dir_all(&src).unwrap();
-        write_text(&src.join("one.bin"), "first member payload");
-        write_text(&src.join("two.bin"), "second member payload");
-        let path = make_solid_archive(dir.path(), &src);
+        let path = write_solid_copy_archive(
+            dir.path(),
+            &[
+                ("one.bin", b"first member payload".to_vec()),
+                ("two.bin", b"second member payload".to_vec()),
+            ],
+        );
         let trusted = trusted_for(dir.path());
         let mut source =
-            SevenZArchiveSource::open(&path, &trusted, ArchiveLimits::default()).unwrap();
+            SevenZArchiveSource::open(&path, &trusted, ArchiveLimits::default(), &TEST_NO_CANCEL)
+                .unwrap();
         assert_eq!(source.member_count(), 2);
         let evidence = collect(&mut source).unwrap();
         assert_eq!(evidence.len(), 2);
@@ -720,7 +833,8 @@ mod tests {
             max_member_logical_bytes: 1024,
             ..ArchiveLimits::default()
         };
-        let mut source = SevenZArchiveSource::open(&path, &trusted, limits).unwrap();
+        let mut source =
+            SevenZArchiveSource::open(&path, &trusted, limits, &TEST_NO_CANCEL).unwrap();
         let evidence = collect(&mut source).unwrap();
         // Small member verified, then the oversized member refused, then stop.
         assert_eq!(evidence.len(), 2);
@@ -735,6 +849,9 @@ mod tests {
 
     #[test]
     fn total_decode_budget_is_refused() {
+        // The pre-decoder probe enforces the cumulative logical-byte budget
+        // before sevenz-rust is ever constructed, so the archive is refused at
+        // open time.
         let dir = tempdir().unwrap();
         let path = make_archive(
             dir.path(),
@@ -745,33 +862,13 @@ mod tests {
             max_archive_logical_bytes: 16,
             ..ArchiveLimits::default()
         };
-        let mut source = SevenZArchiveSource::open(&path, &trusted, limits).unwrap();
-        let evidence = collect(&mut source).unwrap();
-        assert_eq!(evidence.len(), 2);
-        assert!(evidence[0].is_verified());
+        let err = SevenZArchiveSource::open(&path, &trusted, limits, &TEST_NO_CANCEL).unwrap_err();
         assert_eq!(
-            evidence[1].status,
-            ArchiveMemberStatus::RefusedLimits {
+            err,
+            ArchiveMemberSourceError::RefusedLimits {
                 reason: "total logical budget"
             }
         );
-    }
-
-    #[test]
-    fn dictionary_size_helpers_expose_huge_declarations() {
-        // The pure helpers are the mechanism for a sub-4 GiB pre-decode cap
-        // once coder properties are readable (see module doc). Assert both
-        // helpers return a value above the configured ceiling for a crafted
-        // large declaration.
-        let limits = ArchiveLimits::default();
-        // LZMA2 dictionary bits 40 → 0xFFFFFFFF (4 GiB - 1).
-        let lzma2 = lzma2_dictionary_size(&[40]).unwrap();
-        assert!(u64::from(lzma2) > limits.max_dictionary_bytes);
-        // LZMA dictionary 2 GiB.
-        let mut props = vec![0_u8; 5];
-        props[1..5].copy_from_slice(&2_147_483_648_u32.to_le_bytes());
-        let lzma = lzma_dictionary_size(&props).unwrap();
-        assert!(u64::from(lzma) > limits.max_dictionary_bytes);
     }
 
     #[test]
@@ -877,7 +974,8 @@ mod tests {
         let path = make_encrypted_archive(dir.path(), "secret payload");
         let trusted = trusted_for(dir.path());
         let mut source =
-            SevenZArchiveSource::open(&path, &trusted, ArchiveLimits::default()).unwrap();
+            SevenZArchiveSource::open(&path, &trusted, ArchiveLimits::default(), &TEST_NO_CANCEL)
+                .unwrap();
         let evidence = collect(&mut source).unwrap();
         assert_eq!(evidence.len(), 1);
         assert_eq!(evidence[0].status, ArchiveMemberStatus::Encrypted);
@@ -890,7 +988,9 @@ mod tests {
         let path = dir.path().join("corrupt.7z");
         std::fs::write(&path, b"not a 7z archive at all").unwrap();
         let trusted = trusted_for(dir.path());
-        let err = SevenZArchiveSource::open(&path, &trusted, ArchiveLimits::default()).unwrap_err();
+        let err =
+            SevenZArchiveSource::open(&path, &trusted, ArchiveLimits::default(), &TEST_NO_CANCEL)
+                .unwrap_err();
         assert!(matches!(err, ArchiveMemberSourceError::Corrupt { .. }));
     }
 
@@ -899,7 +999,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("game.7z.001");
         let trusted = trusted_for(dir.path());
-        let err = SevenZArchiveSource::open(&path, &trusted, ArchiveLimits::default()).unwrap_err();
+        let err =
+            SevenZArchiveSource::open(&path, &trusted, ArchiveLimits::default(), &TEST_NO_CANCEL)
+                .unwrap_err();
         assert!(matches!(err, ArchiveMemberSourceError::Unsupported { .. }));
     }
 
@@ -909,7 +1011,8 @@ mod tests {
         let path = make_archive(dir.path(), &[("inner.zip", "zip bytes")]);
         let trusted = trusted_for(dir.path());
         let mut source =
-            SevenZArchiveSource::open(&path, &trusted, ArchiveLimits::default()).unwrap();
+            SevenZArchiveSource::open(&path, &trusted, ArchiveLimits::default(), &TEST_NO_CANCEL)
+                .unwrap();
         let evidence = collect(&mut source).unwrap();
         assert_eq!(evidence.len(), 1);
         assert_eq!(evidence[0].status, ArchiveMemberStatus::NestedArchive);
@@ -923,10 +1026,11 @@ mod tests {
         let path = make_archive(dir.path(), &[("a.bin", "aaa"), ("b.bin", "bbb")]);
         let trusted = trusted_for(dir.path());
         let mut source =
-            SevenZArchiveSource::open(&path, &trusted, ArchiveLimits::default()).unwrap();
+            SevenZArchiveSource::open(&path, &trusted, ArchiveLimits::default(), &TEST_NO_CANCEL)
+                .unwrap();
         let cancel = AtomicBool::new(true);
         let mut seen = 0;
-        let result = source.verify_all(&cancel, |_evidence| {
+        let result = source.verify_all(&cancel, &mut |_evidence| {
             seen += 1;
             Ok(true)
         });
@@ -960,7 +1064,8 @@ mod tests {
         };
         let before = snapshot(dir.path());
         let mut source =
-            SevenZArchiveSource::open(&path, &trusted, ArchiveLimits::default()).unwrap();
+            SevenZArchiveSource::open(&path, &trusted, ArchiveLimits::default(), &TEST_NO_CANCEL)
+                .unwrap();
         collect(&mut source).unwrap();
         let after = snapshot(dir.path());
         assert_eq!(
@@ -977,7 +1082,9 @@ mod tests {
         let link = dir.path().join("link.7z");
         std::os::unix::fs::symlink(&real, &link).unwrap();
         let trusted = TrustedRoots::from_paths(std::iter::once(dir.path()));
-        let err = SevenZArchiveSource::open(&link, &trusted, ArchiveLimits::default()).unwrap_err();
+        let err =
+            SevenZArchiveSource::open(&link, &trusted, ArchiveLimits::default(), &TEST_NO_CANCEL)
+                .unwrap_err();
         assert!(
             matches!(err, ArchiveMemberSourceError::Open { .. }),
             "a symlink resolving outside the trusted roots must be refused"
@@ -986,6 +1093,9 @@ mod tests {
 
     #[test]
     fn member_count_limit_is_refused() {
+        // The pre-decoder probe caps both the declared file count (which
+        // bounds sevenz-rust's files-vector allocation) and the stream-member
+        // count against `max_members`, refusing at open time.
         let dir = tempdir().unwrap();
         let path = make_archive(dir.path(), &[("a.bin", "aaa"), ("b.bin", "bbb")]);
         let trusted = trusted_for(dir.path());
@@ -993,12 +1103,10 @@ mod tests {
             max_members: 1,
             ..ArchiveLimits::default()
         };
-        let err = SevenZArchiveSource::open(&path, &trusted, limits).unwrap_err();
-        assert_eq!(
-            err,
-            ArchiveMemberSourceError::RefusedLimits {
-                reason: "member count"
-            }
+        let err = SevenZArchiveSource::open(&path, &trusted, limits, &TEST_NO_CANCEL).unwrap_err();
+        assert!(
+            matches!(err, ArchiveMemberSourceError::RefusedLimits { .. }),
+            "an archive whose declared or stream-member count exceeds the limit must be refused"
         );
     }
 
@@ -1013,10 +1121,552 @@ mod tests {
             .unwrap();
         writer.finish().unwrap();
         let trusted = trusted_for(dir.path());
-        let mut source =
-            SevenZArchiveSource::open(&archive_path, &trusted, ArchiveLimits::default()).unwrap();
+        let mut source = SevenZArchiveSource::open(
+            &archive_path,
+            &trusted,
+            ArchiveLimits::default(),
+            &TEST_NO_CANCEL,
+        )
+        .unwrap();
         let evidence = collect(&mut source).unwrap();
         assert_eq!(evidence.len(), 1);
         assert_eq!(evidence[0].status, ArchiveMemberStatus::EmptyFile);
+    }
+
+    // ------------------------------------------------------------------
+    // Hand-built 7z fixtures for hostile-input tests. The sevenz-rust
+    // writer packs multi-file headers (encoded), which the preflight
+    // deliberately refuses; hostile tests therefore craft the exact bytes.
+    // ------------------------------------------------------------------
+
+    const SIG: [u8; 6] = [b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C];
+    const K_HEADER: u8 = 0x01;
+    const K_MAIN_STREAMS_INFO: u8 = 0x04;
+    const K_FILES_INFO: u8 = 0x05;
+    const K_PACK_INFO: u8 = 0x06;
+    const K_UNPACK_INFO: u8 = 0x07;
+    const K_SUB_STREAMS_INFO: u8 = 0x08;
+    const K_SIZE: u8 = 0x09;
+    const K_END: u8 = 0x00;
+    const K_FOLDER: u8 = 0x0B;
+    const K_CODERS_UNPACK_SIZE: u8 = 0x0C;
+    const K_NUM_UNPACK_STREAM: u8 = 0x0D;
+    const K_NAME: u8 = 0x11;
+
+    /// 7z variable-length integer (mirrors sevenz-rust's encoding).
+    ///
+    /// `n` bytes encode `7n` bits: the first byte has `n - 1` leading 1 bits
+    /// as a length prefix, its low `8 - n` bits are the value's highest bits,
+    /// and the `n - 1` continuation bytes hold the low bytes. The maximum
+    /// (0xFF first byte + 8 continuation bytes) encodes the full u64.
+    fn uvarint(value: u64, out: &mut Vec<u8>) {
+        let bits = (64 - value.leading_zeros()).max(1) as u64;
+        let mut n = bits.div_ceil(7);
+        n = n.min(9);
+        let first_low_bits = 8usize.saturating_sub(n as usize);
+        let prefix: u8 = if n >= 2 {
+            0xFF_u8 << (9 - n as usize)
+        } else {
+            0
+        };
+        let shift = 8 * (n as usize - 1);
+        let low_mask: u64 = if first_low_bits >= 64 {
+            u64::MAX
+        } else {
+            (1_u64 << first_low_bits) - 1
+        };
+        let first_value: u64 = if shift >= 64 { 0 } else { value >> shift };
+        out.push(prefix | ((first_value as u8) & (low_mask as u8)));
+        for i in 0..(n as usize - 1) {
+            out.push(((value >> (8 * i)) & 0xff) as u8);
+        }
+    }
+
+    /// Writes a complete 7z file whose next-header bytes are `next_header`,
+    /// placed immediately after the 32-byte file header. Both CRCs are
+    /// computed so `sevenz-rust` (when the preflight lets it run) accepts the
+    /// file; the preflight validates the start-header CRC itself.
+    fn write_archive_bytes(
+        dir: &std::path::Path,
+        name: &str,
+        packed: &[u8],
+        next_header: &[u8],
+    ) -> PathBuf {
+        let mut file = Vec::new();
+        file.extend_from_slice(&SIG);
+        file.push(0);
+        file.push(2);
+        file.extend_from_slice(&[0; 4]); // start-header CRC, patched below
+        file.extend_from_slice(&(packed.len() as u64).to_le_bytes()); // next_header_offset
+        file.extend_from_slice(&(next_header.len() as u64).to_le_bytes()); // next_header_size
+        let mut next_crc = crate::identity_source::hashing::Crc32::new();
+        next_crc.update(next_header);
+        file.extend_from_slice(&next_crc.finish().to_le_bytes());
+        file.extend_from_slice(packed);
+        file.extend_from_slice(next_header);
+        let mut start_crc = crate::identity_source::hashing::Crc32::new();
+        start_crc.update(&file[12..32]);
+        file[8..12].copy_from_slice(&start_crc.finish().to_le_bytes());
+        let path = dir.join(name);
+        std::fs::write(&path, &file).unwrap();
+        path
+    }
+
+    fn preflight(
+        path: &std::path::Path,
+        limits: &ArchiveLimits,
+    ) -> Result<
+        crate::dat::archive::sevenz_preflight::SevenZPreflightInfo,
+        crate::dat::archive::sevenz_preflight::PreflightRefusal,
+    > {
+        let len = std::fs::metadata(path).unwrap().len();
+        let mut file = std::fs::File::open(path).unwrap();
+        crate::dat::archive::sevenz_preflight::preflight_sevenz(
+            &mut file,
+            len,
+            limits,
+            &TEST_NO_CANCEL,
+        )
+    }
+
+    /// A plain header with one COPY folder of `unpack` bytes and one pack
+    /// stream of `pack` bytes (packed data is empty; the probe never decodes).
+    fn header_one_copy_folder(pack: u64, unpack: u64) -> Vec<u8> {
+        let mut h = Vec::new();
+        h.push(K_HEADER);
+        h.push(K_MAIN_STREAMS_INFO);
+        h.push(K_PACK_INFO);
+        uvarint(0, &mut h); // pack_pos
+        uvarint(1, &mut h); // num_pack_streams
+        h.push(K_SIZE);
+        uvarint(pack, &mut h);
+        h.push(K_END);
+        h.push(K_UNPACK_INFO);
+        h.push(K_FOLDER);
+        uvarint(1, &mut h); // num_folders
+        h.push(0); // external
+        uvarint(1, &mut h); // num_coders
+        h.push(0x01); // coder bits: id_size=1, simple, no props
+        h.push(0x00); // COPY id
+        h.push(K_CODERS_UNPACK_SIZE);
+        uvarint(unpack, &mut h);
+        h.push(K_END);
+        h.push(K_END);
+        h.push(K_FILES_INFO);
+        uvarint(1, &mut h);
+        h.push(K_END);
+        h.push(K_END);
+        h
+    }
+
+    /// A header with one folder whose coder is LZMA or LZMA2 with the given
+    /// property bytes (dictionary lives in the properties).
+    fn header_with_coder(method_id: &[u8], props: &[u8]) -> Vec<u8> {
+        let mut h = Vec::new();
+        h.push(K_HEADER);
+        h.push(K_MAIN_STREAMS_INFO);
+        h.push(K_PACK_INFO);
+        uvarint(0, &mut h);
+        uvarint(1, &mut h);
+        h.push(K_SIZE);
+        uvarint(0, &mut h); // pack size 0
+        h.push(K_END);
+        h.push(K_UNPACK_INFO);
+        h.push(K_FOLDER);
+        uvarint(1, &mut h);
+        h.push(0);
+        uvarint(1, &mut h); // num_coders
+        h.push(0x01 | 0x20 | (method_id.len() as u8)); // id_size | has_attrs
+        h.extend_from_slice(method_id);
+        uvarint(props.len() as u64, &mut h);
+        h.extend_from_slice(props);
+        h.push(K_CODERS_UNPACK_SIZE);
+        uvarint(0, &mut h);
+        h.push(K_END);
+        h.push(K_END);
+        h.push(K_FILES_INFO);
+        uvarint(0, &mut h);
+        h.push(K_END);
+        h.push(K_END);
+        h
+    }
+
+    /// A plain solid (one folder, several sub-streams) COPY archive whose
+    /// member bytes are stored uncompressed in the packed stream. Used for
+    /// the positive solid path, which the sevenz-rust writer cannot produce
+    /// with a plain header.
+    fn write_solid_copy_archive(dir: &std::path::Path, files: &[(&str, Vec<u8>)]) -> PathBuf {
+        let mut h = Vec::new();
+        h.push(K_HEADER);
+        h.push(K_MAIN_STREAMS_INFO);
+        h.push(K_PACK_INFO);
+        uvarint(0, &mut h); // pack_pos
+        uvarint(1, &mut h); // num_pack_streams
+        h.push(K_SIZE);
+        let total: usize = files.iter().map(|(_, c)| c.len()).sum();
+        uvarint(total as u64, &mut h);
+        h.push(K_END);
+        h.push(K_UNPACK_INFO);
+        h.push(K_FOLDER);
+        uvarint(1, &mut h); // num_folders (solid)
+        h.push(0);
+        uvarint(1, &mut h); // num_coders
+        h.push(0x01);
+        h.push(0x00); // COPY
+        h.push(K_CODERS_UNPACK_SIZE);
+        uvarint(total as u64, &mut h);
+        h.push(K_END);
+        h.push(K_SUB_STREAMS_INFO);
+        h.push(K_NUM_UNPACK_STREAM);
+        uvarint(files.len() as u64, &mut h);
+        h.push(K_SIZE);
+        for (index, (_, c)) in files.iter().enumerate() {
+            if index < files.len() - 1 {
+                uvarint(c.len() as u64, &mut h);
+            }
+        }
+        h.push(K_END);
+        h.push(K_END);
+        h.push(K_FILES_INFO);
+        uvarint(files.len() as u64, &mut h);
+        h.push(K_NAME);
+        let mut names = vec![0_u8]; // external = 0
+        for (name, _) in files {
+            for unit in name.encode_utf16() {
+                names.extend_from_slice(&unit.to_le_bytes());
+            }
+            names.extend_from_slice(&[0, 0]);
+        }
+        uvarint(names.len() as u64, &mut h);
+        h.extend_from_slice(&names);
+        h.push(K_END);
+        h.push(K_END);
+
+        let packed: Vec<u8> = files.iter().flat_map(|(_, c)| c.clone()).collect();
+        write_archive_bytes(dir, "solid_copy.7z", &packed, &h)
+    }
+
+    #[test]
+    fn hostile_lzma_dictionary_rejected_before_decode() {
+        let dir = tempdir().unwrap();
+        // LZMA id + a 2 GiB dictionary declaration in coder properties.
+        let header = header_with_coder(&[0x03, 0x01, 0x01], &[0, 0, 0, 0, 0x80]);
+        let path = write_archive_bytes(dir.path(), "dict.7z", &[], &header);
+        let before = READER_NEW_CALLS.load(Ordering::Relaxed);
+        let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
+        assert_eq!(
+            err,
+            crate::dat::archive::sevenz_preflight::PreflightRefusal::DictionaryTooLarge {
+                dictionary: 2_147_483_648,
+                limit: ArchiveLimits::default().max_dictionary_bytes,
+            }
+        );
+        assert_eq!(
+            READER_NEW_CALLS.load(Ordering::Relaxed),
+            before,
+            "preflight must refuse before sevenz-rust constructs a decoder"
+        );
+    }
+
+    #[test]
+    fn hostile_lzma2_dictionary_rejected_before_decode() {
+        let dir = tempdir().unwrap();
+        // LZMA2 id + dict bits 40 → 0xFFFFFFFF (4 GiB - 1).
+        let header = header_with_coder(&[0x21], &[40]);
+        let path = write_archive_bytes(dir.path(), "dict2.7z", &[], &header);
+        let before = READER_NEW_CALLS.load(Ordering::Relaxed);
+        let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
+        assert_eq!(
+            err,
+            crate::dat::archive::sevenz_preflight::PreflightRefusal::DictionaryTooLarge {
+                dictionary: 0xFFFF_FFFF,
+                limit: ArchiveLimits::default().max_dictionary_bytes,
+            }
+        );
+        assert_eq!(READER_NEW_CALLS.load(Ordering::Relaxed), before);
+    }
+
+    #[test]
+    fn hostile_next_header_size_rejected_without_large_allocation() {
+        let dir = tempdir().unwrap();
+        // Start header claims a 100 MiB next header; the actual header is tiny.
+        let header = header_one_copy_folder(1, 1);
+        let mut file = Vec::new();
+        file.extend_from_slice(&SIG);
+        file.push(0);
+        file.push(2);
+        file.extend_from_slice(&[0; 4]);
+        file.extend_from_slice(&0_u64.to_le_bytes()); // next_header_offset
+        file.extend_from_slice(&(100_u64 * 1024 * 1024).to_le_bytes()); // hostile size
+        file.extend_from_slice(&[0; 4]);
+        file.extend_from_slice(&header);
+        let path = dir.path().join("big.7z");
+        std::fs::write(&path, &file).unwrap();
+        let before = READER_NEW_CALLS.load(Ordering::Relaxed);
+        let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
+        assert_eq!(
+            err,
+            crate::dat::archive::sevenz_preflight::PreflightRefusal::NextHeaderTooLarge {
+                size: 100 * 1024 * 1024,
+                limit: ArchiveLimits::default().max_header_bytes,
+            }
+        );
+        assert_eq!(READER_NEW_CALLS.load(Ordering::Relaxed), before);
+    }
+
+    #[test]
+    fn excessive_file_count_refused() {
+        let dir = tempdir().unwrap();
+        let mut h = Vec::new();
+        h.push(K_HEADER);
+        h.push(K_MAIN_STREAMS_INFO);
+        h.push(K_PACK_INFO);
+        uvarint(0, &mut h);
+        uvarint(0, &mut h);
+        h.push(K_END);
+        h.push(K_END);
+        h.push(K_FILES_INFO);
+        uvarint(0x1000_0000, &mut h); // hostile num_files
+        h.push(K_END);
+        h.push(K_END);
+        let path = write_archive_bytes(dir.path(), "many.7z", &[], &h);
+        let before = READER_NEW_CALLS.load(Ordering::Relaxed);
+        let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::dat::archive::sevenz_preflight::PreflightRefusal::TooManyFiles { .. }
+        ));
+        assert_eq!(READER_NEW_CALLS.load(Ordering::Relaxed), before);
+    }
+
+    #[test]
+    fn excessive_folder_count_refused() {
+        let dir = tempdir().unwrap();
+        let mut h = Vec::new();
+        h.push(K_HEADER);
+        h.push(K_MAIN_STREAMS_INFO);
+        h.push(K_PACK_INFO);
+        uvarint(0, &mut h);
+        uvarint(0, &mut h);
+        h.push(K_END);
+        h.push(K_UNPACK_INFO);
+        h.push(K_FOLDER);
+        uvarint(0x1000_0000, &mut h); // hostile num_folders
+        h.push(0);
+        h.push(K_END);
+        h.push(K_END);
+        h.push(K_FILES_INFO);
+        uvarint(0, &mut h);
+        h.push(K_END);
+        h.push(K_END);
+        let path = write_archive_bytes(dir.path(), "folders.7z", &[], &h);
+        let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::dat::archive::sevenz_preflight::PreflightRefusal::TooManyFolders { .. }
+        ));
+    }
+
+    #[test]
+    fn excessive_coder_count_refused() {
+        let dir = tempdir().unwrap();
+        let mut h = Vec::new();
+        h.push(K_HEADER);
+        h.push(K_MAIN_STREAMS_INFO);
+        h.push(K_PACK_INFO);
+        uvarint(0, &mut h);
+        uvarint(0, &mut h);
+        h.push(K_END);
+        h.push(K_UNPACK_INFO);
+        h.push(K_FOLDER);
+        uvarint(1, &mut h);
+        h.push(0);
+        uvarint(0x1000_0000, &mut h); // hostile num_coders
+        h.push(K_END);
+        h.push(K_END);
+        h.push(K_FILES_INFO);
+        uvarint(0, &mut h);
+        h.push(K_END);
+        h.push(K_END);
+        let path = write_archive_bytes(dir.path(), "coders.7z", &[], &h);
+        let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::dat::archive::sevenz_preflight::PreflightRefusal::TooManyCoders { .. }
+        ));
+    }
+
+    #[test]
+    fn encoded_header_is_refused() {
+        let dir = tempdir().unwrap();
+        let mut h = Vec::new();
+        h.push(0x17); // K_ENCODED_HEADER
+        h.extend_from_slice(&[0; 8]);
+        let path = write_archive_bytes(dir.path(), "encoded.7z", &[], &h);
+        let before = READER_NEW_CALLS.load(Ordering::Relaxed);
+        let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
+        assert_eq!(
+            err,
+            crate::dat::archive::sevenz_preflight::PreflightRefusal::EncodedHeader
+        );
+        assert_eq!(READER_NEW_CALLS.load(Ordering::Relaxed), before);
+    }
+
+    #[test]
+    fn encoded_header_archive_open_is_unsupported() {
+        let dir = tempdir().unwrap();
+        let mut h = Vec::new();
+        h.push(0x17);
+        h.extend_from_slice(&[0; 8]);
+        let path = write_archive_bytes(dir.path(), "encoded.7z", &[], &h);
+        let trusted = trusted_for(dir.path());
+        let err =
+            SevenZArchiveSource::open(&path, &trusted, ArchiveLimits::default(), &TEST_NO_CANCEL)
+                .unwrap_err();
+        assert!(matches!(err, ArchiveMemberSourceError::Unsupported { .. }));
+    }
+
+    #[test]
+    fn compressed_size_sum_overflow_is_refused() {
+        let dir = tempdir().unwrap();
+        // One folder with two packed streams summing past u64::MAX.
+        let mut h = Vec::new();
+        h.push(K_HEADER);
+        h.push(K_MAIN_STREAMS_INFO);
+        h.push(K_PACK_INFO);
+        uvarint(0, &mut h);
+        uvarint(2, &mut h);
+        h.push(K_SIZE);
+        uvarint(u64::MAX, &mut h);
+        uvarint(1, &mut h);
+        h.push(K_END);
+        h.push(K_UNPACK_INFO);
+        h.push(K_FOLDER);
+        uvarint(1, &mut h);
+        h.push(0);
+        // One non-simple COPY coder with num_in=2, num_out=1 → two packed streams.
+        uvarint(1, &mut h);
+        h.push(0x11); // bits: id_size=1, not simple, no props
+        h.push(0x00); // COPY
+        uvarint(2, &mut h); // num_in
+        uvarint(1, &mut h); // num_out
+        // no bind pairs (num_out - 1 = 0); num_packed = 2 - 0 = 2 → read indices
+        uvarint(0, &mut h);
+        uvarint(1, &mut h);
+        h.push(K_CODERS_UNPACK_SIZE);
+        uvarint(1, &mut h);
+        h.push(K_END);
+        h.push(K_END);
+        h.push(K_FILES_INFO);
+        uvarint(1, &mut h);
+        h.push(K_END);
+        h.push(K_END);
+        let path = write_archive_bytes(dir.path(), "overflow.7z", &[], &h);
+        let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
+        assert_eq!(
+            err,
+            crate::dat::archive::sevenz_preflight::PreflightRefusal::ArithmeticOverflow
+        );
+    }
+
+    #[test]
+    fn ratio_exactly_at_limit_is_accepted() {
+        let dir = tempdir().unwrap();
+        let header = header_one_copy_folder(10, 10 * 1000);
+        let path = write_archive_bytes(dir.path(), "ratio_ok.7z", &[], &header);
+        let info = preflight(&path, &ArchiveLimits::default()).unwrap();
+        assert_eq!(info.member_count, 1);
+    }
+
+    #[test]
+    fn ratio_one_unit_beyond_limit_is_refused() {
+        let dir = tempdir().unwrap();
+        let header = header_one_copy_folder(10, 10 * 1000 + 1);
+        let path = write_archive_bytes(dir.path(), "ratio_over.7z", &[], &header);
+        let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::dat::archive::sevenz_preflight::PreflightRefusal::CompressionRatioExceeded { .. }
+        ));
+    }
+
+    #[test]
+    fn zero_compressed_size_is_refused_for_nonzero_unpack() {
+        let dir = tempdir().unwrap();
+        let header = header_one_copy_folder(0, 1);
+        let path = write_archive_bytes(dir.path(), "zeropack.7z", &[], &header);
+        let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::dat::archive::sevenz_preflight::PreflightRefusal::CompressionRatioExceeded { .. }
+        ));
+    }
+
+    #[test]
+    fn nested_members_count_toward_the_logical_budget() {
+        // The nested member's bytes are never hashed, but its declared size
+        // counts toward the cumulative logical budget: the archive is refused
+        // at open because the total (nested 8 + normal 3 = 11) exceeds 10.
+        let dir = tempdir().unwrap();
+        let path = make_archive(dir.path(), &[("a.zip", "AAAAAAAA"), ("b.rom", "BBB")]);
+        let trusted = trusted_for(dir.path());
+        let limits = ArchiveLimits {
+            max_archive_logical_bytes: 10,
+            ..ArchiveLimits::default()
+        };
+        let err = SevenZArchiveSource::open(&path, &trusted, limits, &TEST_NO_CANCEL).unwrap_err();
+        assert_eq!(
+            err,
+            ArchiveMemberSourceError::RefusedLimits {
+                reason: "total logical budget"
+            }
+        );
+    }
+
+    #[test]
+    fn cancellation_during_real_decode_stops_verification() {
+        use std::sync::Arc;
+        let dir = tempdir().unwrap();
+        let path = make_archive(dir.path(), &[("a.bin", "aaa"), ("b.bin", "bbb")]);
+        let trusted = trusted_for(dir.path());
+        let mut source =
+            SevenZArchiveSource::open(&path, &trusted, ArchiveLimits::default(), &TEST_NO_CANCEL)
+                .unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_flag = cancel.clone();
+        let mut seen = 0;
+        let result = source.verify_all(&cancel, &mut |evidence| {
+            if evidence.is_verified() {
+                // Set mid-decode: the first member really decoded and hashed
+                // before the flag fires; the second member stops on its first
+                // chunk check.
+                cancel_flag.store(true, Ordering::Relaxed);
+            }
+            seen += 1;
+            Ok(true)
+        });
+        assert_eq!(result, Err(ArchiveMemberSourceError::Cancelled));
+        assert_eq!(seen, 1, "exactly the first member completed");
+    }
+
+    #[test]
+    fn preflight_refused_input_never_constructs_the_reader() {
+        let dir = tempdir().unwrap();
+        let header = header_with_coder(&[0x21], &[40]);
+        let path = write_archive_bytes(dir.path(), "hostile.7z", &[], &header);
+        let trusted = trusted_for(dir.path());
+        let before = READER_NEW_CALLS.load(Ordering::Relaxed);
+        let err =
+            SevenZArchiveSource::open(&path, &trusted, ArchiveLimits::default(), &TEST_NO_CANCEL)
+                .unwrap_err();
+        assert!(matches!(
+            err,
+            ArchiveMemberSourceError::RefusedLimits { .. }
+        ));
+        assert_eq!(
+            READER_NEW_CALLS.load(Ordering::Relaxed),
+            before,
+            "SevenZReader::new must never run for a preflight-refused archive"
+        );
     }
 }

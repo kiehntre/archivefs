@@ -53,6 +53,21 @@ pub const MAX_7Z_DICTIONARY_BYTES: u64 = 1024 * 1024 * 1024;
 /// research flags it UNCERTAIN); this is the placeholder ceiling.
 pub const MAX_7Z_COMPRESSION_RATIO: u64 = 1000;
 
+/// Largest 7z next-header size the pre-decoder probe will read.
+///
+/// NEW. `SevenZReader::new` copies `next_header_size` bytes into a buffer it
+/// allocates from untrusted metadata; the probe validates this value against
+/// this ceiling **before** any such allocation. Legitimate 7z headers are
+/// small (bytes-to-KiB); 16 MiB is a generous safe ceiling.
+pub const MAX_7Z_HEADER_BYTES: usize = 16 * 1024 * 1024;
+
+/// Largest single coder-properties blob the pre-decoder probe will accept.
+///
+/// NEW. Coder properties (LZMA/LZMA2 dictionary declarations live inside
+/// them) are attacker-controlled header bytes; the probe caps each blob so a
+/// hostile archive cannot demand a huge parse/allocation.
+pub const MAX_7Z_CODER_PROPERTIES_BYTES: usize = 1024 * 1024;
+
 /// The tunable set an archive reader enforces. Defaults are the shared
 /// constants above; tests shrink individual fields to force refusals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +78,9 @@ pub struct ArchiveLimits {
     pub max_solid_decode_bytes: u64,
     pub max_dictionary_bytes: u64,
     pub max_compression_ratio: u64,
+    /// Ceiling on the 7z next-header size the pre-decoder probe will read and
+    /// parse before `sevenz-rust` is ever constructed.
+    pub max_header_bytes: usize,
 }
 
 impl Default for ArchiveLimits {
@@ -74,6 +92,7 @@ impl Default for ArchiveLimits {
             max_solid_decode_bytes: MAX_SOLID_DECODE_BYTES,
             max_dictionary_bytes: MAX_7Z_DICTIONARY_BYTES,
             max_compression_ratio: MAX_7Z_COMPRESSION_RATIO,
+            max_header_bytes: MAX_7Z_HEADER_BYTES,
         }
     }
 }
@@ -91,5 +110,6 @@ mod tests {
         assert_eq!(limits.max_solid_decode_bytes, MAX_SOLID_DECODE_BYTES);
         assert_eq!(limits.max_dictionary_bytes, MAX_7Z_DICTIONARY_BYTES);
         assert_eq!(limits.max_compression_ratio, MAX_7Z_COMPRESSION_RATIO);
+        assert_eq!(limits.max_header_bytes, MAX_7Z_HEADER_BYTES);
     }
 }
