@@ -446,6 +446,35 @@ impl ArchiveMemberSource for SevenZArchiveSource {
             match hash_member_stream(stream, meta.logical_size, cancel) {
                 Ok(hashed) => {
                     total_consumed = total_consumed.saturating_add(hashed.bytes_read);
+                    // A short read is EOF, not success: the decoder ran out of
+                    // input before the header's declared logical size was
+                    // satisfied. The hashes cover only the bytes that did
+                    // arrive, so they identify a prefix of the member, not the
+                    // member — reporting them as Verified would let a truncated
+                    // stream claim a clean bill of health. (An over-long stream
+                    // cannot reach here: the hasher is bounded by the declared
+                    // size and refuses with TooLarge below.)
+                    if hashed.bytes_read != meta.logical_size {
+                        let outcome = visit(evidence(
+                            archive,
+                            &meta,
+                            index,
+                            ArchiveMemberStatus::Corrupt {
+                                detail: format!(
+                                    "decoded {} bytes of the {} declared",
+                                    hashed.bytes_read, meta.logical_size
+                                ),
+                            },
+                            None,
+                        ));
+                        return match outcome {
+                            Ok(_) => Ok(false),
+                            Err(error) => {
+                                internal_error = Some(error);
+                                Ok(false)
+                            }
+                        };
+                    }
                     match visit(evidence(
                         archive,
                         &meta,
@@ -1412,6 +1441,118 @@ mod tests {
 
         let packed: Vec<u8> = files.iter().flat_map(|(_, c)| c.clone()).collect();
         write_archive_bytes(dir, "solid_copy.7z", &packed, &h)
+    }
+
+    /// A plain single-member COPY archive. `payload` is stored verbatim as the
+    /// (only) pack stream, while `declared_size` is what the header claims the
+    /// member decompresses to — the two are allowed to disagree, which is how
+    /// a truncated member is expressed: COPY hands the decoder exactly
+    /// `payload.len()` bytes, so decode hits EOF short of `declared_size`.
+    fn write_copy_member_archive(
+        dir: &std::path::Path,
+        file_name: &str,
+        member: &str,
+        payload: &[u8],
+        declared_size: u64,
+    ) -> PathBuf {
+        let mut h = Vec::new();
+        h.push(K_HEADER);
+        h.push(K_MAIN_STREAMS_INFO);
+        h.push(K_PACK_INFO);
+        uvarint(0, &mut h); // pack_pos
+        uvarint(1, &mut h); // num_pack_streams
+        h.push(K_SIZE);
+        uvarint(payload.len() as u64, &mut h); // the real stored size
+        h.push(K_END);
+        h.push(K_UNPACK_INFO);
+        h.push(K_FOLDER);
+        uvarint(1, &mut h); // num_folders
+        h.push(0); // external
+        uvarint(1, &mut h); // num_coders
+        h.push(0x01); // simple, id_size = 1
+        h.push(0x00); // COPY
+        h.push(K_CODERS_UNPACK_SIZE);
+        uvarint(declared_size, &mut h); // the *claimed* logical size
+        h.push(K_END);
+        h.push(K_SUB_STREAMS_INFO);
+        h.push(K_NUM_UNPACK_STREAM);
+        uvarint(1, &mut h); // one sub-stream, so it inherits the folder size
+        h.push(K_SIZE); // no explicit sizes: the last (only) one is implied
+        h.push(K_END);
+        h.push(K_END);
+        h.push(K_FILES_INFO);
+        uvarint(1, &mut h);
+        h.push(K_NAME);
+        let mut names = vec![0_u8]; // external = 0
+        for unit in member.encode_utf16() {
+            names.extend_from_slice(&unit.to_le_bytes());
+        }
+        names.extend_from_slice(&[0, 0]);
+        uvarint(names.len() as u64, &mut h);
+        h.extend_from_slice(&names);
+        h.push(K_END);
+        h.push(K_END);
+        write_archive_bytes(dir, file_name, payload, &h)
+    }
+
+    #[test]
+    fn truncated_member_is_corrupt_not_verified() {
+        // The header declares a 20-byte member but only 10 bytes are stored,
+        // so decode reaches EOF halfway through. The hashes computed over that
+        // prefix are not evidence about the member, and must never be reported
+        // as a verification.
+        let dir = tempdir().unwrap();
+        let path = write_copy_member_archive(
+            dir.path(),
+            "truncated.7z",
+            "game.rom",
+            b"0123456789",
+            20, // declared logical size, twice what is stored
+        );
+        let trusted = trusted_for(dir.path());
+        let mut source =
+            SevenZArchiveSource::open(&path, &trusted, ArchiveLimits::default(), &TEST_NO_CANCEL)
+                .unwrap();
+        let evidence = collect(&mut source).unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert!(
+            !evidence[0].is_verified(),
+            "a member whose decode ended early must not be verified"
+        );
+        assert!(
+            matches!(evidence[0].status, ArchiveMemberStatus::Corrupt { .. }),
+            "unexpected status: {:?}",
+            evidence[0].status
+        );
+        assert!(
+            evidence[0].hashes.is_none(),
+            "a partial hash must never be handed out as evidence"
+        );
+    }
+
+    #[test]
+    fn exactly_sized_copy_member_is_verified() {
+        // The happy path the truncation check must not break: the same fixture
+        // shape with an honest declared size verifies, and its hashes are the
+        // hashes of the stored bytes.
+        let dir = tempdir().unwrap();
+        let path = write_copy_member_archive(
+            dir.path(),
+            "exact.7z",
+            "game.rom",
+            b"hello world",
+            11, // declared size matches the stored bytes exactly
+        );
+        let trusted = trusted_for(dir.path());
+        let mut source =
+            SevenZArchiveSource::open(&path, &trusted, ArchiveLimits::default(), &TEST_NO_CANCEL)
+                .unwrap();
+        let evidence = collect(&mut source).unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert!(evidence[0].is_verified());
+        let hashes = evidence[0].hashes.as_ref().unwrap();
+        assert_eq!(hashes.md5, "5eb63bbbe01eeed093cb22bb8f5acdc3");
+        assert_eq!(hashes.sha1, "2aae6c35c94fcfb415dbe95f408b9ce91ee846ed");
     }
 
     #[test]

@@ -44,7 +44,9 @@ pub struct ArchiveMemberHashes {
 /// The outcome for one archive member.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArchiveMemberStatus {
-    /// The member streamed and was hashed within limits.
+    /// The member streamed and was hashed within limits, and the number of
+    /// bytes actually hashed matched its declared logical size exactly. A
+    /// decode that ended early is [`ArchiveMemberStatus::Corrupt`], never this.
     Verified,
     /// An empty stream member (zero logical size); surfaced, not hashed.
     EmptyFile,
