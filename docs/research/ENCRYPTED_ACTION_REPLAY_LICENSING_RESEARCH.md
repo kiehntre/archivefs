@@ -1,6 +1,11 @@
 # Encrypted GameCube/Wii Action Replay Decryption — Licensing Research
 
-Status: research only. No code was changed, no branch/commit/PR was created.
+Status: research only. This document was originally written as pure research
+with no branch, commit, or PR created; it was subsequently preserved on the
+`research/encrypted-action-replay-licensing` branch as PR #30 (draft). This
+revision reverifies the findings against current sources as of main SHA
+`ca2236110b4210f75d8cf223d8ec1a7ac556ff33` — no code has been added or changed
+in this repository as a result of this research; it remains draft-only.
 
 Scope: determine whether EmuWiz (MIT licensed) can legally and safely implement
 support for encrypted GameCube/Wii Action Replay (`XXXX-XXXX-XXXXX`, a
@@ -377,6 +382,52 @@ Subject: GCNcrypt / GameCube Action Replay decrypt — licence & provenance
 **Verified facts vs interpretation:** facts are labelled in-line above.
 Copyright analysis (§5–§6) and the clean-room/helper/recommendation sections
 are engineering interpretation, not legal advice.
+
+---
+
+## 14. Reverification pass (current)
+
+This report was re-checked against live sources as of main SHA
+`ca2236110b4210f75d8cf223d8ec1a7ac556ff33`. Nothing material has changed:
+
+- **Dolphin `Source/Core/Core/ARDecrypt.cpp`** (fetched live from
+  `dolphin-emu/dolphin@master` via the GitHub API): still present at the same
+  path, still headed `// Copyright 2008 Dolphin Emulator Project` /
+  `// SPDX-License-Identifier: GPL-2.0-or-later`, still crediting
+  `GCNcrypt - GameCube AR Crypto Program, Copyright (C) 2003-2004 Parasyte`
+  verbatim, and the fetched `table0-7`, `gentable0-3`, `gensubtable`, and
+  `crctable0-1` contents still match those described in §6
+  `[FACT — verified, re-fetched today]`.
+- **`pyriell/omniconvert` `source/armax.c`**: re-fetched; still
+  `GPL version 2 or later`, still crediting Parasyte as the source of the bulk
+  of the file `[FACT — verified, re-fetched today]`.
+- **GitHub code search** (`GCNcrypt`, `genseeds gensubtable`,
+  `Unscramble1 DecryptARCode`): all hits are Dolphin itself, Dolphin forks
+  (Ishiiruka, Dolphin-Enhanced, dolphin-ios, DolphinQt, and similar — all
+  GPL-derived), or `omniconvert`. **No permissively-licensed (MIT/BSD/Apache/
+  public-domain) independent implementation was found** — the same conclusion
+  as the original pass `[FACT — verified — absence of evidence, re-checked
+  today]`.
+- **kodewerx.org "Hacking GameCube" (EnHacklopedia)**: still documents only
+  decoded code-type semantics, not the cipher itself; still names Parasyte's
+  GCNcrypt as the tool required, with no license statement
+  `[FACT — verified, re-fetched today]`.
+- **Project Pokemon's "GCN Crypt" mirror**: still hosts the binary with no
+  license statement `[FACT — verified, re-fetched today]`.
+- **gc-forever thread t=5112**: still live, still contains the same
+  encrypted↔decrypted test vectors cited in §4.2
+  `[FACT — verified, re-fetched today]`.
+- **General web search** for any newer MIT/permissive/public-domain
+  implementation of the GameCube/Wii AR decryption scheme, or any newer
+  independent specification of it, turned up nothing beyond the sources
+  already catalogued in §13 `[FACT — verified — absence of evidence,
+  re-checked today]`.
+
+**Conclusion of reverification:** no new permissive implementation, no new
+independent specification, and no change in Dolphin's or omniconvert's
+licensing has appeared. The provenance gap identified in §6 (the
+`gentable0-3`/`gensubtable` scheme constants) is unchanged. **The verdict
+remains YELLOW, unchanged from the original research.**
 
 ---
 
