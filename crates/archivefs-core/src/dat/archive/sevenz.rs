@@ -2456,4 +2456,93 @@ mod tests {
             "unexpected refusal: {err:?}"
         );
     }
+
+    #[test]
+    fn multi_output_coder_is_refused_before_the_fixed_size_arrays_overflow() {
+        // One coder declaring 41 inputs and 40 outputs sends `sevenz-rust`
+        // down `build_decode_stack2`, which writes `coder_used[out_index]`
+        // into a `[bool; 32]` - an out-of-bounds panic for out_index >= 32.
+        let dir = tempdir().unwrap();
+        let mut h = pack_info(&[0, 0]);
+        h.push(K_UNPACK_INFO);
+        h.push(K_FOLDER);
+        uvarint(1, &mut h);
+        h.push(0);
+        uvarint(1, &mut h); // one coder...
+        h.push(0x11); // ...not simple, id_size = 1
+        h.push(0x00); // COPY
+        uvarint(41, &mut h); // num_in
+        uvarint(40, &mut h); // num_out
+        for index in 0..39_u64 {
+            uvarint(index, &mut h); // in_index
+            uvarint(index, &mut h); // out_index
+        }
+        uvarint(39, &mut h); // packed stream indices
+        uvarint(40, &mut h);
+        h.push(K_CODERS_UNPACK_SIZE);
+        for _ in 0..40 {
+            uvarint(0, &mut h);
+        }
+        h.push(K_END);
+        h.push(K_SUB_STREAMS_INFO);
+        h.push(K_NUM_UNPACK_STREAM);
+        uvarint(1, &mut h);
+        h.push(K_END);
+        h.push(K_END);
+        h.push(K_FILES_INFO);
+        uvarint(1, &mut h);
+        h.push(K_END);
+        h.push(K_END);
+        let path = write_archive_bytes(dir.path(), "multiout.7z", &[], &h);
+        let before = READER_NEW_CALLS.load(Ordering::Relaxed);
+        let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::dat::archive::sevenz_preflight::PreflightRefusal::Malformed {
+                    detail: "coder with multiple output streams is unsupported"
+                }
+            ),
+            "unexpected refusal: {err:?}"
+        );
+        assert_eq!(READER_NEW_CALLS.load(Ordering::Relaxed), before);
+    }
+
+    #[test]
+    fn bcj2_coder_with_wrong_input_count_is_refused() {
+        // `BCJ2Reader` indexes a fixed four-element input array; a BCJ2 coder
+        // declaring two inputs panics inside the decoder's read loop.
+        let dir = tempdir().unwrap();
+        let mut h = pack_info(&[0, 0]);
+        h.push(K_UNPACK_INFO);
+        h.push(K_FOLDER);
+        uvarint(1, &mut h);
+        h.push(0);
+        uvarint(1, &mut h);
+        h.push(0x14); // not simple, id_size = 4
+        h.extend_from_slice(&[0x03, 0x03, 0x01, 0x1B]); // BCJ2
+        uvarint(2, &mut h); // num_in (must be 4)
+        uvarint(1, &mut h); // num_out
+        uvarint(0, &mut h); // packed stream indices
+        uvarint(1, &mut h);
+        h.push(K_CODERS_UNPACK_SIZE);
+        uvarint(0, &mut h);
+        h.push(K_END);
+        h.push(K_END);
+        h.push(K_FILES_INFO);
+        uvarint(1, &mut h);
+        h.push(K_END);
+        h.push(K_END);
+        let path = write_archive_bytes(dir.path(), "bcj2.7z", &[], &h);
+        let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::dat::archive::sevenz_preflight::PreflightRefusal::Malformed {
+                    detail: "BCJ2 coder must declare exactly four input streams"
+                }
+            ),
+            "unexpected refusal: {err:?}"
+        );
+    }
 }

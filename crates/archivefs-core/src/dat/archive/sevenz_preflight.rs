@@ -64,6 +64,12 @@ const K_ENCODED_HEADER: u8 = 0x17;
 
 const ID_LZMA: &[u8] = &[0x03, 0x01, 0x01];
 const ID_LZMA2: &[u8] = &[0x21];
+const ID_BCJ2: &[u8] = &[0x03, 0x03, 0x01, 0x1B];
+
+/// The number of input streams a BCJ2 coder must declare. `sevenz-rust`'s
+/// `BCJ2Reader` indexes a fixed four-element stream array, so any other count
+/// is an out-of-bounds panic inside the decoder.
+const BCJ2_INPUT_STREAMS: u64 = 4;
 
 /// Why a hostile (or malformed) header was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,6 +165,8 @@ pub struct SevenZPreflightInfo {
 struct CoderInfo {
     id: Vec<u8>,
     props: Vec<u8>,
+    num_in_streams: u64,
+    num_out_streams: u64,
 }
 
 /// A minimal folder record: everything the probe needs for accounting.
@@ -533,7 +541,12 @@ fn parse_folder(
         } else {
             Vec::new()
         };
-        coders.push(CoderInfo { id, props });
+        coders.push(CoderInfo {
+            id,
+            props,
+            num_in_streams: num_in,
+            num_out_streams: num_out,
+        });
     }
 
     let num_bind_pairs = total_out_streams
@@ -975,6 +988,38 @@ fn enforce_and_summarize(
         // LZMA/LZMA2 dictionary in a folder is allocated simultaneously.
         let mut aggregate_decoder_memory: u64 = 0;
         for coder in &folder.coders {
+            // Coder arity. `sevenz-rust` can only decode single-output coders,
+            // and it indexes several *fixed-size* arrays with values derived
+            // from these counts:
+            //
+            // - `build_decode_stack2` writes `coder_used[bind_pair.out_index]`
+            //   into a `[bool; 32]`, so an output-stream index >= 32 is an
+            //   out-of-bounds panic;
+            // - `get_in_stream2` indexes `folder.coders[out_index]`, which is
+            //   only in range while every coder has exactly one output;
+            // - `BCJ2Reader` indexes a fixed four-element input array, so a
+            //   BCJ2 coder declaring any other input count panics mid-decode.
+            //
+            // Requiring one output per coder (and 4-in only for BCJ2) keeps all
+            // of those in range and refuses nothing that this build could have
+            // decoded anyway.
+            if coder.num_out_streams != 1 {
+                return Err(PreflightRefusal::Malformed {
+                    detail: "coder with multiple output streams is unsupported",
+                });
+            }
+            if coder.id.as_slice() == ID_BCJ2 {
+                if coder.num_in_streams != BCJ2_INPUT_STREAMS {
+                    return Err(PreflightRefusal::Malformed {
+                        detail: "BCJ2 coder must declare exactly four input streams",
+                    });
+                }
+            } else if coder.num_in_streams != 1 {
+                return Err(PreflightRefusal::Malformed {
+                    detail: "multi-input coder is unsupported",
+                });
+            }
+
             let dictionary = if coder.id.as_slice() == ID_LZMA {
                 lzma_dictionary_size(&coder.props)
                     .map_err(|detail| PreflightRefusal::Malformed { detail })?
