@@ -174,10 +174,12 @@ fn map_preflight_refusal(refusal: PreflightRefusal) -> ArchiveMemberSourceError 
         PreflightRefusal::NextHeaderTooLarge { .. }
         | PreflightRefusal::TooManyFiles { .. }
         | PreflightRefusal::TooManyFolders { .. }
-        | PreflightRefusal::TooManyCoders { .. }
         | PreflightRefusal::TooManyPackStreams { .. }
+        | PreflightRefusal::CoderChainTooLong { .. }
         | PreflightRefusal::PropertyBlobTooLarge { .. }
         | PreflightRefusal::DictionaryTooLarge { .. }
+        | PreflightRefusal::AggregateDecoderMemoryExceeded { .. }
+        | PreflightRefusal::MemberSizeExceeded { .. }
         | PreflightRefusal::SolidDecodeBudgetExceeded { .. }
         | PreflightRefusal::CompressionRatioExceeded { .. }
         | PreflightRefusal::LogicalBytesExceeded { .. }
@@ -200,10 +202,12 @@ fn refusal_reason(refusal: &PreflightRefusal) -> &'static str {
         PreflightRefusal::NextHeaderTooLarge { .. } => "next header size",
         PreflightRefusal::TooManyFiles { .. }
         | PreflightRefusal::TooManyFolders { .. }
-        | PreflightRefusal::TooManyCoders { .. }
         | PreflightRefusal::TooManyPackStreams { .. } => "structural count",
+        PreflightRefusal::CoderChainTooLong { .. } => "coder chain",
         PreflightRefusal::PropertyBlobTooLarge { .. } => "property blob",
         PreflightRefusal::DictionaryTooLarge { .. } => "dictionary",
+        PreflightRefusal::AggregateDecoderMemoryExceeded { .. } => "aggregate decoder memory",
+        PreflightRefusal::MemberSizeExceeded { .. } => "member size",
         PreflightRefusal::SolidDecodeBudgetExceeded { .. } => "solid decode budget",
         PreflightRefusal::CompressionRatioExceeded { .. } => "compression ratio",
         PreflightRefusal::LogicalBytesExceeded { .. } => "total logical budget",
@@ -300,7 +304,11 @@ impl ArchiveMemberSource for SevenZArchiveSource {
                     }
                 };
             }
-            total_consumed = consumed_after;
+            // NOTE: `consumed_after` is a guard only. The member is charged
+            // exactly once: drained nested members by their declared size after
+            // draining, ordinary hashed members by their actual bytes after
+            // hashing. Pre-committing the declared size here would double-count
+            // ordinary members (the second charge happens below).
 
             if meta.is_nested {
                 if meta.logical_size > limits.max_member_logical_bytes {
@@ -337,6 +345,17 @@ impl ArchiveMemberSource for SevenZArchiveSource {
                         }
                     });
                     return Ok(false);
+                }
+                // Charge the drained nested member exactly once by its declared
+                // size (its bytes are never hashed, but they were processed).
+                match total_consumed.checked_add(meta.logical_size) {
+                    Some(value) => total_consumed = value,
+                    None => {
+                        internal_error = Some(ArchiveMemberSourceError::RefusedLimits {
+                            reason: "total logical budget",
+                        });
+                        return Ok(false);
+                    }
                 }
                 return match visit(evidence(
                     archive,
@@ -686,6 +705,7 @@ fn evidence(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::vec_init_then_push)]
     //! Focused tests for the experimental 7z reader. Fixtures are generated
     //! in-test with the `sevenz-rust` writer (a dev-dependency feature) into a
     //! temp directory; no copyrighted data and no external tools are used.
@@ -825,6 +845,8 @@ mod tests {
 
     #[test]
     fn oversized_member_is_refused_and_verification_stops() {
+        // The per-member ceiling is enforced by the pre-decoder probe from the
+        // parsed sub-stream sizes, before any decoder is constructed.
         let dir = tempdir().unwrap();
         let big = "x".repeat(4096);
         let path = make_archive(dir.path(), &[("small.bin", "ok"), ("big.bin", &big)]);
@@ -833,15 +855,10 @@ mod tests {
             max_member_logical_bytes: 1024,
             ..ArchiveLimits::default()
         };
-        let mut source =
-            SevenZArchiveSource::open(&path, &trusted, limits, &TEST_NO_CANCEL).unwrap();
-        let evidence = collect(&mut source).unwrap();
-        // Small member verified, then the oversized member refused, then stop.
-        assert_eq!(evidence.len(), 2);
-        assert!(evidence[0].is_verified());
+        let err = SevenZArchiveSource::open(&path, &trusted, limits, &TEST_NO_CANCEL).unwrap_err();
         assert_eq!(
-            evidence[1].status,
-            ArchiveMemberStatus::RefusedLimits {
+            err,
+            ArchiveMemberSourceError::RefusedLimits {
                 reason: "member size"
             }
         );
@@ -1285,7 +1302,7 @@ mod tests {
         h.push(K_END);
         h.push(K_END);
         h.push(K_FILES_INFO);
-        uvarint(0, &mut h);
+        uvarint(1, &mut h); // one stream file, consistent with one sub-stream
         h.push(K_END);
         h.push(K_END);
         h
@@ -1390,16 +1407,23 @@ mod tests {
     fn hostile_next_header_size_rejected_without_large_allocation() {
         let dir = tempdir().unwrap();
         // Start header claims a 100 MiB next header; the actual header is tiny.
+        // The start-header and next-header CRCs are computed correctly so the
+        // probe reaches the size check (a CRC mismatch would refuse earlier).
         let header = header_one_copy_folder(1, 1);
         let mut file = Vec::new();
         file.extend_from_slice(&SIG);
         file.push(0);
         file.push(2);
-        file.extend_from_slice(&[0; 4]);
+        file.extend_from_slice(&[0; 4]); // start-header CRC placeholder
         file.extend_from_slice(&0_u64.to_le_bytes()); // next_header_offset
         file.extend_from_slice(&(100_u64 * 1024 * 1024).to_le_bytes()); // hostile size
-        file.extend_from_slice(&[0; 4]);
+        let mut next_crc = crate::identity_source::hashing::Crc32::new();
+        next_crc.update(&header);
+        file.extend_from_slice(&next_crc.finish().to_le_bytes());
         file.extend_from_slice(&header);
+        let mut start_crc = crate::identity_source::hashing::Crc32::new();
+        start_crc.update(&file[12..32]);
+        file[8..12].copy_from_slice(&start_crc.finish().to_le_bytes());
         let path = dir.path().join("big.7z");
         std::fs::write(&path, &file).unwrap();
         let before = READER_NEW_CALLS.load(Ordering::Relaxed);
@@ -1469,6 +1493,8 @@ mod tests {
 
     #[test]
     fn excessive_coder_count_refused() {
+        // The per-folder coder-chain ceiling is far below the generic
+        // structural ceiling; a hostile chain length is refused up front.
         let dir = tempdir().unwrap();
         let mut h = Vec::new();
         h.push(K_HEADER);
@@ -1489,11 +1515,13 @@ mod tests {
         h.push(K_END);
         h.push(K_END);
         let path = write_archive_bytes(dir.path(), "coders.7z", &[], &h);
+        let before = READER_NEW_CALLS.load(Ordering::Relaxed);
         let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
         assert!(matches!(
             err,
-            crate::dat::archive::sevenz_preflight::PreflightRefusal::TooManyCoders { .. }
+            crate::dat::archive::sevenz_preflight::PreflightRefusal::CoderChainTooLong { .. }
         ));
+        assert_eq!(READER_NEW_CALLS.load(Ordering::Relaxed), before);
     }
 
     #[test]
@@ -1668,5 +1696,540 @@ mod tests {
             before,
             "SevenZReader::new must never run for a preflight-refused archive"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Additional hostile fixtures for the Codex re-review pass.
+    // ------------------------------------------------------------------
+
+    /// A header with one folder containing `count` LZMA2 coders, each with the
+    /// given dictionary bits, chained via bind pairs, with `count` sub-streams
+    /// and `count` files. Used for aggregate-decoder-memory and coder-chain
+    /// tests.
+    fn header_with_lzma2_chain(count: usize, dict_bits: u8) -> Vec<u8> {
+        let mut h = Vec::new();
+        h.push(K_HEADER);
+        h.push(K_MAIN_STREAMS_INFO);
+        h.push(K_PACK_INFO);
+        uvarint(0, &mut h);
+        uvarint(1, &mut h);
+        h.push(K_SIZE);
+        uvarint(0, &mut h);
+        h.push(K_END);
+        h.push(K_UNPACK_INFO);
+        h.push(K_FOLDER);
+        uvarint(1, &mut h);
+        h.push(0);
+        uvarint(count as u64, &mut h); // num_coders
+        for _ in 0..count {
+            h.push(0x21); // bits: id_size=1, simple, has_attrs
+            h.push(0x21); // LZMA2 id
+            uvarint(1, &mut h);
+            h.push(dict_bits);
+        }
+        for i in 0..count.saturating_sub(1) {
+            uvarint(i as u64 + 1, &mut h); // in_index
+            uvarint(i as u64, &mut h); // out_index
+        }
+        h.push(K_CODERS_UNPACK_SIZE);
+        for _ in 0..count {
+            uvarint(0, &mut h);
+        }
+        h.push(K_END);
+        h.push(K_SUB_STREAMS_INFO);
+        h.push(K_NUM_UNPACK_STREAM);
+        uvarint(count as u64, &mut h);
+        h.push(K_SIZE);
+        for _ in 0..count.saturating_sub(1) {
+            uvarint(0, &mut h);
+        }
+        h.push(K_END);
+        h.push(K_END);
+        h.push(K_FILES_INFO);
+        uvarint(count as u64, &mut h);
+        h.push(K_END);
+        h.push(K_END);
+        h
+    }
+
+    /// Writes a file whose start-header or next-header CRC is deliberately
+    /// wrong. `bad_start`/`bad_next` overwrite the stored CRC fields.
+    fn write_archive_bad_crc(
+        dir: &std::path::Path,
+        name: &str,
+        next_header: &[u8],
+        bad_start: bool,
+        bad_next: bool,
+    ) -> PathBuf {
+        let mut file = Vec::new();
+        file.extend_from_slice(&SIG);
+        file.push(0);
+        file.push(2);
+        file.extend_from_slice(&[0; 4]); // start crc placeholder
+        file.extend_from_slice(&0_u64.to_le_bytes()); // offset
+        file.extend_from_slice(&(next_header.len() as u64).to_le_bytes());
+        let mut next_crc = crate::identity_source::hashing::Crc32::new();
+        next_crc.update(next_header);
+        let next_value = if bad_next {
+            next_crc.finish().wrapping_add(1)
+        } else {
+            next_crc.finish()
+        };
+        file.extend_from_slice(&next_value.to_le_bytes());
+        file.extend_from_slice(next_header);
+        let mut start_crc = crate::identity_source::hashing::Crc32::new();
+        start_crc.update(&file[12..32]);
+        let start_value = if bad_start {
+            start_crc.finish().wrapping_add(1)
+        } else {
+            start_crc.finish()
+        };
+        file[8..12].copy_from_slice(&start_value.to_le_bytes());
+        let path = dir.join(name);
+        std::fs::write(&path, &file).unwrap();
+        path
+    }
+
+    #[test]
+    fn aggregate_decoder_memory_budget_is_enforced() {
+        // Three individually valid 1 GiB LZMA2 dictionaries in one folder sum
+        // to 3 GiB, exceeding the 2 GiB aggregate decoder-memory budget.
+        let dir = tempdir().unwrap();
+        let header = header_with_lzma2_chain(3, 36); // 36 → 1 GiB each
+        let path = write_archive_bytes(dir.path(), "agg.7z", &[], &header);
+        let before = READER_NEW_CALLS.load(Ordering::Relaxed);
+        let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
+        assert_eq!(
+            err,
+            crate::dat::archive::sevenz_preflight::PreflightRefusal::AggregateDecoderMemoryExceeded {
+                bytes: 3 * 1024 * 1024 * 1024,
+                limit: ArchiveLimits::default().max_aggregate_decoder_memory_bytes,
+            }
+        );
+        assert_eq!(READER_NEW_CALLS.load(Ordering::Relaxed), before);
+    }
+
+    #[test]
+    fn aggregate_decoder_memory_within_budget_is_accepted() {
+        // Two 512 MiB dictionaries sum to 1 GiB ≤ the 2 GiB budget.
+        let dir = tempdir().unwrap();
+        let header = header_with_lzma2_chain(2, 34); // 34 → 512 MiB each
+        let path = write_archive_bytes(dir.path(), "agg_ok.7z", &[], &header);
+        let info = preflight(&path, &ArchiveLimits::default()).unwrap();
+        assert_eq!(info.member_count, 2);
+    }
+
+    #[test]
+    fn coder_chain_ceiling_is_enforced() {
+        // 17 coders in one folder exceeds the 16-coder chain ceiling.
+        let dir = tempdir().unwrap();
+        let header = header_with_lzma2_chain(17, 36);
+        let path = write_archive_bytes(dir.path(), "chain.7z", &[], &header);
+        let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
+        assert_eq!(
+            err,
+            crate::dat::archive::sevenz_preflight::PreflightRefusal::CoderChainTooLong {
+                count: 17,
+                limit: ArchiveLimits::default().max_coders_per_folder,
+            }
+        );
+    }
+
+    #[test]
+    fn zero_sized_k_name_is_refused() {
+        let dir = tempdir().unwrap();
+        let mut h = Vec::new();
+        h.push(K_HEADER);
+        h.push(K_MAIN_STREAMS_INFO);
+        h.push(K_PACK_INFO);
+        uvarint(0, &mut h);
+        uvarint(0, &mut h);
+        h.push(K_END);
+        h.push(K_END);
+        h.push(K_FILES_INFO);
+        uvarint(1, &mut h);
+        h.push(K_NAME);
+        uvarint(0, &mut h); // zero-sized K_NAME property (panic-prone upstream)
+        h.push(K_END);
+        h.push(K_END);
+        let path = write_archive_bytes(dir.path(), "zname.7z", &[], &h);
+        let before = READER_NEW_CALLS.load(Ordering::Relaxed);
+        let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::dat::archive::sevenz_preflight::PreflightRefusal::Malformed {
+                detail: "zero-sized K_NAME property"
+            }
+        ));
+        assert_eq!(READER_NEW_CALLS.load(Ordering::Relaxed), before);
+    }
+
+    #[test]
+    fn malformed_k_name_names_count_is_refused() {
+        // K_NAME declares two names but only one null-terminated name is stored.
+        let dir = tempdir().unwrap();
+        let mut h = Vec::new();
+        h.push(K_HEADER);
+        h.push(K_MAIN_STREAMS_INFO);
+        h.push(K_PACK_INFO);
+        uvarint(0, &mut h);
+        uvarint(0, &mut h);
+        h.push(K_END);
+        h.push(K_END);
+        h.push(K_FILES_INFO);
+        uvarint(2, &mut h); // two files
+        h.push(K_NAME);
+        let mut names = vec![0_u8];
+        for unit in "a".encode_utf16() {
+            names.extend_from_slice(&unit.to_le_bytes());
+        }
+        names.extend_from_slice(&[0, 0]);
+        uvarint(names.len() as u64, &mut h);
+        h.extend_from_slice(&names);
+        h.push(K_END);
+        h.push(K_END);
+        let path = write_archive_bytes(dir.path(), "bnames.7z", &[], &h);
+        let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::dat::archive::sevenz_preflight::PreflightRefusal::Malformed {
+                detail: "K_NAME names count mismatch"
+            }
+        ));
+    }
+
+    #[test]
+    fn truncated_files_info_is_refused() {
+        // FilesInfo declares a large K_NAME property with only a few bytes.
+        let dir = tempdir().unwrap();
+        let mut h = Vec::new();
+        h.push(K_HEADER);
+        h.push(K_MAIN_STREAMS_INFO);
+        h.push(K_PACK_INFO);
+        uvarint(0, &mut h);
+        uvarint(0, &mut h);
+        h.push(K_END);
+        h.push(K_END);
+        h.push(K_FILES_INFO);
+        uvarint(1, &mut h);
+        h.push(K_NAME);
+        uvarint(101, &mut h); // claims 101 bytes (100 of names); only 2 stored
+        h.push(0); // external byte
+        h.extend_from_slice(&[0, 0]); // only 2 bytes of names
+        h.push(K_END);
+        h.push(K_END);
+        let path = write_archive_bytes(dir.path(), "trunc.7z", &[], &h);
+        let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::dat::archive::sevenz_preflight::PreflightRefusal::Truncated
+        ));
+    }
+
+    #[test]
+    fn missing_files_info_terminator_is_refused() {
+        // FilesInfo properties never end with K_END; the cursor runs past the
+        // bounded buffer.
+        let dir = tempdir().unwrap();
+        let mut h = Vec::new();
+        h.push(K_HEADER);
+        h.push(K_MAIN_STREAMS_INFO);
+        h.push(K_PACK_INFO);
+        uvarint(0, &mut h);
+        uvarint(0, &mut h);
+        h.push(K_END);
+        h.push(K_END);
+        h.push(K_FILES_INFO);
+        uvarint(1, &mut h);
+        h.push(K_NAME);
+        uvarint(3, &mut h); // external byte + one null-terminated name
+        h.push(0); // external byte
+        h.push(0);
+        h.push(0); // the name ("") null; no K_END follows the property
+        let path = write_archive_bytes(dir.path(), "noterm.7z", &[], &h);
+        let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::dat::archive::sevenz_preflight::PreflightRefusal::Truncated
+        ));
+    }
+
+    #[test]
+    fn incorrect_start_header_crc_is_refused() {
+        let dir = tempdir().unwrap();
+        let header = header_one_copy_folder(1, 1);
+        let path = write_archive_bad_crc(dir.path(), "badstart.7z", &header, true, false);
+        let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::dat::archive::sevenz_preflight::PreflightRefusal::Malformed {
+                detail: "start header checksum mismatch"
+            }
+        ));
+    }
+
+    #[test]
+    fn zero_start_header_crc_is_still_validated() {
+        // A stored start-header CRC of 0 must still match the computed CRC;
+        // here it does not (the content's real CRC is non-zero).
+        let dir = tempdir().unwrap();
+        let header = header_one_copy_folder(1, 1);
+        let mut file = Vec::new();
+        file.extend_from_slice(&SIG);
+        file.push(0);
+        file.push(2);
+        file.extend_from_slice(&0_u32.to_le_bytes()); // stored start CRC = 0
+        file.extend_from_slice(&0_u64.to_le_bytes()); // offset
+        file.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        let mut next_crc = crate::identity_source::hashing::Crc32::new();
+        next_crc.update(&header);
+        file.extend_from_slice(&next_crc.finish().to_le_bytes());
+        file.extend_from_slice(&header);
+        // content of the start-header block has a non-zero CRC, so stored 0 is wrong
+        let path = dir.path().join("zerocrc.7z");
+        std::fs::write(&path, &file).unwrap();
+        let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::dat::archive::sevenz_preflight::PreflightRefusal::Malformed {
+                detail: "start header checksum mismatch"
+            }
+        ));
+    }
+
+    #[test]
+    fn incorrect_next_header_crc_is_refused() {
+        let dir = tempdir().unwrap();
+        let header = header_one_copy_folder(1, 1);
+        let path = write_archive_bad_crc(dir.path(), "badnext.7z", &header, false, true);
+        let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::dat::archive::sevenz_preflight::PreflightRefusal::Malformed {
+                detail: "next header checksum mismatch"
+            }
+        ));
+    }
+
+    #[test]
+    fn invalid_bind_pair_index_is_refused() {
+        let dir = tempdir().unwrap();
+        let mut h = Vec::new();
+        h.push(K_HEADER);
+        h.push(K_MAIN_STREAMS_INFO);
+        h.push(K_PACK_INFO);
+        uvarint(0, &mut h);
+        uvarint(1, &mut h);
+        h.push(K_SIZE);
+        uvarint(0, &mut h);
+        h.push(K_END);
+        h.push(K_UNPACK_INFO);
+        h.push(K_FOLDER);
+        uvarint(1, &mut h);
+        h.push(0);
+        uvarint(2, &mut h); // two COPY coders → total_out=2 → one bind pair
+        h.push(0x01);
+        h.push(0x00);
+        h.push(0x01);
+        h.push(0x00);
+        uvarint(1, &mut h); // in_index 1
+        uvarint(5, &mut h); // out_index 5 >= total_out=2 → invalid
+        h.push(K_CODERS_UNPACK_SIZE);
+        uvarint(0, &mut h);
+        uvarint(0, &mut h);
+        h.push(K_END);
+        h.push(K_END);
+        h.push(K_FILES_INFO);
+        uvarint(1, &mut h);
+        h.push(K_END);
+        h.push(K_END);
+        let path = write_archive_bytes(dir.path(), "bindpair.7z", &[], &h);
+        let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::dat::archive::sevenz_preflight::PreflightRefusal::Malformed {
+                detail: "bind pair index out of range"
+            }
+        ));
+    }
+
+    #[test]
+    fn invalid_packed_stream_index_is_refused() {
+        let dir = tempdir().unwrap();
+        let mut h = Vec::new();
+        h.push(K_HEADER);
+        h.push(K_MAIN_STREAMS_INFO);
+        h.push(K_PACK_INFO);
+        uvarint(0, &mut h);
+        uvarint(1, &mut h);
+        h.push(K_SIZE);
+        uvarint(0, &mut h);
+        h.push(K_END);
+        h.push(K_UNPACK_INFO);
+        h.push(K_FOLDER);
+        uvarint(1, &mut h);
+        h.push(0);
+        // One non-simple COPY coder with num_in=2, num_out=1 → two packed streams.
+        uvarint(1, &mut h);
+        h.push(0x11);
+        h.push(0x00);
+        uvarint(2, &mut h);
+        uvarint(1, &mut h);
+        uvarint(0, &mut h);
+        uvarint(5, &mut h); // second packed-stream index 5 >= total_in=2 → invalid
+        h.push(K_CODERS_UNPACK_SIZE);
+        uvarint(0, &mut h);
+        h.push(K_END);
+        h.push(K_END);
+        h.push(K_FILES_INFO);
+        uvarint(1, &mut h);
+        h.push(K_END);
+        h.push(K_END);
+        let path = write_archive_bytes(dir.path(), "packedidx.7z", &[], &h);
+        let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::dat::archive::sevenz_preflight::PreflightRefusal::Malformed {
+                detail: "packed stream index out of range"
+            }
+        ));
+    }
+
+    #[test]
+    fn inconsistent_pack_folder_consumption_is_refused() {
+        let dir = tempdir().unwrap();
+        let mut h = Vec::new();
+        h.push(K_HEADER);
+        h.push(K_MAIN_STREAMS_INFO);
+        h.push(K_PACK_INFO);
+        uvarint(0, &mut h);
+        uvarint(2, &mut h); // two pack streams...
+        h.push(K_SIZE);
+        uvarint(1, &mut h);
+        uvarint(1, &mut h);
+        h.push(K_END);
+        h.push(K_UNPACK_INFO);
+        h.push(K_FOLDER);
+        uvarint(1, &mut h);
+        h.push(0);
+        uvarint(1, &mut h); // ...but only one folder consuming one pack stream
+        h.push(0x01);
+        h.push(0x00);
+        h.push(K_CODERS_UNPACK_SIZE);
+        uvarint(0, &mut h);
+        h.push(K_END);
+        h.push(K_END);
+        h.push(K_FILES_INFO);
+        uvarint(1, &mut h);
+        h.push(K_END);
+        h.push(K_END);
+        let path = write_archive_bytes(dir.path(), "packleft.7z", &[], &h);
+        let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::dat::archive::sevenz_preflight::PreflightRefusal::Malformed {
+                detail: "pack streams not fully consumed"
+            }
+        ));
+    }
+
+    #[test]
+    fn runtime_cumulative_budget_near_limit_succeeds_without_double_counting() {
+        // Two 10-byte members with a 20-byte cumulative budget: each member is
+        // charged once, so both verify. The previous double-count bug charged
+        // ordinary members twice and falsely rejected the second.
+        let dir = tempdir().unwrap();
+        let path = make_archive(
+            dir.path(),
+            &[("a.bin", "AAAAAAAAAA"), ("b.bin", "BBBBBBBBBB")],
+        );
+        let trusted = trusted_for(dir.path());
+        let limits = ArchiveLimits {
+            max_archive_logical_bytes: 20,
+            ..ArchiveLimits::default()
+        };
+        let mut source =
+            SevenZArchiveSource::open(&path, &trusted, limits, &TEST_NO_CANCEL).unwrap();
+        let evidence = collect(&mut source).unwrap();
+        assert_eq!(evidence.len(), 2);
+        assert!(
+            evidence.iter().all(|e| e.is_verified()),
+            "both members must verify when the cumulative total exactly meets the budget"
+        );
+    }
+
+    #[test]
+    fn nested_and_ordinary_runtime_accounting_counts_each_once() {
+        // A 5-byte nested member and a 5-byte ordinary member with a 10-byte
+        // budget: nested counts once (drained), ordinary once (hashed) → both
+        // pass. If nested were double-counted, the total would exceed 10.
+        let dir = tempdir().unwrap();
+        let path = make_archive(dir.path(), &[("a.zip", "AAAAA"), ("b.rom", "BBBBB")]);
+        let trusted = trusted_for(dir.path());
+        let limits = ArchiveLimits {
+            max_archive_logical_bytes: 10,
+            ..ArchiveLimits::default()
+        };
+        let mut source =
+            SevenZArchiveSource::open(&path, &trusted, limits, &TEST_NO_CANCEL).unwrap();
+        let evidence = collect(&mut source).unwrap();
+        assert_eq!(evidence.len(), 2);
+        assert_eq!(evidence[0].status, ArchiveMemberStatus::NestedArchive);
+        assert!(evidence[1].is_verified());
+    }
+
+    #[test]
+    fn deterministic_malformed_headers_never_panic() {
+        // A bounded property-style pass over a valid header's truncated
+        // prefixes and byte-flip mutations: the probe must return Err, never
+        // panic. (A single valid solid header is the seed.)
+        let dir = tempdir().unwrap();
+        let valid = header_one_copy_folder(8, 8);
+        // Truncated prefixes.
+        for length in 0..valid.len() {
+            let path = write_archive_bytes(dir.path(), "prefix.7z", &[], &valid[..length]);
+            let _ = preflight(&path, &ArchiveLimits::default());
+        }
+        // Byte flips (deterministic): each byte XOR 0xFF, plus a few offsets.
+        let mut mutated = valid.clone();
+        for index in 0..valid.len() {
+            let original = mutated[index];
+            mutated[index] ^= 0xFF;
+            let path = write_archive_bytes(dir.path(), "mut.7z", &[], &mutated);
+            let _ = preflight(&path, &ArchiveLimits::default());
+            mutated[index] = original;
+        }
+        // Boundary count values in FilesInfo (0, 1, limit, limit + 1, huge).
+        for count in [0_u64, 1, 2, 4096, 4097, 0x1_0000_0000] {
+            let mut h = Vec::new();
+            h.push(K_HEADER);
+            h.push(K_MAIN_STREAMS_INFO);
+            h.push(K_PACK_INFO);
+            uvarint(0, &mut h);
+            uvarint(0, &mut h);
+            h.push(K_END);
+            h.push(K_END);
+            h.push(K_FILES_INFO);
+            uvarint(count, &mut h);
+            h.push(K_NAME);
+            uvarint(2, &mut h);
+            h.push(0);
+            h.push(0);
+            h.push(0);
+            h.push(K_END);
+            h.push(K_END);
+            let path = write_archive_bytes(dir.path(), "counts.7z", &[], &h);
+            let _ = preflight(&path, &ArchiveLimits::default());
+        }
+        // Malformed varints (a truncated multi-byte varint at the end).
+        let mut h = Vec::new();
+        h.push(K_HEADER);
+        h.push(K_MAIN_STREAMS_INFO);
+        h.push(K_PACK_INFO);
+        h.push(0x80); // varint continuation with no following byte
+        h.push(K_END);
+        h.push(K_END);
+        let path = write_archive_bytes(dir.path(), "varint.7z", &[], &h);
+        let _ = preflight(&path, &ArchiveLimits::default());
     }
 }

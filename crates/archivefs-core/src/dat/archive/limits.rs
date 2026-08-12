@@ -68,6 +68,25 @@ pub const MAX_7Z_HEADER_BYTES: usize = 16 * 1024 * 1024;
 /// hostile archive cannot demand a huge parse/allocation.
 pub const MAX_7Z_CODER_PROPERTIES_BYTES: usize = 1024 * 1024;
 
+/// Largest combined decoder memory one 7z folder/coder chain may demand.
+///
+/// NEW. `sevenz-rust` builds a *nested* decoder stack for a folder, so every
+/// LZMA/LZMA2 dictionary in the chain is allocated simultaneously — the
+/// per-coder dictionary cap alone is not sufficient. The probe checked-sums
+/// the dictionaries of all LZMA/LZMA2 coders in a folder and refuses folders
+/// whose aggregate exceeds this budget. 2 GiB allows the realistic worst case
+/// (a single 1 GiB dictionary, per the per-coder cap, plus headroom for a
+/// filter chain) while rejecting multi-GiB chains.
+pub const MAX_7Z_AGGREGATE_DECODER_MEMORY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Largest number of coders allowed in one 7z folder (coder-chain ceiling).
+///
+/// NEW, and deliberately far below the generic `max_members` structural
+/// ceiling: `sevenz-rust` constructs a nested decoder per coder, so an absurd
+/// chain length is itself a resource attack. Real 7z folders use a handful of
+/// coders (a compression method plus optional filters).
+pub const MAX_7Z_CODERS_PER_FOLDER: usize = 16;
+
 /// The tunable set an archive reader enforces. Defaults are the shared
 /// constants above; tests shrink individual fields to force refusals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +100,10 @@ pub struct ArchiveLimits {
     /// Ceiling on the 7z next-header size the pre-decoder probe will read and
     /// parse before `sevenz-rust` is ever constructed.
     pub max_header_bytes: usize,
+    /// Ceiling on the combined decoder memory of one folder's coder chain.
+    pub max_aggregate_decoder_memory_bytes: u64,
+    /// Ceiling on the number of coders in one folder.
+    pub max_coders_per_folder: usize,
 }
 
 impl Default for ArchiveLimits {
@@ -93,6 +116,8 @@ impl Default for ArchiveLimits {
             max_dictionary_bytes: MAX_7Z_DICTIONARY_BYTES,
             max_compression_ratio: MAX_7Z_COMPRESSION_RATIO,
             max_header_bytes: MAX_7Z_HEADER_BYTES,
+            max_aggregate_decoder_memory_bytes: MAX_7Z_AGGREGATE_DECODER_MEMORY_BYTES,
+            max_coders_per_folder: MAX_7Z_CODERS_PER_FOLDER,
         }
     }
 }
@@ -111,5 +136,10 @@ mod tests {
         assert_eq!(limits.max_dictionary_bytes, MAX_7Z_DICTIONARY_BYTES);
         assert_eq!(limits.max_compression_ratio, MAX_7Z_COMPRESSION_RATIO);
         assert_eq!(limits.max_header_bytes, MAX_7Z_HEADER_BYTES);
+        assert_eq!(
+            limits.max_aggregate_decoder_memory_bytes,
+            MAX_7Z_AGGREGATE_DECODER_MEMORY_BYTES
+        );
+        assert_eq!(limits.max_coders_per_folder, MAX_7Z_CODERS_PER_FOLDER);
     }
 }
