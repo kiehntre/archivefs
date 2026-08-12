@@ -392,7 +392,12 @@ impl ArchiveMemberSource for SevenZArchiveSource {
                 };
             }
 
-            match hash_member_stream(stream, limits.max_member_logical_bytes, cancel) {
+            // Bound the hash by the *declared* logical size (never larger than
+            // the per-member ceiling, which was checked just above) rather than
+            // by the ceiling alone: the cumulative budget was reserved against
+            // the declared size, so a decoder that produced more bytes than the
+            // header promised must be refused, not silently charged.
+            match hash_member_stream(stream, meta.logical_size, cancel) {
                 Ok(hashed) => {
                     total_consumed = total_consumed.saturating_add(hashed.bytes_read);
                     match visit(evidence(
