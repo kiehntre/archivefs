@@ -1652,7 +1652,10 @@ mod tests {
     fn ratio_exactly_at_limit_is_accepted() {
         let dir = tempdir().unwrap();
         let header = header_one_copy_folder(10, 10 * 1000);
-        let path = write_archive_bytes(dir.path(), "ratio_ok.7z", &[], &header);
+        // The ten declared packed bytes are actually stored: the packed region
+        // must exist in the file, or the region check refuses it before the
+        // ratio is ever considered.
+        let path = write_archive_bytes(dir.path(), "ratio_ok.7z", &[0_u8; 10], &header);
         let info = preflight(&path, &ArchiveLimits::default()).unwrap();
         assert_eq!(info.member_count, 1);
     }
@@ -2422,7 +2425,9 @@ mod tests {
         h.extend_from_slice(&[0; 8]); // one 64-bit timestamp
         h.push(K_END);
         h.push(K_END);
-        let path = write_archive_bytes(dir.path(), "mtime.7z", &[], &h);
+        // The single declared packed byte is actually stored, so the packed
+        // region is physically present and only the kMTime parse is under test.
+        let path = write_archive_bytes(dir.path(), "mtime.7z", &[0_u8; 1], &h);
         let info = preflight(&path, &ArchiveLimits::default()).unwrap();
         assert_eq!(info.member_count, 1);
     }
@@ -2557,6 +2562,156 @@ mod tests {
             "unexpected refusal: {err:?}"
         );
         assert_eq!(READER_NEW_CALLS.load(Ordering::Relaxed), before);
+    }
+
+    // ------------------------------------------------------------------
+    // The declared packed-data region must exist in the physical file: the
+    // offsets are attacker-controlled, so every step of the arithmetic is
+    // checked and the region must neither run past EOF nor alias the
+    // next-header region.
+    // ------------------------------------------------------------------
+
+    /// A plain header with an explicit `pack_pos` and one COPY folder per pack
+    /// stream, each folder unpacking to zero bytes. Nothing but the packed
+    /// region checks can fire for these fixtures: a zero unpack size skips the
+    /// compression-ratio check, and one folder per stream keeps the pack
+    /// streams fully consumed.
+    fn header_pack_region(pack_pos: u64, pack_sizes: &[u64]) -> Vec<u8> {
+        let mut h = Vec::new();
+        h.push(K_HEADER);
+        h.push(K_MAIN_STREAMS_INFO);
+        h.push(K_PACK_INFO);
+        uvarint(pack_pos, &mut h);
+        uvarint(pack_sizes.len() as u64, &mut h);
+        h.push(K_SIZE);
+        for &size in pack_sizes {
+            uvarint(size, &mut h);
+        }
+        h.push(K_END);
+        h.push(K_UNPACK_INFO);
+        h.push(K_FOLDER);
+        uvarint(pack_sizes.len() as u64, &mut h); // one folder per pack stream
+        h.push(0); // external
+        for _ in pack_sizes {
+            uvarint(1, &mut h); // one coder
+            h.push(0x01); // simple, id_size = 1
+            h.push(0x00); // COPY
+        }
+        h.push(K_CODERS_UNPACK_SIZE);
+        for _ in pack_sizes {
+            uvarint(0, &mut h); // unpack size 0
+        }
+        h.push(K_END);
+        h.push(K_END);
+        h.push(K_FILES_INFO);
+        uvarint(pack_sizes.len() as u64, &mut h);
+        h.push(K_END);
+        h.push(K_END);
+        h
+    }
+
+    #[test]
+    fn hostile_pack_pos_overflow_is_refused() {
+        // `pack_pos` is added to the 32-byte signature-header size to get the
+        // region's absolute start; a `u64::MAX` declaration overflows that
+        // addition, which must be a refusal rather than a wrap to a small
+        // (and therefore plausible-looking) offset.
+        let dir = tempdir().unwrap();
+        let header = header_pack_region(u64::MAX, &[0]);
+        let path = write_archive_bytes(dir.path(), "packpos.7z", &[], &header);
+        let before = READER_NEW_CALLS.load(Ordering::Relaxed);
+        let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
+        assert_eq!(
+            err,
+            crate::dat::archive::sevenz_preflight::PreflightRefusal::ArithmeticOverflow
+        );
+        assert_eq!(READER_NEW_CALLS.load(Ordering::Relaxed), before);
+    }
+
+    #[test]
+    fn hostile_cumulative_pack_size_overflow_is_refused() {
+        // Two folders of one `u64::MAX` pack stream each. Neither folder's own
+        // packed-size summation overflows, so this can only be caught by the
+        // running total over *all* pack streams.
+        let dir = tempdir().unwrap();
+        let header = header_pack_region(0, &[u64::MAX, u64::MAX]);
+        let path = write_archive_bytes(dir.path(), "packsum.7z", &[], &header);
+        let before = READER_NEW_CALLS.load(Ordering::Relaxed);
+        let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
+        assert_eq!(
+            err,
+            crate::dat::archive::sevenz_preflight::PreflightRefusal::ArithmeticOverflow
+        );
+        assert_eq!(READER_NEW_CALLS.load(Ordering::Relaxed), before);
+    }
+
+    #[test]
+    fn hostile_pack_region_end_overflow_is_refused() {
+        // A plausible `pack_pos` plus a single `u64::MAX` stream: neither the
+        // start offset nor the size sum overflows on its own, only their sum
+        // (the region's end offset).
+        let dir = tempdir().unwrap();
+        let header = header_pack_region(100, &[u64::MAX]);
+        let path = write_archive_bytes(dir.path(), "packend.7z", &[], &header);
+        let before = READER_NEW_CALLS.load(Ordering::Relaxed);
+        let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
+        assert_eq!(
+            err,
+            crate::dat::archive::sevenz_preflight::PreflightRefusal::ArithmeticOverflow
+        );
+        assert_eq!(READER_NEW_CALLS.load(Ordering::Relaxed), before);
+    }
+
+    #[test]
+    fn pack_region_past_end_of_file_is_refused() {
+        // The header declares 4 KiB of packed data; the file holds none of it.
+        // Those bytes do not exist, so the archive is truncated.
+        let dir = tempdir().unwrap();
+        let header = header_pack_region(0, &[4096]);
+        let path = write_archive_bytes(dir.path(), "packeof.7z", &[], &header);
+        let before = READER_NEW_CALLS.load(Ordering::Relaxed);
+        let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
+        assert_eq!(
+            err,
+            crate::dat::archive::sevenz_preflight::PreflightRefusal::Truncated
+        );
+        assert_eq!(READER_NEW_CALLS.load(Ordering::Relaxed), before);
+    }
+
+    #[test]
+    fn pack_region_overlapping_the_next_header_is_refused() {
+        // Four packed bytes are stored (so the next header starts at 36) but
+        // the header declares six, running the packed region into the
+        // next-header region. Both readings of those bytes cannot be true.
+        let dir = tempdir().unwrap();
+        let header = header_pack_region(0, &[6]);
+        let path = write_archive_bytes(dir.path(), "packoverlap.7z", &[0_u8; 4], &header);
+        // The region stays inside the file: only the aliasing is wrong.
+        let len = std::fs::metadata(&path).unwrap().len();
+        assert!(len > 32 + 6, "the fixture must not be truncated as well");
+        let before = READER_NEW_CALLS.load(Ordering::Relaxed);
+        let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::dat::archive::sevenz_preflight::PreflightRefusal::Malformed {
+                    detail: "packed data overlaps the next header"
+                }
+            ),
+            "unexpected refusal: {err:?}"
+        );
+        assert_eq!(READER_NEW_CALLS.load(Ordering::Relaxed), before);
+    }
+
+    #[test]
+    fn pack_region_ending_exactly_at_the_next_header_is_accepted() {
+        // The boundary case the overlap check must not over-refuse: the packed
+        // region ends exactly where the next header begins.
+        let dir = tempdir().unwrap();
+        let header = header_pack_region(0, &[4]);
+        let path = write_archive_bytes(dir.path(), "packflush.7z", &[0_u8; 4], &header);
+        let info = preflight(&path, &ArchiveLimits::default()).unwrap();
+        assert_eq!(info.member_count, 1);
     }
 
     #[test]

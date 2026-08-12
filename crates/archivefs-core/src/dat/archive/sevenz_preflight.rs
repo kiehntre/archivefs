@@ -10,7 +10,9 @@
 //! refuses hostile declarations. It is not a full parser, but it validates
 //! enough structure (FilesInfo properties, names, bind-pair and packed-stream
 //! indices, pack-stream consumption, CRCs, truncation, trailing bytes) that
-//! malformed input cannot reach panic-prone code inside `sevenz-rust`.
+//! malformed input cannot reach panic-prone code inside `sevenz-rust`. The
+//! declared packed-data region is also checked against the physical file: it
+//! must fit inside it and must not alias the next-header region.
 //!
 //! # Bounds before allocation
 //!
@@ -171,6 +173,23 @@ pub struct SevenZPreflightInfo {
     pub max_folder_unpack: u64,
 }
 
+/// The physical layout of the archive file, used to validate that declared
+/// regions actually exist inside it.
+///
+/// Every field is derived from the (CRC-validated) start header plus the
+/// observed file length, never from the next header's own body, so the
+/// pack-region checks below compare attacker-controlled declarations against
+/// facts about the real file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ArchiveGeometry {
+    /// Observed length of the archive file in bytes.
+    file_len: u64,
+    /// Absolute offset of the next-header region.
+    next_header_pos: u64,
+    /// Absolute end offset (exclusive) of the next-header region.
+    next_header_end: u64,
+}
+
 /// A minimal coder record: method id bytes + properties (LZMA/LZMA2
 /// dictionary declarations live in `properties`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -282,8 +301,13 @@ pub fn preflight_sevenz<R: Read + Seek>(
         });
     }
 
+    let geometry = ArchiveGeometry {
+        file_len: reader_len,
+        next_header_pos,
+        next_header_end: header_end,
+    };
     let mut cursor = HeaderCursor::new(&header);
-    let info = parse_header(&mut cursor, limits, cancel)?;
+    let info = parse_header(&mut cursor, limits, &geometry, cancel)?;
     if !cursor.is_exhausted() {
         return Err(PreflightRefusal::Malformed {
             detail: "trailing header bytes",
@@ -295,6 +319,7 @@ pub fn preflight_sevenz<R: Read + Seek>(
 fn parse_header(
     cursor: &mut HeaderCursor<'_>,
     limits: &ArchiveLimits,
+    geometry: &ArchiveGeometry,
     cancel: &AtomicBool,
 ) -> Result<SevenZPreflightInfo, PreflightRefusal> {
     let mut nid = cursor.read_u8()?;
@@ -318,12 +343,13 @@ fn parse_header(
     }
 
     let mut pack_sizes: Vec<u64> = Vec::new();
+    let mut pack_pos: u64 = 0;
     let mut folders: Vec<FolderInfo> = Vec::new();
     let mut total_stream_files: usize = 0;
     if nid == K_MAIN_STREAMS_INFO {
         nid = cursor.read_u8()?;
         if nid == K_PACK_INFO {
-            parse_pack_info(cursor, limits, &mut pack_sizes, cancel)?;
+            pack_pos = parse_pack_info(cursor, limits, &mut pack_sizes, cancel)?;
             nid = cursor.read_u8()?;
         }
         if nid == K_UNPACK_INFO {
@@ -369,7 +395,7 @@ fn parse_header(
         });
     }
 
-    enforce_and_summarize(&pack_sizes, &folders, limits)
+    enforce_and_summarize(pack_pos, &pack_sizes, &folders, limits, geometry)
 }
 
 fn parse_archive_properties(
@@ -388,13 +414,17 @@ fn parse_archive_properties(
     Ok(())
 }
 
+/// Parses PackInfo, returning the declared `pack_pos` (the packed region's
+/// offset relative to the end of the 32-byte signature header). The value is
+/// only interpreted later, by [`validate_pack_region`], where it can be
+/// compared against the real file layout with checked arithmetic.
 fn parse_pack_info(
     cursor: &mut HeaderCursor<'_>,
     limits: &ArchiveLimits,
     pack_sizes: &mut Vec<u64>,
     cancel: &AtomicBool,
-) -> Result<(), PreflightRefusal> {
-    let _pack_pos = cursor.read_varint()?;
+) -> Result<u64, PreflightRefusal> {
+    let pack_pos = cursor.read_varint()?;
     let num_pack_streams = cursor.read_varint()?;
     if num_pack_streams > limits.max_members as u64 {
         return Err(PreflightRefusal::TooManyPackStreams {
@@ -427,7 +457,7 @@ fn parse_pack_info(
             detail: "bad pack-info terminator",
         });
     }
-    Ok(())
+    Ok(pack_pos)
 }
 
 fn parse_unpack_info(
@@ -931,9 +961,11 @@ fn parse_file_names(
 }
 
 fn enforce_and_summarize(
+    pack_pos: u64,
     pack_sizes: &[u64],
     folders: &[FolderInfo],
     limits: &ArchiveLimits,
+    geometry: &ArchiveGeometry,
 ) -> Result<SevenZPreflightInfo, PreflightRefusal> {
     let mut member_count: usize = 0;
     let mut total_logical_bytes: u64 = 0;
@@ -1074,11 +1106,66 @@ fn enforce_and_summarize(
         });
     }
 
+    // The declared pack streams are consistent with the folders; now check
+    // that the region they occupy actually exists in the physical file.
+    validate_pack_region(pack_pos, pack_sizes, geometry)?;
+
     Ok(SevenZPreflightInfo {
         member_count,
         total_logical_bytes,
         max_folder_unpack,
     })
+}
+
+/// Validates the physical packed-data region declared by PackInfo.
+///
+/// `pack_pos` and every pack-stream size come straight from the header, so all
+/// of the arithmetic here is checked: `pack_pos` may be large enough to
+/// overflow the signature-header offset, the individual sizes may overflow as
+/// they accumulate, and the region's end offset may overflow even when neither
+/// half does. Beyond arithmetic, the region has to be real:
+///
+/// - it must lie entirely inside the file (a region running past EOF means the
+///   decoder would read bytes that do not exist);
+/// - it must not alias the next-header region. The next header is a distinct
+///   region of the file whose bytes this probe validated separately (CRC,
+///   structure); an archive claiming packed data that runs into or through it
+///   hands the decoder a stream overlapping structure that was checked as
+///   something else, so both interpretations of those bytes become untrustworthy.
+///
+/// Called after the folder/pack-stream consistency checks, so a header whose
+/// pack streams do not line up with its folders is still refused for that
+/// reason first.
+fn validate_pack_region(
+    pack_pos: u64,
+    pack_sizes: &[u64],
+    geometry: &ArchiveGeometry,
+) -> Result<(), PreflightRefusal> {
+    let pack_start = SIGNATURE_HEADER_SIZE
+        .checked_add(pack_pos)
+        .ok_or(PreflightRefusal::ArithmeticOverflow)?;
+    let mut total_pack_size: u64 = 0;
+    for &size in pack_sizes {
+        total_pack_size = total_pack_size
+            .checked_add(size)
+            .ok_or(PreflightRefusal::ArithmeticOverflow)?;
+    }
+    let pack_end = pack_start
+        .checked_add(total_pack_size)
+        .ok_or(PreflightRefusal::ArithmeticOverflow)?;
+
+    if pack_end > geometry.file_len {
+        return Err(PreflightRefusal::Truncated);
+    }
+    // Half-open interval intersection: the packed region and the next-header
+    // region must be disjoint. An empty packed region (no streams, or all of
+    // them zero-length) never intersects anything.
+    if pack_start < geometry.next_header_end && geometry.next_header_pos < pack_end {
+        return Err(PreflightRefusal::Malformed {
+            detail: "packed data overlaps the next header",
+        });
+    }
+    Ok(())
 }
 
 /// `unpack > pack * ratio`, computed without lossy integer division.
