@@ -22,10 +22,16 @@ replacement. See [Current limitations](#current-limitations) and
 explicit list of what it deliberately does not do.
 
 **Release status:** the current release is `v0.7.1-alpha`, a stabilization
-release on top of `v0.7.0` with no new user-facing features. It adds Games-only
-DAT filtering, DAT rename planning/apply with journaling and rollback,
-classifier-version enforcement on apply, installer ownership hardening, and
-EmuWiz desktop integration, on top of v0.7.0's canonical 74-platform registry,
+release that packages everything merged on top of `v0.7.0` into a single
+tagged, installable build. The release-prep work itself (version bump,
+changelog, documentation) adds no new implementation, but Alpha 1.1 as a
+release does ship real user-facing functionality merged since v0.7.0: RomM
+identity-provider integration with cover-art and platform-artwork workflows,
+a Cheat Sources GUI and a DAT Sources GUI, Games-only DAT filtering, DAT
+rename planning/apply with journaling and rollback, classifier-version
+enforcement on apply, BSFree GameCube and Wii cheat install, installer
+ownership hardening, first-run/empty-state polish, and EmuWiz desktop
+integration - on top of v0.7.0's canonical 74-platform registry,
 evidence-based confidence, bounded Atari ST/Wii/PS2/GameCube identity, safer
 Dolphin profile resolution, PS2/GameCube/Wii GameHacking workflows, expanded
 Doctor diagnostics, and the optional browse-only BSFree Archive source. See

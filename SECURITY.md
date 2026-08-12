@@ -99,10 +99,15 @@ endpoint policy and token-file handling summarized below.
   metadata fetcher accepts only its compiled-in endpoint and refuses every
   other URL before networking). RomM is a separately configured local or
   private service: its endpoint policy allows HTTP or HTTPS, but only to
-  addresses approved as loopback or private LAN (RFC 1918 / IPv6
-  unique-local); the client refuses redirects, or validates them against the
-  same policy before any follow, caps response size, and limits artwork
-  fetches to RomM's own thumbnail URLs, never arbitrary scraper URLs.
+  addresses observed as loopback or private LAN (RFC 1918 / IPv6
+  unique-local) at the time the endpoint is validated - this reduces but
+  does not eliminate DNS-rebinding risk, since the actual connection is
+  re-resolved independently by the HTTP client and the validated address is
+  not pinned through to it; the client refuses every redirect unconditionally
+  (none is ever followed), and may classify a redirect's destination against
+  the same policy purely to report where it pointed, caps response size, and
+  limits artwork fetches to RomM's own thumbnail URLs, never arbitrary
+  scraper URLs.
   Because RomM may be configured over HTTP, its bearer token is **not**
   protected by TLS in transit in that case. RomM tokens are supplied by the
   user as a token file: EmuWiz validates restrictive permissions (a token

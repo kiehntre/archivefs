@@ -13,14 +13,33 @@ guessing at intent, dates, or scope.
 
 ## v0.7.1-alpha (unreleased)
 
-Stabilization release ("Alpha 1.1"). No new user-facing features; this
-release consolidates work merged on top of v0.7.0 into a single tagged,
-installable build and corrects stale documentation. See
+Stabilization release ("Alpha 1.1"). This release-prep pass (PR #41) itself
+introduces no new implementation - it is a docs, version-bump, and changelog
+change only. Alpha 1.1 *as a release*, however, does ship real user-facing
+functionality: everything merged to `main` between `v0.7.0`'s tag and this
+release-prep work, consolidated here into a single tagged, installable build
+alongside a correction of stale documentation. See
 [`docs/releases/v0.7.1-alpha.md`](docs/releases/v0.7.1-alpha.md) for
 installation, upgrade, and validation guidance.
 
 ### Added
 
+- RomM identity-provider integration: a read-only RomM client and adapter
+  (token-based auth, capability inspection, provider-relative paths, bounded
+  adaptive page sizing) with a CLI surface and GUI configuration, browsing,
+  and selected-game identity flow (`crates/archivefs-core/src/identity_source/romm/`,
+  `crates/archivefs-cli/src/romm_identity.rs`,
+  `crates/archivefs-gui/src/romm_source.rs`, `romm_config.rs`, `romm_browse.rs`,
+  `romm_game.rs`).
+- RomM cover-art and platform-artwork workflows: RomM cover artwork shown in
+  Gamer View, plus managed platform-artwork import with canonical naming and
+  33 curated images (#5, #6).
+- Cheat Sources GUI (policy Milestone 1), including cheat source health
+  surfaced in the GUI, CLI `list`, and `info` output, backed by a read-only
+  cache probe (#4, #16).
+- DAT Sources GUI Stage 1: registry, validation, and read-only audit, plus
+  usability follow-up for warning presentation, audit progress, and
+  deterministic cancellation (#7, #11).
 - Games-only DAT content policy: a safe, explicit filter that scopes
   structured category/type/content_type trust to No-Intro DATs, with GUI
   selection of the Games-only mode (#29).
@@ -43,16 +62,20 @@ installation, upgrade, and validation guidance.
   `--replace-foreign` reruns (#38).
 - Linux desktop integration: an EmuWiz application icon and desktop launcher
   entry (`io.github.kiehntre.emuwiz`) (#33).
-- Cheat source health surfaced in the Cheat Sources GUI, CLI `list`, and `info`
-  output, backed by a read-only cache probe (#16).
 - Platform identity enrichment from RomM and verified DAT evidence, with
   conflict handling when an authoritative platform disagrees with a strong
   independently-derived identity (#17).
 - Canonical ROM organisation into a user-configured master ROM root, including
   a GUI page, CLI commands, and journaling that only records
   actually-created platform directories (#18).
+- BSFree GameCube cheat install: supported BSFree GameCube codes applied
+  through the existing Dolphin adapter (#21).
 - BSFree Wii verified-subset cheat install, generalising the existing Dolphin
-  dedup analysis to share the Wii pipeline (#28).
+  dedup analysis to share the Wii pipeline. A distinct, later addition on top
+  of the GameCube install path above, not a fold-in of it (#28).
+- First-run and empty-state polish: a genuinely missing config is treated as
+  first-run rather than an error, with a first-run hint instead of a bare OS
+  error (`crates/archivefs-cli/src/main.rs`) (#8, #9).
 
 ### Changed
 
@@ -94,11 +117,25 @@ installation, upgrade, and validation guidance.
 - README's release install walkthrough updated off the stale `v0.5.0-alpha`
   example to the current release process.
 
+### Dependency security
+
+- Updated `quick-xml` (a build-time-only transitive dependency of the Wayland
+  protocol scanner, never used on game or catalogue data at runtime) from
+  0.39.4 to 0.41.0, resolving RUSTSEC-2026-0195 and RUSTSEC-2026-0194 (#3).
+  See [`docs/DEPENDENCY_SECURITY.md`](docs/DEPENDENCY_SECURITY.md) for the
+  full advisory record.
+
 ### Documentation
 
 - Extensive documentation reconciliation with current-main behavior,
   including a loose-ends audit, EmuWiz reference cleanup, and quarantine of
   stale pre-rename material (#35, #37).
+- Corrected `docs/security.md` and `SECURITY.md` to accurately describe the
+  RomM endpoint policy's DNS-rebinding coverage (validation-time resolution
+  reduces but does not eliminate the risk; the actual connection is
+  independently re-resolved by `ureq` and not pinned to the validated
+  address) and to state precisely that all redirects are refused
+  unconditionally, never followed after "validation" (#41).
 
 Note: archive-aware DAT verification, CHD verification, ZIP-member
 verification, NES header normalization, B2/split-archive grouping, explicit

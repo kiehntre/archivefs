@@ -171,19 +171,31 @@ and this document does not claim it is:
   catalogue/cheat providers above, RomM is a separately configured local or
   private service, and its URL is validated against a local-only endpoint
   policy (`crates/archivefs-core/src/identity_source/net_policy.rs`) before
-  any request is made: only `http` or `https`, only to a host that resolves
-  entirely within loopback, RFC 1918, or IPv6 unique-local ranges (every
-  resolved address must be approved, closing the DNS-rebinding case), never
-  a known cloud-metadata address, and never a URL carrying embedded
-  credentials. The production HTTP client (`UreqTransport`) is built with
-  zero redirects; a redirect response is revalidated against the same
-  policy and reported as a refusal rather than followed, so a compromised or
-  misconfigured instance cannot redirect the bearer token to an
-  unapproved address. Because the policy allows RomM to be reached over
-  plain HTTP, a token sent to an HTTP endpoint has no TLS transport
-  protection for that request - this is a property of HTTP, not something
-  the client works around, and it is the reason the endpoint policy exists
-  to bound *where* HTTP is even reachable.
+  any request is made: only `http` or `https`, only to a host that, when
+  resolved *at validation time*, resolves entirely within loopback, RFC 1918,
+  or IPv6 unique-local ranges (every address observed during that resolution
+  must be approved), never a known cloud-metadata address, and never a URL
+  carrying embedded credentials. Any public, mixed, or otherwise disallowed
+  answer seen during validation is refused outright. This validation reduces
+  but does not eliminate DNS-rebinding risk: the actual HTTP connection is
+  made later by `ureq`, which performs its own independent DNS resolution at
+  connect time, and the validated address is not currently pinned through to
+  that connection. A DNS answer that changes between validation time and
+  connection time - a malicious or misbehaving resolver answering
+  differently on the second lookup - remains outside this guarantee.
+  Closing that gap would require pinning the validated address into the
+  actual socket connection, which is not implemented today. The production
+  HTTP client (`UreqTransport`) is also configured with `max_redirects(0)`,
+  so every redirect response is refused unconditionally and none is ever
+  followed under any circumstance; an attempted redirect's destination may
+  still be classified against the same policy purely for diagnostic/logging
+  purposes (so the refusal message can name where the server tried to send
+  the request), but that classification never results in the redirect being
+  followed. Because the policy allows RomM to be reached over plain HTTP, a
+  token sent to an HTTP endpoint has no TLS transport protection for that
+  request - this is a property of HTTP, not something the client works
+  around, and it is the reason the endpoint policy exists to bound *where*
+  HTTP is even reachable.
 - **RomM tokens are user-supplied and file-based, never inline config.**
   A token is read from a file the user names with `--token-file` (or the GUI
   equivalent); `load_token_file`

@@ -122,23 +122,44 @@ real/irreplaceable ROMs).
 ### D. Stale classifier / legacy journal
 
 Exercises the classifier-version enforcement shipped in this release (#39,
-`validate_classifier_version` in `executor.rs`) and journal
-backward-compatibility.
+`validate_classifier_version` in
+`crates/archivefs-core/src/dat/rename_apply/executor.rs`) and journal
+backward-compatibility. `validate_classifier_version` takes
+`plan_version: Option<&str>` and treats "mismatched version" and "no version
+at all" as two independent inputs to the same check - both must be verified,
+not just one:
 
-- [ ] Build a plan, then force its recorded `classifier_version` to differ
-      from the current `CLASSIFIER_VERSION` (e.g. by reloading against a
+- [ ] **Mismatched classifier version.** Build a plan, then force its
+      recorded `classifier_version` to a *different* string than the current
+      `dat::classification::CLASSIFIER_VERSION` (e.g. by reloading against a
       build with a bumped classifier, or by editing a saved plan file in a
-      test-only setup). Applying this plan must perform **zero** filesystem
+      test-only setup), so `validate_classifier_version(Some("old-version"))`
+      is exercised. Applying this plan must perform **zero** filesystem
       mutation and must surface the "Rename plan is stale because
       classification rules changed. Regenerate the plan before applying."
-      message (`ApplyError::StaleClassifierVersion`), not a partial or silent
-      apply.
-- [ ] A journal produced by a pre-`v0.7.1-alpha` build (before classifier-version
-      enforcement existed) remains inspectable: it opens without error in the
-      Alpha 1.1 build's journal/recovery UI.
-- [ ] That legacy journal remains recoverable (crash reconciliation via
+      message (`ApplyError::StaleClassifierVersion { plan: Some(_), .. }`),
+      not a partial or silent apply.
+- [ ] **Missing classifier provenance entirely.** Build or edit a plan whose
+      `classifier_version` field is absent/`None` rather than merely old
+      (a plan with no version-provenance info at all is a distinct case from
+      "mismatched" - do not conflate the two, and confirm the checklist item
+      above was exercised with an actual differing string, not with a blank
+      one standing in for this case). This exercises
+      `validate_classifier_version(None)`, which must also reject the apply
+      before any journal write or mutation, surfacing
+      `ApplyError::StaleClassifierVersion { plan: None, .. }` with the same
+      "regenerate the plan" message - not a crash, not a silent
+      accept-as-current.
+- [ ] **Legacy journal.** A journal produced by a pre-`v0.7.1-alpha` build
+      (before classifier-version enforcement existed) remains inspectable: it
+      opens without error in the Alpha 1.1 build's journal/recovery UI, it
+      remains recoverable (crash reconciliation via
       `crates/archivefs-core/src/dat/rename_apply/reconcile.rs` correctly
-      classifies any in-flight entries) and rollback-able.
+      classifies any in-flight entries), and it remains rollback-able
+      (`crates/archivefs-core/src/dat/rename_apply/rollback.rs`) - this is a
+      backward-compatibility guarantee on the journal itself, independent of
+      whether that legacy journal's transaction happens to carry a
+      classifier version.
 
 ### E. Real GUI/provider/emulator workflow
 
@@ -165,10 +186,59 @@ recorded as equivalent to an X11 pass.
       `.desktop` entry starts the GUI with the correct window icon and
       `StartupWMClass` (`io.github.kiehntre.emuwiz`).
 
+### F. Pristine clean install
+
+Exercises the actual produced release artifact end to end on a fresh user
+account/profile with **zero** prior EmuWiz or ArchiveFS state - no
+`~/.config/emuwiz`, `~/.config/archivefs`, `~/.local/share/emuwiz`, or
+`~/.local/share/archivefs` directories, and no pre-existing installer
+manifest. This is distinct from Journey A (which exercises upgrading an
+*existing* pre-manifest install) and Journey B (which exercises an existing
+*legacy* profile) - Journey F must start from genuinely nothing.
+
+- [ ] Extract the exact artifact `scripts/build-release.sh` produced (e.g.
+      `archivefs-v0.7.1-alpha-x86_64-linux.tar.gz`) - not a locally built
+      binary - into a clean directory on the fresh account.
+- [ ] Run `./install.sh` from the extracted artifact; confirm it completes
+      without error and without requiring `sudo`.
+- [ ] First CLI check: `emuwiz-cli --version` (and `archivefs-cli --version`
+      alias) report exactly `0.7.1-alpha`, resolved from Cargo metadata, not
+      a hardcoded string.
+- [ ] First GUI launch: `emuwiz` (and the `emuwiz-gui` / `archivefs-gui`
+      aliases) start cleanly with no prior config present; confirm the
+      first-run path is taken (`crates/archivefs-cli/src/main.rs`'s
+      "first-run hint" logic, see
+      `confirmed_missing_config_gets_a_first_run_hint`) rather than the
+      missing-config case being reported as a bare OS error.
+- [ ] Initial config/default behavior: confirm EmuWiz creates its own
+      `~/.config/emuwiz` / `~/.local/share/emuwiz` directories on this
+      genuinely-fresh profile (no legacy ArchiveFS directories exist to fall
+      back to - `app_dirs::choose_dir` in
+      `crates/archivefs-core/src/app_dirs.rs`), and that defaults (no DAT
+      sources, no cheat sources, no RomM source configured) are presented
+      honestly as empty/first-run states, not errors.
+- [ ] Dependency-warning behavior: with `ratarmount` absent from `PATH` on
+      this fresh account, confirm Doctor/diagnostics surfaces it as a clear,
+      actionable `Configuration`-category finding (see the `"ratarmount"`
+      handling in `crates/archivefs-core/src/diagnostics/mod.rs`) rather than
+      a crash or a silent no-op when a mount is attempted.
+- [ ] Desktop launcher and icon: after install, the
+      `io.github.kiehntre.emuwiz.desktop` entry and icon are present and
+      launching EmuWiz from it starts the GUI with the correct window icon
+      and `StartupWMClass`.
+- [ ] Uninstall: run the installer's uninstall path; confirm it completes
+      without error.
+- [ ] Post-uninstall data check: confirm user data created during this
+      journey (config, database, any DAT/cheat-source registrations) and any
+      foreign, non-EmuWiz-owned file placed in the same directories are left
+      untouched by uninstall - uninstall removes only demonstrably-owned
+      installer assets (the manifest-tracked binaries, desktop entry, and
+      icon), never user data and never a foreign path.
+
 ## Publication gate
 
 - [ ] All automated gates above pass on the exact commit to be released.
-- [ ] All five manual smoke journeys (A-E) are executed and signed off
+- [ ] All six manual smoke journeys (A-F) are executed and signed off
       against that same commit.
 - [ ] Explicit authorization received to merge, tag, and publish
       `v0.7.1-alpha`.
