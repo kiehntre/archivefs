@@ -1,0 +1,1363 @@
+//! Pre-decoder 7z header probe (POST-ALPHA-1.1, experimental).
+//!
+//! A minimal, bounded parser over just enough of the 7z header to enforce
+//! hard resource limits **before** `sevenz-rust2` is ever constructed. It is
+//! deliberately NOT a complete 7z decoder: it extracts the information needed
+//! for resource accounting (next-header size, encoded-header presence,
+//! pack-stream/file/folder/coder counts, LZMA/LZMA2 dictionary declarations
+//! and the **aggregate** decoder memory of each folder's coder chain, packed/
+//! unpacked sizes, per-member sub-stream sizes, and the FilesInfo layout) and
+//! refuses hostile declarations. It is not a full parser, but it validates
+//! enough structure (FilesInfo properties, names, bind-pair and packed-stream
+//! indices, pack-stream consumption, CRCs, truncation, trailing bytes) that
+//! malformed input cannot reach panic-prone code inside the upstream parser.
+//! The declared packed-data region is also checked against the physical file:
+//! it must fit inside it and must not alias the next-header region.
+//!
+//! # Bounds before allocation
+//!
+//! Every count/size read from the header is validated against a configured
+//! ceiling before any `Vec` of that size is allocated, all arithmetic on
+//! untrusted lengths is checked, and `u64` lengths are converted to `usize`
+//! with checked conversion. Reads past the bounded header buffer are a named
+//! malformed-archive refusal, never a panic.
+//!
+//! # Encoded headers
+//!
+//! A 7z archive may store its real header in a packed/encrypted "encoded
+//! header" block whose decompressed size is not known until it is decoded.
+//! Because that expansion cannot be bounded without decoding, the probe
+//! refuses every archive with an encoded header. This is a fail-closed
+//! experimental restriction; see the module doc of `sevenz.rs`.
+//!
+//! # The start-header CRC check is load-bearing
+//!
+//! `Archive::read` has a recovery path: when the stored start-header CRC is 0
+//! *and* the 20-byte start-header block is entirely zero, it abandons the
+//! start header and scans backwards from the end of the file for a `kHeader`/
+//! `kEncodedHeader` byte, then parses whatever it finds **with CRC
+//! verification disabled**. That would parse a region this probe never
+//! validated. It is unreachable today only because this probe validates the
+//! start-header CRC unconditionally and CRC-32 of twenty zero bytes is
+//! `0x0FD59B8D`, not 0 — so the all-zero start header is refused here first.
+//! Do not make that check conditional on a non-zero stored value.
+
+use std::io::{Read, Seek, SeekFrom};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use crate::identity_source::hashing::Crc32;
+
+use super::limits::{ARCHIVE_HASH_CHUNK_BYTES, ArchiveLimits, MAX_7Z_CODER_PROPERTIES_BYTES};
+
+pub(crate) const SEVEN_Z_SIGNATURE: &[u8] = &[b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C];
+pub(crate) const SIGNATURE_HEADER_SIZE: u64 = 32;
+const K_END: u8 = 0x00;
+const K_HEADER: u8 = 0x01;
+const K_ARCHIVE_PROPERTIES: u8 = 0x02;
+const K_ADDITIONAL_STREAMS_INFO: u8 = 0x03;
+const K_MAIN_STREAMS_INFO: u8 = 0x04;
+const K_FILES_INFO: u8 = 0x05;
+const K_PACK_INFO: u8 = 0x06;
+const K_UNPACK_INFO: u8 = 0x07;
+const K_SUB_STREAMS_INFO: u8 = 0x08;
+const K_SIZE: u8 = 0x09;
+const K_CRC: u8 = 0x0A;
+const K_FOLDER: u8 = 0x0B;
+const K_CODERS_UNPACK_SIZE: u8 = 0x0C;
+const K_NUM_UNPACK_STREAM: u8 = 0x0D;
+const K_EMPTY_STREAM: u8 = 0x0E;
+const K_EMPTY_FILE: u8 = 0x0F;
+const K_ANTI: u8 = 0x10;
+const K_NAME: u8 = 0x11;
+const K_C_TIME: u8 = 0x12;
+const K_A_TIME: u8 = 0x13;
+const K_M_TIME: u8 = 0x14;
+const K_WIN_ATTRIBUTES: u8 = 0x15;
+const K_START_POS: u8 = 0x18;
+const K_ENCODED_HEADER: u8 = 0x17;
+
+const ID_LZMA: &[u8] = &[0x03, 0x01, 0x01];
+const ID_LZMA2: &[u8] = &[0x21];
+const ID_BCJ2: &[u8] = &[0x03, 0x03, 0x01, 0x1B];
+
+/// The number of input streams a BCJ2 coder must declare. A `BCJ2Reader`
+/// indexes a fixed four-element stream array, so any other count is an
+/// out-of-bounds panic inside a decoder that does not check it first.
+const BCJ2_INPUT_STREAMS: u64 = 4;
+
+/// Why a hostile (or malformed) header was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreflightRefusal {
+    BadSignature,
+    UnsupportedVersion {
+        major: u8,
+        minor: u8,
+    },
+    /// The real header is stored packed/encrypted and cannot be bounded.
+    EncodedHeader,
+    /// A read went past the end of the file or the bounded header buffer.
+    Truncated,
+    NextHeaderTooLarge {
+        size: u64,
+        limit: usize,
+    },
+    TooManyFiles {
+        count: u64,
+        limit: usize,
+    },
+    TooManyFolders {
+        count: u64,
+        limit: usize,
+    },
+    TooManyPackStreams {
+        count: u64,
+        limit: usize,
+    },
+    /// A single folder's coder chain exceeds the per-folder ceiling.
+    CoderChainTooLong {
+        count: usize,
+        limit: usize,
+    },
+    PropertyBlobTooLarge {
+        size: u64,
+        limit: usize,
+    },
+    DictionaryTooLarge {
+        dictionary: u64,
+        limit: u64,
+    },
+    /// The checked sum of a folder's LZMA/LZMA2 dictionaries (simultaneously
+    /// constructed decoder memory) exceeds the aggregate budget.
+    AggregateDecoderMemoryExceeded {
+        bytes: u64,
+        limit: u64,
+    },
+    MemberSizeExceeded {
+        size: u64,
+        limit: u64,
+    },
+    SolidDecodeBudgetExceeded {
+        bytes: u64,
+        limit: u64,
+    },
+    CompressionRatioExceeded {
+        unpack: u64,
+        pack: u64,
+        ratio: u64,
+    },
+    LogicalBytesExceeded {
+        bytes: u64,
+        limit: u64,
+    },
+    MemberCountExceeded {
+        count: usize,
+        limit: usize,
+    },
+    ArithmeticOverflow,
+    Malformed {
+        detail: &'static str,
+    },
+    Cancelled,
+    Io(String),
+}
+
+/// The resource-relevant facts extracted from a plain (non-encoded) header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SevenZPreflightInfo {
+    /// Stream-bearing members implied by the sub-stream counts.
+    pub member_count: usize,
+    /// Sum of every folder's declared unpacked size (all stream members,
+    /// including nested ones), checked against the logical-bytes ceiling.
+    pub total_logical_bytes: u64,
+    /// Largest single folder's unpacked size (the solid-decode worst case).
+    pub max_folder_unpack: u64,
+}
+
+/// The physical layout of the archive file, used to validate that declared
+/// regions actually exist inside it.
+///
+/// Every field is derived from the (CRC-validated) start header plus the
+/// observed file length, never from the next header's own body, so the
+/// pack-region checks below compare attacker-controlled declarations against
+/// facts about the real file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ArchiveGeometry {
+    /// Observed length of the archive file in bytes.
+    file_len: u64,
+    /// Absolute offset of the next-header region.
+    next_header_pos: u64,
+    /// Absolute end offset (exclusive) of the next-header region.
+    next_header_end: u64,
+}
+
+/// A minimal coder record: method id bytes + properties (LZMA/LZMA2
+/// dictionary declarations live in `properties`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CoderInfo {
+    id: Vec<u8>,
+    props: Vec<u8>,
+    num_in_streams: u64,
+    num_out_streams: u64,
+}
+
+/// A minimal folder record: everything the probe needs for accounting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FolderInfo {
+    coders: Vec<CoderInfo>,
+    total_output_streams: usize,
+    bind_pairs: Vec<(u64, u64)>,
+    packed_streams: Vec<u64>,
+    unpack_sizes: Vec<u64>,
+    num_unpack_sub_streams: usize,
+    has_crc: bool,
+}
+
+impl FolderInfo {
+    /// The folder's declared unpacked size, mirroring the upstream
+    /// block/folder unpack-size rule: the last output stream with no bind pair.
+    fn unpack_size(&self) -> u64 {
+        for index in (0..self.total_output_streams).rev() {
+            if !self.bind_pairs.iter().any(|&(_, out)| out == index as u64) {
+                return self.unpack_sizes.get(index).copied().unwrap_or(0);
+            }
+        }
+        0
+    }
+}
+
+/// Parses and enforces limits over the 7z next header found in `reader`.
+///
+/// `reader` must be the already-validated read-only handle; `reader_len` is
+/// its observed length. The probe reads only the 32-byte file header plus the
+/// (bounded) next header, validates both CRCs, checks cancellation during the
+/// header read and every count-driven parse loop, and returns the extracted
+/// resource facts.
+pub fn preflight_sevenz<R: Read + Seek>(
+    reader: &mut R,
+    reader_len: u64,
+    limits: &ArchiveLimits,
+    cancel: &AtomicBool,
+) -> Result<SevenZPreflightInfo, PreflightRefusal> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(PreflightRefusal::Cancelled);
+    }
+    let file_header =
+        read_at(reader, 0, 32).map_err(|detail| PreflightRefusal::Io(detail.to_string()))?;
+    if file_header.len() != 32 || &file_header[..6] != SEVEN_Z_SIGNATURE {
+        return Err(PreflightRefusal::BadSignature);
+    }
+    if file_header[6] != 0 {
+        return Err(PreflightRefusal::UnsupportedVersion {
+            major: file_header[6],
+            minor: file_header[7],
+        });
+    }
+    let start_header_crc = u32::from_le_bytes(file_header[8..12].try_into().unwrap());
+    let next_header_offset = u64::from_le_bytes(file_header[12..20].try_into().unwrap());
+    let next_header_size = u64::from_le_bytes(file_header[20..28].try_into().unwrap());
+    let stored_next_crc = u32::from_le_bytes(file_header[28..32].try_into().unwrap());
+
+    // The start-header CRC is a real CRC even when its stored value is 0; it
+    // is always validated (a 0 stored value must still equal the computed one).
+    let mut start_crc = Crc32::new();
+    start_crc.update(&file_header[12..32]);
+    if start_crc.finish() != start_header_crc {
+        return Err(PreflightRefusal::Malformed {
+            detail: "start header checksum mismatch",
+        });
+    }
+
+    if next_header_size > limits.max_header_bytes as u64 {
+        return Err(PreflightRefusal::NextHeaderTooLarge {
+            size: next_header_size,
+            limit: limits.max_header_bytes,
+        });
+    }
+    let next_header_pos = SIGNATURE_HEADER_SIZE
+        .checked_add(next_header_offset)
+        .ok_or(PreflightRefusal::ArithmeticOverflow)?;
+    let header_end = next_header_pos
+        .checked_add(next_header_size)
+        .ok_or(PreflightRefusal::ArithmeticOverflow)?;
+    if header_end > reader_len {
+        return Err(PreflightRefusal::Truncated);
+    }
+
+    // Read the next header in bounded chunks. The size was validated against
+    // the ceiling before this allocation; cancellation surfaces distinctly.
+    let mut header = vec![0_u8; next_header_size as usize];
+    match read_at_chunked(reader, next_header_pos, &mut header, cancel) {
+        Ok(()) => {}
+        Err(ReadFailure::Cancelled) => return Err(PreflightRefusal::Cancelled),
+        Err(ReadFailure::Io(detail)) => return Err(PreflightRefusal::Io(detail)),
+    }
+
+    // The next-header CRC is validated before its structure is trusted.
+    let mut next_crc = Crc32::new();
+    next_crc.update(&header);
+    if next_crc.finish() != stored_next_crc {
+        return Err(PreflightRefusal::Malformed {
+            detail: "next header checksum mismatch",
+        });
+    }
+
+    let geometry = ArchiveGeometry {
+        file_len: reader_len,
+        next_header_pos,
+        next_header_end: header_end,
+    };
+    let mut cursor = HeaderCursor::new(&header);
+    let info = parse_header(&mut cursor, limits, &geometry, cancel)?;
+    if !cursor.is_exhausted() {
+        return Err(PreflightRefusal::Malformed {
+            detail: "trailing header bytes",
+        });
+    }
+    Ok(info)
+}
+
+fn parse_header(
+    cursor: &mut HeaderCursor<'_>,
+    limits: &ArchiveLimits,
+    geometry: &ArchiveGeometry,
+    cancel: &AtomicBool,
+) -> Result<SevenZPreflightInfo, PreflightRefusal> {
+    let mut nid = cursor.read_u8()?;
+    if nid == K_ENCODED_HEADER {
+        return Err(PreflightRefusal::EncodedHeader);
+    }
+    if nid != K_HEADER {
+        return Err(PreflightRefusal::Malformed {
+            detail: "expected K_HEADER",
+        });
+    }
+    nid = cursor.read_u8()?;
+    if nid == K_ARCHIVE_PROPERTIES {
+        parse_archive_properties(cursor, cancel)?;
+        nid = cursor.read_u8()?;
+    }
+    if nid == K_ADDITIONAL_STREAMS_INFO {
+        return Err(PreflightRefusal::Malformed {
+            detail: "additional streams are unsupported",
+        });
+    }
+
+    let mut pack_sizes: Vec<u64> = Vec::new();
+    let mut pack_pos: u64 = 0;
+    let mut folders: Vec<FolderInfo> = Vec::new();
+    let mut total_stream_files: usize = 0;
+    if nid == K_MAIN_STREAMS_INFO {
+        nid = cursor.read_u8()?;
+        if nid == K_PACK_INFO {
+            pack_pos = parse_pack_info(cursor, limits, &mut pack_sizes, cancel)?;
+            nid = cursor.read_u8()?;
+        }
+        if nid == K_UNPACK_INFO {
+            parse_unpack_info(cursor, limits, &mut folders, cancel)?;
+            nid = cursor.read_u8()?;
+        }
+        if nid == K_SUB_STREAMS_INFO {
+            parse_sub_streams_info(cursor, limits, &mut folders, cancel)?;
+            nid = cursor.read_u8()?;
+        }
+        if nid != K_END {
+            return Err(PreflightRefusal::Malformed {
+                detail: "bad streams-info terminator",
+            });
+        }
+        nid = cursor.read_u8()?;
+        total_stream_files = folders
+            .iter()
+            .map(|folder| folder.num_unpack_sub_streams)
+            .sum();
+    }
+    if nid == K_FILES_INFO {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(PreflightRefusal::Cancelled);
+        }
+        let num_files = cursor.read_varint()?;
+        if num_files > limits.max_members as u64 {
+            return Err(PreflightRefusal::TooManyFiles {
+                count: num_files,
+                limit: limits.max_members,
+            });
+        }
+        parse_files_info(cursor, num_files as usize, total_stream_files, cancel)?;
+        nid = cursor.read_u8()?;
+    } else if nid != K_END {
+        return Err(PreflightRefusal::Malformed {
+            detail: "missing files info",
+        });
+    }
+    if nid != K_END {
+        return Err(PreflightRefusal::Malformed {
+            detail: "missing header terminator",
+        });
+    }
+
+    enforce_and_summarize(pack_pos, &pack_sizes, &folders, limits, geometry)
+}
+
+fn parse_archive_properties(
+    cursor: &mut HeaderCursor<'_>,
+    cancel: &AtomicBool,
+) -> Result<(), PreflightRefusal> {
+    let mut nid = cursor.read_u8()?;
+    while nid != K_END {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(PreflightRefusal::Cancelled);
+        }
+        let size = cursor.read_varint()?;
+        cursor.skip(size)?;
+        nid = cursor.read_u8()?;
+    }
+    Ok(())
+}
+
+/// Parses PackInfo, returning the declared `pack_pos` (the packed region's
+/// offset relative to the end of the 32-byte signature header). The value is
+/// only interpreted later, by [`validate_pack_region`], where it can be
+/// compared against the real file layout with checked arithmetic.
+fn parse_pack_info(
+    cursor: &mut HeaderCursor<'_>,
+    limits: &ArchiveLimits,
+    pack_sizes: &mut Vec<u64>,
+    cancel: &AtomicBool,
+) -> Result<u64, PreflightRefusal> {
+    let pack_pos = cursor.read_varint()?;
+    let num_pack_streams = cursor.read_varint()?;
+    if num_pack_streams > limits.max_members as u64 {
+        return Err(PreflightRefusal::TooManyPackStreams {
+            count: num_pack_streams,
+            limit: limits.max_members,
+        });
+    }
+    let mut nid = cursor.read_u8()?;
+    if nid == K_SIZE {
+        pack_sizes.reserve(num_pack_streams as usize);
+        for _ in 0..num_pack_streams {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(PreflightRefusal::Cancelled);
+            }
+            pack_sizes.push(cursor.read_varint()?);
+        }
+        nid = cursor.read_u8()?;
+    }
+    if nid == K_CRC {
+        let bits = read_all_or_bits(cursor, num_pack_streams as usize, cancel)?;
+        for set in bits {
+            if set {
+                cursor.skip(4)?;
+            }
+        }
+        nid = cursor.read_u8()?;
+    }
+    if nid != K_END {
+        return Err(PreflightRefusal::Malformed {
+            detail: "bad pack-info terminator",
+        });
+    }
+    Ok(pack_pos)
+}
+
+fn parse_unpack_info(
+    cursor: &mut HeaderCursor<'_>,
+    limits: &ArchiveLimits,
+    folders: &mut Vec<FolderInfo>,
+    cancel: &AtomicBool,
+) -> Result<(), PreflightRefusal> {
+    let nid = cursor.read_u8()?;
+    if nid != K_FOLDER {
+        return Err(PreflightRefusal::Malformed {
+            detail: "expected kFolder",
+        });
+    }
+    let num_folders = cursor.read_varint()?;
+    if num_folders > limits.max_members as u64 {
+        return Err(PreflightRefusal::TooManyFolders {
+            count: num_folders,
+            limit: limits.max_members,
+        });
+    }
+    let external = cursor.read_u8()?;
+    if external != 0 {
+        return Err(PreflightRefusal::Malformed {
+            detail: "external folders are unsupported",
+        });
+    }
+    folders.reserve(num_folders as usize);
+    for _ in 0..num_folders {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(PreflightRefusal::Cancelled);
+        }
+        folders.push(parse_folder(cursor, limits, cancel)?);
+    }
+    let nid = cursor.read_u8()?;
+    if nid != K_CODERS_UNPACK_SIZE {
+        return Err(PreflightRefusal::Malformed {
+            detail: "expected kCodersUnpackSize",
+        });
+    }
+    for folder in folders.iter_mut() {
+        folder.unpack_sizes.reserve(folder.total_output_streams);
+        for _ in 0..folder.total_output_streams {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(PreflightRefusal::Cancelled);
+            }
+            folder.unpack_sizes.push(cursor.read_varint()?);
+        }
+    }
+    let mut nid = cursor.read_u8()?;
+    if nid == K_CRC {
+        let bits = read_all_or_bits(cursor, folders.len(), cancel)?;
+        for (index, set) in bits.iter().enumerate() {
+            if *set {
+                folders[index].has_crc = true;
+                cursor.skip(4)?;
+            }
+        }
+        nid = cursor.read_u8()?;
+    }
+    if nid != K_END {
+        return Err(PreflightRefusal::Malformed {
+            detail: "bad unpack-info terminator",
+        });
+    }
+    Ok(())
+}
+
+fn parse_folder(
+    cursor: &mut HeaderCursor<'_>,
+    limits: &ArchiveLimits,
+    cancel: &AtomicBool,
+) -> Result<FolderInfo, PreflightRefusal> {
+    let num_coders = cursor.read_varint()?;
+    if num_coders > limits.max_coders_per_folder as u64 {
+        return Err(PreflightRefusal::CoderChainTooLong {
+            count: num_coders as usize,
+            limit: limits.max_coders_per_folder,
+        });
+    }
+    let mut coders = Vec::with_capacity(num_coders as usize);
+    let mut total_in_streams: u64 = 0;
+    let mut total_out_streams: u64 = 0;
+    for _ in 0..num_coders {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(PreflightRefusal::Cancelled);
+        }
+        let bits = cursor.read_u8()?;
+        if bits & 0x80 != 0 {
+            return Err(PreflightRefusal::Malformed {
+                detail: "alternative coder methods are unsupported",
+            });
+        }
+        let id_size = (bits & 0x0f) as u64;
+        let id = cursor.read_exact(id_size)?;
+        let (num_in, num_out) = if bits & 0x10 == 0 {
+            (1_u64, 1_u64)
+        } else {
+            (cursor.read_varint()?, cursor.read_varint()?)
+        };
+        total_in_streams = total_in_streams
+            .checked_add(num_in)
+            .ok_or(PreflightRefusal::ArithmeticOverflow)?;
+        total_out_streams = total_out_streams
+            .checked_add(num_out)
+            .ok_or(PreflightRefusal::ArithmeticOverflow)?;
+        if total_in_streams > limits.max_members as u64
+            || total_out_streams > limits.max_members as u64
+        {
+            return Err(PreflightRefusal::Malformed {
+                detail: "folder stream counts exceed the structural ceiling",
+            });
+        }
+        let props = if bits & 0x20 != 0 {
+            let property_size = cursor.read_varint()?;
+            if property_size > MAX_7Z_CODER_PROPERTIES_BYTES as u64 {
+                return Err(PreflightRefusal::PropertyBlobTooLarge {
+                    size: property_size,
+                    limit: MAX_7Z_CODER_PROPERTIES_BYTES,
+                });
+            }
+            cursor.read_exact(property_size)?
+        } else {
+            Vec::new()
+        };
+        coders.push(CoderInfo {
+            id,
+            props,
+            num_in_streams: num_in,
+            num_out_streams: num_out,
+        });
+    }
+
+    let num_bind_pairs = total_out_streams
+        .checked_sub(1)
+        .ok_or(PreflightRefusal::Malformed {
+            detail: "folder has no output streams",
+        })?;
+    let mut bind_pairs = Vec::with_capacity(num_bind_pairs as usize);
+    for _ in 0..num_bind_pairs {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(PreflightRefusal::Cancelled);
+        }
+        let in_index = cursor.read_varint()?;
+        let out_index = cursor.read_varint()?;
+        if in_index >= total_in_streams || out_index >= total_out_streams {
+            return Err(PreflightRefusal::Malformed {
+                detail: "bind pair index out of range",
+            });
+        }
+        // 7zFormat.txt: a bind pair connects one coder output to one coder
+        // input, and every stream may take part in at most one bind pair. If a
+        // stream index is reused, an upstream `OrderedCoderIter` (and the
+        // `get_in_stream`/`get_in_stream2` recursion) can walk a cycle: it
+        // follows out-index -> in-index forever, constructing and allocating a
+        // fresh decoder on every step. Distinct indices make the walk a simple
+        // path, so it always terminates.
+        if bind_pairs.iter().any(|&(existing, _)| existing == in_index) {
+            return Err(PreflightRefusal::Malformed {
+                detail: "duplicate bind pair input index",
+            });
+        }
+        if bind_pairs
+            .iter()
+            .any(|&(_, existing)| existing == out_index)
+        {
+            return Err(PreflightRefusal::Malformed {
+                detail: "duplicate bind pair output index",
+            });
+        }
+        bind_pairs.push((in_index, out_index));
+    }
+    if total_in_streams < num_bind_pairs {
+        return Err(PreflightRefusal::Malformed {
+            detail: "more bind pairs than input streams",
+        });
+    }
+    let num_packed_streams = total_in_streams - num_bind_pairs;
+    let mut packed_streams = Vec::with_capacity(num_packed_streams as usize);
+    if num_packed_streams == 1 {
+        let index = (0..total_in_streams)
+            .find(|&index| !bind_pairs.iter().any(|&(in_index, _)| in_index == index));
+        let Some(index) = index else {
+            return Err(PreflightRefusal::Malformed {
+                detail: "no packed stream index",
+            });
+        };
+        packed_streams.push(index);
+    } else {
+        for _ in 0..num_packed_streams {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(PreflightRefusal::Cancelled);
+            }
+            let index = cursor.read_varint()?;
+            if index >= total_in_streams {
+                return Err(PreflightRefusal::Malformed {
+                    detail: "packed stream index out of range",
+                });
+            }
+            // Each input stream is fed either by a bind pair or by exactly one
+            // packed stream — never both, and never twice.
+            if bind_pairs.iter().any(|&(in_index, _)| in_index == index) {
+                return Err(PreflightRefusal::Malformed {
+                    detail: "packed stream index is already bound",
+                });
+            }
+            if packed_streams.contains(&index) {
+                return Err(PreflightRefusal::Malformed {
+                    detail: "duplicate packed stream index",
+                });
+            }
+            packed_streams.push(index);
+        }
+    }
+
+    Ok(FolderInfo {
+        coders,
+        total_output_streams: usize::try_from(total_out_streams)
+            .map_err(|_| PreflightRefusal::ArithmeticOverflow)?,
+        bind_pairs,
+        packed_streams,
+        unpack_sizes: Vec::new(),
+        num_unpack_sub_streams: 1,
+        has_crc: false,
+    })
+}
+
+fn parse_sub_streams_info(
+    cursor: &mut HeaderCursor<'_>,
+    limits: &ArchiveLimits,
+    folders: &mut [FolderInfo],
+    cancel: &AtomicBool,
+) -> Result<(), PreflightRefusal> {
+    let mut nid = cursor.read_u8()?;
+    if nid == K_NUM_UNPACK_STREAM {
+        let mut total_sub_streams: usize = 0;
+        for folder in folders.iter_mut() {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(PreflightRefusal::Cancelled);
+            }
+            let count = cursor.read_varint()?;
+            if count > limits.max_members as u64 {
+                return Err(PreflightRefusal::TooManyFiles {
+                    count,
+                    limit: limits.max_members,
+                });
+            }
+            folder.num_unpack_sub_streams = count as usize;
+            total_sub_streams = total_sub_streams
+                .checked_add(folder.num_unpack_sub_streams)
+                .ok_or(PreflightRefusal::ArithmeticOverflow)?;
+        }
+        if total_sub_streams > limits.max_members {
+            return Err(PreflightRefusal::MemberCountExceeded {
+                count: total_sub_streams,
+                limit: limits.max_members,
+            });
+        }
+        nid = cursor.read_u8()?;
+    }
+    let saw_size = nid == K_SIZE;
+    if saw_size {
+        // Per-member sizes: the per-file logical sizes, used to enforce the
+        // per-member ceiling before any decoder is constructed.
+        for folder in folders.iter() {
+            if folder.num_unpack_sub_streams == 0 {
+                continue;
+            }
+            let mut sum: u64 = 0;
+            for _ in 0..folder.num_unpack_sub_streams.saturating_sub(1) {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(PreflightRefusal::Cancelled);
+                }
+                let size = cursor.read_varint()?;
+                if size > limits.max_member_logical_bytes {
+                    return Err(PreflightRefusal::MemberSizeExceeded {
+                        size,
+                        limit: limits.max_member_logical_bytes,
+                    });
+                }
+                sum = sum
+                    .checked_add(size)
+                    .ok_or(PreflightRefusal::ArithmeticOverflow)?;
+            }
+            let folder_unpack = folder.unpack_size();
+            if sum > folder_unpack {
+                return Err(PreflightRefusal::Malformed {
+                    detail: "sub-stream sizes exceed folder unpack size",
+                });
+            }
+            let last = folder_unpack - sum;
+            if last > limits.max_member_logical_bytes {
+                return Err(PreflightRefusal::MemberSizeExceeded {
+                    size: last,
+                    limit: limits.max_member_logical_bytes,
+                });
+            }
+        }
+        nid = cursor.read_u8()?;
+    } else {
+        // Without K_SIZE, the upstream parser derives one size per folder and would
+        // index past the sizes for a multi-sub-stream (solid) folder — a panic
+        // vector. Fail closed.
+        if folders
+            .iter()
+            .any(|folder| folder.num_unpack_sub_streams > 1)
+        {
+            return Err(PreflightRefusal::Malformed {
+                detail: "solid folder without sub-stream sizes",
+            });
+        }
+    }
+    if nid == K_CRC {
+        let mut num_digests = 0;
+        for folder in folders.iter() {
+            if folder.num_unpack_sub_streams != 1 || !folder.has_crc {
+                num_digests += folder.num_unpack_sub_streams;
+            }
+        }
+        let has_missing = read_all_or_bits(cursor, num_digests, cancel)?;
+        for set in has_missing {
+            if set {
+                cursor.skip(4)?;
+            }
+        }
+        nid = cursor.read_u8()?;
+    }
+    if nid != K_END {
+        return Err(PreflightRefusal::Malformed {
+            detail: "bad sub-streams terminator",
+        });
+    }
+    Ok(())
+}
+
+/// Validates the FilesInfo section far enough that the upstream parser cannot
+/// hit panic-prone paths (zero-sized K_NAME, count/size index mismatches).
+///
+/// Consumes the property records up to and including the FilesInfo `K_END`.
+///
+/// # Byte-for-byte parity with the upstream parser
+///
+/// Every property is consumed exactly as `Archive::read_files_info` consumes
+/// it, so both parsers stay in lockstep and the checks below apply to the very
+/// bytes the decoder will act on. In particular:
+///
+/// - `kEmptyStream`/`kEmptyFile`/`kAnti` are **plain** bit vectors (7zFormat.txt),
+///   *not* "all-or-bits" vectors: they have no leading all-defined byte. Reading
+///   them as all-or-bits consumes one extra byte and inverts the meaning of the
+///   first payload byte, which desynchronises this probe from the decoder — and
+///   a mis-counted empty-stream vector is exactly what lets a hostile archive
+///   drive `sub_streams_info.crcs[non_empty_file_counter]` out of bounds.
+/// - `kEmptyFile`/`kAnti` are sized by the number of *empty-stream* files, not
+///   by `num_files`, and `kEmptyStream` must precede them.
+/// - the timestamp/attribute properties are parsed structurally (all-or-bits +
+///   external flag + fixed-width values) rather than skipped by their declared
+///   size, because the decoder ignores the declared size for them.
+fn parse_files_info(
+    cursor: &mut HeaderCursor<'_>,
+    num_files: usize,
+    total_stream_files: usize,
+    cancel: &AtomicBool,
+) -> Result<(), PreflightRefusal> {
+    let mut empty_stream: Option<Vec<bool>> = None;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(PreflightRefusal::Cancelled);
+        }
+        let property = cursor.read_u8()?;
+        if property == K_END {
+            break;
+        }
+        let size = cursor.read_varint()?;
+        match property {
+            K_EMPTY_STREAM => {
+                empty_stream = Some(read_bits(cursor, num_files, cancel)?);
+            }
+            K_EMPTY_FILE | K_ANTI => {
+                // Sized by the empty-stream count, and only legal after
+                // kEmptyStream (the decoder errors out otherwise).
+                let Some(bits) = empty_stream.as_ref() else {
+                    return Err(PreflightRefusal::Malformed {
+                        detail: "kEmptyStream must precede kEmptyFile/kAnti",
+                    });
+                };
+                let empty_count = bits.iter().filter(|&&bit| bit).count();
+                read_bits(cursor, empty_count, cancel)?;
+            }
+            K_C_TIME | K_A_TIME | K_M_TIME => {
+                parse_defined_values(cursor, num_files, 8, cancel)?;
+            }
+            K_WIN_ATTRIBUTES => {
+                parse_defined_values(cursor, num_files, 4, cancel)?;
+            }
+            K_NAME => {
+                if size == 0 {
+                    return Err(PreflightRefusal::Malformed {
+                        detail: "zero-sized K_NAME property",
+                    });
+                }
+                let external = cursor.read_u8()?;
+                if external != 0 {
+                    return Err(PreflightRefusal::Malformed {
+                        detail: "external K_NAME is unsupported",
+                    });
+                }
+                let names_bytes = size - 1;
+                if names_bytes % 2 != 0 {
+                    return Err(PreflightRefusal::Malformed {
+                        detail: "K_NAME names are not UTF-16 aligned",
+                    });
+                }
+                parse_file_names(cursor, names_bytes, num_files)?;
+            }
+            K_START_POS => {
+                return Err(PreflightRefusal::Malformed {
+                    detail: "kStartPos is unsupported",
+                });
+            }
+            _ => {
+                // Times, attributes, comments, and unknown properties are
+                // skipped by their declared size; the size is bounded by the
+                // cursor (a declared size past the end is Truncated).
+                cursor.skip(size)?;
+            }
+        }
+    }
+
+    let stream_files = match &empty_stream {
+        Some(bits) => num_files - bits.iter().filter(|&&bit| bit).count(),
+        None => num_files,
+    };
+    if stream_files != total_stream_files {
+        return Err(PreflightRefusal::Malformed {
+            detail: "file count inconsistent with stream sizes",
+        });
+    }
+    Ok(())
+}
+
+/// Consumes a timestamp/attribute property exactly as the upstream parser does: an
+/// all-or-bits "defined" vector, an external flag (which must be 0), then
+/// `value_bytes` for every file whose bit is set.
+fn parse_defined_values(
+    cursor: &mut HeaderCursor<'_>,
+    num_files: usize,
+    value_bytes: u64,
+    cancel: &AtomicBool,
+) -> Result<(), PreflightRefusal> {
+    let defined = read_all_or_bits(cursor, num_files, cancel)?;
+    let external = cursor.read_u8()?;
+    if external != 0 {
+        return Err(PreflightRefusal::Malformed {
+            detail: "external time/attribute property is unsupported",
+        });
+    }
+    for set in defined {
+        if set {
+            cursor.skip(value_bytes)?;
+        }
+    }
+    Ok(())
+}
+
+/// Validates that `names_bytes` encodes exactly `num_files` null-terminated
+/// UTF-16 names with no dangling or trailing bytes.
+fn parse_file_names(
+    cursor: &mut HeaderCursor<'_>,
+    names_bytes: u64,
+    num_files: usize,
+) -> Result<(), PreflightRefusal> {
+    let bytes = cursor.read_exact(names_bytes)?;
+    if num_files == 0 {
+        // An empty archive may carry a zero-length name block only.
+        return if bytes.is_empty() {
+            Ok(())
+        } else {
+            Err(PreflightRefusal::Malformed {
+                detail: "K_NAME names for zero files",
+            })
+        };
+    }
+    if bytes.len() < 2 || !bytes.ends_with(&[0, 0]) {
+        return Err(PreflightRefusal::Malformed {
+            detail: "K_NAME names not null-terminated",
+        });
+    }
+    let mut names_seen = 0usize;
+    for chunk in bytes.chunks_exact(2) {
+        let unit = u16::from_le_bytes([chunk[0], chunk[1]]);
+        if unit == 0 {
+            names_seen += 1;
+        }
+    }
+    if names_seen != num_files {
+        return Err(PreflightRefusal::Malformed {
+            detail: "K_NAME names count mismatch",
+        });
+    }
+    Ok(())
+}
+
+fn enforce_and_summarize(
+    pack_pos: u64,
+    pack_sizes: &[u64],
+    folders: &[FolderInfo],
+    limits: &ArchiveLimits,
+    geometry: &ArchiveGeometry,
+) -> Result<SevenZPreflightInfo, PreflightRefusal> {
+    let mut member_count: usize = 0;
+    let mut total_logical_bytes: u64 = 0;
+    let mut max_folder_unpack: u64 = 0;
+    let mut first_pack_stream: usize = 0;
+
+    for folder in folders {
+        member_count = member_count
+            .checked_add(folder.num_unpack_sub_streams)
+            .ok_or(PreflightRefusal::ArithmeticOverflow)?;
+        if member_count > limits.max_members {
+            return Err(PreflightRefusal::MemberCountExceeded {
+                count: member_count,
+                limit: limits.max_members,
+            });
+        }
+
+        let unpack = folder.unpack_size();
+        total_logical_bytes = total_logical_bytes
+            .checked_add(unpack)
+            .ok_or(PreflightRefusal::ArithmeticOverflow)?;
+        if total_logical_bytes > limits.max_archive_logical_bytes {
+            return Err(PreflightRefusal::LogicalBytesExceeded {
+                bytes: total_logical_bytes,
+                limit: limits.max_archive_logical_bytes,
+            });
+        }
+        max_folder_unpack = max_folder_unpack.max(unpack);
+
+        // Per-member ceiling for a folder that is exactly one member.
+        //
+        // `parse_sub_streams_info` enforces this member by member, but only for
+        // folders whose members are itemised by a `kSize` list. A non-solid
+        // archive (one folder per file, which is what `push_archive_entry`
+        // produces) carries no such list, so the only statement of that single
+        // member's logical size is the folder's own unpacked size. Checking it
+        // here keeps the ceiling a pre-decoder refusal in both layouts instead
+        // of leaving the non-solid case to the runtime check in `verify_all`.
+        if folder.num_unpack_sub_streams == 1 && unpack > limits.max_member_logical_bytes {
+            return Err(PreflightRefusal::MemberSizeExceeded {
+                size: unpack,
+                limit: limits.max_member_logical_bytes,
+            });
+        }
+
+        // Solid (multi-member) block budget.
+        if folder.num_unpack_sub_streams > 1 && unpack > limits.max_solid_decode_bytes {
+            return Err(PreflightRefusal::SolidDecodeBudgetExceeded {
+                bytes: unpack,
+                limit: limits.max_solid_decode_bytes,
+            });
+        }
+
+        // Compression ratio, without lossy integer division, with checked
+        // packed-size summation and explicit zero-compressed-size handling.
+        let pack_end = first_pack_stream
+            .checked_add(folder.packed_streams.len())
+            .ok_or(PreflightRefusal::ArithmeticOverflow)?;
+        if pack_end > pack_sizes.len() {
+            return Err(PreflightRefusal::Malformed {
+                detail: "folder pack streams out of range",
+            });
+        }
+        let mut pack: u64 = 0;
+        for &size in &pack_sizes[first_pack_stream..pack_end] {
+            pack = pack
+                .checked_add(size)
+                .ok_or(PreflightRefusal::ArithmeticOverflow)?;
+        }
+        if unpack > 0 && (pack == 0 || ratio_exceeded(unpack, pack, limits.max_compression_ratio)) {
+            return Err(PreflightRefusal::CompressionRatioExceeded {
+                unpack,
+                pack,
+                ratio: limits.max_compression_ratio,
+            });
+        }
+
+        // Dictionary declarations and the aggregate decoder memory of the
+        // coder chain: the upstream reader builds a nested decoder stack, so every
+        // LZMA/LZMA2 dictionary in a folder is allocated simultaneously.
+        let mut aggregate_decoder_memory: u64 = 0;
+        for coder in &folder.coders {
+            // Coder arity. The upstream reader can only decode single-output coders,
+            // and it indexes several *fixed-size* arrays with values derived
+            // from these counts:
+            //
+            // - `build_decode_stack2` writes `coder_used[bind_pair.out_index]`
+            //   into a `[bool; 32]`, so an output-stream index >= 32 is an
+            //   out-of-bounds panic;
+            // - `get_in_stream2` indexes `folder.coders[out_index]`, which is
+            //   only in range while every coder has exactly one output;
+            // - `BCJ2Reader` indexes a fixed four-element input array, so a
+            //   BCJ2 coder declaring any other input count panics mid-decode.
+            //
+            // Requiring one output per coder (and 4-in only for BCJ2) keeps all
+            // of those in range and refuses nothing that this build could have
+            // decoded anyway.
+            if coder.num_out_streams != 1 {
+                return Err(PreflightRefusal::Malformed {
+                    detail: "coder with multiple output streams is unsupported",
+                });
+            }
+            if coder.id.as_slice() == ID_BCJ2 {
+                if coder.num_in_streams != BCJ2_INPUT_STREAMS {
+                    return Err(PreflightRefusal::Malformed {
+                        detail: "BCJ2 coder must declare exactly four input streams",
+                    });
+                }
+            } else if coder.num_in_streams != 1 {
+                return Err(PreflightRefusal::Malformed {
+                    detail: "multi-input coder is unsupported",
+                });
+            }
+
+            let dictionary = if coder.id.as_slice() == ID_LZMA {
+                lzma_dictionary_size(&coder.props)
+                    .map_err(|detail| PreflightRefusal::Malformed { detail })?
+            } else if coder.id.as_slice() == ID_LZMA2 {
+                lzma2_dictionary_size(&coder.props)
+                    .map_err(|detail| PreflightRefusal::Malformed { detail })?
+            } else {
+                continue;
+            };
+            if u64::from(dictionary) > limits.max_dictionary_bytes {
+                return Err(PreflightRefusal::DictionaryTooLarge {
+                    dictionary: u64::from(dictionary),
+                    limit: limits.max_dictionary_bytes,
+                });
+            }
+            aggregate_decoder_memory = aggregate_decoder_memory
+                .checked_add(u64::from(dictionary))
+                .ok_or(PreflightRefusal::ArithmeticOverflow)?;
+        }
+        if aggregate_decoder_memory > limits.max_aggregate_decoder_memory_bytes {
+            return Err(PreflightRefusal::AggregateDecoderMemoryExceeded {
+                bytes: aggregate_decoder_memory,
+                limit: limits.max_aggregate_decoder_memory_bytes,
+            });
+        }
+
+        first_pack_stream = pack_end;
+    }
+
+    // Every declared pack stream must be consumed by a folder; leftover or
+    // unreferenced streams indicate an inconsistent (malformed) archive.
+    if folders.is_empty() && !pack_sizes.is_empty() {
+        return Err(PreflightRefusal::Malformed {
+            detail: "pack streams without folders",
+        });
+    }
+    if first_pack_stream != pack_sizes.len() {
+        return Err(PreflightRefusal::Malformed {
+            detail: "pack streams not fully consumed",
+        });
+    }
+
+    // The declared pack streams are consistent with the folders; now check
+    // that the region they occupy actually exists in the physical file.
+    validate_pack_region(pack_pos, pack_sizes, geometry)?;
+
+    Ok(SevenZPreflightInfo {
+        member_count,
+        total_logical_bytes,
+        max_folder_unpack,
+    })
+}
+
+/// Validates the physical packed-data region declared by PackInfo.
+///
+/// `pack_pos` and every pack-stream size come straight from the header, so all
+/// of the arithmetic here is checked: `pack_pos` may be large enough to
+/// overflow the signature-header offset, the individual sizes may overflow as
+/// they accumulate, and the region's end offset may overflow even when neither
+/// half does. Beyond arithmetic, the region has to be real:
+///
+/// - it must lie entirely inside the file (a region running past EOF means the
+///   decoder would read bytes that do not exist);
+/// - it must not alias the next-header region. The next header is a distinct
+///   region of the file whose bytes this probe validated separately (CRC,
+///   structure); an archive claiming packed data that runs into or through it
+///   hands the decoder a stream overlapping structure that was checked as
+///   something else, so both interpretations of those bytes become untrustworthy.
+///
+/// Called after the folder/pack-stream consistency checks, so a header whose
+/// pack streams do not line up with its folders is still refused for that
+/// reason first.
+fn validate_pack_region(
+    pack_pos: u64,
+    pack_sizes: &[u64],
+    geometry: &ArchiveGeometry,
+) -> Result<(), PreflightRefusal> {
+    let pack_start = SIGNATURE_HEADER_SIZE
+        .checked_add(pack_pos)
+        .ok_or(PreflightRefusal::ArithmeticOverflow)?;
+    let mut total_pack_size: u64 = 0;
+    for &size in pack_sizes {
+        total_pack_size = total_pack_size
+            .checked_add(size)
+            .ok_or(PreflightRefusal::ArithmeticOverflow)?;
+    }
+    let pack_end = pack_start
+        .checked_add(total_pack_size)
+        .ok_or(PreflightRefusal::ArithmeticOverflow)?;
+
+    if pack_end > geometry.file_len {
+        return Err(PreflightRefusal::Truncated);
+    }
+    // Half-open interval intersection: the packed region and the next-header
+    // region must be disjoint. An empty packed region (no streams, or all of
+    // them zero-length) never intersects anything.
+    if pack_start < geometry.next_header_end && geometry.next_header_pos < pack_end {
+        return Err(PreflightRefusal::Malformed {
+            detail: "packed data overlaps the next header",
+        });
+    }
+    Ok(())
+}
+
+/// `unpack > pack * ratio`, computed without lossy integer division.
+fn ratio_exceeded(unpack: u64, pack: u64, ratio: u64) -> bool {
+    match pack.checked_mul(ratio) {
+        Some(limit) => unpack > limit,
+        None => true,
+    }
+}
+
+/// LZMA dictionary size from coder properties (`props[1..5]`, LE u32).
+fn lzma_dictionary_size(properties: &[u8]) -> Result<u32, &'static str> {
+    let bytes = properties.get(1..5).ok_or("LZMA properties too short")?;
+    let mut buffer = [0_u8; 4];
+    buffer.copy_from_slice(bytes);
+    Ok(u32::from_le_bytes(buffer))
+}
+
+/// LZMA2 dictionary size from coder properties (dict bits → bytes).
+fn lzma2_dictionary_size(properties: &[u8]) -> Result<u32, &'static str> {
+    let bits = 0xff & u32::from(*properties.first().ok_or("LZMA2 properties too short")?);
+    if (bits & (!0x3f)) != 0 {
+        return Err("Unsupported LZMA2 property bits");
+    }
+    if bits > 40 {
+        return Err("LZMA2 dictionary larger than 4 GiB");
+    }
+    if bits == 40 {
+        return Ok(0xFFFF_FFFF);
+    }
+    Ok((2 | (bits & 0x1)) << (bits / 2 + 11))
+}
+
+/// A bounded cursor over the already-read next-header buffer.
+struct HeaderCursor<'a> {
+    bytes: &'a [u8],
+    position: usize,
+}
+
+impl<'a> HeaderCursor<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, position: 0 }
+    }
+
+    fn is_exhausted(&self) -> bool {
+        self.position >= self.bytes.len()
+    }
+
+    fn read_u8(&mut self) -> Result<u8, PreflightRefusal> {
+        let byte = self
+            .bytes
+            .get(self.position)
+            .copied()
+            .ok_or(PreflightRefusal::Truncated)?;
+        self.position += 1;
+        Ok(byte)
+    }
+
+    /// Reads the 7z variable-length integer (mirrors the 7z format's encoding).
+    fn read_varint(&mut self) -> Result<u64, PreflightRefusal> {
+        let first = self.read_u8()? as u64;
+        let mut mask = 0x80_u64;
+        let mut value: u64 = 0;
+        for index in 0..8 {
+            if (first & mask) == 0 {
+                return Ok(value | ((first & (mask - 1)) << (8 * index)));
+            }
+            let byte = self.read_u8()? as u64;
+            value |= byte << (8 * index);
+            mask >>= 1;
+        }
+        Ok(value)
+    }
+
+    /// Reads exactly `length` bytes (checked `u64`→`usize` conversion).
+    fn read_exact(&mut self, length: u64) -> Result<Vec<u8>, PreflightRefusal> {
+        let length = usize::try_from(length).map_err(|_| PreflightRefusal::ArithmeticOverflow)?;
+        let end = self
+            .position
+            .checked_add(length)
+            .ok_or(PreflightRefusal::ArithmeticOverflow)?;
+        let slice = self
+            .bytes
+            .get(self.position..end)
+            .ok_or(PreflightRefusal::Truncated)?;
+        self.position = end;
+        Ok(slice.to_vec())
+    }
+
+    /// Advances the cursor by `length` bytes without allocating.
+    fn skip(&mut self, length: u64) -> Result<(), PreflightRefusal> {
+        let length = usize::try_from(length).map_err(|_| PreflightRefusal::ArithmeticOverflow)?;
+        let end = self
+            .position
+            .checked_add(length)
+            .ok_or(PreflightRefusal::ArithmeticOverflow)?;
+        if end > self.bytes.len() {
+            return Err(PreflightRefusal::Truncated);
+        }
+        self.position = end;
+        Ok(())
+    }
+}
+
+/// `read_all_or_bits`: a leading "all" flag byte, else a plain bit vector.
+fn read_all_or_bits(
+    cursor: &mut HeaderCursor<'_>,
+    size: usize,
+    cancel: &AtomicBool,
+) -> Result<Vec<bool>, PreflightRefusal> {
+    let all = cursor.read_u8()?;
+    if all != 0 {
+        return Ok(vec![true; size]);
+    }
+    read_bits(cursor, size, cancel)
+}
+
+/// A plain bit vector: one bit per item, MSB-first within each byte, with no
+/// leading all-defined flag. This is the encoding 7zFormat.txt specifies for
+/// `kEmptyStream`, `kEmptyFile` and `kAnti`.
+fn read_bits(
+    cursor: &mut HeaderCursor<'_>,
+    size: usize,
+    cancel: &AtomicBool,
+) -> Result<Vec<bool>, PreflightRefusal> {
+    let mut out = Vec::with_capacity(size);
+    let mut mask = 0_u32;
+    let mut cache = 0_u32;
+    for _ in 0..size {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(PreflightRefusal::Cancelled);
+        }
+        if mask == 0 {
+            mask = 0x80;
+            cache = cursor.read_u8()? as u32;
+        }
+        out.push((cache & mask) != 0);
+        mask >>= 1;
+    }
+    Ok(out)
+}
+
+fn read_at<R: Read + Seek>(reader: &mut R, offset: u64, length: usize) -> std::io::Result<Vec<u8>> {
+    reader.seek(SeekFrom::Start(offset))?;
+    let mut buffer = vec![0_u8; length];
+    reader.read_exact(&mut buffer)?;
+    Ok(buffer)
+}
+
+/// A bounded, cancellable chunked read failure.
+enum ReadFailure {
+    Cancelled,
+    Io(String),
+}
+
+/// Reads `length` bytes into `buffer` in bounded chunks, checking
+/// cancellation per chunk and surfacing it distinctly from I/O errors.
+fn read_at_chunked<R: Read + Seek>(
+    reader: &mut R,
+    offset: u64,
+    buffer: &mut [u8],
+    cancel: &AtomicBool,
+) -> Result<(), ReadFailure> {
+    reader
+        .seek(SeekFrom::Start(offset))
+        .map_err(|error| ReadFailure::Io(error.to_string()))?;
+    let mut position = 0;
+    while position < buffer.len() {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(ReadFailure::Cancelled);
+        }
+        let chunk = ARCHIVE_HASH_CHUNK_BYTES.min(buffer.len() - position);
+        reader
+            .read_exact(&mut buffer[position..position + chunk])
+            .map_err(|error| ReadFailure::Io(error.to_string()))?;
+        position += chunk;
+    }
+    Ok(())
+}

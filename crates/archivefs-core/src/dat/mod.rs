@@ -32,6 +32,7 @@
 //! - Every parse warning includes byte offset and source context.
 //! - Unknown status values are preserved rather than discarded.
 
+pub mod archive;
 pub mod audit;
 pub mod classification;
 pub mod hash;
