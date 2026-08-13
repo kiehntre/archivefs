@@ -1497,6 +1497,94 @@ fn an_audit_finds_an_exact_match_and_reports_what_is_absent() {
 }
 
 #[test]
+fn zip_members_are_matched_individually_but_never_enter_rename_planning() {
+    use crate::dat::archive::ArchiveMemberStatus;
+    use crate::dat::audit::AuditVerdict;
+    use crate::dat::rename_plan::{RenamePlanContext, build_rename_plan};
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipWriter};
+
+    let dir = temp();
+    let dat = write(
+        dir.path(),
+        "members.dat",
+        r#"<datafile><header><name>ZIP member catalogue</name></header>
+<game name="Game (World)"><rom name="world.rom" size="4" sha1="a94a8fe5ccb19ba61c4c0873d391e987982fbbd3"/></game>
+<game name="Game (USA)"><rom name="usa.rom" size="4" sha1="a94a8fe5ccb19ba61c4c0873d391e987982fbbd3"/></game>
+<game name="Other"><rom name="other.rom" size="3" sha1="a9993e364706816aba3e25717850c26c9cd0d89d"/></game>
+</datafile>"#,
+    );
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    let archive = roms.join("collection.zip");
+    let mut writer = ZipWriter::new(std::fs::File::create(&archive).unwrap());
+    for (name, contents, method) in [
+        ("game.rom", b"test".as_slice(), CompressionMethod::Stored),
+        ("other.rom", b"abc".as_slice(), CompressionMethod::Deflated),
+    ] {
+        writer
+            .start_file(
+                name,
+                SimpleFileOptions::default().compression_method(method),
+            )
+            .unwrap();
+        writer.write_all(contents).unwrap();
+    }
+    writer.finish().unwrap();
+    let archive_before = std::fs::read(&archive).unwrap();
+
+    let request = DatAuditRequest {
+        source_id: "members".to_string(),
+        source_display_name: "ZIP member catalogue".to_string(),
+        dat_path: dat,
+        dat_kind: DatSourceKind::File,
+        scan_root: roms,
+        limits: DatLimits::default(),
+        policy: None,
+        platform: None,
+    };
+    let outcome = run_dat_audit(&request, &TrustedRoots::none(), &no_cancel(), &|_| {}).unwrap();
+
+    assert_eq!(
+        outcome.report.entries.len(),
+        1,
+        "outer ZIP stays one physical row"
+    );
+    assert_eq!(outcome.archives.len(), 1);
+    assert_eq!(outcome.archives[0].members.len(), 2);
+    assert!(
+        outcome.archives[0]
+            .members
+            .iter()
+            .all(|member| member.evidence.status == ArchiveMemberStatus::HashComplete)
+    );
+    assert!(
+        matches!(
+            outcome.archives[0].members[0].verdict,
+            Some(AuditVerdict::ExactMultipleCandidates { count: 2, .. })
+        ),
+        "two exact region variants identify the content; they are not ambiguity"
+    );
+    assert!(matches!(
+        outcome.archives[0].members[1].verdict,
+        Some(AuditVerdict::Exact { ref game_name, .. }) if game_name == "Other"
+    ));
+
+    let plan =
+        build_rename_plan(&outcome, &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+    assert!(
+        plan.proposals.is_empty(),
+        "archive evidence must not produce rename proposals"
+    );
+    assert_eq!(
+        std::fs::read(&archive).unwrap(),
+        archive_before,
+        "audit must not rewrite ZIP"
+    );
+}
+
+#[test]
 fn games_only_keeps_the_full_catalogue_and_audit_semantics() {
     use crate::dat::classification::ContentSelectionPolicy;
     use crate::dat::policy::{DatPolicyConfig, resolve};

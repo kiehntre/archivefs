@@ -1,4 +1,4 @@
-//! Central archive-verification limits (POST-ALPHA-1.1, experimental).
+//! Central archive-verification limits.
 //!
 //! Every numeric bound the member reader enforces lives here so limits are not
 //! magic numbers scattered through the reader. Where an existing constant in
@@ -30,6 +30,11 @@ pub const MAX_MEMBERS_PER_ARCHIVE: usize = MAX_ARCHIVE_MEMBERS;
 /// any single member's size.
 pub const MAX_ARCHIVE_LOGICAL_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
+/// Largest total logical bytes decoded from archives during one DAT audit.
+/// This is independent of each archive's own ceiling, preventing a directory
+/// containing many individually acceptable archives from bypassing the bound.
+pub const MAX_ARCHIVE_RUN_LOGICAL_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+
 /// Largest bytes of one solid (multi-member) decode block.
 ///
 /// NEW, and stricter than the ZIP case on purpose: in a solid 7z archive,
@@ -51,7 +56,10 @@ pub const MAX_7Z_DICTIONARY_BYTES: u64 = 1024 * 1024 * 1024;
 /// NEW. A classic archive-bomb heuristic, evaluated against declared sizes
 /// before any byte is decoded. The exact value is a product decision (the
 /// research flags it UNCERTAIN); this is the placeholder ceiling.
-pub const MAX_7Z_COMPRESSION_RATIO: u64 = 1000;
+pub const MAX_ARCHIVE_COMPRESSION_RATIO: u64 = 1000;
+
+/// Compatibility name retained for the experimental 7z reader.
+pub const MAX_7Z_COMPRESSION_RATIO: u64 = MAX_ARCHIVE_COMPRESSION_RATIO;
 
 /// Largest 7z next-header size the pre-decoder probe will read.
 ///
@@ -60,6 +68,9 @@ pub const MAX_7Z_COMPRESSION_RATIO: u64 = 1000;
 /// this ceiling **before** any such allocation. Legitimate 7z headers are
 /// small (bytes-to-KiB); 16 MiB is a generous safe ceiling.
 pub const MAX_7Z_HEADER_BYTES: usize = 16 * 1024 * 1024;
+
+/// Largest ZIP central directory accepted before `ZipArchive::new`.
+pub const MAX_ZIP_CENTRAL_DIRECTORY_BYTES: usize = 16 * 1024 * 1024;
 
 /// Largest single coder-properties blob the pre-decoder probe will accept.
 ///
@@ -100,6 +111,9 @@ pub struct ArchiveLimits {
     /// Ceiling on the 7z next-header size the pre-decoder probe will read and
     /// parse before `sevenz-rust2` is ever constructed.
     pub max_header_bytes: usize,
+    /// Ceiling on ZIP central-directory metadata parsed before the upstream
+    /// ZIP parser is constructed.
+    pub max_zip_central_directory_bytes: usize,
     /// Ceiling on the combined decoder memory of one folder's coder chain.
     pub max_aggregate_decoder_memory_bytes: u64,
     /// Ceiling on the number of coders in one folder.
@@ -114,8 +128,9 @@ impl Default for ArchiveLimits {
             max_archive_logical_bytes: MAX_ARCHIVE_LOGICAL_BYTES,
             max_solid_decode_bytes: MAX_SOLID_DECODE_BYTES,
             max_dictionary_bytes: MAX_7Z_DICTIONARY_BYTES,
-            max_compression_ratio: MAX_7Z_COMPRESSION_RATIO,
+            max_compression_ratio: MAX_ARCHIVE_COMPRESSION_RATIO,
             max_header_bytes: MAX_7Z_HEADER_BYTES,
+            max_zip_central_directory_bytes: MAX_ZIP_CENTRAL_DIRECTORY_BYTES,
             max_aggregate_decoder_memory_bytes: MAX_7Z_AGGREGATE_DECODER_MEMORY_BYTES,
             max_coders_per_folder: MAX_7Z_CODERS_PER_FOLDER,
         }
@@ -134,8 +149,12 @@ mod tests {
         assert_eq!(limits.max_archive_logical_bytes, MAX_ARCHIVE_LOGICAL_BYTES);
         assert_eq!(limits.max_solid_decode_bytes, MAX_SOLID_DECODE_BYTES);
         assert_eq!(limits.max_dictionary_bytes, MAX_7Z_DICTIONARY_BYTES);
-        assert_eq!(limits.max_compression_ratio, MAX_7Z_COMPRESSION_RATIO);
+        assert_eq!(limits.max_compression_ratio, MAX_ARCHIVE_COMPRESSION_RATIO);
         assert_eq!(limits.max_header_bytes, MAX_7Z_HEADER_BYTES);
+        assert_eq!(
+            limits.max_zip_central_directory_bytes,
+            MAX_ZIP_CENTRAL_DIRECTORY_BYTES
+        );
         assert_eq!(
             limits.max_aggregate_decoder_memory_bytes,
             MAX_7Z_AGGREGATE_DECODER_MEMORY_BYTES

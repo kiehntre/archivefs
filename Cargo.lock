@@ -103,6 +103,7 @@ name = "archivefs-core"
 version = "0.7.1-alpha"
 dependencies = [
  "encoding_rs",
+ "flate2",
  "http",
  "image",
  "libc",

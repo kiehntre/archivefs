@@ -197,7 +197,7 @@ pub fn audit_files(known: &[KnownFileEvidence], index: &DatIndex) -> AuditReport
     AuditReport { entries, summary }
 }
 
-fn audit_one(known: &KnownFileEvidence, index: &DatIndex) -> AuditVerdict {
+pub(crate) fn audit_one(known: &KnownFileEvidence, index: &DatIndex) -> AuditVerdict {
     // Strongest first, but *every* algorithm the caller holds is tried until one
     // finds candidates. Returning on the first algorithm the caller happens to
     // know reports a matching file as absent whenever the DAT does not publish
