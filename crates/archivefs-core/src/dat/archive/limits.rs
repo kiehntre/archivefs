@@ -34,7 +34,7 @@ pub const MAX_ARCHIVE_LOGICAL_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 ///
 /// NEW, and stricter than the ZIP case on purpose: in a solid 7z archive,
 /// reaching member K costs decoding every member before it in the same block
-/// (`sevenz-rust` documents this — you cannot skip ahead in a solid block).
+/// (`sevenz-rust2` documents this — you cannot skip ahead in a solid block).
 /// The cap converts an unbounded sequential decode into a named refusal at a
 /// predictable bound.
 pub const MAX_SOLID_DECODE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -55,7 +55,7 @@ pub const MAX_7Z_COMPRESSION_RATIO: u64 = 1000;
 
 /// Largest 7z next-header size the pre-decoder probe will read.
 ///
-/// NEW. `SevenZReader::new` copies `next_header_size` bytes into a buffer it
+/// NEW. `ArchiveReader::new` copies `next_header_size` bytes into a buffer it
 /// allocates from untrusted metadata; the probe validates this value against
 /// this ceiling **before** any such allocation. Legitimate 7z headers are
 /// small (bytes-to-KiB); 16 MiB is a generous safe ceiling.
@@ -70,7 +70,7 @@ pub const MAX_7Z_CODER_PROPERTIES_BYTES: usize = 1024 * 1024;
 
 /// Largest combined decoder memory one 7z folder/coder chain may demand.
 ///
-/// NEW. `sevenz-rust` builds a *nested* decoder stack for a folder, so every
+/// NEW. `sevenz-rust2` builds a *nested* decoder stack for a folder, so every
 /// LZMA/LZMA2 dictionary in the chain is allocated simultaneously — the
 /// per-coder dictionary cap alone is not sufficient. The probe checked-sums
 /// the dictionaries of all LZMA/LZMA2 coders in a folder and refuses folders
@@ -82,7 +82,7 @@ pub const MAX_7Z_AGGREGATE_DECODER_MEMORY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// Largest number of coders allowed in one 7z folder (coder-chain ceiling).
 ///
 /// NEW, and deliberately far below the generic `max_members` structural
-/// ceiling: `sevenz-rust` constructs a nested decoder per coder, so an absurd
+/// ceiling: `sevenz-rust2` constructs a nested decoder per coder, so an absurd
 /// chain length is itself a resource attack. Real 7z folders use a handful of
 /// coders (a compression method plus optional filters).
 pub const MAX_7Z_CODERS_PER_FOLDER: usize = 16;
@@ -98,7 +98,7 @@ pub struct ArchiveLimits {
     pub max_dictionary_bytes: u64,
     pub max_compression_ratio: u64,
     /// Ceiling on the 7z next-header size the pre-decoder probe will read and
-    /// parse before `sevenz-rust` is ever constructed.
+    /// parse before `sevenz-rust2` is ever constructed.
     pub max_header_bytes: usize,
     /// Ceiling on the combined decoder memory of one folder's coder chain.
     pub max_aggregate_decoder_memory_bytes: u64,

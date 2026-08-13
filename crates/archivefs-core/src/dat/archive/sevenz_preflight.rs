@@ -1,7 +1,7 @@
 //! Pre-decoder 7z header probe (POST-ALPHA-1.1, experimental).
 //!
 //! A minimal, bounded parser over just enough of the 7z header to enforce
-//! hard resource limits **before** `sevenz-rust` is ever constructed. It is
+//! hard resource limits **before** `sevenz-rust2` is ever constructed. It is
 //! deliberately NOT a complete 7z decoder: it extracts the information needed
 //! for resource accounting (next-header size, encoded-header presence,
 //! pack-stream/file/folder/coder counts, LZMA/LZMA2 dictionary declarations
@@ -10,9 +10,9 @@
 //! refuses hostile declarations. It is not a full parser, but it validates
 //! enough structure (FilesInfo properties, names, bind-pair and packed-stream
 //! indices, pack-stream consumption, CRCs, truncation, trailing bytes) that
-//! malformed input cannot reach panic-prone code inside `sevenz-rust`. The
-//! declared packed-data region is also checked against the physical file: it
-//! must fit inside it and must not alias the next-header region.
+//! malformed input cannot reach panic-prone code inside the upstream parser.
+//! The declared packed-data region is also checked against the physical file:
+//! it must fit inside it and must not alias the next-header region.
 //!
 //! # Bounds before allocation
 //!
@@ -80,9 +80,9 @@ const ID_LZMA: &[u8] = &[0x03, 0x01, 0x01];
 const ID_LZMA2: &[u8] = &[0x21];
 const ID_BCJ2: &[u8] = &[0x03, 0x03, 0x01, 0x1B];
 
-/// The number of input streams a BCJ2 coder must declare. `sevenz-rust`'s
-/// `BCJ2Reader` indexes a fixed four-element stream array, so any other count
-/// is an out-of-bounds panic inside the decoder.
+/// The number of input streams a BCJ2 coder must declare. A `BCJ2Reader`
+/// indexes a fixed four-element stream array, so any other count is an
+/// out-of-bounds panic inside a decoder that does not check it first.
 const BCJ2_INPUT_STREAMS: u64 = 4;
 
 /// Why a hostile (or malformed) header was refused.
@@ -213,8 +213,8 @@ struct FolderInfo {
 }
 
 impl FolderInfo {
-    /// The folder's declared unpacked size, mirroring sevenz-rust's
-    /// `Folder::get_unpack_size`: the last output stream with no bind pair.
+    /// The folder's declared unpacked size, mirroring the upstream
+    /// block/folder unpack-size rule: the last output stream with no bind pair.
     fn unpack_size(&self) -> u64 {
         for index in (0..self.total_output_streams).rev() {
             if !self.bind_pairs.iter().any(|&(_, out)| out == index as u64) {
@@ -610,7 +610,7 @@ fn parse_folder(
         }
         // 7zFormat.txt: a bind pair connects one coder output to one coder
         // input, and every stream may take part in at most one bind pair. If a
-        // stream index is reused, `sevenz-rust`'s `OrderedCoderIter` (and the
+        // stream index is reused, an upstream `OrderedCoderIter` (and the
         // `get_in_stream`/`get_in_stream2` recursion) can walk a cycle: it
         // follows out-index -> in-index forever, constructing and allocating a
         // fresh decoder on every step. Distinct indices make the walk a simple
@@ -758,7 +758,7 @@ fn parse_sub_streams_info(
         }
         nid = cursor.read_u8()?;
     } else {
-        // Without K_SIZE, `sevenz-rust` derives one size per folder and would
+        // Without K_SIZE, the upstream parser derives one size per folder and would
         // index past the sizes for a multi-sub-stream (solid) folder — a panic
         // vector. Fail closed.
         if folders
@@ -793,12 +793,12 @@ fn parse_sub_streams_info(
     Ok(())
 }
 
-/// Validates the FilesInfo section far enough that `sevenz-rust` cannot hit
-/// its panic-prone paths (zero-sized K_NAME, count/size index mismatches).
+/// Validates the FilesInfo section far enough that the upstream parser cannot
+/// hit panic-prone paths (zero-sized K_NAME, count/size index mismatches).
 ///
 /// Consumes the property records up to and including the FilesInfo `K_END`.
 ///
-/// # Byte-for-byte parity with `sevenz-rust`
+/// # Byte-for-byte parity with the upstream parser
 ///
 /// Every property is consumed exactly as `Archive::read_files_info` consumes
 /// it, so both parsers stay in lockstep and the checks below apply to the very
@@ -898,7 +898,7 @@ fn parse_files_info(
     Ok(())
 }
 
-/// Consumes a timestamp/attribute property exactly as `sevenz-rust` does: an
+/// Consumes a timestamp/attribute property exactly as the upstream parser does: an
 /// all-or-bits "defined" vector, an external flag (which must be 0), then
 /// `value_bytes` for every file whose bit is set.
 fn parse_defined_values(
@@ -995,6 +995,22 @@ fn enforce_and_summarize(
         }
         max_folder_unpack = max_folder_unpack.max(unpack);
 
+        // Per-member ceiling for a folder that is exactly one member.
+        //
+        // `parse_sub_streams_info` enforces this member by member, but only for
+        // folders whose members are itemised by a `kSize` list. A non-solid
+        // archive (one folder per file, which is what `push_archive_entry`
+        // produces) carries no such list, so the only statement of that single
+        // member's logical size is the folder's own unpacked size. Checking it
+        // here keeps the ceiling a pre-decoder refusal in both layouts instead
+        // of leaving the non-solid case to the runtime check in `verify_all`.
+        if folder.num_unpack_sub_streams == 1 && unpack > limits.max_member_logical_bytes {
+            return Err(PreflightRefusal::MemberSizeExceeded {
+                size: unpack,
+                limit: limits.max_member_logical_bytes,
+            });
+        }
+
         // Solid (multi-member) block budget.
         if folder.num_unpack_sub_streams > 1 && unpack > limits.max_solid_decode_bytes {
             return Err(PreflightRefusal::SolidDecodeBudgetExceeded {
@@ -1028,11 +1044,11 @@ fn enforce_and_summarize(
         }
 
         // Dictionary declarations and the aggregate decoder memory of the
-        // coder chain: sevenz-rust builds a nested decoder stack, so every
+        // coder chain: the upstream reader builds a nested decoder stack, so every
         // LZMA/LZMA2 dictionary in a folder is allocated simultaneously.
         let mut aggregate_decoder_memory: u64 = 0;
         for coder in &folder.coders {
-            // Coder arity. `sevenz-rust` can only decode single-output coders,
+            // Coder arity. The upstream reader can only decode single-output coders,
             // and it indexes several *fixed-size* arrays with values derived
             // from these counts:
             //
@@ -1224,7 +1240,7 @@ impl<'a> HeaderCursor<'a> {
         Ok(byte)
     }
 
-    /// Reads the 7z variable-length integer (mirrors sevenz-rust's encoding).
+    /// Reads the 7z variable-length integer (mirrors the 7z format's encoding).
     fn read_varint(&mut self) -> Result<u64, PreflightRefusal> {
         let first = self.read_u8()? as u64;
         let mut mask = 0x80_u64;
