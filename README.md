@@ -21,21 +21,14 @@ replacement. See [Current limitations](#current-limitations) and
 [`ROADMAP.md`](ROADMAP.md#explicitly-out-of-scope-for-now) for the full,
 explicit list of what it deliberately does not do.
 
-**Release status:** the current release is `v0.7.1-alpha`, a stabilization
-release that packages everything merged on top of `v0.7.0` into a single
-tagged, installable build. The release-prep work itself (version bump,
-changelog, documentation) adds no new implementation, but Alpha 1.1 as a
-release does ship real user-facing functionality merged since v0.7.0: RomM
-identity-provider integration with cover-art and platform-artwork workflows,
-a Cheat Sources GUI and a DAT Sources GUI, Games-only DAT filtering, DAT
-rename planning/apply with journaling and rollback, classifier-version
-enforcement on apply, BSFree GameCube and Wii cheat install, installer
-ownership hardening, first-run/empty-state polish, and EmuWiz desktop
-integration - on top of v0.7.0's canonical 74-platform registry,
-evidence-based confidence, bounded Atari ST/Wii/PS2/GameCube identity, safer
-Dolphin profile resolution, PS2/GameCube/Wii GameHacking workflows, expanded
-Doctor diagnostics, and the optional browse-only BSFree Archive source. See
-[`docs/releases/v0.7.1-alpha.md`](docs/releases/v0.7.1-alpha.md) for the full
+**Release status:** the current release is `v0.7.2-alpha` ("Alpha 1.2"), an
+archive-aware DAT verification release. It adds bounded, read-only DAT
+verification for Stored and Deflate members inside ZIP archives, preserves
+additional DAT ROM provenance, accepts decimal and `0x`-prefixed hexadecimal
+DAT sizes, and includes hardened read-only 7z groundwork for later production
+integration. ZIP evidence does not enter rename plans, archives are never
+rewritten, and 7z DAT verification is not yet a production audit path. See
+[`docs/releases/v0.7.2-alpha.md`](docs/releases/v0.7.2-alpha.md) for the full
 release notes.
 
 ## Principles
@@ -221,7 +214,7 @@ Prebuilt Linux binaries are published on the [Releases](https://github.com/kiehn
 1. Download the release tarball and its `SHA256SUMS` file, substituting the tag from the Releases page:
 
    ```sh
-   VERSION=v0.7.1-alpha   # replace with the tag you picked from the Releases page
+   VERSION=v0.7.2-alpha   # replace with the tag you picked from the Releases page
    curl -LO https://github.com/kiehntre/emuwiz/releases/download/$VERSION/archivefs-$VERSION-x86_64-linux.tar.gz
    curl -LO https://github.com/kiehntre/emuwiz/releases/download/$VERSION/SHA256SUMS
    ```
