@@ -45,7 +45,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::Serialize;
 
 use super::{DatSourceKind, validation};
-use crate::dat::audit::{AuditReport, AuditVerdict, KnownFileEvidence, audit_files};
+use crate::dat::archive::limits::{ArchiveLimits, MAX_ARCHIVE_RUN_LOGICAL_BYTES};
+use crate::dat::archive::zip::ZipArchiveSource;
+use crate::dat::archive::{
+    ArchiveMemberEvidence, ArchiveMemberSource, ArchiveMemberSourceError, ArchiveMemberStatus,
+    ArchivePassCompletion, ArchivePassStopReason, ArchiveRunBudget,
+};
+use crate::dat::audit::{AuditReport, AuditVerdict, KnownFileEvidence, audit_files, audit_one};
 use crate::dat::classification::{
     ContentEligibility, ContentSelectionPolicy, DatContentClassification, DatContentSummary,
     DatOriginalMetadata, summarize,
@@ -189,9 +195,17 @@ pub struct DatAuditOutcome {
     /// nothing to the index.
     pub unreadable_catalogues: Vec<String>,
     pub report: AuditReport,
+    /// Archive-member evidence is deliberately separate from the flat
+    /// physical-file report. In particular, rename planning consumes only
+    /// `report` and cannot turn a member name into a filesystem rename.
+    #[serde(default)]
+    pub archives: Vec<DatArchiveAudit>,
     pub unhashed: Vec<UnhashedFile>,
     pub files_scanned: usize,
     pub bytes_hashed: u64,
+    /// Decoded archive-member bytes hashed in addition to `bytes_hashed`.
+    #[serde(default)]
+    pub archive_bytes_hashed: u64,
     /// The walk hit a ceiling, so this is part of the folder and not all of it.
     pub truncated: bool,
     /// The policy annotation, present only when the request supplied a policy.
@@ -199,6 +213,24 @@ pub struct DatAuditOutcome {
     /// The audited source's canonical platform id, when assigned and
     /// recognised. Provenance for consumers like the rename plan.
     pub platform: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DatArchiveAudit {
+    pub archive_path: PathBuf,
+    pub format: String,
+    pub total_members: usize,
+    pub completion: ArchivePassCompletion,
+    pub members: Vec<DatArchiveMemberAudit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DatArchiveMemberAudit {
+    pub evidence: ArchiveMemberEvidence,
+    /// DAT identity, when decoded bytes were hash-complete and the outer file
+    /// remained the same object for the full pass. `None` is not ambiguity;
+    /// the accompanying member status explains why matching was not attempted.
+    pub verdict: Option<AuditVerdict>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -441,6 +473,8 @@ pub fn run_dat_audit(
     }
     on_progress(DatAuditProgress::Comparing { files: known.len() });
     let report = audit_files(&known, &index);
+    let (archives, archive_bytes_hashed) =
+        audit_zip_archives(&scan.files, trusted, cancel, &index)?;
     let content_matches = annotate_content_matches(&report, &known, &index, content_selection);
 
     // ---- 5. Annotate multi-candidate verdicts with the policy -------------
@@ -475,11 +509,103 @@ pub fn run_dat_audit(
         files_scanned: scan.files.len(),
         truncated: scan.truncated,
         report,
+        archives,
         unhashed,
         bytes_hashed,
+        archive_bytes_hashed,
         policy,
         platform: request.platform.clone(),
     })
+}
+
+fn audit_zip_archives(
+    files: &[PathBuf],
+    trusted: &TrustedRoots,
+    cancel: &AtomicBool,
+    index: &DatIndex,
+) -> Result<(Vec<DatArchiveAudit>, u64), DatAuditError> {
+    let mut archives = Vec::new();
+    let mut bytes_hashed = 0_u64;
+    let mut run_budget = ArchiveRunBudget::new(MAX_ARCHIVE_RUN_LOGICAL_BYTES);
+
+    for path in files.iter().filter(|path| is_zip_path(path)) {
+        if cancelled(cancel) {
+            return Err(DatAuditError::Cancelled);
+        }
+        let mut source =
+            match ZipArchiveSource::open(path, trusted, ArchiveLimits::default(), cancel) {
+                Ok(source) => source,
+                Err(ArchiveMemberSourceError::Cancelled) => return Err(DatAuditError::Cancelled),
+                Err(error) => {
+                    archives.push(DatArchiveAudit {
+                        archive_path: path.clone(),
+                        format: "zip".to_string(),
+                        total_members: 0,
+                        completion: ArchivePassCompletion::Incomplete {
+                            reason: ArchivePassStopReason::SourceError {
+                                detail: format!("{error:?}"),
+                            },
+                        },
+                        members: Vec::new(),
+                    });
+                    continue;
+                }
+            };
+
+        let pass = source.verify_all(cancel, &mut run_budget);
+        let outer_changed = matches!(
+            pass.completion,
+            ArchivePassCompletion::Incomplete {
+                reason: ArchivePassStopReason::OuterFileChanged
+            }
+        );
+        let members = pass
+            .members
+            .into_iter()
+            .map(|evidence| {
+                // A hash-complete member without hashes cannot be matched and
+                // must not panic the audit: the source contract is checked
+                // here rather than asserted, so a future format implementation
+                // that breaks it degrades to "not matched", never to a crash.
+                let verdict = if let (false, ArchiveMemberStatus::HashComplete, Some(hashes)) =
+                    (outer_changed, &evidence.status, evidence.hashes.as_ref())
+                {
+                    bytes_hashed = bytes_hashed.saturating_add(evidence.logical_size);
+                    let known = KnownFileEvidence::new(
+                        format!("{}::#{}", path.display(), evidence.index),
+                        &evidence.member_name_display,
+                    )
+                    .with_size(evidence.logical_size)
+                    .with_crc32(&hashes.crc32)
+                    .with_md5(&hashes.md5)
+                    .with_sha1(&hashes.sha1)
+                    .with_sha256(&hashes.sha256);
+                    Some(audit_one(&known, index))
+                } else {
+                    None
+                };
+                DatArchiveMemberAudit { evidence, verdict }
+            })
+            .collect();
+        archives.push(DatArchiveAudit {
+            archive_path: path.clone(),
+            format: source.archive_format().to_string(),
+            total_members: pass.total_members,
+            completion: pass.completion,
+            members,
+        });
+
+        if cancelled(cancel) {
+            return Err(DatAuditError::Cancelled);
+        }
+    }
+    Ok((archives, bytes_hashed))
+}
+
+fn is_zip_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
 }
 
 fn annotate_content_matches(

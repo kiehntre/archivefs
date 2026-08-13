@@ -1,4 +1,4 @@
-//! Bounded, cancellable streaming member hashing (POST-ALPHA-1.1).
+//! Bounded, cancellable streaming member hashing.
 //!
 //! Hashes a decompressed archive member's stream into the same four
 //! identifiers the DAT index understands (CRC32/MD5/SHA-1/SHA-256) in one

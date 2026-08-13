@@ -95,6 +95,7 @@ use super::hash::{MemberStreamError, hash_member_stream};
 use super::limits::{ARCHIVE_HASH_CHUNK_BYTES, ArchiveLimits};
 use super::{
     ArchiveMemberEvidence, ArchiveMemberSource, ArchiveMemberSourceError, ArchiveMemberStatus,
+    ArchivePassCompletion, ArchivePassOutcome, ArchivePassStopReason, ArchiveRunBudget,
 };
 use crate::dat::archive::sevenz_preflight::{PreflightRefusal, preflight_sevenz};
 
@@ -132,7 +133,7 @@ struct MemberMeta {
 
 /// A bounded, read-only `.7z` archive source.
 pub struct SevenZArchiveSource {
-    archive: String,
+    archive_path: std::path::PathBuf,
     reader: ArchiveReader<std::fs::File>,
     members: Vec<MemberMeta>,
     limits: ArchiveLimits,
@@ -142,7 +143,7 @@ impl std::fmt::Debug for SevenZArchiveSource {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("SevenZArchiveSource")
-            .field("archive", &self.archive)
+            .field("archive_path", &self.archive_path)
             .field("members", &self.members)
             .field("limits", &self.limits)
             .finish_non_exhaustive()
@@ -200,7 +201,7 @@ impl SevenZArchiveSource {
         validate_archive_structure(reader.archive(), &limits)?;
 
         Ok(Self {
-            archive: path.display().to_string(),
+            archive_path: path.to_path_buf(),
             reader,
             members,
             limits,
@@ -294,23 +295,15 @@ fn refusal_reason(refusal: &PreflightRefusal) -> &'static str {
     }
 }
 
-impl ArchiveMemberSource for SevenZArchiveSource {
-    fn archive_format(&self) -> &'static str {
-        "7z"
-    }
-
-    fn member_count(&self) -> usize {
-        self.members.len()
-    }
-
-    fn verify_all(
+impl SevenZArchiveSource {
+    fn verify_with_visitor(
         &mut self,
         cancel: &AtomicBool,
         visit: &mut dyn FnMut(ArchiveMemberEvidence) -> Result<bool, ArchiveMemberSourceError>,
     ) -> Result<(), ArchiveMemberSourceError> {
         let members: Vec<MemberMeta> = self.members.clone();
         let limits = self.limits;
-        let archive = self.archive.as_str();
+        let archive_path = self.archive_path.clone();
         let reader = &mut self.reader;
         let mut cursor: usize = 0;
         let mut total_consumed: u64 = 0;
@@ -341,7 +334,7 @@ impl ArchiveMemberSource for SevenZArchiveSource {
             // Empty members contribute nothing to any budget.
             if meta.logical_size == 0 {
                 return match visit(evidence(
-                    archive,
+                    &archive_path,
                     &meta,
                     index,
                     ArchiveMemberStatus::EmptyFile,
@@ -366,7 +359,7 @@ impl ArchiveMemberSource for SevenZArchiveSource {
             };
             if consumed_after > limits.max_archive_logical_bytes {
                 let outcome = visit(evidence(
-                    archive,
+                    &archive_path,
                     &meta,
                     index,
                     ArchiveMemberStatus::RefusedLimits {
@@ -391,7 +384,7 @@ impl ArchiveMemberSource for SevenZArchiveSource {
             if meta.is_nested {
                 if meta.logical_size > limits.max_member_logical_bytes {
                     let outcome = visit(evidence(
-                        archive,
+                        &archive_path,
                         &meta,
                         index,
                         ArchiveMemberStatus::RefusedLimits {
@@ -436,7 +429,7 @@ impl ArchiveMemberSource for SevenZArchiveSource {
                     }
                 }
                 return match visit(evidence(
-                    archive,
+                    &archive_path,
                     &meta,
                     index,
                     ArchiveMemberStatus::NestedArchive,
@@ -453,7 +446,7 @@ impl ArchiveMemberSource for SevenZArchiveSource {
 
             if meta.logical_size > limits.max_member_logical_bytes {
                 let outcome = visit(evidence(
-                    archive,
+                    &archive_path,
                     &meta,
                     index,
                     ArchiveMemberStatus::RefusedLimits {
@@ -482,13 +475,13 @@ impl ArchiveMemberSource for SevenZArchiveSource {
                     // input before the header's declared logical size was
                     // satisfied. The hashes cover only the bytes that did
                     // arrive, so they identify a prefix of the member, not the
-                    // member — reporting them as Verified would let a truncated
+                    // member — reporting them as HashComplete would let a truncated
                     // stream claim a clean bill of health. (An over-long stream
                     // cannot reach here: the hasher is bounded by the declared
                     // size and refuses with TooLarge below.)
                     if hashed.bytes_read != meta.logical_size {
                         let outcome = visit(evidence(
-                            archive,
+                            &archive_path,
                             &meta,
                             index,
                             ArchiveMemberStatus::Corrupt {
@@ -508,10 +501,10 @@ impl ArchiveMemberSource for SevenZArchiveSource {
                         };
                     }
                     match visit(evidence(
-                        archive,
+                        &archive_path,
                         &meta,
                         index,
-                        ArchiveMemberStatus::Verified,
+                        ArchiveMemberStatus::HashComplete,
                         Some(hashed.hashes),
                     )) {
                         Ok(true) => Ok(true),
@@ -528,7 +521,7 @@ impl ArchiveMemberSource for SevenZArchiveSource {
                 }
                 Err(MemberStreamError::TooLarge { .. }) => {
                     let outcome = visit(evidence(
-                        archive,
+                        &archive_path,
                         &meta,
                         index,
                         ArchiveMemberStatus::RefusedLimits {
@@ -546,7 +539,7 @@ impl ArchiveMemberSource for SevenZArchiveSource {
                 }
                 Err(MemberStreamError::Io(detail)) => {
                     let outcome = visit(evidence(
-                        archive,
+                        &archive_path,
                         &meta,
                         index,
                         ArchiveMemberStatus::Corrupt { detail },
@@ -596,12 +589,111 @@ impl ArchiveMemberSource for SevenZArchiveSource {
     }
 }
 
+impl ArchiveMemberSource for SevenZArchiveSource {
+    fn archive_format(&self) -> &'static str {
+        "7z"
+    }
+
+    fn member_count(&self) -> usize {
+        self.members.len()
+    }
+
+    fn verify_all(
+        &mut self,
+        cancel: &AtomicBool,
+        run_budget: &mut ArchiveRunBudget,
+    ) -> ArchivePassOutcome {
+        let configured_limit = self.limits.max_archive_logical_bytes;
+        let run_remaining = run_budget.remaining();
+        let run_limited = run_remaining < configured_limit;
+        self.limits.max_archive_logical_bytes = configured_limit.min(run_remaining);
+
+        let mut members = Vec::with_capacity(self.members.len());
+        let result = self.verify_with_visitor(cancel, &mut |evidence| {
+            members.push(evidence);
+            Ok(true)
+        });
+        self.limits.max_archive_logical_bytes = configured_limit;
+
+        let charged = members
+            .iter()
+            .filter(|member| {
+                matches!(
+                    member.status,
+                    ArchiveMemberStatus::HashComplete
+                        | ArchiveMemberStatus::NestedArchive
+                        | ArchiveMemberStatus::Corrupt { .. }
+                )
+            })
+            .try_fold(0_u64, |total, member| {
+                total.checked_add(member.logical_size)
+            });
+        // A charge that does not fit still describes bytes this pass really
+        // decoded (the per-archive ceiling was clamped to the run remainder
+        // above). Leaving the budget untouched would hand the next archive the
+        // whole remainder again, so an over-budget pass exhausts it instead.
+        let budget_ok = match charged {
+            Some(bytes) if run_budget.try_charge(bytes) => true,
+            _ => {
+                let remaining = run_budget.remaining();
+                run_budget.try_charge(remaining);
+                false
+            }
+        };
+
+        let completion = match result {
+            Err(ArchiveMemberSourceError::Cancelled) => ArchivePassCompletion::Incomplete {
+                reason: ArchivePassStopReason::Cancelled,
+            },
+            Err(error) => ArchivePassCompletion::Incomplete {
+                reason: ArchivePassStopReason::SourceError {
+                    detail: format!("{error:?}"),
+                },
+            },
+            Ok(()) if !budget_ok => ArchivePassCompletion::Incomplete {
+                reason: ArchivePassStopReason::RunLogicalBudget,
+            },
+            Ok(()) if members.len() == self.members.len() => ArchivePassCompletion::Complete,
+            Ok(()) => {
+                let stopped_for_run_budget = run_limited
+                    && members.last().is_some_and(|member| {
+                        member.status
+                            == ArchiveMemberStatus::RefusedLimits {
+                                reason: "total logical budget",
+                            }
+                    });
+                let reason = if stopped_for_run_budget {
+                    ArchivePassStopReason::RunLogicalBudget
+                } else {
+                    members.last().map_or_else(
+                        || ArchivePassStopReason::SourceError {
+                            detail: "7z pass stopped before producing member evidence".to_string(),
+                        },
+                        |member| ArchivePassStopReason::MemberRefused {
+                            index: member.index,
+                            status: member.status.clone(),
+                        },
+                    )
+                };
+                ArchivePassCompletion::Incomplete { reason }
+            }
+        };
+
+        ArchivePassOutcome {
+            members,
+            total_members: self.members.len(),
+            completion,
+        }
+    }
+}
+
 impl SevenZArchiveSource {
     fn evidence(&self, index: usize, status: ArchiveMemberStatus) -> ArchiveMemberEvidence {
         let meta = &self.members[index];
         ArchiveMemberEvidence {
-            archive: self.archive.clone(),
-            name: meta.name.clone(),
+            archive_path: self.archive_path.clone(),
+            member_name_raw: meta.name.as_bytes().to_vec(),
+            member_name_display: meta.name.clone(),
             index,
             logical_size: meta.logical_size,
             is_nested_archive: meta.is_nested,
@@ -819,15 +911,16 @@ fn drain_member<R: Read>(
 }
 
 fn evidence(
-    archive: &str,
+    archive_path: &Path,
     meta: &MemberMeta,
     index: usize,
     status: ArchiveMemberStatus,
     hashes: Option<super::ArchiveMemberHashes>,
 ) -> ArchiveMemberEvidence {
     ArchiveMemberEvidence {
-        archive: archive.to_string(),
-        name: meta.name.clone(),
+        archive_path: archive_path.to_path_buf(),
+        member_name_raw: meta.name.as_bytes().to_vec(),
+        member_name_display: meta.name.clone(),
         index,
         logical_size: meta.logical_size,
         is_nested_archive: meta.is_nested,
@@ -914,7 +1007,7 @@ mod tests {
     ) -> Result<Vec<ArchiveMemberEvidence>, ArchiveMemberSourceError> {
         let cancel = AtomicBool::new(false);
         let mut out = Vec::new();
-        source.verify_all(&cancel, &mut |evidence| {
+        source.verify_with_visitor(&cancel, &mut |evidence| {
             out.push(evidence);
             Ok(true)
         })?;
@@ -932,7 +1025,7 @@ mod tests {
         assert_eq!(source.member_count(), 1);
         let evidence = collect(&mut source).unwrap();
         assert_eq!(evidence.len(), 1);
-        assert!(evidence[0].is_verified());
+        assert!(evidence[0].is_hash_complete());
         let hashes = evidence[0].hashes.as_ref().unwrap();
         assert_eq!(hashes.md5, "5eb63bbbe01eeed093cb22bb8f5acdc3");
         assert_eq!(hashes.sha1, "2aae6c35c94fcfb415dbe95f408b9ce91ee846ed");
@@ -948,7 +1041,10 @@ mod tests {
                 .unwrap();
         assert_eq!(source.member_count(), 2);
         let first = collect(&mut source).unwrap();
-        let names: Vec<_> = first.iter().map(|e| e.name.as_str()).collect();
+        let names: Vec<_> = first
+            .iter()
+            .map(|e| e.member_name_display.as_str())
+            .collect();
         assert_eq!(names, vec!["b.bin", "a.rom"]);
 
         let mut source2 =
@@ -982,7 +1078,7 @@ mod tests {
         assert_eq!(source.member_count(), 2);
         let evidence = collect(&mut source).unwrap();
         assert_eq!(evidence.len(), 2);
-        assert!(evidence.iter().all(|e| e.is_verified()));
+        assert!(evidence.iter().all(|e| e.is_hash_complete()));
     }
 
     #[test]
@@ -1186,7 +1282,7 @@ mod tests {
                 .unwrap();
         let cancel = AtomicBool::new(true);
         let mut seen = 0;
-        let result = source.verify_all(&cancel, &mut |_evidence| {
+        let result = source.verify_with_visitor(&cancel, &mut |_evidence| {
             seen += 1;
             Ok(true)
         });
@@ -1575,7 +1671,7 @@ mod tests {
         let evidence = collect(&mut source).unwrap();
         assert_eq!(evidence.len(), 1);
         assert!(
-            !evidence[0].is_verified(),
+            !evidence[0].is_hash_complete(),
             "a member whose decode ended early must not be verified"
         );
         assert!(
@@ -1590,7 +1686,7 @@ mod tests {
     }
 
     #[test]
-    fn exactly_sized_copy_member_is_verified() {
+    fn exactly_sized_copy_member_is_hash_complete() {
         // The happy path the truncation check must not break: the same fixture
         // shape with an honest declared size verifies, and its hashes are the
         // hashes of the stored bytes.
@@ -1608,7 +1704,7 @@ mod tests {
                 .unwrap();
         let evidence = collect(&mut source).unwrap();
         assert_eq!(evidence.len(), 1);
-        assert!(evidence[0].is_verified());
+        assert!(evidence[0].is_hash_complete());
         let hashes = evidence[0].hashes.as_ref().unwrap();
         assert_eq!(hashes.md5, "5eb63bbbe01eeed093cb22bb8f5acdc3");
         assert_eq!(hashes.sha1, "2aae6c35c94fcfb415dbe95f408b9ce91ee846ed");
@@ -1917,8 +2013,8 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_flag = cancel.clone();
         let mut seen = 0;
-        let result = source.verify_all(&cancel, &mut |evidence| {
-            if evidence.is_verified() {
+        let result = source.verify_with_visitor(&cancel, &mut |evidence| {
+            if evidence.is_hash_complete() {
                 // Set mid-decode: the first member really decoded and hashed
                 // before the flag fires; the second member stops on its first
                 // chunk check.
@@ -2056,7 +2152,7 @@ mod tests {
                 .unwrap();
         let evidence = collect(&mut source).unwrap();
         assert_eq!(evidence.len(), 2);
-        assert!(evidence.iter().all(|e| e.is_verified()));
+        assert!(evidence.iter().all(|e| e.is_hash_complete()));
 
         let first = evidence[0].hashes.as_ref().unwrap();
         assert_eq!(first.crc32, "302e7de2");
@@ -2185,7 +2281,7 @@ mod tests {
             SevenZArchiveSource::open(&path, &trusted, ArchiveLimits::default(), &TEST_NO_CANCEL)
                 .unwrap();
         assert_eq!(source.member_count(), 1);
-        assert!(collect(&mut source).unwrap()[0].is_verified());
+        assert!(collect(&mut source).unwrap()[0].is_hash_complete());
     }
 
     // ------------------------------------------------------------------
@@ -2643,7 +2739,7 @@ mod tests {
         let evidence = collect(&mut source).unwrap();
         assert_eq!(evidence.len(), 2);
         assert!(
-            evidence.iter().all(|e| e.is_verified()),
+            evidence.iter().all(|e| e.is_hash_complete()),
             "both members must verify when the cumulative total exactly meets the budget"
         );
     }
@@ -2665,7 +2761,7 @@ mod tests {
         let evidence = collect(&mut source).unwrap();
         assert_eq!(evidence.len(), 2);
         assert_eq!(evidence[0].status, ArchiveMemberStatus::NestedArchive);
-        assert!(evidence[1].is_verified());
+        assert!(evidence[1].is_hash_complete());
     }
 
     #[test]

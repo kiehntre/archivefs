@@ -788,6 +788,9 @@ pub(crate) struct AuditResultView {
     /// Per-file lines, capped for display.
     pub(crate) entries: Vec<AuditEntryView>,
     pub(crate) entries_truncated: usize,
+    /// ZIP-member evidence is visually and structurally separate from the
+    /// physical files that can participate in rename planning.
+    pub(crate) archives: Vec<ArchiveAuditView>,
     pub(crate) unhashed: Vec<(String, String)>,
     pub(crate) unreadable_catalogues: Vec<String>,
     pub(crate) truncated: bool,
@@ -798,6 +801,22 @@ pub(crate) struct AuditResultView {
     /// policy. Never changes a verdict; it shows the preferred candidate
     /// order for the files whose hash matched several catalogue entries.
     pub(crate) policy: Option<AuditPolicyView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ArchiveAuditView {
+    pub(crate) archive_name: String,
+    pub(crate) completion: String,
+    pub(crate) members: Vec<ArchiveMemberAuditView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ArchiveMemberAuditView {
+    pub(crate) index: usize,
+    pub(crate) name: String,
+    pub(crate) status: String,
+    pub(crate) verdict: Option<String>,
+    pub(crate) detail: String,
 }
 
 /// The policy annotation of one audit result.
@@ -3391,6 +3410,36 @@ fn audit_view(outcome: &DatAuditOutcome, elapsed_seconds: Option<u64>) -> AuditR
         categories,
         entries,
         entries_truncated,
+        archives: outcome
+            .archives
+            .iter()
+            .map(|archive| ArchiveAuditView {
+                archive_name: archive
+                    .archive_path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| archive.archive_path.display().to_string()),
+                completion: archive_completion_label(&archive.completion),
+                members: archive
+                    .members
+                    .iter()
+                    .map(|member| ArchiveMemberAuditView {
+                        index: member.evidence.index,
+                        name: member.evidence.member_name_display.clone(),
+                        status: archive_member_status_label(&member.evidence.status),
+                        verdict: member
+                            .verdict
+                            .as_ref()
+                            .map(|verdict| verdict.label().to_string()),
+                        detail: member
+                            .verdict
+                            .as_ref()
+                            .map(verdict_detail)
+                            .unwrap_or_default(),
+                    })
+                    .collect(),
+            })
+            .collect(),
         unhashed: outcome
             .unhashed
             .iter()
@@ -3402,6 +3451,47 @@ fn audit_view(outcome: &DatAuditOutcome, elapsed_seconds: Option<u64>) -> AuditR
         content_selection: outcome.content.selection,
         content_summary: outcome.content.catalogue,
         policy: outcome.policy.as_ref().map(audit_policy_view),
+    }
+}
+
+fn archive_completion_label(
+    completion: &archivefs_core::dat::archive::ArchivePassCompletion,
+) -> String {
+    use archivefs_core::dat::archive::{ArchivePassCompletion, ArchivePassStopReason};
+    match completion {
+        ArchivePassCompletion::Complete => "Complete archive pass".to_string(),
+        ArchivePassCompletion::Incomplete { reason } => match reason {
+            ArchivePassStopReason::Cancelled => "Incomplete: cancelled".to_string(),
+            ArchivePassStopReason::MemberRefused { index, .. } => {
+                format!("Incomplete: stopped at member #{index}")
+            }
+            ArchivePassStopReason::RunLogicalBudget => {
+                "Incomplete: audit decode budget reached".to_string()
+            }
+            ArchivePassStopReason::OuterFileChanged => {
+                "Incomplete: archive changed while it was read".to_string()
+            }
+            ArchivePassStopReason::SourceError { detail } => {
+                format!("Incomplete: {detail}")
+            }
+        },
+    }
+}
+
+fn archive_member_status_label(
+    status: &archivefs_core::dat::archive::ArchiveMemberStatus,
+) -> String {
+    use archivefs_core::dat::archive::ArchiveMemberStatus;
+    match status {
+        ArchiveMemberStatus::HashComplete => "Decoded + hashed".to_string(),
+        ArchiveMemberStatus::EmptyFile => "Empty member".to_string(),
+        ArchiveMemberStatus::NestedArchive => "Nested archive refused".to_string(),
+        ArchiveMemberStatus::Encrypted => "Encrypted member refused".to_string(),
+        ArchiveMemberStatus::UnsupportedCodec { method } => {
+            format!("Unsupported codec: {method}")
+        }
+        ArchiveMemberStatus::RefusedLimits { reason } => format!("Refused: {reason}"),
+        ArchiveMemberStatus::Corrupt { detail } => format!("Corrupt: {detail}"),
     }
 }
 
@@ -5986,6 +6076,54 @@ fn show_audit_result(ui: &mut egui::Ui, audit: &AuditResultView) {
             );
         }
     });
+
+    if !audit.archives.is_empty() {
+        ui.add_space(8.0);
+        widgets::card(ui, |ui| {
+            widgets::section_header(
+                ui,
+                "ZIP members",
+                Some("Read-only member evidence; these rows never become rename proposals."),
+            );
+            for archive in &audit.archives {
+                ui.label(egui::RichText::new(&archive.archive_name).strong());
+                ui.label(
+                    egui::RichText::new(&archive.completion)
+                        .color(theme::muted(ui))
+                        .small(),
+                );
+                for member in &archive.members {
+                    ui.horizontal_top(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("#{:04}", member.index))
+                                .monospace()
+                                .small(),
+                        );
+                        ui.vertical(|ui| {
+                            ui.label(&member.name);
+                            let identity = member
+                                .verdict
+                                .as_deref()
+                                .map(|verdict| format!(" · DAT: {verdict}"))
+                                .unwrap_or_default();
+                            ui.label(
+                                egui::RichText::new(format!("{}{identity}", member.status))
+                                    .color(theme::muted(ui))
+                                    .small(),
+                            );
+                            if !member.detail.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(&member.detail)
+                                        .color(theme::muted(ui))
+                                        .small(),
+                                );
+                            }
+                        });
+                    });
+                }
+            }
+        });
+    }
 }
 
 fn show_content_technical_details(ui: &mut egui::Ui, content: &ContentTechnicalView) {

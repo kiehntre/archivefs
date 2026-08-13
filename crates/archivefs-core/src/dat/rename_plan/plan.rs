@@ -550,9 +550,11 @@ mod tests {
                 entries,
                 summary: AuditSummary::default(),
             },
+            archives: Vec::new(),
             unhashed: Vec::new(),
             files_scanned: 0,
             bytes_hashed: 0,
+            archive_bytes_hashed: 0,
             truncated,
             policy: Some(DatAuditPolicyOutcome {
                 source_ordering: vec!["Source".to_string()],

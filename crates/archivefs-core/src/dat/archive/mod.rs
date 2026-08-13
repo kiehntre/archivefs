@@ -1,4 +1,4 @@
-//! Experimental archive-member evidence abstraction (POST-ALPHA-1.1).
+//! Bounded archive-member evidence for read-only DAT audits.
 //!
 //! The smallest reusable shape needed for member-aware DAT verification
 //! across archive formats. It is intentionally narrow: one source trait that
@@ -7,33 +7,31 @@
 //! DAT-verification engine — members are hashed here; matching against a DAT
 //! stays a separate consumer (`DatIndex`/`audit_one`).
 //!
-//! # Status
-//!
-//! Zero production callers. The only implementations today are focused tests
-//! (`dat::archive::sevenz`). Nothing in shipped code calls into this module,
-//! so it is safe to change without affecting any current behavior. See
-//! `docs/research/SEVEN_Z_RAR_ARCHIVE_VERIFICATION_RESEARCH.md` §12 (AR-1).
-//!
 //! # Determinism and safety invariants
 //!
 //! - Members are enumerated in the archive's own deterministic order; nothing
 //!   ever picks a member "by position" as a winner.
-//! - Hashing is bounded, chunked, and cancellable; refusal of a member stops
-//!   verification of the rest of the archive (later members are not
-//!   evaluated). This is fail-closed: after a refusal the caller must treat
-//!   the archive as not fully verified.
+//! - Hashing is bounded, chunked, and cancellable. Each format decides whether
+//!   it can continue after a member refusal: ZIP members are independent,
+//!   while a solid 7z stream may have to stop. The returned pass outcome says
+//!   explicitly whether every member was examined.
 //! - Nested archives are surfaced (with [`ArchiveMemberStatus::NestedArchive`])
 //!   but never recursively opened or hashed.
 
+use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
+
+use serde::Serialize;
 
 pub mod hash;
 pub mod limits;
 pub mod sevenz;
 pub mod sevenz_preflight;
+pub mod zip;
+pub mod zip_preflight;
 
 /// One member's cryptographic hashes, computed over its decompressed bytes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ArchiveMemberHashes {
     pub crc32: String,
     pub md5: String,
@@ -42,12 +40,12 @@ pub struct ArchiveMemberHashes {
 }
 
 /// The outcome for one archive member.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum ArchiveMemberStatus {
     /// The member streamed and was hashed within limits, and the number of
     /// bytes actually hashed matched its declared logical size exactly. A
     /// decode that ended early is [`ArchiveMemberStatus::Corrupt`], never this.
-    Verified,
+    HashComplete,
     /// An empty stream member (zero logical size); surfaced, not hashed.
     EmptyFile,
     /// A nested-archive member (e.g. a `.zip` inside the `.7z`). Surfaced with
@@ -65,16 +63,16 @@ pub enum ArchiveMemberStatus {
 }
 
 /// Format-neutral per-member evidence produced by an [`ArchiveMemberSource`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ArchiveMemberEvidence {
-    /// The outer archive this member belongs to (display path or name), for
-    /// provenance. Set by the source at construction; stable across runs for
-    /// the same archive.
-    pub archive: String,
-    /// The member's stored name. Display-oriented: a future ZIP source must
-    /// supply a lossless representation of raw (possibly non-UTF-8) member
-    /// names rather than forcing a lossy conversion into this `String`.
-    pub name: String,
+    /// Exact operating-system path of the outer archive. This is provenance,
+    /// not a member rename target.
+    pub archive_path: PathBuf,
+    /// Exact bytes stored for the member name. Member index remains the
+    /// identity because ZIP permits duplicate names.
+    pub member_name_raw: Vec<u8>,
+    /// Safe, display-only rendering of `member_name_raw`.
+    pub member_name_display: String,
     /// Position of this member in the source's deterministic enumeration.
     pub index: usize,
     /// The member's declared logical (uncompressed) size in bytes.
@@ -85,13 +83,85 @@ pub struct ArchiveMemberEvidence {
     /// content.
     pub is_nested_archive: bool,
     pub status: ArchiveMemberStatus,
-    /// Present only when [`ArchiveMemberStatus::Verified`].
+    /// Present only when [`ArchiveMemberStatus::HashComplete`].
     pub hashes: Option<ArchiveMemberHashes>,
 }
 
 impl ArchiveMemberEvidence {
-    pub fn is_verified(&self) -> bool {
-        self.status == ArchiveMemberStatus::Verified
+    pub fn is_hash_complete(&self) -> bool {
+        self.status == ArchiveMemberStatus::HashComplete
+    }
+}
+
+/// Why a pass stopped before every stream-bearing member was examined.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum ArchivePassStopReason {
+    Cancelled,
+    MemberRefused {
+        index: usize,
+        status: ArchiveMemberStatus,
+    },
+    RunLogicalBudget,
+    OuterFileChanged,
+    SourceError {
+        detail: String,
+    },
+}
+
+/// Whether the format implementation examined every stream-bearing member.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum ArchivePassCompletion {
+    Complete,
+    Incomplete { reason: ArchivePassStopReason },
+}
+
+/// Bounded result of one archive pass. Per-member refusals may coexist with a
+/// complete ZIP pass because later ZIP members remain independently readable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ArchivePassOutcome {
+    pub members: Vec<ArchiveMemberEvidence>,
+    pub total_members: usize,
+    pub completion: ArchivePassCompletion,
+}
+
+impl ArchivePassOutcome {
+    pub fn is_complete(&self) -> bool {
+        self.completion == ArchivePassCompletion::Complete
+    }
+}
+
+/// Logical bytes decoded across every archive in one DAT audit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArchiveRunBudget {
+    maximum: u64,
+    consumed: u64,
+}
+
+impl ArchiveRunBudget {
+    pub fn new(maximum: u64) -> Self {
+        Self {
+            maximum,
+            consumed: 0,
+        }
+    }
+
+    pub fn remaining(self) -> u64 {
+        self.maximum.saturating_sub(self.consumed)
+    }
+
+    pub fn consumed(self) -> u64 {
+        self.consumed
+    }
+
+    pub fn try_charge(&mut self, bytes: u64) -> bool {
+        let Some(next) = self.consumed.checked_add(bytes) else {
+            return false;
+        };
+        if next > self.maximum {
+            return false;
+        }
+        self.consumed = next;
+        true
     }
 }
 
@@ -119,13 +189,13 @@ pub enum ArchiveMemberSourceError {
 /// A sequential, bounded source of archive-member evidence.
 ///
 /// Implementations open the outer file through `safe_read`/`TrustedRoots`,
-/// enumerate members deterministically, stream each member's decompressed
-/// bytes into bounded hashes, and hand the evidence to `visit`. Returning
-/// `Ok(false)` from `visit` stops iteration early; `Err` aborts.
+/// enumerate members deterministically, and stream accepted members into
+/// bounded hashes. The implementation owns continuation policy and returns
+/// both the member evidence and explicit pass completeness.
 ///
-/// The trait is **object-safe** (`visit` is a `dyn` callback) so a future
-/// consumer can hold `Box<dyn ArchiveMemberSource>` without specialising on
-/// the concrete format.
+/// The trait is **object-safe** so a consumer can hold
+/// `Box<dyn ArchiveMemberSource>` without specialising on the concrete
+/// format.
 pub trait ArchiveMemberSource {
     /// A short, stable format name for diagnostics ("7z", "zip", "rar", …).
     fn archive_format(&self) -> &'static str;
@@ -133,36 +203,29 @@ pub trait ArchiveMemberSource {
     /// Number of stream-bearing members in deterministic order.
     fn member_count(&self) -> usize;
 
-    /// Visit every member in deterministic order, hashing each within limits.
-    ///
-    /// `cancel` is checked during decode/hash at useful granularity. On the
-    /// first member that cannot be verified, that member's evidence is
-    /// emitted with a non-`Verified` status and iteration stops; later
-    /// members are not evaluated.
+    /// Examine members in deterministic order, hashing each accepted member.
     fn verify_all(
         &mut self,
         cancel: &AtomicBool,
-        visit: &mut dyn FnMut(ArchiveMemberEvidence) -> Result<bool, ArchiveMemberSourceError>,
-    ) -> Result<(), ArchiveMemberSourceError>;
+        run_budget: &mut ArchiveRunBudget,
+    ) -> ArchivePassOutcome;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicBool;
 
     #[test]
-    fn verified_marker_only_true_for_verified() {
-        let cancel = AtomicBool::new(false);
-        let _ = &cancel;
+    fn hash_complete_marker_only_true_for_hash_complete() {
         assert!(
             ArchiveMemberEvidence {
-                archive: "a.7z".into(),
-                name: "a".into(),
+                archive_path: "a.7z".into(),
+                member_name_raw: b"a".to_vec(),
+                member_name_display: "a".into(),
                 index: 0,
                 logical_size: 1,
                 is_nested_archive: false,
-                status: ArchiveMemberStatus::Verified,
+                status: ArchiveMemberStatus::HashComplete,
                 hashes: Some(ArchiveMemberHashes {
                     crc32: "00000000".into(),
                     md5: "00".into(),
@@ -170,12 +233,13 @@ mod tests {
                     sha256: "00".into(),
                 }),
             }
-            .is_verified()
+            .is_hash_complete()
         );
         assert!(
             !ArchiveMemberEvidence {
-                archive: "a.7z".into(),
-                name: "a".into(),
+                archive_path: "a.7z".into(),
+                member_name_raw: b"a".to_vec(),
+                member_name_display: "a".into(),
                 index: 0,
                 logical_size: 1,
                 is_nested_archive: false,
@@ -184,7 +248,7 @@ mod tests {
                 },
                 hashes: None,
             }
-            .is_verified()
+            .is_hash_complete()
         );
     }
 
@@ -200,7 +264,7 @@ mod tests {
     fn evidence_statuses_cover_the_fail_closed_set() {
         // The refusal taxonomy must be exhaustively matchable by consumers.
         let statuses = [
-            ArchiveMemberStatus::Verified,
+            ArchiveMemberStatus::HashComplete,
             ArchiveMemberStatus::EmptyFile,
             ArchiveMemberStatus::NestedArchive,
             ArchiveMemberStatus::Encrypted,
@@ -215,7 +279,7 @@ mod tests {
         let mut saw = Vec::new();
         for s in statuses {
             let label = match s {
-                ArchiveMemberStatus::Verified => "verified",
+                ArchiveMemberStatus::HashComplete => "hash_complete",
                 ArchiveMemberStatus::EmptyFile => "empty",
                 ArchiveMemberStatus::NestedArchive => "nested",
                 ArchiveMemberStatus::Encrypted => "encrypted",

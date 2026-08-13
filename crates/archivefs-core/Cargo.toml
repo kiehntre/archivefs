@@ -64,6 +64,9 @@ quick-xml = { version = "0.41", default-features = false }
 # codec feature (deflate/bzip2/lzma/zstd/aes-crypto/...) is enabled here;
 # see the `[dev-dependencies]` entry below for why tests need more.
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
+# ZIP member streams are decoded from preflight-validated packed ranges rather
+# than `ZipArchive`'s name-keyed index (which collapses duplicate names).
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 # Experimental 7z archive-member reader (POST-ALPHA-1.1, zero production
 # callers). `sevenz-rust2` is the maintained fork of the (now unmaintained,
 # advisory-carrying) `sevenz-rust`; it is pure Rust, Apache-2.0. The
@@ -80,8 +83,8 @@ zip = { version = "8.6", default-features = false, features = ["deflate"] }
 # `UnsupportedCompressionMethod("AES256_SHA256")` at decode time, which this
 # reader maps to an explicit Encrypted refusal. `zstd`, `brotli`, `lz4`,
 # `deflate`, `bzip2` and `ppmd` coders are likewise always refused.
-# This dependency is inert: nothing in shipped code calls into
-# `dat::archive` yet
+# The 7z implementation remains inert: the production DAT audit added after
+# this comment was written calls only the ZIP source.
 # (see docs/research/SEVEN_Z_RAR_ARCHIVE_VERIFICATION_RESEARCH.md §12).
 sevenz-rust2 = { version = "0.21.4", default-features = false }
 

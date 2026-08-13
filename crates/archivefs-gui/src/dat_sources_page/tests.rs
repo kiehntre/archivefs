@@ -2697,14 +2697,69 @@ fn minimal_outcome() -> DatAuditOutcome {
             entries: Vec::new(),
             summary: AuditSummary::default(),
         },
+        archives: Vec::new(),
         unhashed: Vec::new(),
         files_scanned: 2,
         bytes_hashed: 4,
+        archive_bytes_hashed: 0,
         truncated: false,
         policy: None,
         content: Default::default(),
         platform: None,
     }
+}
+
+#[test]
+fn archive_member_evidence_has_separate_gui_rows() {
+    use archivefs_core::dat::archive::{
+        ArchiveMemberEvidence, ArchiveMemberHashes, ArchiveMemberStatus, ArchivePassCompletion,
+    };
+    use archivefs_core::dat::audit::AuditVerdict;
+    use archivefs_core::dat::sources::audit_run::{DatArchiveAudit, DatArchiveMemberAudit};
+
+    let mut outcome = minimal_outcome();
+    outcome.archives.push(DatArchiveAudit {
+        archive_path: "/tmp/roms/games.zip".into(),
+        format: "zip".to_string(),
+        total_members: 1,
+        completion: ArchivePassCompletion::Complete,
+        members: vec![DatArchiveMemberAudit {
+            evidence: ArchiveMemberEvidence {
+                archive_path: "/tmp/roms/games.zip".into(),
+                member_name_raw: b"game.rom".to_vec(),
+                member_name_display: "game.rom".to_string(),
+                index: 0,
+                logical_size: 4,
+                is_nested_archive: false,
+                status: ArchiveMemberStatus::HashComplete,
+                hashes: Some(ArchiveMemberHashes {
+                    crc32: "00000000".to_string(),
+                    md5: "00".to_string(),
+                    sha1: "00".to_string(),
+                    sha256: "00".to_string(),
+                }),
+            },
+            verdict: Some(AuditVerdict::Exact {
+                game_name: "Game".to_string(),
+                rom_name: "game.rom".to_string(),
+                algorithm: "SHA-1",
+            }),
+        }],
+    });
+
+    let view = audit_view(&outcome, Some(1));
+    assert_eq!(
+        view.entries.len(),
+        0,
+        "member is not flattened into physical rows"
+    );
+    assert_eq!(view.archives.len(), 1);
+    assert_eq!(view.archives[0].archive_name, "games.zip");
+    assert_eq!(view.archives[0].members[0].name, "game.rom");
+    assert_eq!(
+        view.archives[0].members[0].verdict.as_deref(),
+        Some("Exact")
+    );
 }
 
 #[test]
