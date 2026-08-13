@@ -1,4 +1,4 @@
-//! Bounded, read-only 7z member reading (POST-ALPHA-1.1, experimental).
+//! Bounded, read-only 7z member reading.
 //!
 //! Implements [`super::ArchiveMemberSource`] for `.7z` using `sevenz-rust2`
 //! (Apache-2.0, pure Rust), the maintained fork of the abandoned
@@ -76,11 +76,17 @@
 //! opened; they **count toward the cumulative logical-byte budget** even
 //! though their bytes are only drained, not hashed.
 //!
-//! # Zero production callers
+//! # Production caller
 //!
-//! Nothing in shipped code calls this module. It is experimental scaffolding
-//! exercised only by focused tests (`docs/research/SEVEN_Z_RAR_ARCHIVE_
-//! VERIFICATION_RESEARCH.md` §12, slice 7Z-1).
+//! [`crate::dat::sources::audit_run::run_dat_audit`] opens `.7z` files found
+//! in an audited folder through this module, alongside `.zip` through
+//! [`super::zip`]. Both are driven through the same
+//! [`super::ArchiveMemberSource`] contract, and a solid 7z folder's real
+//! limitation — a later member's readability can depend on an earlier one
+//! decoding cleanly — is not hidden behind ZIP's per-member independence: a
+//! stop mid-folder is reported as
+//! [`super::ArchivePassCompletion::Incomplete`], never silently backfilled as
+//! complete.
 
 use std::io::Read;
 use std::path::Path;
