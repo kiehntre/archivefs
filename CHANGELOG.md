@@ -11,7 +11,43 @@ user-facing effect could not be confirmed from its message and diff alone,
 this file describes only what the code and history actually show, rather than
 guessing at intent, dates, or scope.
 
-## v0.7.1-alpha (unreleased)
+## v0.7.2-alpha (unreleased)
+
+Archive-aware DAT verification release ("Alpha 1.2"). See
+[`docs/releases/v0.7.2-alpha.md`](docs/releases/v0.7.2-alpha.md) for concise
+release and upgrade notes.
+
+### Added
+
+- Production, read-only DAT verification for individual members of ZIP
+  archives, with member evidence kept separate from loose-file evidence and
+  excluded from rename proposals.
+- Bounded archive preflight and safety controls, including entry and byte
+  budgets, decompression-ratio checks, cancellation, CRC completion, and
+  outer-file identity revalidation.
+- Format-neutral archive-member groundwork and a hardened, read-only 7z
+  reader for future integration. 7z DAT verification is not yet a production
+  audit path.
+
+### Changed
+
+- DAT index evidence now preserves each ROM entry's `status` and `merge`
+  provenance.
+- Logiqx DAT sizes accept both decimal and `0x`/`0X`-prefixed hexadecimal
+  values, including real-world MAME values such as `size="0x80000"`.
+- CI avoids duplicate branch-push runs for pull requests while retaining
+  pull-request validation, main-branch push validation, and manual dispatch.
+
+### Known limitations
+
+- ZIP-member verification is read-only. Archive members are not renamed and
+  ZIP archives are never rewritten or recompressed.
+- The production ZIP path supports Stored and Deflate members; encrypted,
+  nested, malformed, and unsupported-codec members fail closed.
+- 7z support remains groundwork only. RAR, CHD verification, NES header
+  normalization, and set-completeness modelling are not included.
+
+## v0.7.1-alpha (2026-08-13)
 
 Stabilization release ("Alpha 1.1"). This release-prep pass (PR #41) itself
 introduces no new implementation - it is a docs, version-bump, and changelog

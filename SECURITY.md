@@ -49,10 +49,11 @@ endpoint policy and token-file handling summarized below.
   handling are designed not to let an archive's name or internal paths
   escape the configured mount area. Encrypted archives and encrypted
   archive entries are refused outright rather than inspected or guessed,
-  and archive inspection is bounded by entry/member limits. DAT
-  verification of individual ZIP members, NES header normalization, and
-  CHD verification are designed but **not yet implemented**; the audit
-  currently hashes each outer file as-is.
+  and archive inspection is bounded by entry/member limits. DAT audits can
+  verify Stored and Deflate ZIP members through a bounded, read-only path;
+  encrypted, nested, malformed, and unsupported-codec members fail closed.
+  ZIP-member evidence cannot enter rename plans, and no archive is rewritten.
+  NES header normalization and CHD verification are not yet implemented.
 - **Verification is read-only.** Scanning, mounting, cataloguing,
   duplicate detection, DAT verification, and library-view/patch-preview
   operations all read archive metadata and filesystem state; none of them
