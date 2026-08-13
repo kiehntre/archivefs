@@ -4159,6 +4159,126 @@ fn an_interrupted_transaction_is_offered_for_recovery_and_never_auto_resumes() {
 }
 
 #[test]
+fn an_applied_transaction_is_rediscovered_after_restart_and_rollbackable() {
+    let (fixture, roms, mut page) = page_with_apply_plan(1);
+    approve_all(&mut page);
+    page.apply(DatSourcesPageAction::BeginApplyReview);
+    page.apply(DatSourcesPageAction::ConfirmApply {
+        typed: String::new(),
+    });
+    run_to_completion(&mut page);
+    // The apply renamed the file and wrote an `Applied` journal on disk.
+    assert!(roms.join("Game 0 (Europe).bin").exists());
+    assert!(!roms.join("game0.bin").exists());
+
+    // Simulate a restart: a fresh page state loaded from the same journal dir
+    // must rediscover the settled Applied transaction, not just interrupted
+    // ones.
+    let journal = fixture.dir("journal");
+    let mut restarted = DatSourcesPageState::load_with_transaction_dir(
+        fixture.config_path.clone(),
+        Vec::new(),
+        TrustedRoots::from_paths([&roms]),
+        journal,
+    );
+    let view = restarted.view();
+    let recovery = &view.rename_apply.recovery;
+    assert_eq!(
+        recovery.len(),
+        1,
+        "the applied journal must be rediscovered"
+    );
+    assert_eq!(recovery[0].state, TransactionState::Applied);
+    assert_eq!(recovery[0].applied_count, 1);
+    let id = recovery[0].transaction_id.clone();
+
+    // The page shows it as Applied and offers the roll-back control.
+    let mut ui_state = DatSourcesPageUi::default();
+    let output = render(&view, &mut ui_state);
+    assert!(rendered_text_contains(&output, "Applied"));
+    assert!(rendered_text_contains(&output, "Roll back transaction"));
+
+    // Rolling back from the rediscovered page restores the original file.
+    restarted.apply(DatSourcesPageAction::RecoveryChoice {
+        id,
+        choice: RecoveryChoice::RollBack,
+    });
+    run_to_completion(&mut restarted);
+    assert!(roms.join("game0.bin").exists());
+    assert!(!roms.join("Game 0 (Europe).bin").exists());
+    assert_eq!(
+        std::fs::read(roms.join("game0.bin")).unwrap(),
+        b"fixture contents"
+    );
+}
+
+#[test]
+fn the_just_applied_transaction_is_not_double_listed_in_recovery() {
+    let (_fixture, _roms, mut page) = page_with_apply_plan(1);
+    approve_all(&mut page);
+    page.apply(DatSourcesPageAction::BeginApplyReview);
+    page.apply(DatSourcesPageAction::ConfirmApply {
+        typed: String::new(),
+    });
+    run_to_completion(&mut page);
+
+    // The transaction is shown via the apply-outcome card, so the recovery list
+    // must not list it a second time even though its journal is `Applied`.
+    let view = page.view();
+    assert!(view.rename_apply.outcome.is_some());
+    assert!(
+        view.rename_apply.recovery.is_empty(),
+        "the just-applied transaction must not be double-listed"
+    );
+}
+
+#[test]
+fn a_rediscovered_applied_transaction_still_refuses_rollback_when_the_destination_changed() {
+    let (fixture, roms, mut page) = page_with_apply_plan(1);
+    approve_all(&mut page);
+    page.apply(DatSourcesPageAction::BeginApplyReview);
+    page.apply(DatSourcesPageAction::ConfirmApply {
+        typed: String::new(),
+    });
+    run_to_completion(&mut page);
+    let destination = roms.join("Game 0 (Europe).bin");
+    assert!(destination.exists());
+
+    // Simulate a restart, then replace the destination externally: identity
+    // protection must still hold after rediscovery, so rollback refuses rather
+    // than guessing.
+    let journal = fixture.dir("journal");
+    let mut restarted = DatSourcesPageState::load_with_transaction_dir(
+        fixture.config_path.clone(),
+        Vec::new(),
+        TrustedRoots::from_paths([&roms]),
+        journal,
+    );
+    let id = restarted.view().rename_apply.recovery[0]
+        .transaction_id
+        .clone();
+    std::fs::remove_file(&destination).unwrap();
+    std::fs::write(&destination, b"externally changed").unwrap();
+
+    restarted.apply(DatSourcesPageAction::RecoveryChoice {
+        id,
+        choice: RecoveryChoice::RollBack,
+    });
+    run_to_completion(&mut restarted);
+
+    let view = restarted.view();
+    assert_eq!(
+        view.rename_apply.rollback_result.as_ref().map(|r| r.label),
+        Some("Rollback failed")
+    );
+    // Nothing was renamed back: the changed destination is untouched and the
+    // original source was not restored.
+    assert!(destination.exists());
+    assert!(!roms.join("game0.bin").exists());
+    assert_eq!(std::fs::read(&destination).unwrap(), b"externally changed");
+}
+
+#[test]
 fn the_apply_section_renders_at_a_narrow_compact_width() {
     let (_fixture, _roms, mut page) = page_with_apply_plan(2);
     approve_all(&mut page);

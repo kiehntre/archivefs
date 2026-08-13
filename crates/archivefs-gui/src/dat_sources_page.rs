@@ -668,7 +668,9 @@ pub(crate) struct RollbackResultView {
     pub(crate) detail: String,
 }
 
-/// One interrupted transaction offered for crash recovery.
+/// One persisted transaction offered for rollback or crash recovery: either a
+/// settled `Applied` batch (roll back the whole transaction) or an interrupted
+/// batch (roll back completed steps or leave untouched).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RecoveryTransactionView {
     pub(crate) transaction_id: String,
@@ -1584,7 +1586,9 @@ pub(crate) struct DatSourcesPageState {
     rollback_error: Option<String>,
     /// The apply/rollback worker.
     apply_job: Option<ApplyJob>,
-    /// Interrupted transactions found on disk, offered for crash recovery.
+    /// Transactions found on disk that are still actionable: settled `Applied`
+    /// batches (eligible for rollback after a restart) and interrupted batches
+    /// (offered for crash recovery). `RolledBack` journals are neither.
     recovery_transactions: Vec<archivefs_core::dat::rename_apply::RenameTransaction>,
     /// History & Logs records produced by apply/rollback outcomes, drained by
     /// the shell. No private paths are included.
@@ -1629,10 +1633,11 @@ impl DatSourcesPageState {
             }
         };
         let draft = saved.clone();
-        // The durable journal directory and any interrupted transactions found
-        // in it, offered for explicit crash recovery.
+        // The durable journal directory and any transactions found in it that
+        // are still actionable: settled `Applied` batches offered for rollback
+        // and interrupted batches offered for explicit crash recovery.
         let (recovery_transactions, _recovery_problems) =
-            archivefs_core::dat::rename_apply::find_recovery_transactions(&transaction_dir);
+            archivefs_core::dat::rename_apply::find_rollbackable_transactions(&transaction_dir);
         Self {
             config_path,
             database_path: None,
@@ -1826,12 +1831,15 @@ impl DatSourcesPageState {
         changed
     }
 
-    /// Re-reads interrupted transactions from the journal directory, reconciling
-    /// any in-flight (`Applying`/`RollingBack`) entries against the filesystem
-    /// so the counts and rollback eligibility reflect what actually happened.
+    /// Re-reads still-actionable transactions from the journal directory,
+    /// reconciling any in-flight (`Applying`/`RollingBack`) entries against the
+    /// filesystem so the counts and rollback eligibility reflect what actually
+    /// happened. A settled `Applied` transaction is listed as-is, eligible for
+    /// rollback.
     fn refresh_recovery(&mut self) {
-        let (mut recovery, _) =
-            archivefs_core::dat::rename_apply::find_recovery_transactions(&self.transaction_dir);
+        let (mut recovery, _) = archivefs_core::dat::rename_apply::find_rollbackable_transactions(
+            &self.transaction_dir,
+        );
         for transaction in &mut recovery {
             if transaction.entries.iter().any(|entry| {
                 matches!(
@@ -1845,6 +1853,13 @@ impl DatSourcesPageState {
                     &self.transaction_dir,
                 );
             }
+        }
+        // The transaction applied this session is already shown by the apply
+        // outcome card; do not list it a second time in the recovery list.
+        if let Some(outcome) = &self.apply_outcome {
+            recovery.retain(|transaction| {
+                transaction.transaction_id != outcome.transaction.transaction_id
+            });
         }
         self.recovery_transactions = recovery;
     }
@@ -5192,11 +5207,12 @@ fn show_rename_apply_section(
 ) -> Option<DatSourcesPageAction> {
     let mut action = None;
 
-    // Crash recovery first: an interrupted transaction is always surfaced
-    // before anything else in this section, and never auto-resumes.
+    // Transactions found on disk first: a settled `Applied` batch is offered
+    // for rollback, and an interrupted batch is surfaced for crash recovery -
+    // never auto-resumed.
     if !apply.recovery.is_empty() {
         ui.add_space(10.0);
-        widgets::section_header(ui, "Interrupted rename transaction", None);
+        widgets::section_header(ui, "Rename transactions", None);
         widgets::card(ui, |ui| {
             for recovery in &apply.recovery {
                 ui.horizontal(|ui| {
@@ -5212,18 +5228,28 @@ fn show_rename_apply_section(
                             .color(theme::muted(ui)),
                     );
                 });
-                ui.label(
-                    egui::RichText::new(
-                        "An interrupted rename transaction was found. EmuWiz will never \
-                         resume it automatically.",
+                let (explanation, rollback_label) = if recovery.state == TransactionState::Applied {
+                    (
+                        "A completed rename transaction is still applied and can be rolled \
+                             back.",
+                        "Roll back transaction",
                     )
-                    .color(theme::muted(ui))
-                    .small(),
+                } else {
+                    (
+                        "An interrupted rename transaction was found. EmuWiz will never \
+                             resume it automatically.",
+                        "Roll back completed steps",
+                    )
+                };
+                ui.label(
+                    egui::RichText::new(explanation)
+                        .color(theme::muted(ui))
+                        .small(),
                 );
                 ui.horizontal(|ui| {
                     if widgets::action_button(
                         ui,
-                        "Roll back completed steps",
+                        rollback_label,
                         widgets::ActionStyle::Destructive,
                         !apply.rollback_running,
                     )

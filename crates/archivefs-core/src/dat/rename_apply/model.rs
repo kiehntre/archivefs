@@ -269,6 +269,17 @@ impl RenameTransaction {
             TransactionState::Planned | TransactionState::Applying | TransactionState::RollingBack
         )
     }
+
+    /// Whether a persisted transaction is still actionable after a restart: a
+    /// settled `Applied` transaction that still has applied entries can be
+    /// rolled back, and any interrupted transaction must be surfaced for
+    /// recovery. A fully `RolledBack` transaction is neither, and an `Applied`
+    /// transaction whose entries are not actually Applied has nothing to
+    /// reverse and is not offered.
+    pub fn is_rollbackable(&self) -> bool {
+        (self.state == TransactionState::Applied && self.has_applied_entries())
+            || self.state.needs_recovery()
+    }
 }
 
 /// A human-readable summary of an apply or rollback run.

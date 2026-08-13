@@ -137,6 +137,23 @@ pub fn find_recovery_transactions(dir: &Path) -> (Vec<RenameTransaction>, Vec<St
     (interrupted, problems)
 }
 
+/// The transactions in `dir` a user can still act on after a restart: every
+/// settled `Applied` transaction that still has applied entries (eligible for
+/// rollback) plus every interrupted transaction recovery must surface.
+///
+/// Unlike [`find_recovery_transactions`], this does not drop a settled
+/// `Applied` batch - a completed rename is still reversible, so its journal
+/// must stay visible and rollback-able across restarts, exactly as the
+/// release checklist's restart-and-rollback journey requires.
+pub fn find_rollbackable_transactions(dir: &Path) -> (Vec<RenameTransaction>, Vec<String>) {
+    let (all, problems) = list_journals(dir);
+    let rollbackable: Vec<RenameTransaction> = all
+        .into_iter()
+        .filter(RenameTransaction::is_rollbackable)
+        .collect();
+    (rollbackable, problems)
+}
+
 /// Whether a transaction's journal still exists on disk.
 pub fn journal_exists(dir: &Path, transaction_id: &str) -> bool {
     journal_path(dir, transaction_id).is_some_and(|path| std::fs::symlink_metadata(&path).is_ok())
@@ -395,6 +412,53 @@ mod tests {
         std::fs::write(dir.path().join("corrupt.json"), "not json {{").unwrap();
         let (recovery, problems) = find_recovery_transactions(dir.path());
         assert!(recovery.is_empty());
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(std::fs::symlink_metadata(dir.path().join("corrupt.json")).is_ok());
+    }
+
+    #[test]
+    fn rollbackable_transactions_include_applied_but_not_rolled_back() {
+        let dir = tempfile::tempdir().unwrap();
+        for (id, state) in [
+            ("applied", TransactionState::Applied),
+            ("interrupted", TransactionState::Applying),
+            ("rolled-back", TransactionState::RolledBack),
+        ] {
+            let mut tx = transaction(state);
+            tx.transaction_id = id.to_string();
+            // A settled Applied transaction must actually have an Applied entry
+            // to be reversible.
+            if state == TransactionState::Applied {
+                tx.entries[0].state = EntryState::Applied;
+            }
+            write_journal(dir.path(), &tx).unwrap();
+        }
+        let (rollbackable, problems) = find_rollbackable_transactions(dir.path());
+        assert!(problems.is_empty(), "{problems:?}");
+        let ids: Vec<&str> = rollbackable
+            .iter()
+            .map(|tx| tx.transaction_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["applied", "interrupted"]);
+    }
+
+    #[test]
+    fn an_applied_journal_with_no_applied_entries_is_not_offered_for_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        // A settled Applied transaction whose entries are not Applied has
+        // nothing to reverse; it must not be offered for rollback.
+        let tx = transaction(TransactionState::Applied);
+        write_journal(dir.path(), &tx).unwrap();
+        let (rollbackable, _) = find_rollbackable_transactions(dir.path());
+        assert!(rollbackable.is_empty());
+    }
+
+    #[test]
+    fn an_unparseable_journal_is_still_reported_by_rollbackable_discovery() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("corrupt.json"), "not json {{").unwrap();
+        let (rollbackable, problems) = find_rollbackable_transactions(dir.path());
+        assert!(rollbackable.is_empty());
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(std::fs::symlink_metadata(dir.path().join("corrupt.json")).is_ok());
     }

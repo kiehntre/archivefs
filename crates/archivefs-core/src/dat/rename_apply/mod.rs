@@ -49,8 +49,8 @@ pub use executor::{
 pub use identity::{capture_identity, classify_at, identity_matches};
 pub use journal::{
     RENAME_TRANSACTIONS_DIRECTORY, default_rename_transaction_dir, find_recovery_transactions,
-    journal_exists, journal_path, list_journals, new_transaction_id, read_journal, remove_journal,
-    rename_transaction_dir_in, write_journal,
+    find_rollbackable_transactions, journal_exists, journal_path, list_journals,
+    new_transaction_id, read_journal, remove_journal, rename_transaction_dir_in, write_journal,
 };
 pub use model::{
     EntryState, ObjectIdentity, ObjectKind, RenameTransaction, RollbackResult, RollbackStatus,
