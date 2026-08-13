@@ -1953,6 +1953,242 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // Regression coverage pinned during the `sevenz-rust` -> `sevenz-rust2`
+    // migration. Each of these guards a property that the swap could have
+    // silently changed.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn the_only_reader_construction_pins_a_single_decode_thread() {
+        // `ArchiveReader::new` defaults its thread count to
+        // `std::thread::available_parallelism()`, which would hand
+        // multi-threaded LZMA2 decode a worker pool and break the sequential
+        // resource/cancellation model this module is built on. The thread
+        // count is not readable back through the public API, so the invariant
+        // is pinned structurally: exactly one construction site, exactly one
+        // thread-count call, and that call pins the count to 1.
+        //
+        // Every needle is assembled with `concat!` so this test's own source
+        // text cannot match it.
+        let source = include_str!("sevenz.rs");
+        let construct = concat!("ArchiveReader", "::new(");
+        let set_threads = concat!("set_thread", "_count(");
+        let pin_to_one = concat!("set_thread", "_count(1)");
+        assert_eq!(
+            source.matches(construct).count(),
+            1,
+            "the upstream reader must be constructed in exactly one place (construct_reader)"
+        );
+        assert_eq!(
+            source.matches(set_threads).count(),
+            1,
+            "the decode thread count must be set in exactly one place"
+        );
+        assert_eq!(
+            source.matches(pin_to_one).count(),
+            1,
+            "the single decode-thread pin must request exactly one thread"
+        );
+    }
+
+    #[test]
+    fn reader_is_constructed_only_after_a_successful_preflight() {
+        // The companion to `preflight_refused_input_never_constructs_the_reader`:
+        // when the probe *passes*, the reader is constructed exactly once, and
+        // only then. Together the two pin the ordering (preflight, then
+        // decoder) rather than just the refusal.
+        let dir = tempdir().unwrap();
+        let trusted = trusted_for(dir.path());
+
+        // A hostile archive: refused by the probe, no construction.
+        let hostile = write_archive_bytes(
+            dir.path(),
+            "hostile_order.7z",
+            &[],
+            &header_with_coder(&[0x21], &[40]),
+        );
+        let before = reader_new_calls();
+        SevenZArchiveSource::open(
+            &hostile,
+            &trusted,
+            ArchiveLimits::default(),
+            &TEST_NO_CANCEL,
+        )
+        .unwrap_err();
+        assert_eq!(
+            reader_new_calls(),
+            before,
+            "a preflight refusal must short-circuit before the decoder"
+        );
+
+        // A well-formed archive: the probe passes and the reader is built once.
+        let good =
+            write_copy_member_archive(dir.path(), "good_order.7z", "game.rom", b"hello world", 11);
+        let before = reader_new_calls();
+        let source =
+            SevenZArchiveSource::open(&good, &trusted, ArchiveLimits::default(), &TEST_NO_CANCEL)
+                .unwrap();
+        assert_eq!(
+            reader_new_calls(),
+            before + 1,
+            "a successful open must construct the reader exactly once"
+        );
+        assert_eq!(source.member_count(), 1);
+    }
+
+    #[test]
+    fn solid_copy_members_decode_to_the_expected_digests() {
+        // The simplest real decode path end to end: a solid COPY block whose
+        // two members are hashed from the decoder's output. Pins the actual
+        // digest values, not just "verified", so a decode that silently
+        // mis-slices a solid block cannot pass.
+        let dir = tempdir().unwrap();
+        let path = write_solid_copy_archive(
+            dir.path(),
+            &[
+                ("one.bin", b"first member payload".to_vec()),
+                ("two.bin", b"second member payload".to_vec()),
+            ],
+        );
+        let trusted = trusted_for(dir.path());
+        let mut source =
+            SevenZArchiveSource::open(&path, &trusted, ArchiveLimits::default(), &TEST_NO_CANCEL)
+                .unwrap();
+        let evidence = collect(&mut source).unwrap();
+        assert_eq!(evidence.len(), 2);
+        assert!(evidence.iter().all(|e| e.is_verified()));
+
+        let first = evidence[0].hashes.as_ref().unwrap();
+        assert_eq!(first.crc32, "302e7de2");
+        assert_eq!(first.md5, "9b93f71af4b39560db80701caddff344");
+        assert_eq!(first.sha1, "20406af015addf5a2fe43a8a7c04e9be1a87356c");
+        assert_eq!(
+            first.sha256,
+            "17be6684584cc6d2c48d23ea9abac38ad08669e1637e43453a3ef656ce31c2f1"
+        );
+
+        let second = evidence[1].hashes.as_ref().unwrap();
+        assert_eq!(second.crc32, "c1501a7e");
+        assert_eq!(second.md5, "c732610b7d7a0688a965f3195030a042");
+        assert_eq!(second.sha1, "ddef793165f269f57f72b348cb8c297104fd785d");
+        assert_eq!(
+            second.sha256,
+            "e77cf0d7502333970eefe7068fc73d5ced4c37f684aed8b55a3d9d35c63f3c16"
+        );
+    }
+
+    #[test]
+    fn encrypted_header_archive_is_refused_before_decode() {
+        // `ArchiveWriter` encrypts the header by default once a content method
+        // is AES (`sevenz-rust` 0.6.1 left small headers plain). That produces
+        // a kEncodedHeader, which the probe refuses outright because its
+        // expansion cannot be bounded - a fail-closed refusal that must happen
+        // before any decoder exists.
+        let dir = tempdir().unwrap();
+        let archive_path = dir.path().join("encrypted_header.7z");
+        let mut writer = ArchiveWriter::new(std::fs::File::create(&archive_path).unwrap()).unwrap();
+        writer.set_content_methods(vec![
+            sevenz_rust2::encoder_options::AesEncoderOptions::new(Password::from("secret")).into(),
+            EncoderMethod::LZMA2.into(),
+        ]);
+        let entry = fixture_entry("game.rom", "secret payload".len() as u64);
+        writer
+            .push_archive_entry(entry, Some(std::io::Cursor::new(b"secret payload")))
+            .unwrap();
+        writer.finish().unwrap();
+
+        assert_eq!(
+            preflight(&archive_path, &ArchiveLimits::default()).unwrap_err(),
+            crate::dat::archive::sevenz_preflight::PreflightRefusal::EncodedHeader
+        );
+
+        let trusted = trusted_for(dir.path());
+        let before = reader_new_calls();
+        let err = SevenZArchiveSource::open(
+            &archive_path,
+            &trusted,
+            ArchiveLimits::default(),
+            &TEST_NO_CANCEL,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ArchiveMemberSourceError::Unsupported { .. }),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(
+            reader_new_calls(),
+            before,
+            "an encrypted header must never reach the decoder"
+        );
+    }
+
+    #[test]
+    fn renamed_aes_method_still_maps_to_encrypted() {
+        // `sevenz-rust2` reports the AES method as "AES256_SHA256" where
+        // `sevenz-rust` 0.6.1 reported "AES256SHA256". Both must classify as
+        // Encrypted, never as a generic unsupported codec: an encrypted member
+        // is refused, never decrypted.
+        use sevenz_rust2::Error as E;
+        assert_eq!(
+            classify_error(&E::UnsupportedCompressionMethod(
+                sevenz_rust2::EncoderMethod::AES256_SHA256
+                    .name()
+                    .to_string()
+            )),
+            ArchiveMemberSourceError::Encrypted
+        );
+        assert_eq!(
+            classify_error(&E::UnsupportedCompressionMethod("AES256_SHA256".into())),
+            ArchiveMemberSourceError::Encrypted
+        );
+    }
+
+    #[test]
+    fn non_solid_member_over_the_ceiling_is_refused_by_the_probe() {
+        // A one-folder-per-file (non-solid) archive carries no sub-stream size
+        // list, so the folder's own unpacked size is the only statement of its
+        // single member's logical size. The probe must still enforce the
+        // per-member ceiling from it, before any decoder is constructed.
+        let dir = tempdir().unwrap();
+        let payload = vec![b'x'; 4096];
+        let path = write_copy_member_archive(
+            dir.path(),
+            "oversized_single.7z",
+            "big.bin",
+            &payload,
+            payload.len() as u64,
+        );
+        let limits = ArchiveLimits {
+            max_member_logical_bytes: 1024,
+            ..ArchiveLimits::default()
+        };
+        let before = reader_new_calls();
+        assert_eq!(
+            preflight(&path, &limits).unwrap_err(),
+            crate::dat::archive::sevenz_preflight::PreflightRefusal::MemberSizeExceeded {
+                size: 4096,
+                limit: 1024,
+            }
+        );
+        let trusted = trusted_for(dir.path());
+        let err = SevenZArchiveSource::open(&path, &trusted, limits, &TEST_NO_CANCEL).unwrap_err();
+        assert_eq!(
+            err,
+            ArchiveMemberSourceError::RefusedLimits {
+                reason: "member size"
+            }
+        );
+        assert_eq!(reader_new_calls(), before);
+        // The same archive under the default ceiling is fine: the new check
+        // must not over-refuse.
+        let mut source =
+            SevenZArchiveSource::open(&path, &trusted, ArchiveLimits::default(), &TEST_NO_CANCEL)
+                .unwrap();
+        assert_eq!(source.member_count(), 1);
+        assert!(collect(&mut source).unwrap()[0].is_verified());
+    }
+
+    // ------------------------------------------------------------------
     // Additional hostile fixtures for the Codex re-review pass.
     // ------------------------------------------------------------------
 
