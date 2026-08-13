@@ -777,15 +777,18 @@ fn attr_u64(
     let Some(raw) = attr_str_opt(elem, attr_name, warnings, max_warnings) else {
         return Ok(None);
     };
-    raw.parse::<u64>()
-        .map(Some)
-        .map_err(|_| ParseError::MalformedXml {
-            detail: format!(
-                "attribute {}={raw:?} is not a valid u64",
-                String::from_utf8_lossy(attr_name)
-            ),
-            byte_offset: None,
-        })
+    let parsed = if let Some(hex) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16)
+    } else {
+        raw.parse::<u64>()
+    };
+    parsed.map(Some).map_err(|_| ParseError::MalformedXml {
+        detail: format!(
+            "attribute {}={raw:?} is not a valid decimal or 0x-prefixed u64",
+            String::from_utf8_lossy(attr_name)
+        ),
+        byte_offset: None,
+    })
 }
 
 fn detect_logiqx_ecosystem(
@@ -1050,6 +1053,23 @@ mod tests {
         assert_eq!(outcome.dat.games.len(), 1);
         assert_eq!(outcome.dat.games[0].roms.len(), 1);
         assert_eq!(outcome.dat.games[0].roms[0].crc32, Some("aaaaaaaa".into()));
+    }
+
+    #[test]
+    fn rom_size_accepts_decimal_and_prefixed_hexadecimal() {
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+    <game name="Mixed size formats">
+        <rom name="decimal.bin" size="524288" crc="AAAAAAAA"/>
+        <rom name="hex.bin" size="0x80000" crc="BBBBBBBB"/>
+    </game>
+</datafile>"#;
+
+        let outcome = parse_xml(xml).unwrap();
+        let roms = &outcome.dat.games[0].roms;
+
+        assert_eq!(roms[0].size_bytes, Some(524_288));
+        assert_eq!(roms[1].size_bytes, Some(524_288));
     }
 
     // ------------------------------------------------------------------

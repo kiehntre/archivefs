@@ -21,6 +21,8 @@ pub struct DatRomRef {
     pub rom_name: String,
     pub size_bytes: Option<u64>,
     pub checksums: Vec<DatChecksum>,
+    pub status: Option<String>,
+    pub merge: Option<String>,
     pub content_classification: DatContentClassification,
     pub original_metadata: DatOriginalMetadata,
 }
@@ -58,6 +60,8 @@ impl DatIndex {
                     rom_name: rom.name.clone(),
                     size_bytes: rom.size_bytes,
                     checksums: rom.checksums(),
+                    status: rom.status.clone(),
+                    merge: rom.merge.clone(),
                     content_classification: game.content_classification.clone(),
                     original_metadata: game.original_metadata.clone(),
                 };
@@ -257,6 +261,20 @@ mod tests {
         let candidates = index.lookup_crc32("deadbeef");
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].game_name, "Game Alpha");
+    }
+
+    #[test]
+    fn index_preserves_rom_status_and_merge_provenance() {
+        let mut dat = make_dat();
+        dat.games[0].roms[0].status = Some("baddump".into());
+        dat.games[0].roms[0].merge = Some("parent.bin".into());
+
+        let index = DatIndex::build(&dat);
+        let candidates = index.lookup_crc32("deadbeef");
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].status.as_deref(), Some("baddump"));
+        assert_eq!(candidates[0].merge.as_deref(), Some("parent.bin"));
     }
 
     #[test]
