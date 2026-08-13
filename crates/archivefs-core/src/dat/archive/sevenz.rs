@@ -1,45 +1,52 @@
 //! Bounded, read-only 7z member reading (POST-ALPHA-1.1, experimental).
 //!
-//! Implements [`super::ArchiveMemberSource`] for `.7z` using `sevenz-rust`
-//! (Apache-2.0, pure Rust). Everything is in-process and read-only.
+//! Implements [`super::ArchiveMemberSource`] for `.7z` using `sevenz-rust2`
+//! (Apache-2.0, pure Rust), the maintained fork of the abandoned
+//! `sevenz-rust`. Everything is in-process and read-only.
 //!
 //! # Hostile-input ordering
 //!
-//! Before `sevenz-rust` is ever constructed, a dedicated pre-decoder probe
+//! Before `sevenz-rust2` is ever constructed, a dedicated pre-decoder probe
 //! (`super::sevenz_preflight`) parses just enough of the 7z header to enforce
 //! hard resource ceilings: next-header size, file/folder/coder/pack-stream
 //! counts, LZMA/LZMA2 dictionary declarations, per-folder solid-decode budget,
 //! decompression ratio, and the cumulative logical-byte budget. Archives that
 //! declare hostile values — including any archive with an **encoded header**
 //! (whose expansion cannot be bounded) — are refused **before** any large
-//! allocation inside `sevenz-rust`, and cancellation is checked during the
+//! allocation inside `sevenz-rust2`, and cancellation is checked during the
 //! probe. The probe is deliberately not a complete decoder; it extracts only
 //! the resource-relevant facts.
 //!
-//! After preflight passes, `SevenZReader::new` runs with every
+//! After preflight passes, `ArchiveReader::new` runs with every
 //! attacker-controlled allocation already bounded by the configured limits
-//! (its next-header buffer is at most `max_header_bytes`; its file/folder/
+//! (its next-header buffer is at most `max_header_bytes`; its file/block/
 //! coder vectors are at most `max_members`; its decoder dictionaries are at
 //! most `max_dictionary_bytes`). A belt-and-braces revalidation re-checks the
-//! same limits against `sevenz-rust`'s parsed `Archive`, and member hashing
+//! same limits against `sevenz-rust2`'s parsed `Archive`, and member hashing
 //! re-enforces per-member and cumulative budgets while streaming.
 //!
 //! # Upstream advisories and the API surface this module may use
 //!
-//! `sevenz-rust` 0.6.1 carries two open RUSTSEC entries:
+//! This module previously used `sevenz-rust` 0.6.1, which carries two open
+//! RUSTSEC entries (RUSTSEC-2026-0245, a path-traversal in the `decompress*`
+//! convenience functions' shared `decompress_impl` body, and RUSTSEC-2026-0246,
+//! unmaintained). It now uses the maintained fork `sevenz-rust2`, which has
+//! neither.
 //!
-//! - **RUSTSEC-2026-0245** (high): `decompress_impl` — the shared body of the
-//!   crate's `decompress*` convenience functions — does not validate member
-//!   paths, so a hostile archive can write outside the destination directory.
-//!   There is no patched release. This module is unaffected **because it never
-//!   extracts to disk**: it only uses `Archive`, `SevenZReader` and
-//!   `for_each_entries`, and hashes member bytes in memory. Nothing in this
-//!   crate may call `sevenz_rust::decompress`, `decompress_file`,
-//!   `decompress_with_password` or any other `de_funcs` entry point.
-//! - **RUSTSEC-2026-0246**: the crate is unmaintained. Upstream defects — such
-//!   as the out-of-bounds indexing that `sevenz_preflight` refuses on our
-//!   behalf — will not be fixed upstream, so the probe carries that burden
-//!   permanently.
+//! The extract-to-disk convenience helpers that carried the traversal defect
+//! live behind `sevenz-rust2`'s `util` feature, and this crate enables **no**
+//! features in the production build, so those functions are not compiled at
+//! all. Independently of that, this module never extracts to disk: it only
+//! uses `Archive`, `ArchiveReader` and `for_each_entries`, and hashes member
+//! bytes in memory. Nothing in this crate may call `sevenz_rust2::decompress`,
+//! `decompress_file`, `decompress_with_password` or any other `util` entry
+//! point.
+//!
+//! The pre-decoder probe (`super::sevenz_preflight`) is retained unchanged.
+//! Its hostile-input refusals are a defence-in-depth property of *this*
+//! module, not a workaround for one upstream release: it bounds allocation
+//! before any third-party parser sees attacker-controlled counts, and it
+//! refuses malformed coder graphs regardless of which fork is underneath.
 //!
 //! # Cancellation granularity
 //!
@@ -52,13 +59,13 @@
 //!   hashing and draining loops).
 //!
 //! It is **not** observed inside a single `Read::read` call into
-//! `sevenz-rust`: that call is a plain blocking function with no yield point,
+//! `sevenz-rust2`: that call is a plain blocking function with no yield point,
 //! so the smallest uninterruptible unit is "decode until the next chunk of
 //! output is available". A folder whose packed stream decodes very slowly into
 //! very little output therefore stalls cancellation for as long as it takes to
 //! consume that folder's packed bytes — bounded by the archive's own size and
 //! by the compression-ratio, dictionary and solid-decode ceilings, but not by
-//! the cancellation flag. `SevenZReader::new` and the per-folder decoder-stack
+//! the cancellation flag. `ArchiveReader::new` and the per-folder decoder-stack
 //! construction are likewise uninterruptible; both are bounded (at most
 //! `max_header_bytes` of header parsing and `max_aggregate_decoder_memory_bytes`
 //! of allocation) and neither decodes member data.
@@ -79,8 +86,8 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
-use sevenz_rust::Error as SevenZError;
-use sevenz_rust::{Archive, Password, SevenZReader};
+use sevenz_rust2::Error as SevenZError;
+use sevenz_rust2::{Archive, ArchiveEntry, ArchiveReader, Password};
 
 use crate::safe_read::{TrustedRoots, open_bounded_read};
 
@@ -95,13 +102,24 @@ use crate::dat::archive::sevenz_preflight::{PreflightRefusal, preflight_sevenz};
 /// of these extensions are surfaced with metadata but never opened.
 const NESTED_ARCHIVE_EXTENSIONS: &[&str] = &["zip", "7z", "rar", "tar", "gz", "bz2", "xz", "zst"];
 
-/// Test-only count of `SevenZReader::new` constructions, so hostile-input
-/// tests can prove the preflight refused an archive before the upstream
-/// decoder was ever reached.
+// Test-only count of `ArchiveReader::new` constructions, so hostile-input
+// tests can prove the preflight refused an archive before the upstream decoder
+// was ever reached.
+//
+// Thread-local, not global: the test harness runs tests in parallel and
+// `construct_reader` always runs on the calling test's own thread, so a shared
+// counter would let one test's successful open perturb another test's
+// before/after comparison.
 #[cfg(test)]
-static READER_NEW_CALLS: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    static READER_NEW_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Reads this thread's `construct_reader` call count.
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+fn reader_new_calls() -> usize {
+    READER_NEW_CALLS.with(std::cell::Cell::get)
+}
 
 /// Precomputed, deterministic member metadata (stream-bearing files in the
 /// archive's own order).
@@ -115,7 +133,7 @@ struct MemberMeta {
 /// A bounded, read-only `.7z` archive source.
 pub struct SevenZArchiveSource {
     archive: String,
-    reader: SevenZReader<std::fs::File>,
+    reader: ArchiveReader<std::fs::File>,
     members: Vec<MemberMeta>,
     limits: ArchiveLimits,
 }
@@ -136,7 +154,7 @@ impl SevenZArchiveSource {
     /// archive up to decode.
     ///
     /// The pre-decoder probe runs first and refuses hostile archives before
-    /// `sevenz-rust` performs any attacker-controlled allocation. `cancel` is
+    /// `sevenz-rust2` performs any attacker-controlled allocation. `cancel` is
     /// checked during the probe and can be shared with the later `verify_all`
     /// pass.
     pub fn open(
@@ -157,18 +175,20 @@ impl SevenZArchiveSource {
         let len = safe.len();
         let mut file = safe.into_file();
 
-        // Hard resource limits BEFORE sevenz-rust sees the archive.
+        // Hard resource limits BEFORE sevenz-rust2 sees the archive.
         preflight_sevenz(&mut file, len, &limits, cancel).map_err(map_preflight_refusal)?;
 
-        // The probe left the file position at the end of the next header;
-        // sevenz-rust reads the signature from the current position, so rewind.
+        // The probe left the file position at the end of the next header.
+        // `sevenz-rust2`'s `Archive::read` seeks to the start itself, but the
+        // rewind is kept so this module never depends on that internal detail
+        // (`sevenz-rust` 0.6.1 read the signature from the current position).
         use std::io::{Seek, SeekFrom};
         file.seek(SeekFrom::Start(0))
             .map_err(|error| ArchiveMemberSourceError::Open {
                 detail: format!("could not rewind the archive: {error:?}"),
             })?;
 
-        let reader = construct_reader(file, len);
+        let reader = construct_reader(file);
         let reader = reader.map_err(|error| classify_error(&error))?;
 
         let members = collect_members(reader.archive());
@@ -191,15 +211,27 @@ impl SevenZArchiveSource {
 /// Constructs the upstream reader, incrementing a test-only counter so
 /// hostile-input tests can assert the preflight refused an archive before the
 /// decoder was reached.
-fn construct_reader(
-    file: std::fs::File,
-    len: u64,
-) -> Result<SevenZReader<std::fs::File>, SevenZError> {
+///
+/// This is the **only** construction site for `ArchiveReader` in this crate,
+/// and it always pins the reader to a single decode thread.
+/// `ArchiveReader::new` otherwise defaults its thread count to
+/// `std::thread::available_parallelism()`, which would hand multi-threaded
+/// LZMA2 decode a pool of worker threads: that breaks the sequential
+/// resource model this module is built on (one bounded decode at a time,
+/// cancellation observed between output chunks, memory ceilings reasoned
+/// about for one decoder stack rather than N). Never call
+/// `ArchiveReader::new` elsewhere, and never raise this count.
+///
+/// The password is always empty: encrypted members are refused, never
+/// decrypted.
+fn construct_reader(file: std::fs::File) -> Result<ArchiveReader<std::fs::File>, SevenZError> {
     #[cfg(test)]
     {
-        READER_NEW_CALLS.fetch_add(1, Ordering::Relaxed);
+        READER_NEW_CALLS.with(|calls| calls.set(calls.get() + 1));
     }
-    SevenZReader::new(file, len, Password::empty())
+    let mut reader = ArchiveReader::new(file, Password::empty())?;
+    reader.set_thread_count(1);
+    Ok(reader)
 }
 
 /// Maps a preflight refusal onto the archive-source error taxonomy.
@@ -290,8 +322,8 @@ impl ArchiveMemberSource for SevenZArchiveSource {
                 // after every stream member and never match a cursor member.
                 return Ok(true);
             };
-            // KNOWN LIMITATION: `sevenz-rust`'s `calculate_stream_map` assigns
-            // a folder's file range as `[first_file_index, +num_sub_streams)`,
+            // KNOWN LIMITATION: `sevenz-rust2`'s stream map assigns a block's
+            // file range as `[block_first_file_index, +num_unpack_sub_streams)`,
             // so an empty-stream entry sitting *between* two stream members of
             // the same folder shifts that window and hides the last member.
             // The name check below turns that into a fail-closed `Corrupt`
@@ -579,9 +611,9 @@ impl SevenZArchiveSource {
     }
 }
 
-/// Maps a `sevenz-rust` error onto our fail-closed refusal taxonomy.
+/// Maps a `sevenz-rust2` error onto our fail-closed refusal taxonomy.
 fn classify_error(error: &SevenZError) -> ArchiveMemberSourceError {
-    use sevenz_rust::Error as E;
+    use sevenz_rust2::Error as E;
     match error {
         E::PasswordRequired | E::MaybeBadPassword(_) => ArchiveMemberSourceError::Encrypted,
         E::UnsupportedCompressionMethod(method) if method.contains("AES") => {
@@ -613,7 +645,11 @@ fn classify_error(error: &SevenZError) -> ArchiveMemberSourceError {
         | E::BadTerminatedUnpackInfo
         | E::BadTerminatedPackInfo(_)
         | E::BadTerminatedSubStreamsInfo
-        | E::BadTerminatedheader(_) => ArchiveMemberSourceError::Corrupt {
+        | E::BadTerminatedHeader(_)
+        // `FileNotFound` is only produced by `ArchiveReader::read_file`, which
+        // this module never calls; treat it as corrupt rather than letting a
+        // future refactor fall through to something more permissive.
+        | E::FileNotFound => ArchiveMemberSourceError::Corrupt {
             detail: format!("{error:?}"),
         },
     }
@@ -657,28 +693,52 @@ fn is_multivolume_name(path: &Path) -> bool {
 
 /// Enforces structure-level limits from header metadata, before any decode.
 ///
-/// Uses only `sevenz-rust`'s public surface (`Archive`, `StreamMap`,
-/// `pack_sizes`, `files`): folder `Folder`/`Coder` internals are not public,
-/// so per-folder sizes and ratios are derived from the pack-stream ranges and
-/// the files each folder owns.
+/// Uses only `sevenz-rust2`'s public surface (`Archive`, `StreamMap`,
+/// `pack_sizes()`, `files`): the `Block`/`Coder` internals are not public, so
+/// per-block sizes and ratios are derived from the pack-stream ranges and the
+/// files each block owns.
+///
+/// (`sevenz-rust2` renamed `sevenz-rust`'s "folder" concept to "block"; the
+/// on-disk structure is identical, so the checks below are unchanged.)
 fn validate_archive_structure(
     archive: &Archive,
     limits: &ArchiveLimits,
 ) -> Result<(), ArchiveMemberSourceError> {
-    let folder_first_stream = &archive.stream_map.folder_first_pack_stream_index;
-    let folder_count = folder_first_stream.len();
+    validate_structure_parts(
+        archive.pack_sizes(),
+        archive.stream_map.block_first_pack_stream_index(),
+        &archive.files,
+        &archive.stream_map.file_block_index,
+        limits,
+    )
+}
+
+/// The body of [`validate_archive_structure`], over borrowed slices.
+///
+/// `sevenz-rust2` made `pack_sizes` and `block_first_pack_stream_index`
+/// read-only accessors rather than public fields, so a hand-built hostile
+/// `Archive` can no longer be constructed in a test. Taking the same data as
+/// slices keeps the ratio and solid-budget checks directly testable without
+/// changing what they check.
+fn validate_structure_parts(
+    pack_sizes: &[u64],
+    block_first_stream: &[usize],
+    files: &[ArchiveEntry],
+    file_block_index: &[Option<usize>],
+    limits: &ArchiveLimits,
+) -> Result<(), ArchiveMemberSourceError> {
+    let folder_count = block_first_stream.len();
     for folder_index in 0..folder_count {
-        let pack_start = folder_first_stream[folder_index];
-        let pack_end = folder_first_stream
+        let pack_start = block_first_stream[folder_index];
+        let pack_end = block_first_stream
             .get(folder_index + 1)
             .copied()
-            .unwrap_or(archive.pack_sizes.len());
-        let pack_slice = archive
-            .pack_sizes
-            .get(pack_start..pack_end)
-            .ok_or_else(|| ArchiveMemberSourceError::Corrupt {
+            .unwrap_or(pack_sizes.len());
+        let pack_slice = pack_sizes.get(pack_start..pack_end).ok_or_else(|| {
+            ArchiveMemberSourceError::Corrupt {
                 detail: "folder pack stream range out of bounds".to_string(),
-            })?;
+            }
+        })?;
         // Checked summation of the folder's compressed bytes.
         let mut pack: u64 = 0;
         for &size in pack_slice {
@@ -691,19 +751,12 @@ fn validate_archive_structure(
 
         // Files owned by this folder: their declared sizes sum to the folder's
         // logical (unpacked) size.
-        let (files_in_folder, unpack) = archive
-            .files
+        let (files_in_folder, unpack) = files
             .iter()
             .enumerate()
             .filter(|(index, file)| {
                 file.has_stream
-                    && archive
-                        .stream_map
-                        .file_folder_index
-                        .get(*index)
-                        .copied()
-                        .flatten()
-                        == Some(folder_index)
+                    && file_block_index.get(*index).copied().flatten() == Some(folder_index)
             })
             .fold((0_usize, 0_u64), |(count, sum), (_, file)| {
                 (count + 1, sum.saturating_add(file.size))
@@ -787,16 +840,16 @@ fn evidence(
 mod tests {
     #![allow(clippy::vec_init_then_push)]
     //! Focused tests for the experimental 7z reader. Fixtures are generated
-    //! in-test with the `sevenz-rust` writer (a dev-dependency feature) into a
-    //! temp directory; no copyrighted data and no external tools are used.
+    //! in-test with the `sevenz-rust2` writer (a dev-dependency feature) into
+    //! a temp directory; no copyrighted data and no external tools are used.
 
     use super::*;
     use crate::safe_read::TrustedRoots;
     use std::path::PathBuf;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tempfile::tempdir;
 
-    use sevenz_rust::{SevenZMethod, SevenZWriter};
+    use sevenz_rust2::{ArchiveWriter, EncoderMethod};
 
     static TEST_NO_CANCEL: AtomicBool = AtomicBool::new(false);
 
@@ -804,12 +857,11 @@ mod tests {
         TrustedRoots::from_paths(std::iter::once(root))
     }
 
-    /// Builds a stream-bearing fixture entry. Field assignment is the only
-    /// way to construct this from outside `sevenz-rust` (its `content_methods`
-    /// field is crate-private, which also rules out struct-literal syntax).
+    /// Builds a stream-bearing fixture entry. Only the three fields the reader
+    /// cares about are set; everything else keeps its default.
     #[allow(clippy::field_reassign_with_default)]
-    fn fixture_entry(name: &str, size: u64) -> sevenz_rust::SevenZArchiveEntry {
-        let mut entry = sevenz_rust::SevenZArchiveEntry::new();
+    fn fixture_entry(name: &str, size: u64) -> ArchiveEntry {
+        let mut entry = ArchiveEntry::new();
         entry.name = name.to_string();
         entry.has_stream = true;
         entry.size = size;
@@ -819,7 +871,7 @@ mod tests {
     /// Writes a 7z with the given entries, all in one non-solid archive.
     fn make_archive(dir: &std::path::Path, files: &[(&str, &str)]) -> PathBuf {
         let archive_path = dir.join("archive.7z");
-        let mut writer = SevenZWriter::new(std::fs::File::create(&archive_path).unwrap()).unwrap();
+        let mut writer = ArchiveWriter::new(std::fs::File::create(&archive_path).unwrap()).unwrap();
         for (name, contents) in files {
             let entry = fixture_entry(name, contents.len() as u64);
             let bytes = contents.as_bytes();
@@ -831,13 +883,23 @@ mod tests {
         archive_path
     }
 
-    /// Writes a password-encrypted 7z (encrypted header + encrypted content).
+    /// Writes a password-encrypted 7z with a **plain** header and AES-encrypted
+    /// content, so the encryption surfaces at decode time.
+    ///
+    /// `ArchiveWriter` defaults `encrypt_header` to `true` and honours it
+    /// whenever a content method is AES, which produces a `kEncodedHeader` the
+    /// preflight refuses outright (its expansion cannot be bounded). That
+    /// refusal is real and is pinned by
+    /// `encrypted_header_archive_is_refused_before_decode`; this fixture turns
+    /// header encryption off so the *member-level* Encrypted refusal is still
+    /// exercised too.
     fn make_encrypted_archive(dir: &std::path::Path, contents: &str) -> PathBuf {
         let archive_path = dir.join("encrypted.7z");
-        let mut writer = SevenZWriter::new(std::fs::File::create(&archive_path).unwrap()).unwrap();
+        let mut writer = ArchiveWriter::new(std::fs::File::create(&archive_path).unwrap()).unwrap();
+        writer.set_encrypt_header(false);
         writer.set_content_methods(vec![
-            sevenz_rust::AesEncoderOptions::new(sevenz_rust::Password::from("secret")).into(),
-            SevenZMethod::LZMA2.into(),
+            sevenz_rust2::encoder_options::AesEncoderOptions::new(Password::from("secret")).into(),
+            EncoderMethod::LZMA2.into(),
         ]);
         let entry = fixture_entry("game.rom", contents.len() as u64);
         writer
@@ -901,7 +963,7 @@ mod tests {
 
     #[test]
     fn solid_archive_within_budget_hashes_every_member() {
-        // The sevenz-rust writer packs multi-file headers, which the preflight
+        // The sevenz-rust2 writer packs multi-file headers, which the preflight
         // refuses (encoded-header expansion is unbounded). A hand-built solid
         // archive with a plain header and COPY-compressed members is the legal
         // fixture for the positive solid path.
@@ -947,7 +1009,7 @@ mod tests {
     #[test]
     fn total_decode_budget_is_refused() {
         // The pre-decoder probe enforces the cumulative logical-byte budget
-        // before sevenz-rust is ever constructed, so the archive is refused at
+        // before sevenz-rust2 is ever constructed, so the archive is refused at
         // open time.
         let dir = tempdir().unwrap();
         let path = make_archive(
@@ -970,7 +1032,7 @@ mod tests {
 
     #[test]
     fn dictionary_memory_error_maps_to_refusal() {
-        use sevenz_rust::Error as E;
+        use sevenz_rust2::Error as E;
         let mapped = classify_error(&E::MaxMemLimited {
             max_kb: 1024,
             actaul_kb: 4096,
@@ -992,7 +1054,7 @@ mod tests {
 
     #[test]
     fn encrypted_error_variants_map_to_encrypted() {
-        use sevenz_rust::Error as E;
+        use sevenz_rust2::Error as E;
         assert_eq!(
             classify_error(&E::PasswordRequired),
             ArchiveMemberSourceError::Encrypted
@@ -1011,20 +1073,17 @@ mod tests {
 
     #[test]
     fn compression_ratio_limit_is_refused() {
-        // A tiny pack with a huge unpack: craft a folder-shaped declaration via
-        // the public Archive surface (pack 1 byte, unpack 2 GiB).
-        let mut archive = Archive::default();
-        archive.pack_sizes.push(1);
-        archive.stream_map.folder_first_pack_stream_index.push(0);
-        // One file of 2 GiB in folder 0.
-        let file = fixture_entry("bomb.bin", 2 * 1024 * 1024 * 1024);
-        archive.files.push(file);
-        archive.stream_map.file_folder_index.push(Some(0));
+        // A tiny pack with a huge unpack: a block-shaped declaration of
+        // pack 1 byte, unpack 2 GiB. `sevenz-rust2` made `pack_sizes` and
+        // `block_first_pack_stream_index` read-only accessors, so the same
+        // declaration is handed to the check as slices instead of being
+        // pushed into a hand-built `Archive`.
+        let files = vec![fixture_entry("bomb.bin", 2 * 1024 * 1024 * 1024)];
         let limits = ArchiveLimits {
             max_compression_ratio: 1000,
             ..ArchiveLimits::default()
         };
-        let err = validate_archive_structure(&archive, &limits).unwrap_err();
+        let err = validate_structure_parts(&[1], &[0], &files, &[Some(0)], &limits).unwrap_err();
         assert_eq!(
             err,
             ArchiveMemberSourceError::RefusedLimits {
@@ -1035,23 +1094,23 @@ mod tests {
 
     #[test]
     fn solid_decode_budget_is_refused() {
-        // Two files sharing one folder with a total above the solid budget.
-        let mut archive = Archive::default();
+        // Two files sharing one block with a total above the solid budget.
         // Pack large enough that the ratio check passes (6 GiB / 64 MiB = 96)
         // so the solid-budget check is the one that fires.
-        archive.pack_sizes.push(64 * 1024 * 1024);
-        archive.stream_map.folder_first_pack_stream_index.push(0);
         let size = 3 * 1024 * 1024 * 1024;
-        for name in ["a.bin", "b.bin"] {
-            let file = fixture_entry(name, size);
-            archive.files.push(file);
-            archive.stream_map.file_folder_index.push(Some(0));
-        }
+        let files = vec![fixture_entry("a.bin", size), fixture_entry("b.bin", size)];
         let limits = ArchiveLimits {
             max_solid_decode_bytes: 2 * 1024 * 1024 * 1024,
             ..ArchiveLimits::default()
         };
-        let err = validate_archive_structure(&archive, &limits).unwrap_err();
+        let err = validate_structure_parts(
+            &[64 * 1024 * 1024],
+            &[0],
+            &files,
+            &[Some(0), Some(0)],
+            &limits,
+        )
+        .unwrap_err();
         assert_eq!(
             err,
             ArchiveMemberSourceError::RefusedLimits {
@@ -1062,11 +1121,11 @@ mod tests {
 
     #[test]
     fn encrypted_member_is_refused_and_stops() {
-        // For tiny archives the 7z header is stored plain even with
-        // `encrypt_header` on (compressing it would not pay), so the archive
-        // opens; the encryption surfaces at decode time as a per-member
-        // refusal. The genuinely-encrypted-header path is covered by the
-        // `PasswordRequired → Encrypted` mapping test below.
+        // Plain header, AES-encrypted content: the archive opens and the
+        // encryption surfaces at decode time as a per-member refusal. The
+        // encrypted-*header* path is covered by
+        // `encrypted_header_archive_is_refused_before_decode`, and the error
+        // mapping itself by `encrypted_error_variants_map_to_encrypted`.
         let dir = tempdir().unwrap();
         let path = make_encrypted_archive(dir.path(), "secret payload");
         let trusted = trusted_for(dir.path());
@@ -1191,7 +1250,7 @@ mod tests {
     #[test]
     fn member_count_limit_is_refused() {
         // The pre-decoder probe caps both the declared file count (which
-        // bounds sevenz-rust's files-vector allocation) and the stream-member
+        // bounds sevenz-rust2's files-vector allocation) and the stream-member
         // count against `max_members`, refusing at open time.
         let dir = tempdir().unwrap();
         let path = make_archive(dir.path(), &[("a.bin", "aaa"), ("b.bin", "bbb")]);
@@ -1211,7 +1270,7 @@ mod tests {
     fn empty_stream_member_is_surfaced() {
         let dir = tempdir().unwrap();
         let archive_path = dir.path().join("empty.7z");
-        let mut writer = SevenZWriter::new(std::fs::File::create(&archive_path).unwrap()).unwrap();
+        let mut writer = ArchiveWriter::new(std::fs::File::create(&archive_path).unwrap()).unwrap();
         let entry = fixture_entry("empty.bin", 0);
         writer
             .push_archive_entry(entry, Some(std::io::Cursor::new(Vec::<u8>::new())))
@@ -1231,7 +1290,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Hand-built 7z fixtures for hostile-input tests. The sevenz-rust
+    // Hand-built 7z fixtures for hostile-input tests. The sevenz-rust2
     // writer packs multi-file headers (encoded), which the preflight
     // deliberately refuses; hostile tests therefore craft the exact bytes.
     // ------------------------------------------------------------------
@@ -1250,7 +1309,7 @@ mod tests {
     const K_NUM_UNPACK_STREAM: u8 = 0x0D;
     const K_NAME: u8 = 0x11;
 
-    /// 7z variable-length integer (mirrors sevenz-rust's encoding).
+    /// 7z variable-length integer (mirrors the 7z format's encoding).
     ///
     /// `n` bytes encode `7n` bits: the first byte has `n - 1` leading 1 bits
     /// as a length prefix, its low `8 - n` bits are the value's highest bits,
@@ -1281,7 +1340,7 @@ mod tests {
 
     /// Writes a complete 7z file whose next-header bytes are `next_header`,
     /// placed immediately after the 32-byte file header. Both CRCs are
-    /// computed so `sevenz-rust` (when the preflight lets it run) accepts the
+    /// computed so `sevenz-rust2` (when the preflight lets it run) accepts the
     /// file; the preflight validates the start-header CRC itself.
     fn write_archive_bytes(
         dir: &std::path::Path,
@@ -1390,7 +1449,7 @@ mod tests {
 
     /// A plain solid (one folder, several sub-streams) COPY archive whose
     /// member bytes are stored uncompressed in the packed stream. Used for
-    /// the positive solid path, which the sevenz-rust writer cannot produce
+    /// the positive solid path, which the sevenz-rust2 writer cannot produce
     /// with a plain header.
     fn write_solid_copy_archive(dir: &std::path::Path, files: &[(&str, Vec<u8>)]) -> PathBuf {
         let mut h = Vec::new();
@@ -1561,7 +1620,7 @@ mod tests {
         // LZMA id + a 2 GiB dictionary declaration in coder properties.
         let header = header_with_coder(&[0x03, 0x01, 0x01], &[0, 0, 0, 0, 0x80]);
         let path = write_archive_bytes(dir.path(), "dict.7z", &[], &header);
-        let before = READER_NEW_CALLS.load(Ordering::Relaxed);
+        let before = reader_new_calls();
         let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
         assert_eq!(
             err,
@@ -1571,9 +1630,9 @@ mod tests {
             }
         );
         assert_eq!(
-            READER_NEW_CALLS.load(Ordering::Relaxed),
+            reader_new_calls(),
             before,
-            "preflight must refuse before sevenz-rust constructs a decoder"
+            "preflight must refuse before sevenz-rust2 constructs a decoder"
         );
     }
 
@@ -1583,7 +1642,7 @@ mod tests {
         // LZMA2 id + dict bits 40 → 0xFFFFFFFF (4 GiB - 1).
         let header = header_with_coder(&[0x21], &[40]);
         let path = write_archive_bytes(dir.path(), "dict2.7z", &[], &header);
-        let before = READER_NEW_CALLS.load(Ordering::Relaxed);
+        let before = reader_new_calls();
         let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
         assert_eq!(
             err,
@@ -1592,7 +1651,7 @@ mod tests {
                 limit: ArchiveLimits::default().max_dictionary_bytes,
             }
         );
-        assert_eq!(READER_NEW_CALLS.load(Ordering::Relaxed), before);
+        assert_eq!(reader_new_calls(), before);
     }
 
     #[test]
@@ -1618,7 +1677,7 @@ mod tests {
         file[8..12].copy_from_slice(&start_crc.finish().to_le_bytes());
         let path = dir.path().join("big.7z");
         std::fs::write(&path, &file).unwrap();
-        let before = READER_NEW_CALLS.load(Ordering::Relaxed);
+        let before = reader_new_calls();
         let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
         assert_eq!(
             err,
@@ -1627,7 +1686,7 @@ mod tests {
                 limit: ArchiveLimits::default().max_header_bytes,
             }
         );
-        assert_eq!(READER_NEW_CALLS.load(Ordering::Relaxed), before);
+        assert_eq!(reader_new_calls(), before);
     }
 
     #[test]
@@ -1646,13 +1705,13 @@ mod tests {
         h.push(K_END);
         h.push(K_END);
         let path = write_archive_bytes(dir.path(), "many.7z", &[], &h);
-        let before = READER_NEW_CALLS.load(Ordering::Relaxed);
+        let before = reader_new_calls();
         let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
         assert!(matches!(
             err,
             crate::dat::archive::sevenz_preflight::PreflightRefusal::TooManyFiles { .. }
         ));
-        assert_eq!(READER_NEW_CALLS.load(Ordering::Relaxed), before);
+        assert_eq!(reader_new_calls(), before);
     }
 
     #[test]
@@ -1707,13 +1766,13 @@ mod tests {
         h.push(K_END);
         h.push(K_END);
         let path = write_archive_bytes(dir.path(), "coders.7z", &[], &h);
-        let before = READER_NEW_CALLS.load(Ordering::Relaxed);
+        let before = reader_new_calls();
         let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
         assert!(matches!(
             err,
             crate::dat::archive::sevenz_preflight::PreflightRefusal::CoderChainTooLong { .. }
         ));
-        assert_eq!(READER_NEW_CALLS.load(Ordering::Relaxed), before);
+        assert_eq!(reader_new_calls(), before);
     }
 
     #[test]
@@ -1723,13 +1782,13 @@ mod tests {
         h.push(0x17); // K_ENCODED_HEADER
         h.extend_from_slice(&[0; 8]);
         let path = write_archive_bytes(dir.path(), "encoded.7z", &[], &h);
-        let before = READER_NEW_CALLS.load(Ordering::Relaxed);
+        let before = reader_new_calls();
         let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
         assert_eq!(
             err,
             crate::dat::archive::sevenz_preflight::PreflightRefusal::EncodedHeader
         );
-        assert_eq!(READER_NEW_CALLS.load(Ordering::Relaxed), before);
+        assert_eq!(reader_new_calls(), before);
     }
 
     #[test]
@@ -1878,7 +1937,7 @@ mod tests {
         let header = header_with_coder(&[0x21], &[40]);
         let path = write_archive_bytes(dir.path(), "hostile.7z", &[], &header);
         let trusted = trusted_for(dir.path());
-        let before = READER_NEW_CALLS.load(Ordering::Relaxed);
+        let before = reader_new_calls();
         let err =
             SevenZArchiveSource::open(&path, &trusted, ArchiveLimits::default(), &TEST_NO_CANCEL)
                 .unwrap_err();
@@ -1887,9 +1946,9 @@ mod tests {
             ArchiveMemberSourceError::RefusedLimits { .. }
         ));
         assert_eq!(
-            READER_NEW_CALLS.load(Ordering::Relaxed),
+            reader_new_calls(),
             before,
-            "SevenZReader::new must never run for a preflight-refused archive"
+            "ArchiveReader::new must never run for a preflight-refused archive"
         );
     }
 
@@ -1992,7 +2051,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let header = header_with_lzma2_chain(3, 36); // 36 → 1 GiB each
         let path = write_archive_bytes(dir.path(), "agg.7z", &[], &header);
-        let before = READER_NEW_CALLS.load(Ordering::Relaxed);
+        let before = reader_new_calls();
         let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
         assert_eq!(
             err,
@@ -2001,7 +2060,7 @@ mod tests {
                 limit: ArchiveLimits::default().max_aggregate_decoder_memory_bytes,
             }
         );
-        assert_eq!(READER_NEW_CALLS.load(Ordering::Relaxed), before);
+        assert_eq!(reader_new_calls(), before);
     }
 
     #[test]
@@ -2048,7 +2107,7 @@ mod tests {
         h.push(K_END);
         h.push(K_END);
         let path = write_archive_bytes(dir.path(), "zname.7z", &[], &h);
-        let before = READER_NEW_CALLS.load(Ordering::Relaxed);
+        let before = reader_new_calls();
         let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
         assert!(matches!(
             err,
@@ -2056,7 +2115,7 @@ mod tests {
                 detail: "zero-sized K_NAME property"
             }
         ));
-        assert_eq!(READER_NEW_CALLS.load(Ordering::Relaxed), before);
+        assert_eq!(reader_new_calls(), before);
     }
 
     #[test]
@@ -2429,8 +2488,11 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Regressions for parser-divergence and coder-graph defects found by
-    // reading the `sevenz-rust` 0.6.1 source (see sevenz_preflight docs).
+    // Regressions for parser-divergence and coder-graph defects originally
+    // found by reading the `sevenz-rust` 0.6.1 source (see sevenz_preflight
+    // docs). They are kept after the move to `sevenz-rust2`: the probe owns
+    // these refusals regardless of what the upstream parser does with the
+    // same bytes, so they must keep failing closed here.
     // ------------------------------------------------------------------
 
     const K_EMPTY_STREAM: u8 = 0x0E;
@@ -2457,7 +2519,7 @@ mod tests {
     #[test]
     fn empty_stream_vector_is_a_plain_bit_vector_not_all_or_bits() {
         // `kEmptyStream` has NO leading all-defined byte (7zFormat.txt), and
-        // `sevenz-rust` reads it as a plain bit vector. Reading it as
+        // both forks read it as a plain bit vector. Reading it as
         // all-or-bits made the probe see "every file is empty" for any payload
         // whose first byte is non-zero, so this archive passed the
         // stream-count reconciliation while `read_files_info` went on to index
@@ -2502,12 +2564,12 @@ mod tests {
 
         // End to end: the decoder must never be constructed for this archive.
         let trusted = trusted_for(dir.path());
-        let before = READER_NEW_CALLS.load(Ordering::Relaxed);
+        let before = reader_new_calls();
         let err =
             SevenZArchiveSource::open(&path, &trusted, ArchiveLimits::default(), &TEST_NO_CANCEL)
                 .unwrap_err();
         assert!(matches!(err, ArchiveMemberSourceError::Corrupt { .. }));
-        assert_eq!(READER_NEW_CALLS.load(Ordering::Relaxed), before);
+        assert_eq!(reader_new_calls(), before);
     }
 
     #[test]
@@ -2539,7 +2601,7 @@ mod tests {
 
     #[test]
     fn timestamp_property_is_parsed_structurally_not_skipped_by_declared_size() {
-        // `sevenz-rust` ignores the declared size of kMTime and parses it
+        // both forks ignore the declared size of kMTime and parse it
         // structurally, so a lying size would desynchronise a probe that
         // skipped by size. Here the size lies (0) but the payload is a real
         // all-defined kMTime record; the probe must consume it and still find
@@ -2604,7 +2666,7 @@ mod tests {
         h.push(K_END);
         h.push(K_END);
         let path = write_archive_bytes(dir.path(), "cycle.7z", &[], &h);
-        let before = READER_NEW_CALLS.load(Ordering::Relaxed);
+        let before = reader_new_calls();
         let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
         assert!(
             matches!(
@@ -2615,7 +2677,7 @@ mod tests {
             ),
             "unexpected refusal: {err:?}"
         );
-        assert_eq!(READER_NEW_CALLS.load(Ordering::Relaxed), before);
+        assert_eq!(reader_new_calls(), before);
     }
 
     #[test]
@@ -2691,7 +2753,7 @@ mod tests {
         h.push(K_END);
         h.push(K_END);
         let path = write_archive_bytes(dir.path(), "multiout.7z", &[], &h);
-        let before = READER_NEW_CALLS.load(Ordering::Relaxed);
+        let before = reader_new_calls();
         let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
         assert!(
             matches!(
@@ -2702,7 +2764,7 @@ mod tests {
             ),
             "unexpected refusal: {err:?}"
         );
-        assert_eq!(READER_NEW_CALLS.load(Ordering::Relaxed), before);
+        assert_eq!(reader_new_calls(), before);
     }
 
     // ------------------------------------------------------------------
@@ -2760,13 +2822,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let header = header_pack_region(u64::MAX, &[0]);
         let path = write_archive_bytes(dir.path(), "packpos.7z", &[], &header);
-        let before = READER_NEW_CALLS.load(Ordering::Relaxed);
+        let before = reader_new_calls();
         let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
         assert_eq!(
             err,
             crate::dat::archive::sevenz_preflight::PreflightRefusal::ArithmeticOverflow
         );
-        assert_eq!(READER_NEW_CALLS.load(Ordering::Relaxed), before);
+        assert_eq!(reader_new_calls(), before);
     }
 
     #[test]
@@ -2777,13 +2839,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let header = header_pack_region(0, &[u64::MAX, u64::MAX]);
         let path = write_archive_bytes(dir.path(), "packsum.7z", &[], &header);
-        let before = READER_NEW_CALLS.load(Ordering::Relaxed);
+        let before = reader_new_calls();
         let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
         assert_eq!(
             err,
             crate::dat::archive::sevenz_preflight::PreflightRefusal::ArithmeticOverflow
         );
-        assert_eq!(READER_NEW_CALLS.load(Ordering::Relaxed), before);
+        assert_eq!(reader_new_calls(), before);
     }
 
     #[test]
@@ -2794,13 +2856,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let header = header_pack_region(100, &[u64::MAX]);
         let path = write_archive_bytes(dir.path(), "packend.7z", &[], &header);
-        let before = READER_NEW_CALLS.load(Ordering::Relaxed);
+        let before = reader_new_calls();
         let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
         assert_eq!(
             err,
             crate::dat::archive::sevenz_preflight::PreflightRefusal::ArithmeticOverflow
         );
-        assert_eq!(READER_NEW_CALLS.load(Ordering::Relaxed), before);
+        assert_eq!(reader_new_calls(), before);
     }
 
     #[test]
@@ -2810,13 +2872,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let header = header_pack_region(0, &[4096]);
         let path = write_archive_bytes(dir.path(), "packeof.7z", &[], &header);
-        let before = READER_NEW_CALLS.load(Ordering::Relaxed);
+        let before = reader_new_calls();
         let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
         assert_eq!(
             err,
             crate::dat::archive::sevenz_preflight::PreflightRefusal::Truncated
         );
-        assert_eq!(READER_NEW_CALLS.load(Ordering::Relaxed), before);
+        assert_eq!(reader_new_calls(), before);
     }
 
     #[test]
@@ -2830,7 +2892,7 @@ mod tests {
         // The region stays inside the file: only the aliasing is wrong.
         let len = std::fs::metadata(&path).unwrap().len();
         assert!(len > 32 + 6, "the fixture must not be truncated as well");
-        let before = READER_NEW_CALLS.load(Ordering::Relaxed);
+        let before = reader_new_calls();
         let err = preflight(&path, &ArchiveLimits::default()).unwrap_err();
         assert!(
             matches!(
@@ -2841,7 +2903,7 @@ mod tests {
             ),
             "unexpected refusal: {err:?}"
         );
-        assert_eq!(READER_NEW_CALLS.load(Ordering::Relaxed), before);
+        assert_eq!(reader_new_calls(), before);
     }
 
     #[test]
