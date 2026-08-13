@@ -46,6 +46,7 @@ use serde::Serialize;
 
 use super::{DatSourceKind, validation};
 use crate::dat::archive::limits::{ArchiveLimits, MAX_ARCHIVE_RUN_LOGICAL_BYTES};
+use crate::dat::archive::sevenz::SevenZArchiveSource;
 use crate::dat::archive::zip::ZipArchiveSource;
 use crate::dat::archive::{
     ArchiveMemberEvidence, ArchiveMemberSource, ArchiveMemberSourceError, ArchiveMemberStatus,
@@ -473,8 +474,7 @@ pub fn run_dat_audit(
     }
     on_progress(DatAuditProgress::Comparing { files: known.len() });
     let report = audit_files(&known, &index);
-    let (archives, archive_bytes_hashed) =
-        audit_zip_archives(&scan.files, trusted, cancel, &index)?;
+    let (archives, archive_bytes_hashed) = audit_archives(&scan.files, trusted, cancel, &index)?;
     let content_matches = annotate_content_matches(&report, &known, &index, content_selection);
 
     // ---- 5. Annotate multi-candidate verdicts with the policy -------------
@@ -518,7 +518,32 @@ pub fn run_dat_audit(
     })
 }
 
-fn audit_zip_archives(
+/// Opens the right [`ArchiveMemberSource`] for `path`'s extension.
+///
+/// Returned as `Box<dyn ArchiveMemberSource>` precisely so the caller below
+/// does not need to know which format it is holding: the trait is
+/// object-safe for exactly this reason (see its doc). Dispatch is by
+/// extension only - this never sniffs file contents to pick a format.
+fn open_archive_source(
+    path: &Path,
+    trusted: &TrustedRoots,
+    limits: ArchiveLimits,
+    cancel: &AtomicBool,
+) -> Result<Box<dyn ArchiveMemberSource>, ArchiveMemberSourceError> {
+    if is_zip_path(path) {
+        ZipArchiveSource::open(path, trusted, limits, cancel)
+            .map(|source| Box::new(source) as Box<dyn ArchiveMemberSource>)
+    } else if is_sevenz_path(path) {
+        SevenZArchiveSource::open(path, trusted, limits, cancel)
+            .map(|source| Box::new(source) as Box<dyn ArchiveMemberSource>)
+    } else {
+        Err(ArchiveMemberSourceError::Unsupported {
+            detail: "unrecognised archive extension".to_string(),
+        })
+    }
+}
+
+fn audit_archives(
     files: &[PathBuf],
     trusted: &TrustedRoots,
     cancel: &AtomicBool,
@@ -528,29 +553,35 @@ fn audit_zip_archives(
     let mut bytes_hashed = 0_u64;
     let mut run_budget = ArchiveRunBudget::new(MAX_ARCHIVE_RUN_LOGICAL_BYTES);
 
-    for path in files.iter().filter(|path| is_zip_path(path)) {
+    for path in files
+        .iter()
+        .filter(|path| is_zip_path(path) || is_sevenz_path(path))
+    {
         if cancelled(cancel) {
             return Err(DatAuditError::Cancelled);
         }
-        let mut source =
-            match ZipArchiveSource::open(path, trusted, ArchiveLimits::default(), cancel) {
-                Ok(source) => source,
-                Err(ArchiveMemberSourceError::Cancelled) => return Err(DatAuditError::Cancelled),
-                Err(error) => {
-                    archives.push(DatArchiveAudit {
-                        archive_path: path.clone(),
-                        format: "zip".to_string(),
-                        total_members: 0,
-                        completion: ArchivePassCompletion::Incomplete {
-                            reason: ArchivePassStopReason::SourceError {
-                                detail: format!("{error:?}"),
-                            },
+        // The format label for a source-open failure is inferred from the
+        // extension alone, since no `ArchiveMemberSource` exists yet to ask.
+        let format_guess = if is_zip_path(path) { "zip" } else { "7z" };
+        let mut source = match open_archive_source(path, trusted, ArchiveLimits::default(), cancel)
+        {
+            Ok(source) => source,
+            Err(ArchiveMemberSourceError::Cancelled) => return Err(DatAuditError::Cancelled),
+            Err(error) => {
+                archives.push(DatArchiveAudit {
+                    archive_path: path.clone(),
+                    format: format_guess.to_string(),
+                    total_members: 0,
+                    completion: ArchivePassCompletion::Incomplete {
+                        reason: ArchivePassStopReason::SourceError {
+                            detail: format!("{error:?}"),
                         },
-                        members: Vec::new(),
-                    });
-                    continue;
-                }
-            };
+                    },
+                    members: Vec::new(),
+                });
+                continue;
+            }
+        };
 
         let pass = source.verify_all(cancel, &mut run_budget);
         let outer_changed = matches!(
@@ -606,6 +637,12 @@ fn is_zip_path(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
+}
+
+fn is_sevenz_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("7z"))
 }
 
 fn annotate_content_matches(

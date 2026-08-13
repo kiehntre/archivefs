@@ -1,4 +1,4 @@
-//! Pre-decoder 7z header probe (POST-ALPHA-1.1, experimental).
+//! Pre-decoder 7z header probe.
 //!
 //! A minimal, bounded parser over just enough of the 7z header to enforce
 //! hard resource limits **before** `sevenz-rust2` is ever constructed. It is
@@ -27,8 +27,9 @@
 //! A 7z archive may store its real header in a packed/encrypted "encoded
 //! header" block whose decompressed size is not known until it is decoded.
 //! Because that expansion cannot be bounded without decoding, the probe
-//! refuses every archive with an encoded header. This is a fail-closed
-//! experimental restriction; see the module doc of `sevenz.rs`.
+//! refuses every archive with an encoded header. This is a deliberate,
+//! permanent fail-closed restriction, not a gap to be lifted later; see the
+//! module doc of `sevenz.rs`.
 //!
 //! # The start-header CRC check is load-bearing
 //!
