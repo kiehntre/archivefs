@@ -42,8 +42,9 @@ release notes.
 
 - **Local-first.** No telemetry, no required cloud account, and it keeps
   working offline.
-- **Read-only by default.** Archives are mounted read-only; EmuWiz never
-  modifies your source archive files.
+- **Read-only by default.** Archives are mounted read-only, and source data
+  is read-only by default; files are changed only by explicit, user-confirmed
+  operations such as DAT rename/apply where supported.
 - **Explicit over automatic.** Mounting, unmounting, cleanup, patch preview,
   and library-view changes are all explicit user actions - nothing silently
   mounts, unmounts, downloads, or rewrites emulator configuration on your

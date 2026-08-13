@@ -8,8 +8,8 @@ graph; it does not claim that all future dependency versions are safe.
 
 | Advisory | Before | Exposure in EmuWiz | Resolution |
 | --- | --- | --- | --- |
-| RUSTSEC-2026-0195 | `quick-xml 0.39.4` | Build-time only, through the `wayland-scanner` procedural macro. EmuWiz does not use this parser on game or catalogue data at runtime. | Updated to `quick-xml 0.41.0` through `wayland-scanner 0.31.11`. |
-| RUSTSEC-2026-0194 | `quick-xml 0.39.4` | Build-time only, through the same Wayland protocol-generation path. | Updated to `quick-xml 0.41.0` through `wayland-scanner 0.31.11`. |
+| RUSTSEC-2026-0195 | `quick-xml 0.39.4` | Reached at build time through the `wayland-scanner` procedural macro. quick-xml is also a runtime dependency of `archivefs-core`, where it parses Logiqx DAT/catalogue XML. | Updated to `quick-xml 0.41.0` through `wayland-scanner 0.31.11`. |
+| RUSTSEC-2026-0194 | `quick-xml 0.39.4` | Reached at build time through the same Wayland protocol-generation path. quick-xml is also a runtime dependency of `archivefs-core`, where it parses Logiqx DAT/catalogue XML. | Updated to `quick-xml 0.41.0` through `wayland-scanner 0.31.11`. |
 | RUSTSEC-2026-0192 | `ttf-parser 0.25.1` | Runtime GUI font parsing and rendering through `owned_ttf_parser`, `ab_glyph`, `epaint`, and `egui`. The finding is an unmaintained-crate warning rather than a known vulnerability. | Removed by updating the coordinated `eframe`/`egui` family from 0.32.3 to 0.34.3. The replacement font path uses `font-types 0.11.3`, `read-fonts 0.37.0`, and `skrifa 0.40.0`. |
 
 Before remediation, the relevant dependency paths were:
