@@ -72,6 +72,7 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
     let mut current_game_rom_of: Option<String> = None;
     let mut current_game_sample_of: Option<String> = None;
     let mut current_game_is_bios: Option<String> = None;
+    let mut current_game_is_device: Option<String> = None;
     let mut current_game_runnable: Option<String> = None;
     let mut current_game_supported: Option<String> = None;
     let mut current_game_metadata = DatOriginalMetadata::default();
@@ -173,6 +174,7 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                             &mut current_game_rom_of,
                             &mut current_game_sample_of,
                             &mut current_game_is_bios,
+                            &mut current_game_is_device,
                             &mut current_game_runnable,
                             &mut current_game_supported,
                             &mut current_game_metadata,
@@ -230,6 +232,12 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                         current_game_is_bios = attr_str_opt(
                             start_bytes,
                             b"isbios",
+                            &mut warnings,
+                            limits.max_warnings,
+                        );
+                        current_game_is_device = attr_str_opt(
+                            start_bytes,
+                            b"isdevice",
                             &mut warnings,
                             limits.max_warnings,
                         );
@@ -984,6 +992,7 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
         &mut current_game_rom_of,
         &mut current_game_sample_of,
         &mut current_game_is_bios,
+        &mut current_game_is_device,
         &mut current_game_runnable,
         &mut current_game_supported,
         &mut current_game_metadata,
@@ -1194,6 +1203,7 @@ fn drop_current_game(
     rom_of: &mut Option<String>,
     sample_of: &mut Option<String>,
     is_bios: &mut Option<String>,
+    is_device: &mut Option<String>,
     runnable: &mut Option<String>,
     supported: &mut Option<String>,
     metadata: &mut DatOriginalMetadata,
@@ -1223,6 +1233,7 @@ fn drop_current_game(
             rom_of: rom_of.take(),
             sample_of: sample_of.take(),
             is_bios: is_bios.take(),
+            is_device: is_device.take(),
             runnable: runnable.take(),
             supported: supported.take(),
             disks: std::mem::take(disks),

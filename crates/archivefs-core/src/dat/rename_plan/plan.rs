@@ -1555,6 +1555,7 @@ mod tests {
             disks_required: Vec::new(),
             disks_verified: Vec::new(),
             disks_parent_required: Vec::new(),
+            dependencies: crate::dat::dependency::SetDependencyReport::not_evaluated(),
         }
     }
 
