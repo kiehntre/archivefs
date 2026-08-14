@@ -443,8 +443,16 @@ fn blocked_missing_source(
 ///   `BadMetadata`, and every `NeedsReview` reason (ambiguous attribution,
 ///   unsupported parser/model provenance, partial pass, duplicate game
 ///   name, duplicate archive evidence) all refuse;
-/// - the archive's path extension is `.zip` or `.7z` (case-insensitive) -
-///   the only two formats [`crate::dat::archive`] produces evidence for.
+/// - the archive's path extension is `.zip`, `.7z`, or `.rar`
+///   (case-insensitive) - the formats [`crate::dat::archive`] produces
+///   evidence for. RAR's `Complete` guarantee is at least as strong as
+///   ZIP/7z's here: every member that reached `HashComplete` did so through
+///   the fd-pinned provider's full success contract (relist agreement, exit
+///   0, exact size, strong-hash match), and any member that could not be
+///   verified that way (`NotVerified`, `Corrupt`, a refused limit, or a
+///   backend/consistency failure) keeps the archive - and therefore every
+///   [`SetResolution`] naming it - out of `Complete` in the first place (see
+///   `dat::archive::rar`'s `verify_all`).
 ///
 /// The canonical name is always `resolution.identity.game_name` - the DAT
 /// set/game name - **never** the archive's current filename and never an
@@ -476,14 +484,16 @@ fn derive_outer_archive_proposals(
             // individual SetResolution's state happens to say.
             continue;
         }
-        let is_zip_or_7z = archive
+        let is_supported_archive_extension = archive
             .archive_path
             .extension()
             .and_then(|extension| extension.to_str())
             .is_some_and(|extension| {
-                extension.eq_ignore_ascii_case("zip") || extension.eq_ignore_ascii_case("7z")
+                extension.eq_ignore_ascii_case("zip")
+                    || extension.eq_ignore_ascii_case("7z")
+                    || extension.eq_ignore_ascii_case("rar")
             });
-        if !is_zip_or_7z {
+        if !is_supported_archive_extension {
             continue;
         }
         let Some(resolutions) = resolutions_by_archive.get(archive.archive_path.as_path()) else {
@@ -2021,9 +2031,13 @@ mod tests {
     }
 
     #[test]
-    fn a_non_zip_7z_archive_path_is_never_proposed() {
+    fn a_non_zip_7z_rar_archive_path_is_never_proposed() {
+        // `.rar` is deliberately excluded from this example now that RAR
+        // outer-archive renaming is supported (`is_supported_archive_extension`
+        // above); `.tar` stands in as a format `dat::archive` never produces
+        // evidence for at all.
         let dir = temp();
-        let archive = write(dir.path(), "game.rar");
+        let archive = write(dir.path(), "game.tar");
         let mut out = outcome(dir.path(), Vec::new(), Vec::new(), None, false);
         out.archives = vec![archive_audit(&archive, complete_pass(), "Game (World)", 1)];
         out.sets = vec![set_resolution(

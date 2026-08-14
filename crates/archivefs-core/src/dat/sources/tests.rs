@@ -2452,3 +2452,354 @@ fn an_audit_refuses_a_relative_scan_root() {
         .expect_err("a relative scan root must be refused");
     assert!(matches!(error, DatAuditError::ScanPath(_)), "{error:?}");
 }
+
+// ---------------------------------------------------------------------
+// RAR integration: dispatch, DAT-driven verification, set completeness,
+// ambiguity, cross-format isolation, and rename eligibility through the
+// real `run_dat_audit` entry point.
+// ---------------------------------------------------------------------
+
+fn rar_fixture(name: &str) -> PathBuf {
+    PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/rar")).join(name)
+}
+
+// helloworld.txt's real digests (the RAR5-stored libarchive fixture's one
+// 29-byte member), computed once out-of-band - see `dat::archive::rar`'s
+// own test module for the same constants at the lower-level API.
+const RAR_HELLOWORLD_SHA1: &str = "253aafde5dec9a54ed554bc7f95e6f291c60cbb0";
+const RAR_HELLOWORLD_WRONG_SHA1: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+#[test]
+fn rar_member_reaches_set_complete_and_only_the_outer_archive_becomes_rename_eligible() {
+    use crate::dat::rename_plan::{RenamePlanContext, build_rename_plan};
+    use crate::dat::set::SetState;
+
+    let dir = temp();
+    let dat_path = write(
+        dir.path(),
+        "rar.dat",
+        &format!(
+            r#"<datafile><header><name>RAR catalogue</name></header>
+<game name="Hello World (Demo)">
+<rom name="helloworld.txt" size="29" sha1="{RAR_HELLOWORLD_SHA1}"/>
+</game>
+</datafile>"#
+        ),
+    );
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    let archive_path = roms.join("collection.rar");
+    std::fs::copy(
+        rar_fixture("test_read_format_rar5_stored.rar"),
+        &archive_path,
+    )
+    .unwrap();
+
+    let request = DatAuditRequest {
+        source_id: "rar-set".to_string(),
+        source_display_name: "RAR catalogue".to_string(),
+        dat_path,
+        dat_kind: DatSourceKind::File,
+        scan_root: roms,
+        limits: DatLimits::default(),
+        policy: None,
+        platform: None,
+    };
+    let outcome = run_dat_audit(&request, &TrustedRoots::none(), &no_cancel(), &|_| {}).unwrap();
+
+    assert_eq!(outcome.archives.len(), 1);
+    assert_eq!(outcome.archives[0].format, "rar");
+    assert_eq!(
+        outcome.archives[0].completion,
+        crate::dat::archive::ArchivePassCompletion::Complete
+    );
+    assert_eq!(outcome.archives[0].members.len(), 1);
+    assert_eq!(
+        outcome.archives[0].members[0].evidence.status,
+        crate::dat::archive::ArchiveMemberStatus::HashComplete
+    );
+    // The outer .rar is also scanned and hashed as one ordinary physical
+    // file, exactly like ZIP/7z - its internal member content is never
+    // additionally represented as a loose-ROM report row.
+    assert_eq!(outcome.report.entries.len(), 1);
+
+    assert_eq!(outcome.sets.len(), 1);
+    assert_eq!(outcome.sets[0].state, SetState::Complete);
+
+    let plan =
+        build_rename_plan(&outcome, &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+    assert_eq!(plan.proposals.len(), 1);
+    let proposal = &plan.proposals[0];
+    assert!(
+        proposal.is_outer_archive,
+        "a Complete RAR set's one proposal must be the outer-archive rename"
+    );
+    assert_eq!(proposal.source_path, archive_path);
+    assert!(
+        proposal
+            .proposed_basename
+            .as_deref()
+            .is_none_or(|name| name.ends_with(".rar")),
+        "the outer archive's .rar extension must be preserved, never rewritten to .zip/.7z"
+    );
+    assert_ne!(
+        proposal.source_path.file_name().unwrap().to_str().unwrap(),
+        "helloworld.txt",
+        "the RAR member name must never itself become a rename source"
+    );
+    assert_ne!(
+        proposal.proposed_basename.as_deref(),
+        Some("helloworld.txt"),
+        "the RAR member name must never itself become a rename target"
+    );
+}
+
+#[test]
+fn rar_member_with_a_wrong_dat_hash_never_reaches_set_complete() {
+    use crate::dat::set::SetState;
+
+    let dir = temp();
+    let dat_path = write(
+        dir.path(),
+        "rar.dat",
+        &format!(
+            r#"<datafile><header><name>RAR catalogue</name></header>
+<game name="Hello World (Demo)">
+<rom name="helloworld.txt" size="29" sha1="{RAR_HELLOWORLD_WRONG_SHA1}"/>
+</game>
+</datafile>"#
+        ),
+    );
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    std::fs::copy(
+        rar_fixture("test_read_format_rar5_stored.rar"),
+        roms.join("collection.rar"),
+    )
+    .unwrap();
+
+    let request = DatAuditRequest {
+        source_id: "rar-wrong-hash".to_string(),
+        source_display_name: "RAR catalogue".to_string(),
+        dat_path,
+        dat_kind: DatSourceKind::File,
+        scan_root: roms,
+        limits: DatLimits::default(),
+        policy: None,
+        platform: None,
+    };
+    let outcome = run_dat_audit(&request, &TrustedRoots::none(), &no_cancel(), &|_| {}).unwrap();
+
+    assert_eq!(outcome.archives[0].members[0].verdict, None);
+    assert!(outcome.archives[0].members[0].matched_refs.is_empty());
+    assert!(
+        outcome
+            .sets
+            .iter()
+            .all(|set| set.state != SetState::Complete),
+        "a member that fails the strong-hash gate must never let its set reach Complete: {:?}",
+        outcome.sets
+    );
+}
+
+#[test]
+fn rar4_never_reaches_set_complete_and_is_marked_unsupported_not_corrupt_rom_data() {
+    let dir = temp();
+    let dat_path = write(
+        dir.path(),
+        "rar.dat",
+        r#"<datafile><header><name>RAR catalogue</name></header>
+<game name="Anything"><rom name="anything.bin" size="4" sha1="a94a8fe5ccb19ba61c4c0873d391e987982fbbd3"/></game>
+</datafile>"#,
+    );
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    // A real RAR4 archive named `.rar` - the extension gate never sniffs
+    // content, so this still dispatches to the RAR branch, where the
+    // provider itself refuses the unsupported version.
+    std::fs::copy(
+        rar_fixture("test_read_format_rar_compress_best.rar"),
+        roms.join("collection.rar"),
+    )
+    .unwrap();
+
+    let request = DatAuditRequest {
+        source_id: "rar4".to_string(),
+        source_display_name: "RAR catalogue".to_string(),
+        dat_path,
+        dat_kind: DatSourceKind::File,
+        scan_root: roms,
+        limits: DatLimits::default(),
+        policy: None,
+        platform: None,
+    };
+    let outcome = run_dat_audit(&request, &TrustedRoots::none(), &no_cancel(), &|_| {}).unwrap();
+
+    assert_eq!(outcome.archives.len(), 1);
+    assert_eq!(outcome.archives[0].format, "rar");
+    assert!(
+        !matches!(
+            outcome.archives[0].completion,
+            crate::dat::archive::ArchivePassCompletion::Complete
+        ),
+        "an unsupported RAR envelope must never report a Complete pass"
+    );
+    assert!(outcome.archives[0].members.is_empty());
+    assert!(
+        outcome
+            .sets
+            .iter()
+            .all(|set| set.state != crate::dat::set::SetState::Complete)
+    );
+}
+
+#[test]
+fn ambiguous_dat_candidates_for_one_rar_filename_never_produce_an_exact_verdict() {
+    let dir = temp();
+    // Two different games both declare a rom named "helloworld.txt", with
+    // different SHA-1 values - a genuine filename collision across the
+    // catalogue. Neither may be silently picked.
+    let dat_path = write(
+        dir.path(),
+        "rar.dat",
+        &format!(
+            r#"<datafile><header><name>RAR catalogue</name></header>
+<game name="Hello World (Demo)">
+<rom name="helloworld.txt" size="29" sha1="{RAR_HELLOWORLD_SHA1}"/>
+</game>
+<game name="Some Other Game">
+<rom name="helloworld.txt" size="29" sha1="{RAR_HELLOWORLD_WRONG_SHA1}"/>
+</game>
+</datafile>"#
+        ),
+    );
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    std::fs::copy(
+        rar_fixture("test_read_format_rar5_stored.rar"),
+        roms.join("collection.rar"),
+    )
+    .unwrap();
+
+    let request = DatAuditRequest {
+        source_id: "rar-ambiguous".to_string(),
+        source_display_name: "RAR catalogue".to_string(),
+        dat_path,
+        dat_kind: DatSourceKind::File,
+        scan_root: roms,
+        limits: DatLimits::default(),
+        policy: None,
+        platform: None,
+    };
+    let outcome = run_dat_audit(&request, &TrustedRoots::none(), &no_cancel(), &|_| {}).unwrap();
+
+    assert_eq!(
+        outcome.archives[0].members[0].evidence.status,
+        crate::dat::archive::ArchiveMemberStatus::NotVerified {
+            reason: "no unambiguous DAT candidate for this filename"
+        }
+    );
+    assert_eq!(outcome.archives[0].members[0].verdict, None);
+    assert!(
+        outcome
+            .sets
+            .iter()
+            .all(|set| set.state != crate::dat::set::SetState::Complete),
+        "neither colliding game may reach Complete off an unresolved ambiguity"
+    );
+}
+
+#[test]
+fn a_corrupt_rar_never_downgrades_an_unrelated_zip_in_the_same_audit() {
+    use crate::dat::set::SetState;
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipWriter};
+
+    let dir = temp();
+    let dat_path = write(
+        dir.path(),
+        "mixed.dat",
+        &format!(
+            r#"<datafile><header><name>Mixed catalogue</name></header>
+<game name="Hello World (Demo)">
+<rom name="helloworld.txt" size="29" sha1="{RAR_HELLOWORLD_WRONG_SHA1}"/>
+</game>
+<game name="ZIP Game (World)">
+<rom name="zipgame.rom" size="4" sha1="a94a8fe5ccb19ba61c4c0873d391e987982fbbd3"/>
+</game>
+</datafile>"#
+        ),
+    );
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    // A RAR whose one member cannot verify against the (deliberately wrong)
+    // DAT hash above.
+    std::fs::copy(
+        rar_fixture("test_read_format_rar5_stored.rar"),
+        roms.join("broken.rar"),
+    )
+    .unwrap();
+    // An unrelated, perfectly valid ZIP for a different game.
+    let zip_path = roms.join("zipgame.zip");
+    let mut writer = ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+    writer
+        .start_file(
+            "zipgame.rom",
+            SimpleFileOptions::default().compression_method(CompressionMethod::Stored),
+        )
+        .unwrap();
+    writer.write_all(b"test").unwrap();
+    writer.finish().unwrap();
+
+    let request = DatAuditRequest {
+        source_id: "mixed".to_string(),
+        source_display_name: "Mixed catalogue".to_string(),
+        dat_path,
+        dat_kind: DatSourceKind::File,
+        scan_root: roms,
+        limits: DatLimits::default(),
+        policy: None,
+        platform: None,
+    };
+    let outcome = run_dat_audit(&request, &TrustedRoots::none(), &no_cancel(), &|_| {}).unwrap();
+
+    assert_eq!(outcome.archives.len(), 2);
+    let rar_archive = outcome
+        .archives
+        .iter()
+        .find(|archive| archive.format == "rar")
+        .unwrap();
+    let zip_archive = outcome
+        .archives
+        .iter()
+        .find(|archive| archive.format == "zip")
+        .unwrap();
+    assert_eq!(
+        zip_archive.completion,
+        crate::dat::archive::ArchivePassCompletion::Complete
+    );
+    assert_eq!(
+        zip_archive.members[0].evidence.status,
+        crate::dat::archive::ArchiveMemberStatus::HashComplete
+    );
+
+    let rar_set = outcome
+        .sets
+        .iter()
+        .find(|set| set.archive_path == rar_archive.archive_path);
+    assert!(
+        rar_set.is_none_or(|set| set.state != SetState::Complete),
+        "the broken RAR's own set must not reach Complete"
+    );
+    let zip_set = outcome
+        .sets
+        .iter()
+        .find(|set| set.archive_path == zip_archive.archive_path)
+        .expect("the unrelated ZIP set must have been classified independently");
+    assert_eq!(
+        zip_set.state,
+        SetState::Complete,
+        "a failure confined to the RAR archive must never downgrade the unrelated ZIP set"
+    );
+}

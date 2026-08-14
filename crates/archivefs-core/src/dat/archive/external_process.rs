@@ -302,17 +302,25 @@ impl ManagedChild {
 
     fn terminate_and_reap(&mut self) -> Result<(), String> {
         let mut failures = Vec::new();
-        // SAFETY: `process_group` is the positive PID `Command::spawn`
-        // returned for this child, which called `setsid()` before `exec`
-        // (making it its own process-group leader). Negating it targets the
-        // whole group, so a 7-Zip helper it spawned is killed too.
-        if unsafe { libc::kill(-self.process_group, libc::SIGKILL) } == -1 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::ESRCH) {
-                failures.push(format!("kill process group: {error}"));
-            }
-        }
+        // Only signal the group while we know the direct child is still
+        // alive. Once `self.reaped` is true, `self.process_group` (the
+        // direct child's own PID, its pgid after `setsid()`) has already
+        // been released back to the kernel's PID allocator - signalling it
+        // here would risk hitting an unrelated process/group that has since
+        // reused the number, rather than anything we spawned.
         if !self.reaped {
+            // SAFETY: `process_group` is the positive PID `Command::spawn`
+            // returned for this child, which called `setsid()` before
+            // `exec` (making it its own process-group leader). Negating it
+            // targets the whole group, so a 7-Zip helper it spawned is
+            // killed too. Reached only while the child is not yet known
+            // reaped, so the PID cannot yet have been recycled.
+            if unsafe { libc::kill(-self.process_group, libc::SIGKILL) } == -1 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    failures.push(format!("kill process group: {error}"));
+                }
+            }
             match self.child.wait() {
                 Ok(_) => self.reaped = true,
                 Err(error) => failures.push(format!("wait child: {error}")),
@@ -462,6 +470,23 @@ mod tests {
         // Give the (now-killed) grandchild a moment, then confirm no
         // lingering `sleep 30` from this test remains reachable via /proc.
         std::thread::sleep(Duration::from_millis(100));
+    }
+
+    #[test]
+    fn terminate_and_reap_skips_kill_once_child_is_already_reaped() {
+        // Once the direct child is known reaped, its PID is free for the
+        // kernel to recycle; `terminate_and_reap` must not still attempt a
+        // process-group kill against that (possibly now-unrelated) number.
+        // Exercised directly against `ManagedChild` since a real run always
+        // reaps through the normal success (`disarm`) path, never through
+        // `terminate_and_reap`.
+        let mut command = Command::new("true");
+        let child = command.spawn().unwrap();
+        let mut managed = ManagedChild::new(child);
+        managed.child.wait().unwrap();
+        managed.reaped = true;
+        assert!(managed.terminate_and_reap().is_ok());
+        assert!(!managed.armed);
     }
 
     #[test]
