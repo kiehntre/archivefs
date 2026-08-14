@@ -10,6 +10,14 @@
 //! * Multi-line:  `game (\n\tname "Game Name"\n\t...\n)`
 //!
 //! The same two styles apply to ROM blocks.
+//!
+//! Stage 2a preserves game and ROM key/value fields this line parser can
+//! observe safely. Nested `disk (...)`, `sample (...)`, `biosset (...)`,
+//! `device_ref (...)`, `part (...)`, `dataarea (...)`, and `diskarea (...)`
+//! blocks remain intentionally unparsed: the current single-block state
+//! machine cannot represent them without restructuring. Consequently every
+//! emitted game keeps `unsupported_structure = true` and Stage 1 remains
+//! fail-closed for all ClrMamePro inputs.
 
 use std::fs;
 use std::path::Path;
@@ -79,6 +87,7 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
     let mut current_game_name: Option<String> = None;
     let mut current_game_desc: Option<String> = None;
     let mut current_game_clone_of: Option<String> = None;
+    let mut current_game_fidelity = CurrentGameFidelity::default();
     let mut current_rom_name: Option<String> = None;
     let mut current_rom_size: Option<u64> = None;
     let mut current_rom_crc: Option<String> = None;
@@ -89,6 +98,7 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
     let mut current_rom_merge: Option<String> = None;
     let mut current_rom_date: Option<String> = None;
     let mut current_rom_loadflag: Option<String> = None;
+    let mut current_rom_fidelity = CurrentRomFidelity::default();
     let mut current_roms: Vec<DatRomEntry> = Vec::new();
 
     for line in &lines {
@@ -140,6 +150,7 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
                 &mut current_rom_merge,
                 &mut current_rom_date,
                 &mut current_rom_loadflag,
+                &mut current_rom_fidelity,
                 &mut current_roms,
                 &mut in_rom,
             );
@@ -147,6 +158,7 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
                 &mut current_game_name,
                 &mut current_game_desc,
                 &mut current_game_clone_of,
+                &mut current_game_fidelity,
                 &mut current_roms,
                 &mut games,
                 &limits,
@@ -167,13 +179,11 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
                     "description" => {
                         current_game_desc = Some(v.to_string());
                     }
-                    // `cloneof` / `romof` both declare a parent relationship;
-                    // `romof` names the parent's ROM set, so either is a parent
-                    // reference for the clone policy. `cloneof` wins when both
-                    // are present.
-                    "cloneof" | "romof" => {
-                        capture_parent(&mut current_game_clone_of, k, v);
-                    }
+                    "cloneof" => current_game_clone_of = Some(v.to_string()),
+                    "romof" => current_game_fidelity.rom_of = Some(v.to_string()),
+                    "sampleof" => current_game_fidelity.sample_of = Some(v.to_string()),
+                    "isbios" => current_game_fidelity.is_bios = Some(v.to_string()),
+                    "runnable" => current_game_fidelity.runnable = Some(v.to_string()),
                     _ => {}
                 });
             }
@@ -183,6 +193,7 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
                     &mut current_game_name,
                     &mut current_game_desc,
                     &mut current_game_clone_of,
+                    &mut current_game_fidelity,
                     &mut current_roms,
                     &mut games,
                     &limits,
@@ -209,6 +220,7 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
                     &mut current_rom_merge,
                     &mut current_rom_date,
                     &mut current_rom_loadflag,
+                    &mut current_rom_fidelity,
                     &mut current_roms,
                     &mut in_rom,
                 );
@@ -218,6 +230,7 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
                     &mut current_game_name,
                     &mut current_game_desc,
                     &mut current_game_clone_of,
+                    &mut current_game_fidelity,
                     &mut current_roms,
                     &mut games,
                     &limits,
@@ -243,6 +256,7 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
                 &mut current_rom_merge,
                 &mut current_rom_date,
                 &mut current_rom_loadflag,
+                &mut current_rom_fidelity,
                 &mut current_roms,
                 &mut in_rom,
             );
@@ -282,6 +296,7 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
                         &mut current_rom_merge,
                         &mut current_rom_date,
                         &mut current_rom_loadflag,
+                        &mut current_rom_fidelity,
                     );
                 });
             }
@@ -300,6 +315,7 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
                     &mut current_rom_merge,
                     &mut current_rom_date,
                     &mut current_rom_loadflag,
+                    &mut current_rom_fidelity,
                     &mut current_roms,
                     &mut in_rom,
                 );
@@ -321,6 +337,7 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
                     &mut current_rom_merge,
                     &mut current_rom_date,
                     &mut current_rom_loadflag,
+                    &mut current_rom_fidelity,
                 );
             });
         } else if in_game {
@@ -331,8 +348,16 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
                         current_game_name = Some(v.to_string());
                     } else if k == "description" {
                         current_game_desc = Some(v.to_string());
-                    } else if k == "cloneof" || k == "romof" {
-                        capture_parent(&mut current_game_clone_of, k, v);
+                    } else if k == "cloneof" {
+                        current_game_clone_of = Some(v.to_string());
+                    } else if k == "romof" {
+                        current_game_fidelity.rom_of = Some(v.to_string());
+                    } else if k == "sampleof" {
+                        current_game_fidelity.sample_of = Some(v.to_string());
+                    } else if k == "isbios" {
+                        current_game_fidelity.is_bios = Some(v.to_string());
+                    } else if k == "runnable" {
+                        current_game_fidelity.runnable = Some(v.to_string());
                     }
                 });
                 in_game = false;
@@ -342,8 +367,16 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
                         current_game_name = Some(v.to_string());
                     } else if k == "description" {
                         current_game_desc = Some(v.to_string());
-                    } else if k == "cloneof" || k == "romof" {
-                        capture_parent(&mut current_game_clone_of, k, v);
+                    } else if k == "cloneof" {
+                        current_game_clone_of = Some(v.to_string());
+                    } else if k == "romof" {
+                        current_game_fidelity.rom_of = Some(v.to_string());
+                    } else if k == "sampleof" {
+                        current_game_fidelity.sample_of = Some(v.to_string());
+                    } else if k == "isbios" {
+                        current_game_fidelity.is_bios = Some(v.to_string());
+                    } else if k == "runnable" {
+                        current_game_fidelity.runnable = Some(v.to_string());
                     }
                 });
             }
@@ -361,6 +394,7 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
         &mut current_rom_merge,
         &mut current_rom_date,
         &mut current_rom_loadflag,
+        &mut current_rom_fidelity,
         &mut current_roms,
         &mut in_rom,
     );
@@ -368,6 +402,7 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
         &mut current_game_name,
         &mut current_game_desc,
         &mut current_game_clone_of,
+        &mut current_game_fidelity,
         &mut current_roms,
         &mut games,
         &limits,
@@ -398,17 +433,6 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
         dat: ParsedDat { source, games },
         warnings,
     })
-}
-
-/// Records a parent reference, with `cloneof` taking precedence over `romof`.
-///
-/// Both keys declare a parent relationship (a `romof` names the parent's ROM
-/// set), so either is a parent reference for the clone policy; `cloneof` wins
-/// when both are present on one game.
-fn capture_parent(clone_of: &mut Option<String>, key: &str, value: &str) {
-    if key == "cloneof" || clone_of.is_none() {
-        *clone_of = Some(value.to_string());
-    }
 }
 
 /// Extract the content inside `prefix(...)`, stripping the closing `)` if present.
@@ -507,6 +531,7 @@ fn apply_rom_kv(
     merge: &mut Option<String>,
     date: &mut Option<String>,
     loadflag: &mut Option<String>,
+    fidelity: &mut CurrentRomFidelity,
 ) {
     match key {
         "name" => {
@@ -548,10 +573,15 @@ fn apply_rom_kv(
         "date" => {
             *date = Some(value.to_string());
         }
+        "offset" => fidelity.offset = Some(value.to_string()),
         // Raw passthrough only, never interpreted - see `DatRomEntry::loadflag`.
         "loadflag" => {
             *loadflag = Some(value.to_string());
         }
+        "value" => fidelity.value = Some(value.to_string()),
+        "optional" => fidelity.optional = Some(value.to_string()),
+        "bios" => fidelity.bios = Some(value.to_string()),
+        "region" => fidelity.region = Some(value.to_string()),
         _ => {}
     }
 }
@@ -568,12 +598,14 @@ fn emit_rom_flush(
     merge: &mut Option<String>,
     date: &mut Option<String>,
     loadflag: &mut Option<String>,
+    fidelity: &mut CurrentRomFidelity,
     roms: &mut Vec<DatRomEntry>,
     in_rom: &mut bool,
 ) {
     if !*in_rom {
         return;
     }
+    let fidelity = std::mem::take(fidelity);
     if let Some(rom_name) = name.take() {
         roms.push(DatRomEntry {
             name: rom_name,
@@ -585,7 +617,12 @@ fn emit_rom_flush(
             status: status.take(),
             merge: merge.take(),
             date: date.take(),
+            offset: fidelity.offset,
             loadflag: loadflag.take(),
+            value: fidelity.value,
+            optional: fidelity.optional,
+            bios: fidelity.bios,
+            region: fidelity.region,
         });
     }
     *in_rom = false;
@@ -595,10 +632,12 @@ fn emit_game(
     name: &mut Option<String>,
     desc: &mut Option<String>,
     clone_of: &mut Option<String>,
+    fidelity: &mut CurrentGameFidelity,
     roms: &mut Vec<DatRomEntry>,
     games: &mut Vec<DatGameEntry>,
     limits: &DatLimits,
 ) -> Result<(), ParseError> {
+    let fidelity = std::mem::take(fidelity);
     if let Some(game_name) = name.take() {
         if games.len() >= limits.max_entries {
             return Err(ParseError::EntryLimitExceeded {
@@ -611,7 +650,15 @@ fn emit_game(
             description: desc.take(),
             roms: std::mem::take(roms),
             clone_of: clone_of.take(),
-            sample_of: None,
+            rom_of: fidelity.rom_of,
+            sample_of: fidelity.sample_of,
+            is_bios: fidelity.is_bios,
+            runnable: fidelity.runnable,
+            disks: Vec::new(),
+            device_refs: Vec::new(),
+            samples: Vec::new(),
+            bios_sets: Vec::new(),
+            parts: Vec::new(),
             board: None,
             rebuild_to: None,
             year: None,
@@ -705,6 +752,23 @@ fn detect_clrmamepro_ecosystem(
     }
 
     DatEcosystem::GenericClrMamePro
+}
+
+#[derive(Default)]
+struct CurrentGameFidelity {
+    rom_of: Option<String>,
+    sample_of: Option<String>,
+    is_bios: Option<String>,
+    runnable: Option<String>,
+}
+
+#[derive(Default)]
+struct CurrentRomFidelity {
+    offset: Option<String>,
+    value: Option<String>,
+    optional: Option<String>,
+    bios: Option<String>,
+    region: Option<String>,
 }
 
 #[cfg(test)]
@@ -829,7 +893,7 @@ mod tests {
     }
 
     #[test]
-    fn cloneof_and_romof_declare_the_parent_entry() {
+    fn cloneof_and_romof_are_preserved_separately() {
         let content = concat!(
             "clrmamepro (\n",
             "\tname Test\n",
@@ -857,7 +921,8 @@ mod tests {
         assert_eq!(result.dat.games.len(), 3);
         assert_eq!(result.dat.games[0].clone_of, None);
         assert_eq!(result.dat.games[1].clone_of.as_deref(), Some("Parent Game"));
-        assert_eq!(result.dat.games[2].clone_of.as_deref(), Some("Parent Game"));
+        assert_eq!(result.dat.games[2].clone_of, None);
+        assert_eq!(result.dat.games[2].rom_of.as_deref(), Some("Parent Game"));
     }
 
     #[test]
@@ -872,6 +937,7 @@ mod tests {
         let mut merge = None;
         let mut date = None;
         let mut loadflag = None;
+        let mut fidelity = CurrentRomFidelity::default();
         apply_kvs("name test.bin size 1024 crc DEADBEEF", &mut |k, v| {
             apply_rom_kv(
                 k,
@@ -886,6 +952,7 @@ mod tests {
                 &mut merge,
                 &mut date,
                 &mut loadflag,
+                &mut fidelity,
             );
         });
         assert_eq!(name, Some("test.bin".into()));
@@ -905,6 +972,7 @@ mod tests {
         let mut merge = None;
         let mut date = None;
         let mut loadflag = None;
+        let mut fidelity = CurrentRomFidelity::default();
         apply_kvs(
             "name \"Super Mario (World)\" size 4096 crc ABCD1234",
             &mut |k, v| {
@@ -921,11 +989,63 @@ mod tests {
                     &mut merge,
                     &mut date,
                     &mut loadflag,
+                    &mut fidelity,
                 );
             },
         );
         assert_eq!(name, Some("Super Mario (World)".into()));
         assert_eq!(size, Some(4096));
         assert_eq!(crc, Some("abcd1234".into()));
+    }
+
+    #[test]
+    fn supported_game_and_rom_fidelity_fields_are_preserved_without_leakage() {
+        let content = concat!(
+            "clrmamepro (\n",
+            "\tname Test\n",
+            ")\n",
+            "game (\n",
+            "\tname detailed\n",
+            "\tcloneof clone-parent\n",
+            "\tromof rom-parent\n",
+            "\tsampleof samples\n",
+            "\tisbios yes\n",
+            "\trunnable no\n",
+            "\trom ( name detailed.bin size 4 crc AAAAAAAA offset 1000 loadflag reload value ff optional yes bios us region maincpu )\n",
+            "\trom ( name ordinary.bin size 4 crc BBBBBBBB )\n",
+            ")\n",
+            "game (\n",
+            "\tname ordinary\n",
+            "\trom ( name final.bin size 4 crc CCCCCCCC )\n",
+            ")\n"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fidelity.dat");
+        std::fs::write(&path, content).unwrap();
+        let result = parse_clrmamepro(&path, DatLimits::default()).unwrap();
+
+        let detailed = &result.dat.games[0];
+        assert_eq!(detailed.clone_of.as_deref(), Some("clone-parent"));
+        assert_eq!(detailed.rom_of.as_deref(), Some("rom-parent"));
+        assert_eq!(detailed.sample_of.as_deref(), Some("samples"));
+        assert_eq!(detailed.is_bios.as_deref(), Some("yes"));
+        assert_eq!(detailed.runnable.as_deref(), Some("no"));
+        let rom = &detailed.roms[0];
+        assert_eq!(rom.offset.as_deref(), Some("1000"));
+        assert_eq!(rom.loadflag.as_deref(), Some("reload"));
+        assert_eq!(rom.value.as_deref(), Some("ff"));
+        assert_eq!(rom.optional.as_deref(), Some("yes"));
+        assert_eq!(rom.bios.as_deref(), Some("us"));
+        assert_eq!(rom.region.as_deref(), Some("maincpu"));
+        assert_eq!(detailed.roms[1].offset, None);
+        assert_eq!(detailed.roms[1].optional, None);
+        assert!(detailed.unsupported_structure);
+
+        let ordinary = &result.dat.games[1];
+        assert_eq!(ordinary.rom_of, None);
+        assert_eq!(ordinary.sample_of, None);
+        assert_eq!(ordinary.is_bios, None);
+        assert_eq!(ordinary.runnable, None);
+        assert!(ordinary.unsupported_structure);
     }
 }

@@ -214,6 +214,7 @@ mod tests {
                         merge: None,
                         date: None,
                         loadflag: None,
+                        ..Default::default()
                     }],
                     clone_of: None,
                     sample_of: None,
@@ -226,6 +227,7 @@ mod tests {
                     original_metadata: Default::default(),
                     content_classification: Default::default(),
                     unsupported_structure: false,
+                    ..Default::default()
                 },
                 DatGameEntry {
                     name: "Game Beta".into(),
@@ -241,6 +243,7 @@ mod tests {
                         merge: None,
                         date: None,
                         loadflag: None,
+                        ..Default::default()
                     }],
                     clone_of: None,
                     sample_of: None,
@@ -253,6 +256,7 @@ mod tests {
                     original_metadata: Default::default(),
                     content_classification: Default::default(),
                     unsupported_structure: false,
+                    ..Default::default()
                 },
             ],
         }

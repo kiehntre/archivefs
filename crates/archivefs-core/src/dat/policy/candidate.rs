@@ -126,6 +126,7 @@ mod tests {
             merge: None,
             date: None,
             loadflag: None,
+            ..Default::default()
         }
     }
 
@@ -145,6 +146,7 @@ mod tests {
             original_metadata: Default::default(),
             content_classification: Default::default(),
             unsupported_structure: false,
+            ..Default::default()
         }
     }
 

@@ -491,6 +491,7 @@ mod tests {
                         merge: None,
                         date: None,
                         loadflag: None,
+                        ..Default::default()
                     }],
                     clone_of: None,
                     sample_of: None,
@@ -503,6 +504,7 @@ mod tests {
                     original_metadata: DatOriginalMetadata::default(),
                     content_classification: DatContentClassification::unknown(),
                     unsupported_structure: false,
+                    ..Default::default()
                 })
                 .collect(),
         }

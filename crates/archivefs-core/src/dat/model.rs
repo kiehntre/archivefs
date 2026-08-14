@@ -140,6 +140,9 @@ pub struct DatRomEntry {
     pub status: Option<String>,
     pub merge: Option<String>,
     pub date: Option<String>,
+    /// Raw placement and loading attributes retained for later set semantics.
+    #[serde(default)]
+    pub offset: Option<String>,
     /// Raw `loadflag` value, when the DAT declares one (Logiqx `<rom
     /// loadflag="...">`, ClrMamePro `loadflag value`).
     ///
@@ -152,6 +155,14 @@ pub struct DatRomEntry {
     /// ROM" should treat `Some(_)` here as "no", regardless of the value.
     #[serde(default)]
     pub loadflag: Option<String>,
+    #[serde(default)]
+    pub value: Option<String>,
+    #[serde(default)]
+    pub optional: Option<String>,
+    #[serde(default)]
+    pub bios: Option<String>,
+    #[serde(default)]
+    pub region: Option<String>,
 }
 
 impl DatRomEntry {
@@ -185,6 +196,82 @@ impl DatRomEntry {
     }
 }
 
+/// One disk/CHD declaration within a DAT entry.
+///
+/// These fields are provenance only. In particular, the SHA-1 is not treated
+/// as an ordinary ROM-file hash and no CHD content is opened or verified here.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatDiskEntry {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub sha1: Option<String>,
+    #[serde(default)]
+    pub merge: Option<String>,
+    #[serde(default)]
+    pub region: Option<String>,
+    #[serde(default)]
+    pub index: Option<String>,
+    #[serde(default)]
+    pub writable: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub optional: Option<String>,
+}
+
+/// A referenced device set.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatDeviceRefEntry {
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// A sample-file declaration.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatSampleEntry {
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// One BIOS variant declaration.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatBiosSetEntry {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub default: Option<String>,
+}
+
+/// A software-list data area. Member interpretation remains deferred.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatDataAreaEntry {
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// A software-list disk area. Member interpretation remains deferred.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatDiskAreaEntry {
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// One software-list part and the structural areas declared inside it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatPartEntry {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub interface: Option<String>,
+    #[serde(default)]
+    pub data_areas: Vec<DatDataAreaEntry>,
+    #[serde(default)]
+    pub disk_areas: Vec<DatDiskAreaEntry>,
+}
+
 /// One game entry from a DAT file.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DatGameEntry {
@@ -192,7 +279,23 @@ pub struct DatGameEntry {
     pub description: Option<String>,
     pub roms: Vec<DatRomEntry>,
     pub clone_of: Option<String>,
+    #[serde(default)]
+    pub rom_of: Option<String>,
     pub sample_of: Option<String>,
+    #[serde(default)]
+    pub is_bios: Option<String>,
+    #[serde(default)]
+    pub runnable: Option<String>,
+    #[serde(default)]
+    pub disks: Vec<DatDiskEntry>,
+    #[serde(default)]
+    pub device_refs: Vec<DatDeviceRefEntry>,
+    #[serde(default)]
+    pub samples: Vec<DatSampleEntry>,
+    #[serde(default)]
+    pub bios_sets: Vec<DatBiosSetEntry>,
+    #[serde(default)]
+    pub parts: Vec<DatPartEntry>,
     pub board: Option<String>,
     pub rebuild_to: Option<String>,
     pub year: Option<String>,
@@ -205,15 +308,11 @@ pub struct DatGameEntry {
     /// Derived EmuWiz annotation. Never changes upstream identity semantics.
     #[serde(default)]
     pub content_classification: DatContentClassification,
-    /// Whether the source parser detected structure or a relationship on
-    /// this entry that it does not fully observe - a `<disk>`, `<sample>`,
-    /// `<part>`, `<dataarea>`, or device/dependency-style child (Logiqx) -
-    /// **or** cannot prove the absence of such structure at all (every
-    /// entry the ClrMamePro parser produces).
+    /// Whether the source parser detected structure that Stage 1 does not
+    /// interpret, or cannot prove the absence of such structure at all.
     ///
-    /// This is a capability/provenance signal, not a parsed model: nothing
-    /// in this codebase interprets what any of these elements mean, and
-    /// this flag never distinguishes which one was seen. It exists so a
+    /// This remains a capability signal even when the raw elements are
+    /// preserved by the additive Stage 2a model. It exists so a
     /// consumer that cannot safely reason about structure beyond plain
     /// `<rom>` children - `dat::set`'s Stage 1 completeness classifier,
     /// currently - can tell that `roms` is not proven to be the whole

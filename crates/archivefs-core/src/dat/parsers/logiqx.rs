@@ -29,7 +29,9 @@ use super::super::classification::{DatContentClassification, DatOriginalMetadata
 use super::super::hash::{normalise_crc32, normalise_md5, normalise_sha1, normalise_sha256};
 use super::super::limits::DatLimits;
 use super::super::model::{
-    DatEcosystem, DatFormat, DatGameEntry, DatRomEntry, DatSource, ParsedDat,
+    DatBiosSetEntry, DatDataAreaEntry, DatDeviceRefEntry, DatDiskAreaEntry, DatDiskEntry,
+    DatEcosystem, DatFormat, DatGameEntry, DatPartEntry, DatRomEntry, DatSampleEntry, DatSource,
+    ParsedDat,
 };
 use super::super::parser::{ParseError, ParseOutcome, ParseWarning};
 
@@ -67,10 +69,21 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
     let mut current_game_name: Option<String> = None;
     let mut current_game_desc: Option<String> = None;
     let mut current_game_clone_of: Option<String> = None;
+    let mut current_game_rom_of: Option<String> = None;
+    let mut current_game_sample_of: Option<String> = None;
+    let mut current_game_is_bios: Option<String> = None;
+    let mut current_game_runnable: Option<String> = None;
     let mut current_game_metadata = DatOriginalMetadata::default();
     // Provenance only, never interpreted - see `DatGameEntry::unsupported_structure`.
     let mut current_game_unsupported_structure: bool = false;
     let mut current_roms: Vec<DatRomEntry> = Vec::new();
+    let mut current_disks: Vec<DatDiskEntry> = Vec::new();
+    let mut current_device_refs: Vec<DatDeviceRefEntry> = Vec::new();
+    let mut current_samples: Vec<DatSampleEntry> = Vec::new();
+    let mut current_bios_sets: Vec<DatBiosSetEntry> = Vec::new();
+    let mut current_parts: Vec<DatPartEntry> = Vec::new();
+    let mut current_part: Option<DatPartEntry> = None;
+    let mut current_disk: Option<DatDiskEntry> = None;
     let mut current_rom_name: Option<String> = None;
     let mut current_rom_size: Option<u64> = None;
     let mut current_rom_crc: Option<String> = None;
@@ -80,8 +93,13 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
     let mut current_rom_status: Option<String> = None;
     let mut current_rom_merge: Option<String> = None;
     let mut current_rom_date: Option<String> = None;
+    let mut current_rom_offset: Option<String> = None;
     // Raw passthrough only - see `DatRomEntry::loadflag`.
     let mut current_rom_loadflag: Option<String> = None;
+    let mut current_rom_value: Option<String> = None;
+    let mut current_rom_optional: Option<String> = None;
+    let mut current_rom_bios: Option<String> = None;
+    let mut current_rom_region: Option<String> = None;
 
     let mut text_buf = String::new();
     let mut depth: usize = 0;
@@ -130,15 +148,25 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
 
                 match tag.as_str() {
                     "datafile" => {}
-                    "game" | "machine" => {
+                    "game" | "machine" | "software" => {
                         in_game_element = true;
                         drop_current_game(
                             &mut current_game_name,
                             &mut current_game_desc,
                             &mut current_game_clone_of,
+                            &mut current_game_rom_of,
+                            &mut current_game_sample_of,
+                            &mut current_game_is_bios,
+                            &mut current_game_runnable,
                             &mut current_game_metadata,
                             &mut current_game_unsupported_structure,
                             &mut current_roms,
+                            &mut current_disks,
+                            &mut current_device_refs,
+                            &mut current_samples,
+                            &mut current_bios_sets,
+                            &mut current_parts,
+                            &mut current_part,
                             &mut games,
                         );
                         if games.len() >= limits.max_entries {
@@ -174,6 +202,26 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                                 limits.max_warnings,
                             )
                         });
+                        current_game_rom_of =
+                            attr_str_opt(start_bytes, b"romof", &mut warnings, limits.max_warnings);
+                        current_game_sample_of = attr_str_opt(
+                            start_bytes,
+                            b"sampleof",
+                            &mut warnings,
+                            limits.max_warnings,
+                        );
+                        current_game_is_bios = attr_str_opt(
+                            start_bytes,
+                            b"isbios",
+                            &mut warnings,
+                            limits.max_warnings,
+                        );
+                        current_game_runnable = attr_str_opt(
+                            start_bytes,
+                            b"runnable",
+                            &mut warnings,
+                            limits.max_warnings,
+                        );
                         current_game_desc = None;
                         current_game_metadata = DatOriginalMetadata::default();
                         for (key, attribute) in [
@@ -194,8 +242,15 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                             }
                         }
                         current_roms = Vec::new();
+                        current_disks = Vec::new();
+                        current_device_refs = Vec::new();
+                        current_samples = Vec::new();
+                        current_bios_sets = Vec::new();
+                        current_parts = Vec::new();
+                        current_part = None;
+                        current_disk = None;
                     }
-                    "rom" => {
+                    "rom" if in_game_element => {
                         if current_roms.len() >= limits.max_roms_per_entry {
                             return Err(ParseError::RomsPerEntryExceeded {
                                 game_name: current_game_name
@@ -256,24 +311,108 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                             attr_str_opt(start_bytes, b"merge", &mut warnings, limits.max_warnings);
                         current_rom_date =
                             attr_str_opt(start_bytes, b"date", &mut warnings, limits.max_warnings);
+                        current_rom_offset = attr_str_opt(
+                            start_bytes,
+                            b"offset",
+                            &mut warnings,
+                            limits.max_warnings,
+                        );
                         current_rom_loadflag = attr_str_opt(
                             start_bytes,
                             b"loadflag",
                             &mut warnings,
                             limits.max_warnings,
                         );
+                        current_rom_value =
+                            attr_str_opt(start_bytes, b"value", &mut warnings, limits.max_warnings);
+                        current_rom_optional = attr_str_opt(
+                            start_bytes,
+                            b"optional",
+                            &mut warnings,
+                            limits.max_warnings,
+                        );
+                        current_rom_bios =
+                            attr_str_opt(start_bytes, b"bios", &mut warnings, limits.max_warnings);
+                        current_rom_region = attr_str_opt(
+                            start_bytes,
+                            b"region",
+                            &mut warnings,
+                            limits.max_warnings,
+                        );
                     }
-                    // Never parsed into a model: presence alone is recorded
-                    // on the enclosing game so a consumer that cannot reason
-                    // about structure beyond plain <rom> children knows
-                    // `roms` is not proven to be the whole picture. See
-                    // `DatGameEntry::unsupported_structure`. This list is
-                    // deliberately not exhaustive of every DTD variant - it
-                    // covers what is safely, cheaply detectable by tag name
-                    // alone; `<part>`/`<dataarea>` nest inside `<rom>`-like
-                    // structures in some schemas and are caught here at the
-                    // point they'd appear as their own element.
-                    "disk" | "sample" | "part" | "dataarea" | "device_ref" | "device" => {
+                    "disk" if in_game_element => {
+                        current_game_unsupported_structure = true;
+                        current_disk = Some(parse_disk_entry(
+                            start_bytes,
+                            &mut warnings,
+                            limits.max_warnings,
+                        ));
+                    }
+                    "device_ref" if in_game_element => {
+                        current_game_unsupported_structure = true;
+                        current_device_refs.push(DatDeviceRefEntry {
+                            name: attr_str_opt(
+                                start_bytes,
+                                b"name",
+                                &mut warnings,
+                                limits.max_warnings,
+                            ),
+                        });
+                    }
+                    "sample" if in_game_element => {
+                        current_game_unsupported_structure = true;
+                        current_samples.push(DatSampleEntry {
+                            name: attr_str_opt(
+                                start_bytes,
+                                b"name",
+                                &mut warnings,
+                                limits.max_warnings,
+                            ),
+                        });
+                    }
+                    "biosset" if in_game_element => {
+                        current_game_unsupported_structure = true;
+                        current_bios_sets.push(parse_bios_set_entry(
+                            start_bytes,
+                            &mut warnings,
+                            limits.max_warnings,
+                        ));
+                    }
+                    "part" if in_game_element => {
+                        current_game_unsupported_structure = true;
+                        current_part = Some(parse_part_entry(
+                            start_bytes,
+                            &mut warnings,
+                            limits.max_warnings,
+                        ));
+                    }
+                    "dataarea" if in_game_element => {
+                        current_game_unsupported_structure = true;
+                        if let Some(part) = current_part.as_mut() {
+                            part.data_areas.push(DatDataAreaEntry {
+                                name: attr_str_opt(
+                                    start_bytes,
+                                    b"name",
+                                    &mut warnings,
+                                    limits.max_warnings,
+                                ),
+                            });
+                        }
+                    }
+                    "diskarea" if in_game_element => {
+                        current_game_unsupported_structure = true;
+                        if let Some(part) = current_part.as_mut() {
+                            part.disk_areas.push(DatDiskAreaEntry {
+                                name: attr_str_opt(
+                                    start_bytes,
+                                    b"name",
+                                    &mut warnings,
+                                    limits.max_warnings,
+                                ),
+                            });
+                        }
+                    }
+                    "device" if in_game_element => {
                         current_game_unsupported_structure = true;
                     }
                     _ => {}
@@ -368,11 +507,26 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                                 status: current_rom_status.take(),
                                 merge: current_rom_merge.take(),
                                 date: current_rom_date.take(),
+                                offset: current_rom_offset.take(),
                                 loadflag: current_rom_loadflag.take(),
+                                value: current_rom_value.take(),
+                                optional: current_rom_optional.take(),
+                                bios: current_rom_bios.take(),
+                                region: current_rom_region.take(),
                             });
                         }
                     }
-                    "game" | "machine" => {
+                    "disk" => {
+                        if let Some(disk) = current_disk.take() {
+                            current_disks.push(disk);
+                        }
+                    }
+                    "part" => {
+                        if let Some(part) = current_part.take() {
+                            current_parts.push(part);
+                        }
+                    }
+                    "game" | "machine" | "software" => {
                         in_game_element = false;
                     }
                     _ => {}
@@ -388,7 +542,7 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                     })?
                     .to_ascii_lowercase();
 
-                if tag == "rom" {
+                if tag == "rom" && in_game_element {
                     // Real Logiqx DATs write every ROM as a self-closing element,
                     // so this - not the Start/End pair below - is the path that
                     // actually needs the ceiling. Checked against the game being
@@ -464,8 +618,18 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                         attr_str_opt(empty_bytes, b"merge", &mut warnings, limits.max_warnings);
                     let date =
                         attr_str_opt(empty_bytes, b"date", &mut warnings, limits.max_warnings);
+                    let offset =
+                        attr_str_opt(empty_bytes, b"offset", &mut warnings, limits.max_warnings);
                     let loadflag =
                         attr_str_opt(empty_bytes, b"loadflag", &mut warnings, limits.max_warnings);
+                    let value =
+                        attr_str_opt(empty_bytes, b"value", &mut warnings, limits.max_warnings);
+                    let optional =
+                        attr_str_opt(empty_bytes, b"optional", &mut warnings, limits.max_warnings);
+                    let bios =
+                        attr_str_opt(empty_bytes, b"bios", &mut warnings, limits.max_warnings);
+                    let region =
+                        attr_str_opt(empty_bytes, b"region", &mut warnings, limits.max_warnings);
 
                     current_roms.push(DatRomEntry {
                         name: rom_name,
@@ -477,16 +641,90 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                         status,
                         merge,
                         date,
+                        offset,
                         loadflag,
+                        value,
+                        optional,
+                        bios,
+                        region,
                     });
-                } else if matches!(
-                    tag.as_str(),
-                    "disk" | "sample" | "part" | "dataarea" | "device_ref" | "device"
-                ) {
-                    // Most real Logiqx DATs write these self-closing, same as
-                    // `<rom>` above - see the combined arm in the Start-event
-                    // match for what this flag means.
-                    current_game_unsupported_structure = true;
+                } else if in_game_element {
+                    match tag.as_str() {
+                        "disk" => {
+                            current_game_unsupported_structure = true;
+                            current_disks.push(parse_disk_entry(
+                                empty_bytes,
+                                &mut warnings,
+                                limits.max_warnings,
+                            ));
+                        }
+                        "device_ref" => {
+                            current_game_unsupported_structure = true;
+                            current_device_refs.push(DatDeviceRefEntry {
+                                name: attr_str_opt(
+                                    empty_bytes,
+                                    b"name",
+                                    &mut warnings,
+                                    limits.max_warnings,
+                                ),
+                            });
+                        }
+                        "sample" => {
+                            current_game_unsupported_structure = true;
+                            current_samples.push(DatSampleEntry {
+                                name: attr_str_opt(
+                                    empty_bytes,
+                                    b"name",
+                                    &mut warnings,
+                                    limits.max_warnings,
+                                ),
+                            });
+                        }
+                        "biosset" => {
+                            current_game_unsupported_structure = true;
+                            current_bios_sets.push(parse_bios_set_entry(
+                                empty_bytes,
+                                &mut warnings,
+                                limits.max_warnings,
+                            ));
+                        }
+                        "part" => {
+                            current_game_unsupported_structure = true;
+                            current_parts.push(parse_part_entry(
+                                empty_bytes,
+                                &mut warnings,
+                                limits.max_warnings,
+                            ));
+                        }
+                        "dataarea" => {
+                            current_game_unsupported_structure = true;
+                            if let Some(part) = current_part.as_mut() {
+                                part.data_areas.push(DatDataAreaEntry {
+                                    name: attr_str_opt(
+                                        empty_bytes,
+                                        b"name",
+                                        &mut warnings,
+                                        limits.max_warnings,
+                                    ),
+                                });
+                            }
+                        }
+                        "diskarea" => {
+                            current_game_unsupported_structure = true;
+                            if let Some(part) = current_part.as_mut() {
+                                part.disk_areas.push(DatDiskAreaEntry {
+                                    name: attr_str_opt(
+                                        empty_bytes,
+                                        b"name",
+                                        &mut warnings,
+                                        limits.max_warnings,
+                                    ),
+                                });
+                            }
+                        }
+                        "device" => current_game_unsupported_structure = true,
+                        _ => {}
+                    }
                 }
                 text_buf.clear();
             }
@@ -603,9 +841,19 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
         &mut current_game_name,
         &mut current_game_desc,
         &mut current_game_clone_of,
+        &mut current_game_rom_of,
+        &mut current_game_sample_of,
+        &mut current_game_is_bios,
+        &mut current_game_runnable,
         &mut current_game_metadata,
         &mut current_game_unsupported_structure,
         &mut current_roms,
+        &mut current_disks,
+        &mut current_device_refs,
+        &mut current_samples,
+        &mut current_bios_sets,
+        &mut current_parts,
+        &mut current_part,
         &mut games,
     );
 
@@ -630,6 +878,55 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
         dat: ParsedDat { source, games },
         warnings,
     })
+}
+
+fn parse_disk_entry(
+    elem: &quick_xml::events::BytesStart<'_>,
+    warnings: &mut Vec<ParseWarning>,
+    max_warnings: usize,
+) -> DatDiskEntry {
+    DatDiskEntry {
+        name: attr_str_opt(elem, b"name", warnings, max_warnings),
+        sha1: checksum_attr(
+            elem,
+            b"sha1",
+            normalise_sha1,
+            "a disk element",
+            warnings,
+            max_warnings,
+        ),
+        merge: attr_str_opt(elem, b"merge", warnings, max_warnings),
+        region: attr_str_opt(elem, b"region", warnings, max_warnings),
+        index: attr_str_opt(elem, b"index", warnings, max_warnings),
+        writable: attr_str_opt(elem, b"writable", warnings, max_warnings),
+        status: attr_str_opt(elem, b"status", warnings, max_warnings),
+        optional: attr_str_opt(elem, b"optional", warnings, max_warnings),
+    }
+}
+
+fn parse_bios_set_entry(
+    elem: &quick_xml::events::BytesStart<'_>,
+    warnings: &mut Vec<ParseWarning>,
+    max_warnings: usize,
+) -> DatBiosSetEntry {
+    DatBiosSetEntry {
+        name: attr_str_opt(elem, b"name", warnings, max_warnings),
+        description: attr_str_opt(elem, b"description", warnings, max_warnings),
+        default: attr_str_opt(elem, b"default", warnings, max_warnings),
+    }
+}
+
+fn parse_part_entry(
+    elem: &quick_xml::events::BytesStart<'_>,
+    warnings: &mut Vec<ParseWarning>,
+    max_warnings: usize,
+) -> DatPartEntry {
+    DatPartEntry {
+        name: attr_str_opt(elem, b"name", warnings, max_warnings),
+        interface: attr_str_opt(elem, b"interface", warnings, max_warnings),
+        data_areas: Vec::new(),
+        disk_areas: Vec::new(),
+    }
 }
 
 /// Normalises one checksum attribute, reporting a malformed value.
@@ -688,26 +985,48 @@ fn record_note(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drop_current_game(
     name: &mut Option<String>,
     desc: &mut Option<String>,
     clone_of: &mut Option<String>,
+    rom_of: &mut Option<String>,
+    sample_of: &mut Option<String>,
+    is_bios: &mut Option<String>,
+    runnable: &mut Option<String>,
     metadata: &mut DatOriginalMetadata,
-    has_disk: &mut bool,
+    unsupported_structure: &mut bool,
     roms: &mut Vec<DatRomEntry>,
+    disks: &mut Vec<DatDiskEntry>,
+    device_refs: &mut Vec<DatDeviceRefEntry>,
+    samples: &mut Vec<DatSampleEntry>,
+    bios_sets: &mut Vec<DatBiosSetEntry>,
+    parts: &mut Vec<DatPartEntry>,
+    current_part: &mut Option<DatPartEntry>,
     games: &mut Vec<DatGameEntry>,
 ) {
     // Taken unconditionally, not just on the `Some(name)` path below: this is
     // what resets the flag for the *next* game regardless of whether the
     // just-finished one ever got a name.
-    let had_unsupported_structure = std::mem::take(has_disk);
+    let had_unsupported_structure = std::mem::take(unsupported_structure);
+    if let Some(part) = current_part.take() {
+        parts.push(part);
+    }
     if let Some(game_name) = name.take() {
         games.push(DatGameEntry {
             name: game_name,
             description: desc.take(),
             roms: std::mem::take(roms),
             clone_of: clone_of.take(),
-            sample_of: None,
+            rom_of: rom_of.take(),
+            sample_of: sample_of.take(),
+            is_bios: is_bios.take(),
+            runnable: runnable.take(),
+            disks: std::mem::take(disks),
+            device_refs: std::mem::take(device_refs),
+            samples: std::mem::take(samples),
+            bios_sets: std::mem::take(bios_sets),
+            parts: std::mem::take(parts),
             board: None,
             rebuild_to: None,
             year: None,
@@ -718,6 +1037,17 @@ fn drop_current_game(
             content_classification: DatContentClassification::unknown(),
             unsupported_structure: had_unsupported_structure,
         });
+    } else {
+        rom_of.take();
+        sample_of.take();
+        is_bios.take();
+        runnable.take();
+        roms.clear();
+        disks.clear();
+        device_refs.clear();
+        samples.clear();
+        bios_sets.clear();
+        parts.clear();
     }
 }
 
@@ -1268,8 +1598,16 @@ mod tests {
     }
 
     #[test]
-    fn sample_part_dataarea_and_device_elements_all_set_unsupported_structure() {
-        for tag in ["sample", "part", "dataarea", "device_ref", "device"] {
+    fn structural_elements_all_set_unsupported_structure() {
+        for tag in [
+            "sample",
+            "part",
+            "dataarea",
+            "diskarea",
+            "device_ref",
+            "device",
+            "biosset",
+        ] {
             let xml = format!(
                 r#"<?xml version="1.0"?>
 <datafile>
@@ -1407,5 +1745,124 @@ mod tests {
             Some("This is the game description"),
             "Game description must be captured separately"
         );
+    }
+
+    #[test]
+    fn mame_machine_and_member_fidelity_is_preserved() {
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+    <machine name="clone" cloneof="parent" romof="bios" sampleof="samples" isbios="yes" runnable="no">
+        <rom name="program.bin" size="4" crc="AAAAAAAA" offset="1000" loadflag="reload" value="ff" optional="yes" bios="us" region="maincpu"></rom>
+        <disk name="disk0" sha1="DA39A3EE5E6B4B0D3255BFEF95601890AFD80709" merge="parent.chd" region="cdrom" index="0" writable="no" status="baddump" optional="yes"></disk>
+        <device_ref name="namco51"/>
+        <sample name="shot"></sample>
+        <biosset name="us" description="US BIOS" default="yes"/>
+    </machine>
+</datafile>"#;
+        let outcome = parse_xml(xml).unwrap();
+        let game = &outcome.dat.games[0];
+        assert_eq!(game.clone_of.as_deref(), Some("parent"));
+        assert_eq!(game.rom_of.as_deref(), Some("bios"));
+        assert_eq!(game.sample_of.as_deref(), Some("samples"));
+        assert_eq!(game.is_bios.as_deref(), Some("yes"));
+        assert_eq!(game.runnable.as_deref(), Some("no"));
+
+        let rom = &game.roms[0];
+        assert_eq!(rom.offset.as_deref(), Some("1000"));
+        assert_eq!(rom.loadflag.as_deref(), Some("reload"));
+        assert_eq!(rom.value.as_deref(), Some("ff"));
+        assert_eq!(rom.optional.as_deref(), Some("yes"));
+        assert_eq!(rom.bios.as_deref(), Some("us"));
+        assert_eq!(rom.region.as_deref(), Some("maincpu"));
+
+        let disk = &game.disks[0];
+        assert_eq!(disk.name.as_deref(), Some("disk0"));
+        assert_eq!(
+            disk.sha1.as_deref(),
+            Some("da39a3ee5e6b4b0d3255bfef95601890afd80709")
+        );
+        assert_eq!(disk.merge.as_deref(), Some("parent.chd"));
+        assert_eq!(disk.region.as_deref(), Some("cdrom"));
+        assert_eq!(disk.index.as_deref(), Some("0"));
+        assert_eq!(disk.writable.as_deref(), Some("no"));
+        assert_eq!(disk.status.as_deref(), Some("baddump"));
+        assert_eq!(disk.optional.as_deref(), Some("yes"));
+        assert_eq!(game.device_refs[0].name.as_deref(), Some("namco51"));
+        assert_eq!(game.samples[0].name.as_deref(), Some("shot"));
+        assert_eq!(game.bios_sets[0].name.as_deref(), Some("us"));
+        assert_eq!(game.bios_sets[0].description.as_deref(), Some("US BIOS"));
+        assert_eq!(game.bios_sets[0].default.as_deref(), Some("yes"));
+        assert!(game.unsupported_structure);
+    }
+
+    #[test]
+    fn software_part_area_structure_is_scoped_to_its_software() {
+        let xml = r#"<?xml version="1.0"?>
+<softwarelist name="test">
+    <software name="structured">
+        <part name="cart" interface="nes_cart">
+            <dataarea name="prg">
+                <rom name="program.bin" size="4" crc="AAAAAAAA"/>
+            </dataarea>
+            <diskarea name="cdrom">
+                <disk name="disc" sha1="DA39A3EE5E6B4B0D3255BFEF95601890AFD80709"/>
+            </diskarea>
+        </part>
+    </software>
+    <software name="ordinary">
+        <rom name="ordinary.bin" size="4" crc="BBBBBBBB"/>
+    </software>
+</softwarelist>"#;
+        let outcome = parse_xml(xml).unwrap();
+        assert_eq!(outcome.dat.games.len(), 2);
+        let structured = &outcome.dat.games[0];
+        assert_eq!(structured.parts.len(), 1);
+        assert_eq!(structured.parts[0].name.as_deref(), Some("cart"));
+        assert_eq!(structured.parts[0].interface.as_deref(), Some("nes_cart"));
+        assert_eq!(
+            structured.parts[0].data_areas[0].name.as_deref(),
+            Some("prg")
+        );
+        assert_eq!(
+            structured.parts[0].disk_areas[0].name.as_deref(),
+            Some("cdrom")
+        );
+        assert_eq!(structured.roms[0].name, "program.bin");
+        assert_eq!(structured.disks[0].name.as_deref(), Some("disc"));
+        assert!(structured.unsupported_structure);
+
+        let ordinary = &outcome.dat.games[1];
+        assert_eq!(ordinary.roms[0].name, "ordinary.bin");
+        assert!(ordinary.parts.is_empty());
+        assert!(ordinary.disks.is_empty());
+        assert!(ordinary.device_refs.is_empty());
+        assert!(ordinary.samples.is_empty());
+        assert!(ordinary.bios_sets.is_empty());
+        assert_eq!(ordinary.rom_of, None);
+        assert_eq!(ordinary.sample_of, None);
+        assert_eq!(ordinary.is_bios, None);
+        assert_eq!(ordinary.runnable, None);
+        assert!(!ordinary.unsupported_structure);
+    }
+
+    #[test]
+    fn self_closing_structural_entries_are_preserved() {
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+    <game name="self-closing">
+        <disk name="disc" sha1="DA39A3EE5E6B4B0D3255BFEF95601890AFD80709"/>
+        <device_ref name="device"/>
+        <sample name="sample"/>
+        <biosset name="bios" description="BIOS" default="no"/>
+        <part name="cart" interface="slot"/>
+    </game>
+</datafile>"#;
+        let outcome = parse_xml(xml).unwrap();
+        let game = &outcome.dat.games[0];
+        assert_eq!(game.disks.len(), 1);
+        assert_eq!(game.device_refs.len(), 1);
+        assert_eq!(game.samples.len(), 1);
+        assert_eq!(game.bios_sets.len(), 1);
+        assert_eq!(game.parts.len(), 1);
     }
 }
