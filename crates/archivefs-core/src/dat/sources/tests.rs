@@ -1584,6 +1584,308 @@ fn zip_members_are_matched_individually_but_never_enter_rename_planning() {
     );
 }
 
+/// Builds a syntactically valid 124-byte CHD v5 header with the given
+/// `overall_sha1`, mirroring the fixture in `dat::disk_audit`'s own tests.
+fn synthetic_chd_header(overall_sha1: [u8; 20]) -> Vec<u8> {
+    fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+    }
+    fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
+        bytes[offset..offset + 8].copy_from_slice(&value.to_be_bytes());
+    }
+    let mut bytes = [0_u8; 124];
+    bytes[0..8].copy_from_slice(b"MComprHD");
+    put_u32(&mut bytes, 8, 124);
+    put_u32(&mut bytes, 12, 5);
+    put_u64(&mut bytes, 32, 4096);
+    put_u32(&mut bytes, 56, 0x0002_0000);
+    put_u32(&mut bytes, 60, 0x0000_0800);
+    bytes[84..104].copy_from_slice(&overall_sha1);
+    bytes.to_vec()
+}
+
+#[test]
+fn end_to_end_chd_disk_evidence_reaches_a_complete_mixed_set() {
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipWriter};
+
+    let dir = temp();
+    let dat = write(
+        dir.path(),
+        "disc.dat",
+        r#"<datafile><header><name>Disc catalogue</name></header>
+<game name="Disc Game (World)">
+<rom name="game.cue" size="4" sha1="a94a8fe5ccb19ba61c4c0873d391e987982fbbd3"/>
+<disk name="game" sha1="111111111111111111111111111111111111111a"/>
+</game>
+</datafile>"#,
+    );
+    let library = dir.path().join("library");
+    std::fs::create_dir(&library).unwrap();
+
+    // The ROM half: a ZIP containing the one required rom.
+    let archive = library.join("collection.zip");
+    let mut writer = ZipWriter::new(std::fs::File::create(&archive).unwrap());
+    writer
+        .start_file(
+            "game.cue",
+            SimpleFileOptions::default().compression_method(CompressionMethod::Stored),
+        )
+        .unwrap();
+    std::io::Write::write_all(&mut writer, b"test").unwrap();
+    writer.finish().unwrap();
+
+    // The disk half: a loose .chd whose header `overall_sha1` matches the
+    // DAT's declared disk identity - never a hash of the .chd file's own
+    // bytes.
+    let mut overall_sha1 = [0x11_u8; 20];
+    overall_sha1[19] = 0x1a;
+    std::fs::write(library.join("game.chd"), synthetic_chd_header(overall_sha1)).unwrap();
+
+    let request = DatAuditRequest {
+        source_id: "disc".to_string(),
+        source_display_name: "Disc catalogue".to_string(),
+        dat_path: dat,
+        dat_kind: DatSourceKind::File,
+        scan_root: library,
+        limits: DatLimits::default(),
+        policy: None,
+        platform: None,
+    };
+    let outcome = run_dat_audit(&request, &TrustedRoots::none(), &no_cancel(), &|_| {}).unwrap();
+
+    assert_eq!(outcome.sets.len(), 1);
+    assert_eq!(outcome.sets[0].state, crate::dat::set::SetState::Complete);
+    assert_eq!(outcome.sets[0].disks_required, vec!["game"]);
+    assert_eq!(outcome.sets[0].disks_verified, vec!["game"]);
+}
+
+#[test]
+fn end_to_end_wrong_chd_never_satisfies_the_required_disk_slot() {
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipWriter};
+
+    let dir = temp();
+    let dat = write(
+        dir.path(),
+        "disc.dat",
+        r#"<datafile><header><name>Disc catalogue</name></header>
+<game name="Disc Game (World)">
+<rom name="game.cue" size="4" sha1="a94a8fe5ccb19ba61c4c0873d391e987982fbbd3"/>
+<disk name="game" sha1="111111111111111111111111111111111111111a"/>
+</game>
+</datafile>"#,
+    );
+    let library = dir.path().join("library");
+    std::fs::create_dir(&library).unwrap();
+
+    let archive = library.join("collection.zip");
+    let mut writer = ZipWriter::new(std::fs::File::create(&archive).unwrap());
+    writer
+        .start_file(
+            "game.cue",
+            SimpleFileOptions::default().compression_method(CompressionMethod::Stored),
+        )
+        .unwrap();
+    std::io::Write::write_all(&mut writer, b"test").unwrap();
+    writer.finish().unwrap();
+
+    // A CHD is present, but its overall_sha1 matches nothing in the DAT.
+    let mut unrelated_sha1 = [0x22_u8; 20];
+    unrelated_sha1[19] = 0x2b;
+    std::fs::write(
+        library.join("game.chd"),
+        synthetic_chd_header(unrelated_sha1),
+    )
+    .unwrap();
+
+    let request = DatAuditRequest {
+        source_id: "disc".to_string(),
+        source_display_name: "Disc catalogue".to_string(),
+        dat_path: dat,
+        dat_kind: DatSourceKind::File,
+        scan_root: library,
+        limits: DatLimits::default(),
+        policy: None,
+        platform: None,
+    };
+    let outcome = run_dat_audit(&request, &TrustedRoots::none(), &no_cancel(), &|_| {}).unwrap();
+
+    assert_eq!(outcome.sets.len(), 1);
+    assert_ne!(outcome.sets[0].state, crate::dat::set::SetState::Complete);
+    assert!(outcome.sets[0].disks_verified.is_empty());
+}
+
+#[test]
+fn end_to_end_all_zero_sentinel_disk_and_chd_never_reach_complete() {
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipWriter};
+
+    let dir = temp();
+    // Independent review's concrete false-Complete finding: an unset DAT
+    // disk SHA-1 (all zeroes) and an unset CHD header overall_sha1 (all
+    // zeroes) must never be treated as matching each other, even with a
+    // genuinely verified ROM alongside.
+    let dat = write(
+        dir.path(),
+        "disc.dat",
+        r#"<datafile><header><name>Disc catalogue</name></header>
+<game name="Disc Game (World)">
+<rom name="game.cue" size="4" sha1="a94a8fe5ccb19ba61c4c0873d391e987982fbbd3"/>
+<disk name="game" sha1="0000000000000000000000000000000000000000"/>
+</game>
+</datafile>"#,
+    );
+    let library = dir.path().join("library");
+    std::fs::create_dir(&library).unwrap();
+
+    let archive = library.join("collection.zip");
+    let mut writer = ZipWriter::new(std::fs::File::create(&archive).unwrap());
+    writer
+        .start_file(
+            "game.cue",
+            SimpleFileOptions::default().compression_method(CompressionMethod::Stored),
+        )
+        .unwrap();
+    std::io::Write::write_all(&mut writer, b"test").unwrap();
+    writer.finish().unwrap();
+
+    // A CHD whose header overall_sha1 is also all-zero.
+    std::fs::write(library.join("game.chd"), synthetic_chd_header([0x00; 20])).unwrap();
+
+    let request = DatAuditRequest {
+        source_id: "disc".to_string(),
+        source_display_name: "Disc catalogue".to_string(),
+        dat_path: dat,
+        dat_kind: DatSourceKind::File,
+        scan_root: library,
+        limits: DatLimits::default(),
+        policy: None,
+        platform: None,
+    };
+    let outcome = run_dat_audit(&request, &TrustedRoots::none(), &no_cancel(), &|_| {}).unwrap();
+
+    assert_eq!(outcome.sets.len(), 1);
+    assert_ne!(
+        outcome.sets[0].state,
+        crate::dat::set::SetState::Complete,
+        "two all-zero sentinels must never satisfy a required disk slot"
+    );
+    assert!(outcome.sets[0].disks_verified.is_empty());
+}
+
+#[test]
+fn end_to_end_chd_container_bytes_matching_a_dat_rom_digest_never_produces_a_rom_match() {
+    use crate::dat::rename_plan::{RenamePlanContext, build_rename_plan};
+    use sha1::{Sha1, digest::Digest};
+
+    let dir = temp();
+    let library = dir.path().join("library");
+    std::fs::create_dir(&library).unwrap();
+
+    // A syntactically valid CHD v5 header whose own whole-file bytes will be
+    // declared, in the DAT below, as a ROM's digest - modelling a
+    // pathological (or adversarial) container whose container-level SHA-1
+    // happens to collide with a completely unrelated DAT ROM entry.
+    let mut overall_sha1 = [0x33_u8; 20];
+    overall_sha1[19] = 0x3c;
+    let chd_bytes = synthetic_chd_header(overall_sha1);
+    let container_sha1: String = Sha1::digest(&chd_bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let disk_sha1: String = overall_sha1
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+
+    // Explicit assertion (finding 2C): the raw container digest and the
+    // disk-identity digest are never the same value or the same lookup
+    // path - constructing them from different byte spans of the same file
+    // proves they cannot coincidentally be compared against each other.
+    assert_ne!(container_sha1, disk_sha1);
+
+    let dat = write(
+        dir.path(),
+        "collision.dat",
+        &format!(
+            r#"<datafile><header><name>Collision catalogue</name></header>
+<game name="Unrelated ROM Game">
+<rom name="evil.rom" size="{}" sha1="{container_sha1}"/>
+</game>
+<game name="Disc Game">
+<disk name="game" sha1="{disk_sha1}"/>
+</game>
+</datafile>"#,
+            chd_bytes.len()
+        ),
+    );
+    std::fs::write(library.join("game.chd"), &chd_bytes).unwrap();
+
+    let request = DatAuditRequest {
+        source_id: "collision".to_string(),
+        source_display_name: "Collision catalogue".to_string(),
+        dat_path: dat,
+        dat_kind: DatSourceKind::File,
+        scan_root: library,
+        limits: DatLimits::default(),
+        policy: None,
+        platform: None,
+    };
+    let outcome = run_dat_audit(&request, &TrustedRoots::none(), &no_cancel(), &|_| {}).unwrap();
+
+    // Finding 2A: the CHD must never appear as ordinary ROM evidence, even
+    // though its whole-file bytes are a byte-for-byte match for a declared
+    // DAT ROM digest.
+    assert!(
+        outcome
+            .report
+            .entries
+            .iter()
+            .all(|entry| !entry.local_path.contains("game.chd")),
+        "a .chd must never enter the ordinary loose-ROM report at all"
+    );
+    assert!(
+        !outcome.report.entries.iter().any(|entry| matches!(
+            &entry.verdict,
+            crate::dat::audit::AuditVerdict::Exact { game_name, .. }
+                if game_name == "Unrelated ROM Game"
+        )),
+        "the coincidental container-byte match must never surface as a ROM Exact verdict"
+    );
+
+    let plan =
+        build_rename_plan(&outcome, &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+    assert!(
+        plan.proposals.is_empty(),
+        "a CHD misidentified as a ROM must never become rename-eligible"
+    );
+
+    // Finding 2B: the very same CHD still independently matches its DAT
+    // <disk sha1> declaration via overall_sha1 - the fix routes it away from
+    // ROM evidence, it does not blind the disk-evidence path to it.
+    let disk_dat = crate::dat::parsers::parse_dat_file(
+        &request.dat_path,
+        crate::dat::limits::DatLimits::default(),
+    )
+    .unwrap()
+    .dat;
+    let disk_index = crate::dat::index::DatDiskIndex::build(&disk_dat);
+    let disk_audit = crate::dat::disk_audit::audit_chd_disk(
+        &request.scan_root.join("game.chd"),
+        &TrustedRoots::none(),
+        &disk_index,
+    );
+    assert!(
+        matches!(
+            disk_audit.verdict,
+            Some(crate::dat::disk_audit::DiskAuditVerdict::Exact { ref game_name, .. })
+                if game_name == "Disc Game"
+        ),
+        "the CHD's overall_sha1 must still independently match its DAT disk entry"
+    );
+}
+
 #[test]
 fn sevenz_members_are_matched_individually_but_never_enter_rename_planning() {
     use crate::dat::archive::ArchiveMemberStatus;

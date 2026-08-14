@@ -23,6 +23,7 @@ use std::sync::atomic::AtomicBool;
 
 use serde::Serialize;
 
+pub mod chd;
 pub mod hash;
 pub mod limits;
 pub mod sevenz;

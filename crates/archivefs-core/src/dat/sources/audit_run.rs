@@ -57,7 +57,8 @@ use crate::dat::classification::{
     ContentEligibility, ContentSelectionPolicy, DatContentClassification, DatContentSummary,
     DatOriginalMetadata, summarize,
 };
-use crate::dat::index::{DatIndex, DatMemberKey, DatRomRef, MemberLocation};
+use crate::dat::disk_audit::{DatDiskAudit, audit_chd_disk, is_chd_path};
+use crate::dat::index::{DatDiskIndex, DatIndex, DatMemberKey, DatRomRef, MemberLocation};
 use crate::dat::limits::DatLimits;
 use crate::dat::model::{DatGameEntry, ParsedDat};
 use crate::dat::parsers::parse_dat_file;
@@ -399,6 +400,7 @@ pub fn run_dat_audit(
     };
 
     let index = DatIndex::build(&catalogue);
+    let disk_index = DatDiskIndex::build(&catalogue);
     let catalogue_entries = catalogue.source.entry_count;
     let catalogue_roms = catalogue.source.rom_count;
     let content_selection = request
@@ -444,6 +446,18 @@ pub fn run_dat_audit(
         if cancelled(cancel) {
             return Err(DatAuditError::Cancelled);
         }
+        // CHDs are never ordinary loose ROM files: a CHD's DAT identity is
+        // its header's `overall_sha1`, not a hash of the `.chd` container's
+        // own bytes. Hashing the container here and matching it against the
+        // ROM `DatIndex` would be a false-evidence path (and, on a
+        // pathological container whose whole-file digest happens to equal
+        // some ROM's declared hash, a false `Exact` ROM match). CHDs are
+        // handled exclusively by the disk-evidence pass below (step 3.5),
+        // via `audit_chd_disk`/`overall_sha1` - never `KnownFileEvidence`,
+        // never `audit_one`, never `outcome.report`, never rename-eligible.
+        if is_chd_path(path) {
+            continue;
+        }
         let file_name = file_name_of(path);
         on_progress(DatAuditProgress::Hashing {
             index: position + 1,
@@ -482,6 +496,27 @@ pub fn run_dat_audit(
         }
     }
 
+    // ---- 3.5 CHD disk evidence --------------------------------------------
+    // Deliberately not folded into step 3's loop: a CHD's DAT identity is its
+    // header's `overall_sha1` field, not a hash of the `.chd` file's own
+    // bytes, so this reads a bounded header instead of hashing the file. See
+    // `dat::disk_audit`'s module doc for why this never touches `DatIndex`
+    // (the ROM hash index) or `KnownFileEvidence`/`audit_one`.
+    let mut disk_evidence: Vec<DatDiskAudit> = Vec::new();
+    for path in scan.files.iter().filter(|path| is_chd_path(path)) {
+        if cancelled(cancel) {
+            return Err(DatAuditError::Cancelled);
+        }
+        disk_evidence.push(audit_chd_disk(path, trusted, &disk_index));
+    }
+    // Mirrors `ArchivePassCompletion`: either an intentional ceiling
+    // (`truncated`) or a silent traversal error (`!scan_complete` - an
+    // unreadable directory, a directory-entry read failure, or a
+    // `file_type()` failure) means some required disk's true presence is
+    // unknown, so a set that actually declares one cannot be safely called
+    // `Complete` (R8 for disks, scoped per-set - see `dat::set`'s "R9" doc).
+    let disk_scan_complete = !scan.truncated && scan.scan_complete;
+
     // ---- 4. Compare ------------------------------------------------------
     if cancelled(cancel) {
         return Err(DatAuditError::Cancelled);
@@ -493,6 +528,8 @@ pub fn run_dat_audit(
         trusted,
         cancel,
         &index,
+        &disk_evidence,
+        disk_scan_complete,
         &catalogue_games,
         &request.source_id,
     )?;
@@ -565,11 +602,14 @@ fn open_archive_source(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn audit_archives(
     files: &[PathBuf],
     trusted: &TrustedRoots,
     cancel: &AtomicBool,
     index: &DatIndex,
+    disk_evidence: &[DatDiskAudit],
+    disk_scan_complete: bool,
     games: &[DatGameEntry],
     source_id: &str,
 ) -> Result<(Vec<DatArchiveAudit>, u64, Vec<SetResolution>), DatAuditError> {
@@ -674,7 +714,13 @@ fn audit_archives(
         // `games` is the exact parsed instance `index` (above) was built
         // from - see dat::set's "Runtime DAT binding" doc for why this must
         // never be an independently re-parsed slice.
-        sets.extend(classify_archive_sets(&archive_audit, games, source_id));
+        sets.extend(classify_archive_sets(
+            &archive_audit,
+            disk_evidence,
+            disk_scan_complete,
+            games,
+            source_id,
+        ));
         archives.push(archive_audit);
 
         if cancelled(cancel) {
@@ -884,7 +930,19 @@ fn matched_refs_for_verdict(
 
 struct LocalScan {
     files: Vec<PathBuf>,
+    /// The scan hit a configured ceiling ([`MAX_SCAN_DEPTH`],
+    /// [`MAX_SCAN_FILES`], or [`MAX_SCAN_ENTRIES_EXAMINED`]) and stopped
+    /// early by design.
     truncated: bool,
+    /// The scan encountered a traversal error - an unreadable directory, a
+    /// directory-entry read failure, or a `file_type()` failure - and
+    /// silently skipped whatever that entry might have been, rather than
+    /// hitting a ceiling on purpose. Deliberately a separate concept from
+    /// `truncated`: a ceiling is an intentional, reported stopping point: an
+    /// unreadable subtree is missing candidates nobody chose to skip, and a
+    /// caller deciding whether it can trust "nothing required was missed"
+    /// needs to tell the two apart.
+    scan_complete: bool,
 }
 
 /// Walks `root`, collecting regular files in a deterministic order.
@@ -899,6 +957,20 @@ fn scan_local_files(
     root: &Path,
     cancel: &AtomicBool,
     on_progress: &dyn Fn(DatAuditProgress),
+) -> Result<LocalScan, DatAuditError> {
+    // Production always uses the real filesystem; only tests inject a
+    // failure, and only for one directory they name, to prove the
+    // bookkeeping below without depending on chmod (root bypasses
+    // permission checks, so a chmod-based test behaves differently under
+    // CI-as-root) or an unreproducible TOCTOU race against the real OS.
+    scan_local_files_impl(root, cancel, on_progress, &|_| false)
+}
+
+fn scan_local_files_impl(
+    root: &Path,
+    cancel: &AtomicBool,
+    on_progress: &dyn Fn(DatAuditProgress),
+    inject_read_dir_failure: &dyn Fn(&Path) -> bool,
 ) -> Result<LocalScan, DatAuditError> {
     if !root.is_absolute() {
         return Err(DatAuditError::ScanPath(
@@ -916,6 +988,7 @@ fn scan_local_files(
 
     let mut files: Vec<PathBuf> = Vec::new();
     let mut truncated = false;
+    let mut scan_complete = true;
     let mut examined = 0usize;
     // Breadth-first over an explicit queue rather than recursion, so depth is a
     // number this function controls instead of a property of the call stack.
@@ -926,22 +999,35 @@ fn scan_local_files(
         if cancelled(cancel) {
             return Err(DatAuditError::Cancelled);
         }
+        if inject_read_dir_failure(&directory) {
+            scan_complete = false;
+            continue;
+        }
         let Ok(read_dir) = std::fs::read_dir(&directory) else {
             // An unreadable subdirectory is skipped, not fatal: one permission
             // problem deep in a library should not throw away the rest of the
-            // audit.
+            // audit. It does mean this walk cannot claim to have seen every
+            // candidate, though - a required disk (or ROM) could be exactly
+            // what sits behind the door that would not open.
+            scan_complete = false;
             continue;
         };
 
         let mut children: Vec<PathBuf> = Vec::new();
         for entry in read_dir {
-            let Ok(entry) = entry else { continue };
+            let Ok(entry) = entry else {
+                // A directory-entry read failure loses that one candidate
+                // the same way an unreadable directory does.
+                scan_complete = false;
+                continue;
+            };
             examined += 1;
             if examined > MAX_SCAN_ENTRIES_EXAMINED {
                 truncated = true;
                 break;
             }
             let Ok(file_type) = entry.file_type() else {
+                scan_complete = false;
                 continue;
             };
             let path = entry.path();
@@ -977,7 +1063,11 @@ fn scan_local_files(
     }
 
     files.sort();
-    Ok(LocalScan { files, truncated })
+    Ok(LocalScan {
+        files,
+        truncated,
+        scan_complete,
+    })
 }
 
 fn file_name_of(path: &Path) -> String {
@@ -1046,5 +1136,62 @@ mod nested_member_evidence_tests {
             rom_name: "nested.bin".to_string(),
         };
         assert!(matched_refs_for_verdict(&filename_only, &known, &index).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod local_scan_traversal_tests {
+    use super::*;
+
+    fn no_progress(_: DatAuditProgress) {}
+
+    /// A deterministic, portable, non-chmod stand-in for a real traversal
+    /// error (an unreadable directory, a directory-entry read failure, a
+    /// `file_type()` failure): `chmod`-based fixtures behave differently
+    /// under CI running as root (root bypasses the permission check the test
+    /// depends on), and racing a real `read_dir` failure against the OS is
+    /// not reproducible. `scan_local_files_impl`'s injection hook exercises
+    /// exactly the same `scan_complete = false` bookkeeping a real failure
+    /// would, without depending on either.
+    #[test]
+    fn an_injected_read_dir_failure_marks_the_scan_incomplete() {
+        let dir = tempfile::tempdir().unwrap();
+        let broken = dir.path().join("unreadable");
+        std::fs::create_dir(&broken).unwrap();
+        std::fs::write(dir.path().join("ordinary.rom"), b"test").unwrap();
+        std::fs::write(broken.join("hidden.rom"), b"test").unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let scan = scan_local_files_impl(dir.path(), &cancel, &no_progress, &|path| path == broken)
+            .unwrap();
+
+        assert!(
+            !scan.scan_complete,
+            "an injected traversal failure must mark the scan incomplete"
+        );
+        assert!(
+            !scan.truncated,
+            "a traversal error is not the same concept as hitting a ceiling"
+        );
+        assert!(
+            scan.files.iter().any(|f| f.ends_with("ordinary.rom")),
+            "files outside the failed directory are still collected"
+        );
+        assert!(
+            !scan.files.iter().any(|f| f.ends_with("hidden.rom")),
+            "the file behind the failed directory is genuinely lost, not silently found anyway"
+        );
+    }
+
+    #[test]
+    fn a_clean_traversal_with_no_injected_failure_is_scan_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ordinary.rom"), b"test").unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let scan = scan_local_files_impl(dir.path(), &cancel, &no_progress, &|_| false).unwrap();
+
+        assert!(scan.scan_complete);
+        assert!(!scan.truncated);
     }
 }
