@@ -14,18 +14,24 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::dat::archive::ArchivePassCompletion;
 use crate::dat::audit::{AuditEntry, AuditVerdict};
 use crate::dat::classification::{
     ContentEligibility, DatContentClassification, DatOriginalMetadata,
 };
 use crate::dat::rename_plan::collisions::{
-    DirSiblings, detect_proposal_collisions, detect_target_collision,
+    DirSiblings, detect_duplicate_sources, detect_proposal_collisions, detect_target_collision,
 };
-use crate::dat::rename_plan::derive::{DeriveOutcome, derive_proposed_basename};
+use crate::dat::rename_plan::derive::{
+    DeriveOutcome, derive_outer_archive_basename, derive_proposed_basename,
+};
 use crate::dat::rename_plan::model::{
     ProposalState, RenamePlan, RenamePlanCounts, RenameProposal, SourceObjectKind,
 };
-use crate::dat::sources::audit_run::{DatAuditOutcome, DatContentMatch, DatPolicyNote};
+use crate::dat::set::{SetResolution, SetState};
+use crate::dat::sources::audit_run::{
+    DatArchiveAudit, DatAuditOutcome, DatContentMatch, DatPolicyNote,
+};
 
 /// The identity a plan is built for. `generation` lets a caller reject a plan
 /// built for a stale audit generation.
@@ -148,8 +154,22 @@ pub fn build_rename_plan(
         }
     }
 
+    // Outer .zip/.7z archive proposals, from Stage 1 set-completeness
+    // evidence rather than a per-file DAT match - see
+    // `derive_outer_archive_proposals`'s own doc for the eligibility rules.
+    // Pushed into the same `proposals` list *before* collision detection
+    // runs, so the existing collision machinery below covers archive-vs-
+    // archive and archive-vs-loose-file collisions for free, exactly as it
+    // already does between two loose-file proposals.
+    proposals.extend(derive_outer_archive_proposals(
+        &outcome.archives,
+        &outcome.sets,
+        &proposal_context,
+    ));
+
     detect_target_collisions(&mut proposals, &siblings_by_parent);
     detect_proposal_collisions(&mut proposals);
+    detect_duplicate_sources(&mut proposals);
 
     // Deterministic ordering, independent of input order.
     proposals.sort_by(|a, b| {
@@ -374,6 +394,8 @@ fn derive_proposal(
         extension_status,
         sanitisation_notes,
         actionable: state == ProposalState::Suggested,
+        audited_identity: None,
+        is_outer_archive: false,
     }
 }
 
@@ -399,6 +421,242 @@ fn blocked_missing_source(
         "the source file is no longer present on disk; its plan cannot be verified".to_string(),
     );
     proposal
+}
+
+/// Derives proposals for renaming outer `.zip`/`.7z` archives as a whole,
+/// from Stage 1 set-completeness evidence (`dat::set`) rather than a
+/// per-file DAT match.
+///
+/// A proposal is derived for an archive only when every condition holds:
+///
+/// - the archive's own pass was `Complete` - re-verified here directly from
+///   [`DatArchiveAudit::completion`], not merely inferred from a
+///   [`SetState`] (a set can only ever *reach* `Complete` when its pass was
+///   complete, per `dat::set`'s own R8, but this function does not trust
+///   that transitively - a partial pass always refuses, independent of
+///   whatever state happened to come out of it);
+/// - `outcome.sets` contains **exactly one** [`SetResolution`] naming this
+///   archive - zero means nothing was verified for it at all (R1), and more
+///   than one means a mixed or multi-set archive; neither can be safely
+///   named from a single set identity, so both refuse;
+/// - that one resolution's `state` is [`SetState::Complete`] - `Incomplete`,
+///   `BadMetadata`, and every `NeedsReview` reason (ambiguous attribution,
+///   unsupported parser/model provenance, partial pass, duplicate game
+///   name, duplicate archive evidence) all refuse;
+/// - the archive's path extension is `.zip` or `.7z` (case-insensitive) -
+///   the only two formats [`crate::dat::archive`] produces evidence for.
+///
+/// The canonical name is always `resolution.identity.game_name` - the DAT
+/// set/game name - **never** the archive's current filename and never an
+/// archive member's name; this function never reads `archive.members` for
+/// naming purposes, only to have located `resolution` at all.
+///
+/// This renames the outer archive pathname only. Nothing here opens the
+/// archive, reads its contents, or has any way to rename a member inside
+/// it - the return type is the same [`RenameProposal`] a loose file gets,
+/// applied by the same executor that already refuses everything but a
+/// plain filesystem rename of a regular file.
+fn derive_outer_archive_proposals(
+    archives: &[DatArchiveAudit],
+    sets: &[SetResolution],
+    context: &ProposalContext<'_>,
+) -> Vec<RenameProposal> {
+    let mut resolutions_by_archive: HashMap<&Path, Vec<&SetResolution>> = HashMap::new();
+    for resolution in sets {
+        resolutions_by_archive
+            .entry(resolution.archive_path.as_path())
+            .or_default()
+            .push(resolution);
+    }
+
+    let mut proposals = Vec::new();
+    for archive in archives {
+        if !matches!(archive.completion, ArchivePassCompletion::Complete) {
+            // Partial archive pass: never a proposal, regardless of what any
+            // individual SetResolution's state happens to say.
+            continue;
+        }
+        let is_zip_or_7z = archive
+            .archive_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("zip") || extension.eq_ignore_ascii_case("7z")
+            });
+        if !is_zip_or_7z {
+            continue;
+        }
+        let Some(resolutions) = resolutions_by_archive.get(archive.archive_path.as_path()) else {
+            // R1: nothing in this archive was ever verified against the DAT.
+            continue;
+        };
+        let [resolution] = resolutions.as_slice() else {
+            // Zero is unreachable here (the map entry would not exist), so
+            // this is always "more than one" - a mixed or multi-set archive.
+            continue;
+        };
+        if resolution.state != SetState::Complete {
+            continue;
+        }
+        if resolution.identity.source_id != context.source_id {
+            continue;
+        }
+        if !archive_exactly_matches_set(archive, resolution) {
+            continue;
+        }
+        let Some(audited_identity) = archive.outer_identity.as_ref() else {
+            continue;
+        };
+        let current_identity = crate::dat::rename_apply::capture_identity(&archive.archive_path);
+        if !current_identity.as_ref().is_ok_and(|current| {
+            crate::dat::rename_apply::identity_matches(audited_identity, current)
+        }) {
+            continue;
+        }
+
+        let Some(current_basename) = archive
+            .archive_path
+            .file_name()
+            .and_then(|name| name.to_str())
+        else {
+            continue;
+        };
+        let Some(object_kind) = classify_object(&archive.archive_path) else {
+            // The archive is no longer present on disk since the audit ran.
+            continue;
+        };
+
+        let mut state = ProposalState::Suggested;
+        let mut blockers: Vec<String> = Vec::new();
+        let mut proposed_basename: Option<String> = None;
+        let mut extension_status = None;
+        let mut sanitisation_notes: Vec<String> = Vec::new();
+
+        match object_kind {
+            SourceObjectKind::Symlink => {
+                state = ProposalState::Unsupported;
+                blockers.push(
+                    "the source is a symlink; renaming a link is not supported yet - a future \
+                     stage would rename the link itself, never its target"
+                        .to_string(),
+                );
+            }
+            SourceObjectKind::BrokenSymlink => {
+                state = ProposalState::Unsupported;
+                blockers.push(
+                    "the source is a broken symlink; planning cannot verify what a rename would \
+                     move"
+                        .to_string(),
+                );
+            }
+            SourceObjectKind::RegularFile => {}
+        }
+
+        if state == ProposalState::Suggested {
+            match derive_outer_archive_basename(&resolution.identity.game_name, current_basename) {
+                DeriveOutcome::Ok(derived) => {
+                    extension_status = Some(derived.extension_status);
+                    sanitisation_notes = derived.sanitisation_notes;
+                    if derived.proposed_basename == current_basename {
+                        state = ProposalState::AlreadyCanonical;
+                    } else {
+                        proposed_basename = Some(derived.proposed_basename);
+                    }
+                }
+                DeriveOutcome::Blocked(reason) => {
+                    state = ProposalState::Blocked;
+                    blockers.push(reason);
+                }
+                DeriveOutcome::Unsupported(reason) => {
+                    state = ProposalState::Unsupported;
+                    blockers.push(reason);
+                }
+            }
+        }
+
+        proposals.push(RenameProposal {
+            source_path: archive.archive_path.clone(),
+            current_basename: current_basename.to_string(),
+            proposed_basename,
+            platform: context.platform.map(str::to_string),
+            platform_display: context.platform_display.map(str::to_string),
+            source_id: context.source_id.to_string(),
+            source_display_name: context.source_display_name.to_string(),
+            game_name: Some(resolution.identity.game_name.clone()),
+            // A set, not one rom - there is no single matched rom name to
+            // report, and reporting one would misrepresent an outer-archive
+            // proposal as an ordinary loose-file one.
+            rom_name: None,
+            verdict_label: "Set complete".to_string(),
+            match_confident: true,
+            explanations: Vec::new(),
+            content_policy: context.content_policy,
+            // Per-ROM content classification does not apply to a whole-set
+            // resolution; Games-only filtering is not applied to outer
+            // archive proposals for the same reason.
+            content_classification: DatContentClassification::unknown(),
+            original_metadata: DatOriginalMetadata::default(),
+            state,
+            object_kind,
+            ambiguity_reason: None,
+            collision: None,
+            blockers,
+            extension_status,
+            sanitisation_notes,
+            actionable: state == ProposalState::Suggested,
+            audited_identity: Some(audited_identity.clone()),
+            is_outer_archive: true,
+        });
+    }
+    proposals
+}
+
+/// Outer-rename eligibility is stricter than Stage 1 `SetState::Complete`:
+/// every physical member must be uniquely and exactly attributed to one
+/// required ROM of this set, with no extras or duplicate copies.
+fn archive_exactly_matches_set(archive: &DatArchiveAudit, resolution: &SetResolution) -> bool {
+    if archive.members.len() != archive.total_members
+        || archive.members.len() != resolution.members_required.len()
+        || resolution.members_verified.len() != resolution.members_required.len()
+    {
+        return false;
+    }
+
+    let mut required: HashMap<&str, usize> = resolution
+        .members_required
+        .iter()
+        .map(|name| (name.as_str(), 0))
+        .collect();
+    if required.len() != resolution.members_required.len() {
+        return false;
+    }
+
+    let mut seen_indices = std::collections::HashSet::with_capacity(archive.members.len());
+    for member in &archive.members {
+        if !seen_indices.insert(member.evidence.index) {
+            return false;
+        }
+        let Some(AuditVerdict::Exact {
+            game_name,
+            rom_name,
+            ..
+        }) = member.verdict.as_ref()
+        else {
+            return false;
+        };
+        if game_name != &resolution.identity.game_name {
+            return false;
+        }
+        let Some(count) = required.get_mut(rom_name.as_str()) else {
+            return false;
+        };
+        *count += 1;
+        if *count > 1 {
+            return false;
+        }
+    }
+
+    required.values().all(|count| *count == 1)
 }
 
 /// Applies existing-target and case-only sibling collisions to suggested
@@ -1205,6 +1463,565 @@ mod tests {
         assert_eq!(
             effective.language_preferences,
             Vec::<LanguagePreference>::new()
+        );
+    }
+
+    // -- Outer archive rename ------------------------------------------------
+
+    use crate::dat::archive::{
+        ArchiveMemberEvidence, ArchiveMemberHashes, ArchiveMemberStatus, ArchivePassStopReason,
+    };
+    use crate::dat::set::{BadMetadataReason, NeedsReviewReason, SetIdentity};
+    use crate::dat::sources::audit_run::DatArchiveMemberAudit;
+
+    fn archive_audit(
+        path: &Path,
+        completion: ArchivePassCompletion,
+        game_name: &str,
+        total_members: usize,
+    ) -> DatArchiveAudit {
+        let format = if path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("7z"))
+        {
+            "7z"
+        } else {
+            "zip"
+        };
+        DatArchiveAudit {
+            archive_path: path.to_path_buf(),
+            outer_identity: crate::dat::rename_apply::capture_identity(path).ok(),
+            format: format.to_string(),
+            total_members,
+            completion,
+            members: (0..total_members)
+                .map(|index| {
+                    let rom_name = format!("rom-{index}.bin");
+                    DatArchiveMemberAudit {
+                        evidence: ArchiveMemberEvidence {
+                            archive_path: path.to_path_buf(),
+                            member_name_raw: rom_name.as_bytes().to_vec(),
+                            member_name_display: rom_name.clone(),
+                            index,
+                            logical_size: 7,
+                            is_nested_archive: false,
+                            status: ArchiveMemberStatus::HashComplete,
+                            hashes: Some(ArchiveMemberHashes {
+                                crc32: "00000000".to_string(),
+                                md5: "00".to_string(),
+                                sha1: "00".to_string(),
+                                sha256: "00".to_string(),
+                            }),
+                        },
+                        verdict: Some(AuditVerdict::Exact {
+                            game_name: game_name.to_string(),
+                            rom_name,
+                            algorithm: "SHA-1",
+                        }),
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    fn complete_pass() -> ArchivePassCompletion {
+        ArchivePassCompletion::Complete
+    }
+
+    fn set_resolution(
+        archive_path: &Path,
+        game_name: &str,
+        state: SetState,
+        total_members: usize,
+    ) -> SetResolution {
+        let members: Vec<String> = (0..total_members)
+            .map(|index| format!("rom-{index}.bin"))
+            .collect();
+        SetResolution {
+            identity: SetIdentity {
+                source_id: "src".to_string(),
+                game_name: game_name.to_string(),
+            },
+            archive_path: archive_path.to_path_buf(),
+            state,
+            members_required: members.clone(),
+            members_verified: members,
+            members_bad: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_complete_one_set_zip_produces_a_correct_outer_rename_proposal() {
+        let dir = temp();
+        let archive = write(dir.path(), "bad_old_name.zip");
+        let mut out = outcome(dir.path(), Vec::new(), Vec::new(), None, false);
+        out.archives = vec![archive_audit(
+            &archive,
+            complete_pass(),
+            "Sonic the Hedgehog (USA, Europe)",
+            2,
+        )];
+        out.sets = vec![set_resolution(
+            &archive,
+            "Sonic the Hedgehog (USA, Europe)",
+            SetState::Complete,
+            2,
+        )];
+
+        let plan =
+            build_rename_plan(&out, &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+
+        assert_eq!(plan.proposals.len(), 1);
+        let proposal = &plan.proposals[0];
+        assert!(proposal.is_outer_archive);
+        assert_eq!(proposal.state, ProposalState::Suggested);
+        assert!(proposal.actionable);
+        assert_eq!(
+            proposal.proposed_basename.as_deref(),
+            Some("Sonic the Hedgehog (USA, Europe).zip")
+        );
+        assert_eq!(proposal.source_path, archive);
+        assert_eq!(
+            proposal.game_name.as_deref(),
+            Some("Sonic the Hedgehog (USA, Europe)")
+        );
+        assert_eq!(proposal.rom_name, None);
+        assert!(proposal.audited_identity.is_some());
+    }
+
+    #[test]
+    fn complete_set_with_an_unrelated_exact_member_produces_no_proposal() {
+        let dir = temp();
+        let archive = write(dir.path(), "mixed.zip");
+        let mut audit = archive_audit(&archive, complete_pass(), "Game A", 1);
+        let mut extra = audit.members[0].clone();
+        extra.evidence.index = 1;
+        extra.verdict = Some(AuditVerdict::Exact {
+            game_name: "Game B".to_string(),
+            rom_name: "other.bin".to_string(),
+            algorithm: "SHA-1",
+        });
+        audit.members.push(extra);
+        audit.total_members = 2;
+        let mut out = outcome(dir.path(), Vec::new(), Vec::new(), None, false);
+        out.archives = vec![audit];
+        out.sets = vec![set_resolution(&archive, "Game A", SetState::Complete, 1)];
+
+        let plan =
+            build_rename_plan(&out, &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+        assert!(plan.proposals.is_empty());
+    }
+
+    #[test]
+    fn complete_set_with_a_not_in_dat_member_produces_no_proposal() {
+        let dir = temp();
+        let archive = write(dir.path(), "extra.zip");
+        let mut audit = archive_audit(&archive, complete_pass(), "Game", 1);
+        let mut extra = audit.members[0].clone();
+        extra.evidence.index = 1;
+        extra.verdict = Some(AuditVerdict::NotInDat);
+        audit.members.push(extra);
+        audit.total_members = 2;
+        let mut out = outcome(dir.path(), Vec::new(), Vec::new(), None, false);
+        out.archives = vec![audit];
+        out.sets = vec![set_resolution(&archive, "Game", SetState::Complete, 1)];
+
+        let plan =
+            build_rename_plan(&out, &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+        assert!(plan.proposals.is_empty());
+    }
+
+    #[test]
+    fn duplicate_copy_of_a_required_member_produces_no_proposal() {
+        let dir = temp();
+        let archive = write(dir.path(), "duplicate.zip");
+        let mut audit = archive_audit(&archive, complete_pass(), "Game", 1);
+        let mut duplicate = audit.members[0].clone();
+        duplicate.evidence.index = 1;
+        audit.members.push(duplicate);
+        audit.total_members = 2;
+        let mut out = outcome(dir.path(), Vec::new(), Vec::new(), None, false);
+        out.archives = vec![audit];
+        out.sets = vec![set_resolution(&archive, "Game", SetState::Complete, 1)];
+
+        let plan =
+            build_rename_plan(&out, &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+        assert!(plan.proposals.is_empty());
+    }
+
+    #[test]
+    fn duplicate_physical_member_index_with_different_exact_verdicts_produces_no_proposal() {
+        let dir = temp();
+        let archive = write(dir.path(), "duplicate-index.zip");
+        let mut audit = archive_audit(&archive, complete_pass(), "Game", 2);
+        audit.members[1].evidence.index = audit.members[0].evidence.index;
+        let resolution = set_resolution(&archive, "Game", SetState::Complete, 2);
+
+        assert!(
+            !archive_exactly_matches_set(&audit, &resolution),
+            "two evidence rows for one physical member index must not satisfy two required ROMs"
+        );
+
+        let mut out = outcome(dir.path(), Vec::new(), Vec::new(), None, false);
+        out.archives = vec![audit];
+        out.sets = vec![resolution];
+        let plan =
+            build_rename_plan(&out, &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+        assert!(plan.proposals.is_empty());
+    }
+
+    #[test]
+    fn weak_ambiguous_or_missing_member_verdict_produces_no_proposal() {
+        for verdict in [
+            Some(AuditVerdict::Probable {
+                game_name: "Game".to_string(),
+                rom_name: "rom-0.bin".to_string(),
+            }),
+            Some(AuditVerdict::Ambiguous {
+                detail: "conflicting evidence".to_string(),
+            }),
+            None,
+        ] {
+            let dir = temp();
+            let archive = write(dir.path(), "weak.zip");
+            let mut audit = archive_audit(&archive, complete_pass(), "Game", 1);
+            audit.members[0].verdict = verdict;
+            let mut out = outcome(dir.path(), Vec::new(), Vec::new(), None, false);
+            out.archives = vec![audit];
+            out.sets = vec![set_resolution(&archive, "Game", SetState::Complete, 1)];
+            let plan = build_rename_plan(&out, &RenamePlanContext { generation: 1 }, &no_cancel())
+                .unwrap();
+            assert!(plan.proposals.is_empty());
+        }
+    }
+
+    #[test]
+    fn replacing_the_outer_object_after_audit_produces_no_proposal() {
+        let dir = temp();
+        let archive = write(dir.path(), "changed.zip");
+        let audit = archive_audit(&archive, complete_pass(), "Game", 1);
+        std::fs::remove_file(&archive).unwrap();
+        std::fs::write(&archive, b"replacement").unwrap();
+        let mut out = outcome(dir.path(), Vec::new(), Vec::new(), None, false);
+        out.archives = vec![audit];
+        out.sets = vec![set_resolution(&archive, "Game", SetState::Complete, 1)];
+
+        let plan =
+            build_rename_plan(&out, &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+        assert!(plan.proposals.is_empty());
+    }
+
+    #[test]
+    fn a_mismatched_dat_source_id_produces_no_proposal() {
+        let dir = temp();
+        let archive = write(dir.path(), "source.zip");
+        let mut out = outcome(dir.path(), Vec::new(), Vec::new(), None, false);
+        out.archives = vec![archive_audit(&archive, complete_pass(), "Game", 1)];
+        let mut resolution = set_resolution(&archive, "Game", SetState::Complete, 1);
+        resolution.identity.source_id = "different-source".to_string();
+        out.sets = vec![resolution];
+
+        let plan =
+            build_rename_plan(&out, &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+        assert!(plan.proposals.is_empty());
+    }
+
+    #[test]
+    fn archive_suffixed_canonical_set_names_are_refused() {
+        for game_name in ["Game.zip", "Game.ZIP", "Game.7z", "Game.7Z"] {
+            let dir = temp();
+            let archive = write(dir.path(), "old.zip");
+            let mut out = outcome(dir.path(), Vec::new(), Vec::new(), None, false);
+            out.archives = vec![archive_audit(&archive, complete_pass(), game_name, 1)];
+            out.sets = vec![set_resolution(&archive, game_name, SetState::Complete, 1)];
+            let plan = build_rename_plan(&out, &RenamePlanContext { generation: 1 }, &no_cancel())
+                .unwrap();
+            assert_eq!(plan.proposals.len(), 1);
+            assert_eq!(plan.proposals[0].state, ProposalState::Blocked);
+            assert!(!plan.proposals[0].actionable);
+        }
+    }
+
+    #[test]
+    fn loose_and_outer_proposals_for_one_source_are_both_conflicts() {
+        let dir = temp();
+        let archive = write(dir.path(), "same.zip");
+        let mut out = outcome(
+            dir.path(),
+            vec![entry_for(&archive, "same.zip", exact("Loose.zip"))],
+            Vec::new(),
+            None,
+            false,
+        );
+        out.archives = vec![archive_audit(&archive, complete_pass(), "Game", 1)];
+        out.sets = vec![set_resolution(&archive, "Game", SetState::Complete, 1)];
+
+        let plan =
+            build_rename_plan(&out, &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+        assert_eq!(plan.proposals.len(), 2);
+        assert!(plan.proposals.iter().all(|proposal| {
+            proposal.state == ProposalState::Conflict
+                && !proposal.actionable
+                && proposal
+                    .collision
+                    .as_ref()
+                    .is_some_and(|collision| collision.kind == CollisionKind::DuplicateSource)
+        }));
+    }
+
+    #[test]
+    fn a_complete_one_set_7z_produces_a_correct_outer_rename_proposal() {
+        let dir = temp();
+        let archive = write(dir.path(), "old.7z");
+        let mut out = outcome(dir.path(), Vec::new(), Vec::new(), None, false);
+        out.archives = vec![archive_audit(
+            &archive,
+            complete_pass(),
+            "Golden Axe (Europe)",
+            3,
+        )];
+        out.sets = vec![set_resolution(
+            &archive,
+            "Golden Axe (Europe)",
+            SetState::Complete,
+            3,
+        )];
+
+        let plan =
+            build_rename_plan(&out, &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+
+        assert_eq!(plan.proposals.len(), 1);
+        let proposal = &plan.proposals[0];
+        assert!(proposal.is_outer_archive);
+        assert_eq!(proposal.state, ProposalState::Suggested);
+        assert_eq!(
+            proposal.proposed_basename.as_deref(),
+            Some("Golden Axe (Europe).7z")
+        );
+    }
+
+    #[test]
+    fn the_zip_extension_is_preserved_in_the_proposal() {
+        let dir = temp();
+        let archive = write(dir.path(), "x.zip");
+        let mut out = outcome(dir.path(), Vec::new(), Vec::new(), None, false);
+        out.archives = vec![archive_audit(&archive, complete_pass(), "Game (World)", 1)];
+        out.sets = vec![set_resolution(
+            &archive,
+            "Game (World)",
+            SetState::Complete,
+            1,
+        )];
+
+        let plan =
+            build_rename_plan(&out, &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+
+        assert!(
+            plan.proposals[0]
+                .proposed_basename
+                .as_deref()
+                .unwrap()
+                .ends_with(".zip")
+        );
+    }
+
+    #[test]
+    fn incomplete_set_state_produces_no_outer_archive_proposal() {
+        let dir = temp();
+        let archive = write(dir.path(), "game.zip");
+        let mut out = outcome(dir.path(), Vec::new(), Vec::new(), None, false);
+        out.archives = vec![archive_audit(&archive, complete_pass(), "Game (World)", 2)];
+        out.sets = vec![set_resolution(
+            &archive,
+            "Game (World)",
+            SetState::Incomplete,
+            2,
+        )];
+
+        let plan =
+            build_rename_plan(&out, &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+
+        assert!(
+            plan.proposals.is_empty(),
+            "Incomplete must never produce a proposal"
+        );
+    }
+
+    #[test]
+    fn needs_review_state_produces_no_outer_archive_proposal() {
+        let dir = temp();
+        let archive = write(dir.path(), "game.zip");
+        let mut out = outcome(dir.path(), Vec::new(), Vec::new(), None, false);
+        out.archives = vec![archive_audit(&archive, complete_pass(), "Game (World)", 2)];
+        out.sets = vec![set_resolution(
+            &archive,
+            "Game (World)",
+            SetState::NeedsReview(NeedsReviewReason::UnsupportedSetStructure),
+            2,
+        )];
+
+        let plan =
+            build_rename_plan(&out, &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+
+        assert!(
+            plan.proposals.is_empty(),
+            "NeedsReview must never produce a proposal"
+        );
+    }
+
+    #[test]
+    fn bad_metadata_state_produces_no_outer_archive_proposal() {
+        let dir = temp();
+        let archive = write(dir.path(), "game.zip");
+        let mut out = outcome(dir.path(), Vec::new(), Vec::new(), None, false);
+        out.archives = vec![archive_audit(&archive, complete_pass(), "Game (World)", 2)];
+        out.sets = vec![set_resolution(
+            &archive,
+            "Game (World)",
+            SetState::BadMetadata(BadMetadataReason::NoDump),
+            2,
+        )];
+
+        let plan =
+            build_rename_plan(&out, &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+
+        assert!(
+            plan.proposals.is_empty(),
+            "BadMetadata must never produce a proposal"
+        );
+    }
+
+    #[test]
+    fn multiple_sets_in_one_archive_produce_no_proposal() {
+        let dir = temp();
+        let archive = write(dir.path(), "mixed.zip");
+        let mut out = outcome(dir.path(), Vec::new(), Vec::new(), None, false);
+        out.archives = vec![archive_audit(&archive, complete_pass(), "Game A", 4)];
+        out.sets = vec![
+            set_resolution(&archive, "Game A", SetState::Complete, 4),
+            set_resolution(&archive, "Game B", SetState::Complete, 4),
+        ];
+
+        let plan =
+            build_rename_plan(&out, &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+
+        assert!(
+            plan.proposals.is_empty(),
+            "a mixed/multi-set archive must never produce a proposal from either set"
+        );
+    }
+
+    #[test]
+    fn partial_archive_pass_produces_no_proposal_even_if_a_set_reports_complete() {
+        let dir = temp();
+        let archive = write(dir.path(), "game.zip");
+        let mut out = outcome(dir.path(), Vec::new(), Vec::new(), None, false);
+        out.archives = vec![archive_audit(
+            &archive,
+            ArchivePassCompletion::Incomplete {
+                reason: ArchivePassStopReason::RunLogicalBudget,
+            },
+            "Game (World)",
+            2,
+        )];
+        // Even a (hypothetically inconsistent) Complete SetState must not
+        // override a partial archive pass - this function re-verifies the
+        // pass itself rather than trusting the state transitively.
+        out.sets = vec![set_resolution(
+            &archive,
+            "Game (World)",
+            SetState::Complete,
+            2,
+        )];
+
+        let plan =
+            build_rename_plan(&out, &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+
+        assert!(
+            plan.proposals.is_empty(),
+            "a partial archive pass must never produce a proposal"
+        );
+    }
+
+    #[test]
+    fn an_existing_destination_collision_refuses_the_outer_archive_proposal() {
+        let dir = temp();
+        let archive = write(dir.path(), "old.zip");
+        // The proposed canonical name already exists as a sibling file.
+        write(dir.path(), "Game (World).zip");
+        let mut out = outcome(dir.path(), Vec::new(), Vec::new(), None, false);
+        out.archives = vec![archive_audit(&archive, complete_pass(), "Game (World)", 1)];
+        out.sets = vec![set_resolution(
+            &archive,
+            "Game (World)",
+            SetState::Complete,
+            1,
+        )];
+        // The sibling index is built from `report.entries`, exactly as the
+        // real audit populates it (every scanned file, archive included).
+        out.report.entries.push(entry_for(
+            &dir.path().join("Game (World).zip"),
+            "Game (World).zip",
+            AuditVerdict::NotInDat,
+        ));
+
+        let plan =
+            build_rename_plan(&out, &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+
+        assert_eq!(plan.proposals.len(), 1);
+        assert_eq!(plan.proposals[0].state, ProposalState::Conflict);
+        assert!(!plan.proposals[0].actionable);
+    }
+
+    #[test]
+    fn a_non_zip_7z_archive_path_is_never_proposed() {
+        let dir = temp();
+        let archive = write(dir.path(), "game.rar");
+        let mut out = outcome(dir.path(), Vec::new(), Vec::new(), None, false);
+        out.archives = vec![archive_audit(&archive, complete_pass(), "Game (World)", 1)];
+        out.sets = vec![set_resolution(
+            &archive,
+            "Game (World)",
+            SetState::Complete,
+            1,
+        )];
+
+        let plan =
+            build_rename_plan(&out, &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+
+        assert!(plan.proposals.is_empty());
+    }
+
+    #[test]
+    fn ordinary_loose_file_proposals_are_unaffected_by_outer_archive_logic() {
+        // Positive control: a completely ordinary loose-file proposal, with
+        // no archive evidence anywhere in the outcome, behaves exactly as
+        // before - `is_outer_archive` is false and nothing about the new
+        // code path touches it.
+        let dir = temp();
+        let path = write(dir.path(), "goldenaxe.bin");
+        let out = outcome(
+            dir.path(),
+            vec![entry_for(
+                &path,
+                "goldenaxe.bin",
+                exact("Golden Axe (Europe).bin"),
+            )],
+            Vec::new(),
+            None,
+            false,
+        );
+
+        let plan =
+            build_rename_plan(&out, &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+
+        assert_eq!(plan.proposals.len(), 1);
+        assert!(!plan.proposals[0].is_outer_archive);
+        assert_eq!(plan.proposals[0].state, ProposalState::Suggested);
+        assert_eq!(
+            plan.proposals[0].proposed_basename.as_deref(),
+            Some("Golden Axe (Europe).bin")
         );
     }
 }

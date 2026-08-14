@@ -36,23 +36,36 @@ pub struct DerivedName {
     pub sanitisation_notes: Vec<String>,
 }
 
+/// Rejects a candidate name that cannot safely become any part of a
+/// filename: empty, a reserved path component, or containing a path
+/// separator or NUL. Shared by every deriver in this module so "what makes a
+/// name unusable" is answered in exactly one place.
+fn reject_unsafe_component(trimmed: &str, source_label: &str) -> Option<DeriveOutcome> {
+    if trimmed.is_empty() {
+        return Some(DeriveOutcome::Blocked(format!(
+            "the {source_label} is empty"
+        )));
+    }
+    if trimmed == "." || trimmed == ".." {
+        return Some(DeriveOutcome::Blocked(format!(
+            "the {source_label} is a reserved path component ('.' or '..')"
+        )));
+    }
+    if trimmed.contains(['/', '\\', '\0']) {
+        return Some(DeriveOutcome::Blocked(format!(
+            "the {source_label} {trimmed:?} contains a path separator; refusing to derive a \
+             name that could traverse or escape its directory"
+        )));
+    }
+    None
+}
+
 /// Derives the proposed basename for `rom_name` (the matched DAT entry's ROM
 /// name) against the source file's current basename.
 pub fn derive_proposed_basename(rom_name: &str, source_basename: &str) -> DeriveOutcome {
     let trimmed = rom_name.trim();
-    if trimmed.is_empty() {
-        return DeriveOutcome::Blocked("the DAT entry name is empty".to_string());
-    }
-    if trimmed == "." || trimmed == ".." {
-        return DeriveOutcome::Blocked(
-            "the DAT entry name is a reserved path component ('.' or '..')".to_string(),
-        );
-    }
-    if trimmed.contains(['/', '\\', '\0']) {
-        return DeriveOutcome::Blocked(format!(
-            "the DAT entry name {trimmed:?} contains a path separator; refusing to derive a \
-             name that could traverse or escape its directory"
-        ));
+    if let Some(rejected) = reject_unsafe_component(trimmed, "DAT entry name") {
+        return rejected;
     }
 
     let source_extension = extension_of(source_basename);
@@ -90,6 +103,60 @@ pub fn derive_proposed_basename(rom_name: &str, source_basename: &str) -> Derive
     DeriveOutcome::Ok(DerivedName {
         proposed_basename,
         extension_status,
+        sanitisation_notes,
+    })
+}
+
+/// Derives the proposed basename for an **outer archive** rename from
+/// `set_name` (a DAT set/game name - [`crate::dat::set::SetIdentity::game_name`],
+/// never a filename or an archive member name), against the archive's
+/// current basename.
+///
+/// Deliberately not [`derive_proposed_basename`]: that function requires the
+/// candidate name to carry its own extension matching the source's, which is
+/// the right rule for a ROM name (`"Sonic.bin"`) but wrong here - a DAT
+/// set/game name (`"Sonic the Hedgehog (USA, Europe)"`) has no extension of
+/// its own at all. The source archive's extension is instead preserved
+/// unconditionally, exactly as written (`.zip` stays `.zip`, `.7z` stays
+/// `.7z`, and an unusual original case like `.ZIP` is not normalised).
+pub fn derive_outer_archive_basename(set_name: &str, source_basename: &str) -> DeriveOutcome {
+    let trimmed = set_name.trim();
+    if let Some(rejected) = reject_unsafe_component(trimmed, "DAT set name") {
+        return rejected;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.ends_with(".zip") || lower.ends_with(".7z") {
+        return DeriveOutcome::Blocked(
+            "the DAT set name already ends in an archive extension; refusing to reinterpret it"
+                .to_string(),
+        );
+    }
+
+    let Some((_, extension)) = source_basename.rsplit_once('.') else {
+        // Every caller of this function has already confirmed the source is
+        // a `.zip`/`.7z` path before deriving a name from it; a source with
+        // no extension at all reaching here would be a caller bug, not a
+        // user-facing "unsupported" case - refuse rather than guess.
+        return DeriveOutcome::Blocked(
+            "the source archive has no extension to preserve".to_string(),
+        );
+    };
+    if extension.is_empty() {
+        return DeriveOutcome::Blocked(
+            "the source archive has no extension to preserve".to_string(),
+        );
+    }
+
+    let (stem, sanitisation_notes) = sanitise(trimmed);
+    if stem.is_empty() || stem == "." || stem == ".." {
+        return DeriveOutcome::Blocked(
+            "sanitising the DAT set name produced no usable name".to_string(),
+        );
+    }
+
+    DeriveOutcome::Ok(DerivedName {
+        proposed_basename: format!("{stem}.{extension}"),
+        extension_status: ExtensionStatus::Preserved,
         sanitisation_notes,
     })
 }
@@ -266,5 +333,110 @@ mod tests {
             }
             other => panic!("expected Ok, got {other:?}"),
         }
+    }
+
+    // -- derive_outer_archive_basename --------------------------------------
+
+    #[test]
+    fn a_set_name_preserves_the_source_zip_extension() {
+        match derive_outer_archive_basename("Sonic the Hedgehog (USA, Europe)", "bad_old_name.zip")
+        {
+            DeriveOutcome::Ok(derived) => {
+                assert_eq!(
+                    derived.proposed_basename,
+                    "Sonic the Hedgehog (USA, Europe).zip"
+                );
+                assert_eq!(derived.extension_status, ExtensionStatus::Preserved);
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_set_name_preserves_the_source_7z_extension() {
+        match derive_outer_archive_basename("Golden Axe (Europe)", "old.7z") {
+            DeriveOutcome::Ok(derived) => {
+                assert_eq!(derived.proposed_basename, "Golden Axe (Europe).7z");
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_original_extension_case_is_preserved_verbatim() {
+        match derive_outer_archive_basename("Game", "old.ZIP") {
+            DeriveOutcome::Ok(derived) => {
+                assert_eq!(derived.proposed_basename, "Game.ZIP");
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_set_name_with_a_period_does_not_confuse_extension_detection() {
+        // Unlike `derive_proposed_basename`, this function never inspects
+        // the candidate name's own extension - a literal period in a game
+        // name (a real, if rare, No-Intro/Redump shape) cannot misfire.
+        match derive_outer_archive_basename("Mr. Game and Watch", "old.zip") {
+            DeriveOutcome::Ok(derived) => {
+                assert_eq!(derived.proposed_basename, "Mr. Game and Watch.zip");
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn outer_archive_path_separators_are_blocked_not_sanitised() {
+        for evil in ["../escape", "dir/escape", "dir\\escape", "a\0b"] {
+            assert!(
+                matches!(
+                    derive_outer_archive_basename(evil, "x.zip"),
+                    DeriveOutcome::Blocked(_)
+                ),
+                "{evil:?} must be blocked"
+            );
+        }
+    }
+
+    #[test]
+    fn outer_archive_empty_and_reserved_names_are_blocked() {
+        for bad in ["", "   ", ".", ".."] {
+            assert!(
+                matches!(
+                    derive_outer_archive_basename(bad, "x.zip"),
+                    DeriveOutcome::Blocked(_)
+                ),
+                "{bad:?} must be blocked"
+            );
+        }
+    }
+
+    #[test]
+    fn a_source_with_no_extension_is_blocked_not_guessed() {
+        assert!(matches!(
+            derive_outer_archive_basename("Game", "no_extension"),
+            DeriveOutcome::Blocked(_)
+        ));
+    }
+
+    #[test]
+    fn outer_archive_sanitisation_is_deterministic_and_explained() {
+        let control = '\u{1}';
+        let name = format!("Game{control}Special");
+        let first = derive_outer_archive_basename(&name, "old.zip");
+        let second = derive_outer_archive_basename(&name, "old.zip");
+        assert_eq!(first, second, "sanitisation must be deterministic");
+        let DeriveOutcome::Ok(derived) = first else {
+            panic!("expected Ok");
+        };
+        assert_eq!(derived.proposed_basename, "Game_Special.zip");
+        assert!(
+            derived
+                .sanitisation_notes
+                .iter()
+                .any(|note| note.contains("replaced")),
+            "{:?}",
+            derived.sanitisation_notes
+        );
     }
 }

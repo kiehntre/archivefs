@@ -153,10 +153,18 @@ pub fn build_transaction_entries(
         let Some(parent) = proposal.source_path.parent() else {
             continue;
         };
-        let Ok(identity) = capture_identity(&proposal.source_path) else {
+        let Ok(current_identity) = capture_identity(&proposal.source_path) else {
             // The source is gone between plan and build; the entry cannot be
             // built with a recorded identity, so it is not included.
             continue;
+        };
+        let identity = if let Some(audited) = proposal.audited_identity.as_ref() {
+            if !super::identity::identity_matches(audited, &current_identity) {
+                continue;
+            }
+            audited.clone()
+        } else {
+            current_identity
         };
         entries.push(TransactionEntry {
             source_path: proposal.source_path.clone(),

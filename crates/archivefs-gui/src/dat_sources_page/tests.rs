@@ -2721,6 +2721,7 @@ fn archive_member_evidence_has_separate_gui_rows() {
     let mut outcome = minimal_outcome();
     outcome.archives.push(DatArchiveAudit {
         archive_path: "/tmp/roms/games.zip".into(),
+        outer_identity: None,
         format: "zip".to_string(),
         total_members: 1,
         completion: ArchivePassCompletion::Complete,
@@ -3597,6 +3598,8 @@ fn plan_proposal(
         extension_status: None,
         sanitisation_notes: Vec::new(),
         actionable: state == ProposalState::Suggested,
+        audited_identity: None,
+        is_outer_archive: false,
     }
 }
 
