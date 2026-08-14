@@ -1471,6 +1471,7 @@ mod tests {
     use crate::dat::archive::{
         ArchiveMemberEvidence, ArchiveMemberHashes, ArchiveMemberStatus, ArchivePassStopReason,
     };
+    use crate::dat::index::{DatMemberKey, DatRomRef, MemberLocation};
     use crate::dat::set::{BadMetadataReason, NeedsReviewReason, SetIdentity};
     use crate::dat::sources::audit_run::DatArchiveMemberAudit;
 
@@ -1519,6 +1520,7 @@ mod tests {
                             rom_name,
                             algorithm: "SHA-1",
                         }),
+                        matched_refs: Vec::new(),
                     }
                 })
                 .collect(),
@@ -1591,6 +1593,44 @@ mod tests {
         );
         assert_eq!(proposal.rom_name, None);
         assert!(proposal.audited_identity.is_some());
+    }
+
+    #[test]
+    fn nested_dat_ref_never_becomes_a_member_level_rename_proposal() {
+        let dir = temp();
+        let archive = write(dir.path(), "software.zip");
+        let mut audit = archive_audit(&archive, complete_pass(), "Software", 1);
+        audit.members[0].matched_refs = vec![DatRomRef {
+            game_index: 0,
+            game_name: "Software".to_string(),
+            rom_index: 0,
+            member_key: DatMemberKey {
+                game_index: 0,
+                location: MemberLocation::DataArea {
+                    part_index: 0,
+                    data_area_index: 0,
+                    member_index: 0,
+                },
+            },
+            rom_name: "nested/member.bin".to_string(),
+            size_bytes: Some(7),
+            checksums: Vec::new(),
+            status: None,
+            merge: None,
+            content_classification: Default::default(),
+            original_metadata: Default::default(),
+        }];
+        let mut out = outcome(dir.path(), Vec::new(), Vec::new(), None, false);
+        out.archives = vec![audit];
+        out.sets = vec![set_resolution(&archive, "Software", SetState::Complete, 1)];
+
+        let plan =
+            build_rename_plan(&out, &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+
+        assert_eq!(plan.proposals.len(), 1);
+        assert!(plan.proposals[0].is_outer_archive);
+        assert!(plan.proposals[0].rom_name.is_none());
+        assert_eq!(plan.proposals[0].source_path, archive);
     }
 
     #[test]

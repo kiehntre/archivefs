@@ -7,17 +7,43 @@
 
 use std::collections::HashMap;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::classification::{DatContentClassification, DatOriginalMetadata};
 use super::model::{DatChecksum, ParsedDat};
 
+/// The position of a ROM declaration within its game.
+///
+/// Names are deliberately absent: duplicate ROM, part, and data-area names
+/// are legal catalogue data and are not stable identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum MemberLocation {
+    TopLevel {
+        rom_index: usize,
+    },
+    DataArea {
+        part_index: usize,
+        data_area_index: usize,
+        member_index: usize,
+    },
+}
+
+/// Positional identity for one declared ROM slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DatMemberKey {
+    pub game_index: usize,
+    pub location: MemberLocation,
+}
+
 /// A reference to one ROM in one game entry.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DatRomRef {
     pub game_index: usize,
     pub game_name: String,
     pub rom_index: usize,
+    /// Exact declaration position. `rom_index` remains above for source and
+    /// diagnostic compatibility; identity always comes from this key.
+    pub member_key: DatMemberKey,
     pub rom_name: String,
     pub size_bytes: Option<u64>,
     pub checksums: Vec<DatChecksum>,
@@ -25,6 +51,13 @@ pub struct DatRomRef {
     pub merge: Option<String>,
     pub content_classification: DatContentClassification,
     pub original_metadata: DatOriginalMetadata,
+}
+
+impl DatRomRef {
+    /// Returns the exact declaration key without involving display names.
+    pub fn key(&self) -> DatMemberKey {
+        self.member_key
+    }
 }
 
 /// Index into a parsed DAT file, keyed by hash values.
@@ -57,6 +90,10 @@ impl DatIndex {
                     game_index,
                     game_name: game.name.clone(),
                     rom_index,
+                    member_key: DatMemberKey {
+                        game_index,
+                        location: MemberLocation::TopLevel { rom_index },
+                    },
                     rom_name: rom.name.clone(),
                     size_bytes: rom.size_bytes,
                     checksums: rom.checksums(),
@@ -66,45 +103,73 @@ impl DatIndex {
                     original_metadata: game.original_metadata.clone(),
                 };
 
-                if let Some(ref crc) = rom.crc32 {
-                    index
-                        .by_crc32
-                        .entry(crc.clone())
-                        .or_default()
-                        .push(rom_ref.clone());
-                }
-                if let Some(ref md5) = rom.md5 {
-                    index
-                        .by_md5
-                        .entry(md5.clone())
-                        .or_default()
-                        .push(rom_ref.clone());
-                }
-                if let Some(ref sha1) = rom.sha1 {
-                    index
-                        .by_sha1
-                        .entry(sha1.clone())
-                        .or_default()
-                        .push(rom_ref.clone());
-                }
-                if let Some(ref sha256) = rom.sha256 {
-                    index
-                        .by_sha256
-                        .entry(sha256.clone())
-                        .or_default()
-                        .push(rom_ref.clone());
-                }
+                index.insert_rom(rom, rom_ref);
+            }
 
-                let fname_lower = rom.name.to_ascii_lowercase();
-                index
-                    .by_filename
-                    .entry(fname_lower)
-                    .or_default()
-                    .push(rom_ref.clone());
+            for (part_index, part) in game.parts.iter().enumerate() {
+                for (data_area_index, area) in part.data_areas.iter().enumerate() {
+                    for (member_index, rom) in area.roms.iter().enumerate() {
+                        let rom_ref = DatRomRef {
+                            game_index,
+                            game_name: game.name.clone(),
+                            // Retained for source compatibility. Nested identity
+                            // always comes from `member_key`.
+                            rom_index: member_index,
+                            member_key: DatMemberKey {
+                                game_index,
+                                location: MemberLocation::DataArea {
+                                    part_index,
+                                    data_area_index,
+                                    member_index,
+                                },
+                            },
+                            rom_name: rom.name.clone(),
+                            size_bytes: rom.size_bytes,
+                            checksums: rom.checksums(),
+                            status: rom.status.clone(),
+                            merge: rom.merge.clone(),
+                            content_classification: game.content_classification.clone(),
+                            original_metadata: game.original_metadata.clone(),
+                        };
+                        index.insert_rom(rom, rom_ref);
+                    }
+                }
             }
         }
 
         index
+    }
+
+    fn insert_rom(&mut self, rom: &super::model::DatRomEntry, rom_ref: DatRomRef) {
+        if let Some(ref crc) = rom.crc32 {
+            self.by_crc32
+                .entry(crc.clone())
+                .or_default()
+                .push(rom_ref.clone());
+        }
+        if let Some(ref md5) = rom.md5 {
+            self.by_md5
+                .entry(md5.clone())
+                .or_default()
+                .push(rom_ref.clone());
+        }
+        if let Some(ref sha1) = rom.sha1 {
+            self.by_sha1
+                .entry(sha1.clone())
+                .or_default()
+                .push(rom_ref.clone());
+        }
+        if let Some(ref sha256) = rom.sha256 {
+            self.by_sha256
+                .entry(sha256.clone())
+                .or_default()
+                .push(rom_ref.clone());
+        }
+
+        self.by_filename
+            .entry(rom.name.to_ascii_lowercase())
+            .or_default()
+            .push(rom_ref);
     }
 
     /// Look up by CRC32. Returns candidates (empty if none).
@@ -180,7 +245,8 @@ impl DatIndex {
 mod tests {
     use super::*;
     use crate::dat::model::{
-        DatEcosystem, DatFormat, DatGameEntry, DatRomEntry, DatSource, ParsedDat,
+        DatDataAreaEntry, DatEcosystem, DatFormat, DatGameEntry, DatPartEntry, DatRomEntry,
+        DatSource, ParsedDat,
     };
 
     fn make_dat() -> ParsedDat {
@@ -269,6 +335,13 @@ mod tests {
         let candidates = index.lookup_crc32("deadbeef");
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].game_name, "Game Alpha");
+        assert_eq!(
+            candidates[0].key(),
+            DatMemberKey {
+                game_index: 0,
+                location: MemberLocation::TopLevel { rom_index: 0 },
+            }
+        );
     }
 
     #[test]
@@ -309,5 +382,49 @@ mod tests {
         dat.games[1].roms[0].crc32 = Some("deadbeef".into());
         let index = DatIndex::build(&dat);
         assert_eq!(index.crc32_collisions(), 1);
+    }
+
+    #[test]
+    fn nested_data_area_roms_join_every_existing_rom_map_with_positional_identity() {
+        let mut dat = make_dat();
+        let nested = DatRomEntry {
+            name: "folder/nested.bin".into(),
+            size_bytes: Some(4),
+            crc32: Some("12345678".into()),
+            md5: Some("11111111111111111111111111111111".into()),
+            sha1: Some("2222222222222222222222222222222222222222".into()),
+            sha256: Some("3333333333333333333333333333333333333333333333333333333333333333".into()),
+            ..Default::default()
+        };
+        dat.games[0].parts = vec![DatPartEntry {
+            data_areas: vec![DatDataAreaEntry {
+                roms: vec![nested],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+
+        let index = DatIndex::build(&dat);
+        for candidate in [
+            &index.lookup_crc32("12345678")[0],
+            &index.lookup_md5("11111111111111111111111111111111")[0],
+            &index.lookup_sha1("2222222222222222222222222222222222222222")[0],
+            &index
+                .lookup_sha256("3333333333333333333333333333333333333333333333333333333333333333")
+                [0],
+            &index.lookup_filename("FOLDER/NESTED.BIN")[0],
+        ] {
+            assert_eq!(
+                candidate.key(),
+                DatMemberKey {
+                    game_index: 0,
+                    location: MemberLocation::DataArea {
+                        part_index: 0,
+                        data_area_index: 0,
+                        member_index: 0,
+                    },
+                }
+            );
+        }
     }
 }
