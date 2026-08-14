@@ -2746,6 +2746,7 @@ fn archive_member_evidence_has_separate_gui_rows() {
                 rom_name: "game.rom".to_string(),
                 algorithm: "SHA-1",
             }),
+            matched_refs: Vec::new(),
         }],
     });
 

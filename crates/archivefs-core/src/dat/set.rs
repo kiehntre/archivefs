@@ -19,11 +19,11 @@
 //! - **R1 — membership comes only from the DAT.** A set is emitted only when
 //!   at least one of its `<rom>`s was matched by a member's verdict. Nothing
 //!   is grouped by filename, basename, or directory.
-//! - **R2 — only a single-candidate cryptographic match counts as verified.**
-//!   [`AuditVerdict::Exact`] counts; [`AuditVerdict::ExactMultipleCandidates`]
-//!   cannot be attributed to one set, so every named candidate set is marked
-//!   [`NeedsReviewReason::AmbiguousMemberAttribution`] instead. CRC32-only,
-//!   filename-only, and unmatched members never count.
+//! - **R2 — only positionally attributable cryptographic matches count.** A
+//!   single candidate counts. Multiple candidates remain ambiguous across
+//!   games; within one game, one strong digest may satisfy multiple declared
+//!   slots carrying that identical digest. CRC32-only, filename-only, and
+//!   unmatched members never count.
 //! - **R3 — `nodump` blocks `Complete` unconditionally.** A `<rom
 //!   status="nodump">` in the set's DAT entry makes the set
 //!   [`SetState::BadMetadata`] the moment the entry is read, whether or not
@@ -36,11 +36,12 @@
 //!   - makes the set [`SetState::BadMetadata`].
 //! - **R5 — classification and unsupported shapes fail closed.** ROMs and
 //!   disks are classified by [`MemberClass`]. Contradictory flags, unknown
-//!   loadflags, malformed member metadata, duplicate evidence-bearing ROM
-//!   names, parser-reported unrepresented structure, and physical disks whose
-//!   presence cannot be established by the ROM evidence stream all refuse a
-//!   confident verdict. Software-list part/dataarea/diskarea ownership is
-//!   traversed without flattening.
+//!   loadflags, malformed member metadata, duplicate top-level ROM names,
+//!   duplicate names used through legacy name-only evidence, parser-reported
+//!   unrepresented structure, and physical disks whose presence cannot be
+//!   established by the ROM evidence stream all refuse a confident verdict.
+//!   Software-list part/dataarea/diskarea ownership is traversed without
+//!   flattening.
 //! - **ClrMamePro is fail-closed unconditionally.** That parser does not
 //!   currently detect *any* of the structure above - no disk/sample/part/
 //!   dataarea/device detection at all - so it cannot honestly claim `false`
@@ -115,7 +116,8 @@ use serde::Serialize;
 
 use super::archive::ArchivePassCompletion;
 use super::audit::AuditVerdict;
-use super::model::{DatDiskEntry, DatGameEntry, DatRomEntry};
+use super::index::{DatMemberKey, DatRomRef, MemberLocation};
+use super::model::{ChecksumAlgorithm, DatDiskEntry, DatGameEntry, DatRomEntry};
 use super::sources::audit_run::DatArchiveAudit;
 
 /// Durable identity for one catalogue set.
@@ -396,7 +398,9 @@ fn yes_no_marker(value: &Option<String>) -> MarkerValue {
 
 #[derive(Default)]
 struct TouchedSet {
-    verified_rom_names: HashSet<String>,
+    verified_member_keys: HashSet<DatMemberKey>,
+    legacy_verified_rom_names: HashSet<String>,
+    used_legacy_evidence: bool,
     ambiguous: bool,
     /// Set when any member that touched this set shared its archive-member
     /// index with another member in the same archive's evidence (item 7):
@@ -444,6 +448,43 @@ pub(crate) fn classify_archive_sets(
 
     for member in &archive.members {
         let at_duplicate_index = duplicate_indices.contains(&member.evidence.index);
+        if !member.matched_refs.is_empty() {
+            let refs = &member.matched_refs;
+            let strong_verdict = matches!(
+                member.verdict,
+                Some(AuditVerdict::Exact { .. })
+                    | Some(AuditVerdict::ExactMultipleCandidates { .. })
+            );
+            let valid_positions = refs
+                .iter()
+                .all(|candidate| ref_matches_catalogue(candidate, games));
+            let one_game = refs
+                .first()
+                .map(|first| {
+                    refs.iter()
+                        .all(|candidate| candidate.game_name == first.game_name)
+                })
+                .unwrap_or(false);
+            let safely_shared_slot_evidence =
+                one_game && valid_positions && refs_share_cryptographic_identity(refs);
+
+            if strong_verdict && valid_positions && (refs.len() == 1 || safely_shared_slot_evidence)
+            {
+                let game_name = refs[0].game_name.clone();
+                let set = touched.entry(game_name).or_default();
+                set.verified_member_keys
+                    .extend(refs.iter().map(DatRomRef::key));
+                set.duplicate_evidence |= at_duplicate_index;
+            } else {
+                for candidate in refs {
+                    let set = touched.entry(candidate.game_name.clone()).or_default();
+                    set.ambiguous = true;
+                    set.duplicate_evidence |= at_duplicate_index;
+                }
+            }
+            continue;
+        }
+
         match &member.verdict {
             Some(AuditVerdict::Exact {
                 game_name,
@@ -451,7 +492,8 @@ pub(crate) fn classify_archive_sets(
                 ..
             }) => {
                 let set = touched.entry(game_name.clone()).or_default();
-                set.verified_rom_names.insert(rom_name.clone());
+                set.legacy_verified_rom_names.insert(rom_name.clone());
+                set.used_legacy_evidence = true;
                 set.duplicate_evidence |= at_duplicate_index;
             }
             Some(AuditVerdict::ExactMultipleCandidates { game_names, .. }) => {
@@ -483,11 +525,12 @@ pub(crate) fn classify_archive_sets(
         // this set's completeness to whichever entry happens to sort first,
         // which is exactly the positional-identity risk `SetIdentity` is
         // designed never to have. Every candidate is left unresolved.
-        let matching_games: Vec<&DatGameEntry> = games
+        let matching_games: Vec<(usize, &DatGameEntry)> = games
             .iter()
-            .filter(|candidate| candidate.name == game_name)
+            .enumerate()
+            .filter(|(_, candidate)| candidate.name == game_name)
             .collect();
-        let game = match matching_games.as_slice() {
+        let (game_index, game) = match matching_games.as_slice() {
             // The verdict named a game that isn't in our own game list. Both
             // come from the same DatIndex build in every real caller; fail
             // closed on the mismatch rather than guess or panic.
@@ -508,9 +551,10 @@ pub(crate) fn classify_archive_sets(
             }
         };
 
-        let classified_roms: Vec<(&DatRomEntry, MemberClass)> = declared_roms(game)
-            .map(|rom| (rom, classify_rom_member(rom)))
-            .collect();
+        let classified_roms: Vec<(DatMemberKey, &DatRomEntry, MemberClass)> =
+            declared_roms(game_index, game)
+                .map(|(key, rom)| (key, rom, classify_rom_member(rom)))
+                .collect();
         let classified_disks: Vec<(&DatDiskEntry, MemberClass)> = declared_disks(game)
             .map(|disk| (disk, classify_disk_member(disk)))
             .collect();
@@ -524,12 +568,12 @@ pub(crate) fn classify_archive_sets(
         let mut has_unknown_loadflag = false;
         let mut has_non_file_or_optional = false;
 
-        for (rom, class) in &classified_roms {
+        for (key, rom, class) in &classified_roms {
             match class {
                 MemberClass::PhysicalRequired => members_required.push(rom.name.clone()),
                 MemberClass::OptionalPhysical => {
                     has_non_file_or_optional = true;
-                    if touch.verified_rom_names.contains(&rom.name) {
+                    if member_slot_verified(&touch, *key, &rom.name) {
                         members_optional.push(rom.name.clone());
                     }
                 }
@@ -574,10 +618,13 @@ pub(crate) fn classify_archive_sets(
             }
         }
 
-        let members_verified: Vec<String> = members_required
+        let members_verified: Vec<String> = classified_roms
             .iter()
-            .filter(|name| touch.verified_rom_names.contains(*name))
-            .cloned()
+            .filter(|(key, rom, class)| {
+                *class == MemberClass::PhysicalRequired
+                    && member_slot_verified(&touch, *key, &rom.name)
+            })
+            .map(|(_, rom, _)| rom.name.clone())
             .collect();
 
         // S2c transition 1: an incomplete archive pass invalidates confidence
@@ -638,7 +685,11 @@ pub(crate) fn classify_archive_sets(
         // disk names may omit `.chd`) would create false Complete verdicts.
         let unsupported_structure = game.unsupported_structure
             || has_unsupported_member_shape(&classified_roms, &classified_disks)
-            || has_duplicate_evidence_names(&classified_roms)
+            || has_unsafe_duplicate_evidence_names(&classified_roms, touch.used_legacy_evidence)
+            || touch
+                .verified_member_keys
+                .iter()
+                .any(|key| key.game_index != game_index)
             || !disks_required.is_empty();
 
         let supported_refusal = match game.supported.as_deref().map(str::trim) {
@@ -665,9 +716,9 @@ pub(crate) fn classify_archive_sets(
             && has_non_file_or_optional
             && !has_nodump
             && !has_baddump;
-        let all_required_present = members_required
-            .iter()
-            .all(|name| touch.verified_rom_names.contains(name));
+        let all_required_present = classified_roms.iter().all(|(key, rom, class)| {
+            *class != MemberClass::PhysicalRequired || member_slot_verified(&touch, *key, &rom.name)
+        });
 
         let state = if let Some(reason) = classification_refusal {
             SetState::NeedsReview(reason)
@@ -722,12 +773,181 @@ fn empty_resolution(
     }
 }
 
-fn declared_roms(game: &DatGameEntry) -> impl Iterator<Item = &DatRomEntry> {
-    game.roms.iter().chain(
-        game.parts
-            .iter()
-            .flat_map(|part| part.data_areas.iter().flat_map(|area| area.roms.iter())),
-    )
+fn declared_roms(
+    game_index: usize,
+    game: &DatGameEntry,
+) -> impl Iterator<Item = (DatMemberKey, &DatRomEntry)> {
+    game.roms
+        .iter()
+        .enumerate()
+        .map(move |(rom_index, rom)| {
+            (
+                DatMemberKey {
+                    game_index,
+                    location: MemberLocation::TopLevel { rom_index },
+                },
+                rom,
+            )
+        })
+        .chain(
+            game.parts
+                .iter()
+                .enumerate()
+                .flat_map(move |(part_index, part)| {
+                    part.data_areas
+                        .iter()
+                        .enumerate()
+                        .flat_map(move |(data_area_index, area)| {
+                            area.roms
+                                .iter()
+                                .enumerate()
+                                .map(move |(member_index, rom)| {
+                                    (
+                                        DatMemberKey {
+                                            game_index,
+                                            location: MemberLocation::DataArea {
+                                                part_index,
+                                                data_area_index,
+                                                member_index,
+                                            },
+                                        },
+                                        rom,
+                                    )
+                                })
+                        })
+                }),
+        )
+}
+
+fn member_slot_verified(touch: &TouchedSet, key: DatMemberKey, name: &str) -> bool {
+    touch.verified_member_keys.contains(&key) || touch.legacy_verified_rom_names.contains(name)
+}
+
+fn ref_matches_catalogue(candidate: &DatRomRef, games: &[DatGameEntry]) -> bool {
+    let key = candidate.key();
+    if key.game_index != candidate.game_index {
+        return false;
+    }
+    let Some(game) = games.get(key.game_index) else {
+        return false;
+    };
+    if game.name != candidate.game_name {
+        return false;
+    }
+    let rom = match key.location {
+        MemberLocation::TopLevel { rom_index } => game.roms.get(rom_index),
+        MemberLocation::DataArea {
+            part_index,
+            data_area_index,
+            member_index,
+        } => game
+            .parts
+            .get(part_index)
+            .and_then(|part| part.data_areas.get(data_area_index))
+            .and_then(|area| area.roms.get(member_index)),
+    };
+    rom.is_some_and(|rom| {
+        rom.name == candidate.rom_name
+            && rom.size_bytes == candidate.size_bytes
+            && rom.checksums() == candidate.checksums
+    })
+}
+
+/// Whether every ref in `refs` may safely be treated as declarations of one
+/// physical member.
+///
+/// Two conditions must both hold:
+/// 1. at least one strong (non-CRC32) algorithm has a value populated by
+///    *every* ref, and that value is identical across all of them;
+/// 2. no algorithm populated by two or more refs disagrees in value -
+///    including CRC32, and including one ref that declares the same
+///    algorithm twice with conflicting values.
+///
+/// A single ref carrying an internal conflict, or an empty checksum value,
+/// is treated as malformed and refuses the whole group rather than being
+/// silently skipped.
+fn refs_share_cryptographic_identity(refs: &[DatRomRef]) -> bool {
+    if refs.len() < 2 {
+        return false;
+    }
+    if refs.iter().any(|candidate| {
+        ref_has_malformed_checksums(candidate) || ref_has_conflicting_checksums(candidate)
+    }) {
+        return false;
+    }
+
+    let mut algorithms = Vec::new();
+    for candidate in refs {
+        for checksum in &candidate.checksums {
+            if !algorithms.contains(&checksum.algorithm) {
+                algorithms.push(checksum.algorithm);
+            }
+        }
+    }
+
+    let mut strong_algorithm_shared_by_all = false;
+
+    for algorithm in algorithms {
+        let mut agreed_value: Option<&str> = None;
+        let mut populated_count = 0usize;
+        let mut populated_by_all = true;
+
+        for candidate in refs {
+            match ref_checksum_value(candidate, algorithm) {
+                Some(value) => {
+                    populated_count += 1;
+                    match agreed_value {
+                        None => agreed_value = Some(value),
+                        Some(existing) if existing == value => {}
+                        // Requirement 2/5: any algorithm two or more refs
+                        // populate must agree, CRC32 included.
+                        Some(_) => return false,
+                    }
+                }
+                None => populated_by_all = false,
+            }
+        }
+
+        if populated_count >= 2 && populated_by_all && algorithm != ChecksumAlgorithm::Crc32 {
+            strong_algorithm_shared_by_all = true;
+        }
+    }
+
+    strong_algorithm_shared_by_all
+}
+
+/// Whether `candidate` declares the same checksum algorithm twice with
+/// disagreeing values. Internally contradictory metadata cannot anchor a
+/// cross-slot identity decision.
+fn ref_has_conflicting_checksums(candidate: &DatRomRef) -> bool {
+    for (index, checksum) in candidate.checksums.iter().enumerate() {
+        for other in &candidate.checksums[index + 1..] {
+            if other.algorithm == checksum.algorithm && other.value != checksum.value {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Whether `candidate` declares an empty checksum value. Malformed metadata
+/// at this layer must never silently participate in an identity decision.
+fn ref_has_malformed_checksums(candidate: &DatRomRef) -> bool {
+    candidate
+        .checksums
+        .iter()
+        .any(|checksum| checksum.value.trim().is_empty())
+}
+
+/// The single value `candidate` declares for `algorithm`, or `None` if it
+/// declares none. Callers must have already ruled out internal conflicts via
+/// [`ref_has_conflicting_checksums`].
+fn ref_checksum_value(candidate: &DatRomRef, algorithm: ChecksumAlgorithm) -> Option<&str> {
+    candidate
+        .checksums
+        .iter()
+        .find(|checksum| checksum.algorithm == algorithm)
+        .map(|checksum| checksum.value.as_str())
 }
 
 fn declared_disks(game: &DatGameEntry) -> impl Iterator<Item = &DatDiskEntry> {
@@ -739,10 +959,10 @@ fn declared_disks(game: &DatGameEntry) -> impl Iterator<Item = &DatDiskEntry> {
 }
 
 fn has_unsupported_member_shape(
-    roms: &[(&DatRomEntry, MemberClass)],
+    roms: &[(DatMemberKey, &DatRomEntry, MemberClass)],
     disks: &[(&DatDiskEntry, MemberClass)],
 ) -> bool {
-    let invalid_rom = roms.iter().any(|(rom, class)| match class {
+    let invalid_rom = roms.iter().any(|(_, rom, class)| match class {
         MemberClass::PhysicalRequired | MemberClass::OptionalPhysical | MemberClass::Borrowed => {
             rom.name.trim().is_empty() || rom.size_bytes.is_none() || rom.checksums().is_empty()
         }
@@ -757,13 +977,18 @@ fn has_unsupported_member_shape(
     invalid_rom || invalid_disk
 }
 
-/// Prevents one exact ROM verdict from satisfying two file-bearing slots.
-/// Unnamed/non-file instructions are deliberately excluded: they require no
-/// archive evidence and commonly repeat an empty name in software lists.
-fn has_duplicate_evidence_names(roms: &[(&DatRomEntry, MemberClass)]) -> bool {
-    let mut seen = HashSet::with_capacity(roms.len());
+/// Keeps legacy name-only evidence from satisfying two file-bearing slots and
+/// preserves the pre-bridge refusal for duplicate top-level names. Keyed
+/// duplicate names are accepted only when every duplicate is a nested
+/// data-area slot. Unnamed/non-file instructions are excluded because they
+/// require no archive evidence and commonly repeat an empty name.
+fn has_unsafe_duplicate_evidence_names(
+    roms: &[(DatMemberKey, &DatRomEntry, MemberClass)],
+    used_legacy_evidence: bool,
+) -> bool {
+    let mut seen = std::collections::HashMap::with_capacity(roms.len());
     roms.iter()
-        .filter(|(_, class)| {
+        .filter(|(_, _, class)| {
             matches!(
                 class,
                 MemberClass::PhysicalRequired
@@ -771,7 +996,14 @@ fn has_duplicate_evidence_names(roms: &[(&DatRomEntry, MemberClass)]) -> bool {
                     | MemberClass::Borrowed
             )
         })
-        .any(|(rom, _)| !seen.insert(rom.name.as_str()))
+        .any(|(key, rom, _)| {
+            let Some(previous) = seen.insert(rom.name.as_str(), key.location) else {
+                return false;
+            };
+            used_legacy_evidence
+                || matches!(previous, MemberLocation::TopLevel { .. })
+                || matches!(key.location, MemberLocation::TopLevel { .. })
+        })
 }
 
 #[cfg(test)]
@@ -780,7 +1012,7 @@ mod tests {
     use crate::dat::archive::{
         ArchiveMemberEvidence, ArchiveMemberHashes, ArchiveMemberStatus, ArchivePassStopReason,
     };
-    use crate::dat::model::{DatDataAreaEntry, DatPartEntry, DatRomEntry};
+    use crate::dat::model::{DatChecksum, DatDataAreaEntry, DatPartEntry, DatRomEntry};
     use crate::dat::sources::audit_run::DatArchiveMemberAudit;
 
     mod member_classification {
@@ -984,6 +1216,137 @@ mod tests {
         }
     }
 
+    mod cross_slot_identity {
+        use super::*;
+
+        fn checksum(algorithm: ChecksumAlgorithm, value: &str) -> DatChecksum {
+            DatChecksum {
+                algorithm,
+                value: value.to_string(),
+            }
+        }
+
+        fn bare_ref(checksums: Vec<DatChecksum>) -> DatRomRef {
+            DatRomRef {
+                game_index: 0,
+                game_name: "Bare".to_string(),
+                rom_index: 0,
+                member_key: DatMemberKey {
+                    game_index: 0,
+                    location: MemberLocation::TopLevel { rom_index: 0 },
+                },
+                rom_name: "bare.bin".to_string(),
+                size_bytes: Some(4),
+                checksums,
+                status: None,
+                merge: None,
+                content_classification: Default::default(),
+                original_metadata: Default::default(),
+            }
+        }
+
+        #[test]
+        fn a_shared_md5_with_conflicting_shared_sha1_is_rejected() {
+            let a = bare_ref(vec![
+                checksum(ChecksumAlgorithm::Md5, "x"),
+                checksum(ChecksumAlgorithm::Sha1, "y"),
+            ]);
+            let b = bare_ref(vec![
+                checksum(ChecksumAlgorithm::Md5, "x"),
+                checksum(ChecksumAlgorithm::Sha1, "z"),
+            ]);
+
+            assert!(!refs_share_cryptographic_identity(&[a, b]));
+        }
+
+        #[test]
+        fn a_shared_sha1_with_an_extra_unshared_md5_is_accepted() {
+            let a = bare_ref(vec![checksum(ChecksumAlgorithm::Sha1, "x")]);
+            let b = bare_ref(vec![
+                checksum(ChecksumAlgorithm::Sha1, "x"),
+                checksum(ChecksumAlgorithm::Md5, "y"),
+            ]);
+
+            assert!(refs_share_cryptographic_identity(&[a, b]));
+        }
+
+        #[test]
+        fn a_shared_sha1_with_conflicting_shared_md5_is_rejected() {
+            let a = bare_ref(vec![
+                checksum(ChecksumAlgorithm::Sha1, "x"),
+                checksum(ChecksumAlgorithm::Md5, "p"),
+            ]);
+            let b = bare_ref(vec![
+                checksum(ChecksumAlgorithm::Sha1, "x"),
+                checksum(ChecksumAlgorithm::Md5, "q"),
+            ]);
+
+            assert!(!refs_share_cryptographic_identity(&[a, b]));
+        }
+
+        #[test]
+        fn crc32_only_equality_is_never_sufficient() {
+            let a = bare_ref(vec![checksum(ChecksumAlgorithm::Crc32, "x")]);
+            let b = bare_ref(vec![checksum(ChecksumAlgorithm::Crc32, "x")]);
+
+            assert!(!refs_share_cryptographic_identity(&[a, b]));
+        }
+
+        #[test]
+        fn consistent_sha256_sha1_and_md5_across_every_ref_is_accepted() {
+            let a = bare_ref(vec![
+                checksum(ChecksumAlgorithm::Sha256, "x"),
+                checksum(ChecksumAlgorithm::Sha1, "y"),
+                checksum(ChecksumAlgorithm::Md5, "z"),
+            ]);
+            let b = bare_ref(vec![
+                checksum(ChecksumAlgorithm::Sha256, "x"),
+                checksum(ChecksumAlgorithm::Sha1, "y"),
+                checksum(ChecksumAlgorithm::Md5, "z"),
+            ]);
+
+            assert!(refs_share_cryptographic_identity(&[a, b]));
+        }
+
+        #[test]
+        fn a_shared_strong_digest_tolerates_a_weaker_algorithm_missing_on_some_refs() {
+            let a = bare_ref(vec![checksum(ChecksumAlgorithm::Sha1, "x")]);
+            let b = bare_ref(vec![
+                checksum(ChecksumAlgorithm::Sha1, "x"),
+                checksum(ChecksumAlgorithm::Md5, "y"),
+            ]);
+            let c = bare_ref(vec![checksum(ChecksumAlgorithm::Sha1, "x")]);
+
+            assert!(refs_share_cryptographic_identity(&[a, b, c]));
+        }
+
+        #[test]
+        fn one_ref_declaring_the_same_algorithm_twice_with_conflicting_values_is_rejected() {
+            let a = bare_ref(vec![
+                checksum(ChecksumAlgorithm::Sha1, "x"),
+                checksum(ChecksumAlgorithm::Sha1, "not-x"),
+            ]);
+            let b = bare_ref(vec![checksum(ChecksumAlgorithm::Sha1, "x")]);
+
+            assert!(!refs_share_cryptographic_identity(&[a, b]));
+        }
+
+        #[test]
+        fn an_empty_checksum_value_fails_closed() {
+            let a = bare_ref(vec![checksum(ChecksumAlgorithm::Sha1, "x")]);
+            let b = bare_ref(vec![checksum(ChecksumAlgorithm::Sha1, "")]);
+
+            assert!(!refs_share_cryptographic_identity(&[a, b]));
+        }
+
+        #[test]
+        fn a_single_ref_is_never_shared_identity() {
+            let a = bare_ref(vec![checksum(ChecksumAlgorithm::Sha1, "x")]);
+
+            assert!(!refs_share_cryptographic_identity(&[a]));
+        }
+    }
+
     fn rom(name: &str, status: Option<&str>) -> DatRomEntry {
         DatRomEntry {
             name: name.to_string(),
@@ -1051,6 +1414,101 @@ mod tests {
                 rom_name: rom_name.to_string(),
                 algorithm: "SHA-1",
             }),
+            matched_refs: Vec::new(),
+        }
+    }
+
+    fn keyed_member(index: usize, refs: Vec<DatRomRef>) -> DatArchiveMemberAudit {
+        let verdict = if refs.len() == 1 {
+            AuditVerdict::Exact {
+                game_name: refs[0].game_name.clone(),
+                rom_name: refs[0].rom_name.clone(),
+                algorithm: "SHA-1",
+            }
+        } else {
+            AuditVerdict::ExactMultipleCandidates {
+                algorithm: "SHA-1",
+                count: refs.len(),
+                game_names: refs
+                    .iter()
+                    .map(|candidate| candidate.game_name.clone())
+                    .collect(),
+            }
+        };
+        DatArchiveMemberAudit {
+            evidence: evidence(index, &refs[0].rom_name),
+            verdict: Some(verdict),
+            matched_refs: refs,
+        }
+    }
+
+    fn nested_game(name: &str, roms: Vec<DatRomEntry>) -> DatGameEntry {
+        let mut game = game(name, Vec::new());
+        game.parts = vec![DatPartEntry {
+            data_areas: vec![DatDataAreaEntry {
+                roms,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        game
+    }
+
+    fn sha1_rom(name: &str, digit: char) -> DatRomEntry {
+        DatRomEntry {
+            name: name.to_string(),
+            size_bytes: Some(4),
+            crc32: None,
+            sha1: Some(std::iter::repeat_n(digit, 40).collect()),
+            ..Default::default()
+        }
+    }
+
+    fn nested_ref(game_index: usize, game: &DatGameEntry, member_index: usize) -> DatRomRef {
+        let rom = &game.parts[0].data_areas[0].roms[member_index];
+        DatRomRef {
+            game_index,
+            game_name: game.name.clone(),
+            rom_index: member_index,
+            member_key: DatMemberKey {
+                game_index,
+                location: MemberLocation::DataArea {
+                    part_index: 0,
+                    data_area_index: 0,
+                    member_index,
+                },
+            },
+            rom_name: rom.name.clone(),
+            size_bytes: rom.size_bytes,
+            checksums: vec![
+                DatChecksum::parse(ChecksumAlgorithm::Sha1, rom.sha1.as_deref().unwrap()).unwrap(),
+            ],
+            status: rom.status.clone(),
+            merge: rom.merge.clone(),
+            content_classification: game.content_classification.clone(),
+            original_metadata: game.original_metadata.clone(),
+        }
+    }
+
+    fn top_ref(game_index: usize, game: &DatGameEntry, rom_index: usize) -> DatRomRef {
+        let rom = &game.roms[rom_index];
+        DatRomRef {
+            game_index,
+            game_name: game.name.clone(),
+            rom_index,
+            member_key: DatMemberKey {
+                game_index,
+                location: MemberLocation::TopLevel { rom_index },
+            },
+            rom_name: rom.name.clone(),
+            size_bytes: rom.size_bytes,
+            checksums: vec![
+                DatChecksum::parse(ChecksumAlgorithm::Sha1, rom.sha1.as_deref().unwrap()).unwrap(),
+            ],
+            status: rom.status.clone(),
+            merge: rom.merge.clone(),
+            content_classification: game.content_classification.clone(),
+            original_metadata: game.original_metadata.clone(),
         }
     }
 
@@ -1224,6 +1682,7 @@ mod tests {
                     "10-Yard Fight (US, Clone)".to_string(),
                 ],
             }),
+            matched_refs: Vec::new(),
         }];
         let audit = archive(members, complete_pass());
 
@@ -1435,6 +1894,247 @@ mod tests {
         assert_eq!(resolutions[0].identity.game_name, "Game (World)");
     }
 
+    #[test]
+    fn ordinary_top_level_keyed_evidence_keeps_complete_behavior() {
+        let games = vec![game("Ordinary", vec![sha1_rom("game.bin", '1')])];
+        let audit = archive(
+            vec![keyed_member(0, vec![top_ref(0, &games[0], 0)])],
+            complete_pass(),
+        );
+
+        let resolutions = classify_archive_sets(&audit, &games, "collection");
+
+        assert_eq!(resolutions[0].state, SetState::Complete);
+    }
+
+    #[test]
+    fn keyed_duplicate_top_level_names_keep_the_existing_fail_closed_gate() {
+        let games = vec![game(
+            "Duplicate",
+            vec![sha1_rom("same.bin", '1'), sha1_rom("same.bin", '2')],
+        )];
+        let audit = archive(
+            vec![
+                keyed_member(0, vec![top_ref(0, &games[0], 0)]),
+                keyed_member(1, vec![top_ref(0, &games[0], 1)]),
+            ],
+            complete_pass(),
+        );
+
+        let resolutions = classify_archive_sets(&audit, &games, "collection");
+
+        assert_eq!(
+            resolutions[0].state,
+            SetState::NeedsReview(NeedsReviewReason::UnsupportedSetStructure)
+        );
+    }
+
+    #[test]
+    fn nested_only_required_roms_are_complete_when_every_key_is_verified() {
+        let games = vec![nested_game(
+            "Software",
+            vec![sha1_rom("one.bin", '1'), sha1_rom("two.bin", '2')],
+        )];
+        let members = vec![
+            keyed_member(0, vec![nested_ref(0, &games[0], 0)]),
+            keyed_member(1, vec![nested_ref(0, &games[0], 1)]),
+        ];
+
+        let resolutions =
+            classify_archive_sets(&archive(members, complete_pass()), &games, "collection");
+
+        assert_eq!(resolutions[0].state, SetState::Complete);
+        assert_eq!(resolutions[0].members_verified, vec!["one.bin", "two.bin"]);
+    }
+
+    #[test]
+    fn missing_nested_required_key_is_incomplete_even_when_names_match() {
+        let games = vec![nested_game(
+            "Software",
+            vec![sha1_rom("same.bin", '1'), sha1_rom("same.bin", '2')],
+        )];
+        let members = vec![keyed_member(0, vec![nested_ref(0, &games[0], 0)])];
+
+        let resolutions =
+            classify_archive_sets(&archive(members, complete_pass()), &games, "collection");
+
+        assert_eq!(resolutions[0].state, SetState::Incomplete);
+        assert_eq!(resolutions[0].members_verified, vec!["same.bin"]);
+    }
+
+    #[test]
+    fn identical_hash_can_satisfy_two_same_game_required_slots() {
+        let games = vec![nested_game(
+            "Software",
+            vec![sha1_rom("same.bin", '1'), sha1_rom("same.bin", '1')],
+        )];
+        let refs = vec![nested_ref(0, &games[0], 0), nested_ref(0, &games[0], 1)];
+
+        let resolutions = classify_archive_sets(
+            &archive(vec![keyed_member(0, refs)], complete_pass()),
+            &games,
+            "collection",
+        );
+
+        assert_eq!(resolutions[0].state, SetState::Complete);
+        assert_eq!(
+            resolutions[0].members_verified,
+            vec!["same.bin", "same.bin"]
+        );
+    }
+
+    #[test]
+    fn contradictory_shared_md5_with_conflicting_sha1_never_reaches_complete() {
+        fn md5_and_sha1_rom(name: &str, md5_digit: char, sha1_digit: char) -> DatRomEntry {
+            DatRomEntry {
+                name: name.to_string(),
+                size_bytes: Some(4),
+                crc32: None,
+                md5: Some(std::iter::repeat_n(md5_digit, 32).collect()),
+                sha1: Some(std::iter::repeat_n(sha1_digit, 40).collect()),
+                ..Default::default()
+            }
+        }
+
+        fn nested_ref_with_full_checksums(
+            game_index: usize,
+            game: &DatGameEntry,
+            member_index: usize,
+        ) -> DatRomRef {
+            let rom = &game.parts[0].data_areas[0].roms[member_index];
+            DatRomRef {
+                game_index,
+                game_name: game.name.clone(),
+                rom_index: member_index,
+                member_key: DatMemberKey {
+                    game_index,
+                    location: MemberLocation::DataArea {
+                        part_index: 0,
+                        data_area_index: 0,
+                        member_index,
+                    },
+                },
+                rom_name: rom.name.clone(),
+                size_bytes: rom.size_bytes,
+                checksums: rom.checksums(),
+                status: rom.status.clone(),
+                merge: rom.merge.clone(),
+                content_classification: game.content_classification.clone(),
+                original_metadata: game.original_metadata.clone(),
+            }
+        }
+
+        // Same MD5 ('a'..) on both declared slots, but a contradictory SHA1
+        // ('1' vs '2') - exactly the internally contradictory DAT metadata
+        // the fix must refuse rather than silently trust.
+        let games = vec![nested_game(
+            "Software",
+            vec![
+                md5_and_sha1_rom("same.bin", 'a', '1'),
+                md5_and_sha1_rom("same.bin", 'a', '2'),
+            ],
+        )];
+        let refs = vec![
+            nested_ref_with_full_checksums(0, &games[0], 0),
+            nested_ref_with_full_checksums(0, &games[0], 1),
+        ];
+
+        let resolutions = classify_archive_sets(
+            &archive(vec![keyed_member(0, refs)], complete_pass()),
+            &games,
+            "collection",
+        );
+
+        assert_ne!(resolutions[0].state, SetState::Complete);
+    }
+
+    #[test]
+    fn nested_and_unrelated_top_level_hash_collision_is_ambiguous() {
+        let games = vec![
+            nested_game("Software", vec![sha1_rom("nested.bin", '1')]),
+            game("Unrelated", vec![sha1_rom("flat.bin", '1')]),
+        ];
+        let nested = nested_ref(0, &games[0], 0);
+        let top = DatRomRef {
+            game_index: 1,
+            game_name: games[1].name.clone(),
+            rom_index: 0,
+            member_key: DatMemberKey {
+                game_index: 1,
+                location: MemberLocation::TopLevel { rom_index: 0 },
+            },
+            rom_name: games[1].roms[0].name.clone(),
+            size_bytes: games[1].roms[0].size_bytes,
+            checksums: nested.checksums.clone(),
+            status: None,
+            merge: None,
+            content_classification: games[1].content_classification.clone(),
+            original_metadata: games[1].original_metadata.clone(),
+        };
+
+        let resolutions = classify_archive_sets(
+            &archive(vec![keyed_member(0, vec![nested, top])], complete_pass()),
+            &games,
+            "collection",
+        );
+
+        assert_eq!(resolutions.len(), 2);
+        assert!(resolutions.iter().all(|resolution| {
+            resolution.state == SetState::NeedsReview(NeedsReviewReason::AmbiguousMemberAttribution)
+        }));
+    }
+
+    #[test]
+    fn legacy_exact_evidence_without_matched_refs_keeps_top_level_behavior() {
+        let games = vec![game("Legacy", vec![rom("legacy.bin", None)])];
+        let audit = archive(
+            vec![exact_member(0, "legacy.bin", "Legacy", "legacy.bin")],
+            complete_pass(),
+        );
+
+        let json = serde_json::to_value(&audit).unwrap();
+        assert!(json["members"][0].get("matched_refs").is_none());
+        let resolutions = classify_archive_sets(&audit, &games, "collection");
+
+        assert_eq!(resolutions[0].state, SetState::Complete);
+    }
+
+    #[test]
+    fn filename_only_nested_match_never_creates_a_complete_resolution() {
+        let games = vec![nested_game("Software", vec![sha1_rom("nested.bin", '1')])];
+        let audit = archive(
+            vec![DatArchiveMemberAudit {
+                evidence: evidence(0, "nested.bin"),
+                verdict: Some(AuditVerdict::FilenameOnly {
+                    game_name: "Software".to_string(),
+                    rom_name: "nested.bin".to_string(),
+                }),
+                matched_refs: Vec::new(),
+            }],
+            complete_pass(),
+        );
+
+        assert!(classify_archive_sets(&audit, &games, "collection").is_empty());
+    }
+
+    #[test]
+    fn malformed_nested_structure_stays_needs_review_with_keyed_evidence() {
+        let mut game = nested_game("Malformed", vec![sha1_rom("nested.bin", '1')]);
+        game.unsupported_structure = true;
+        let games = vec![game];
+        let audit = archive(
+            vec![keyed_member(0, vec![nested_ref(0, &games[0], 0)])],
+            complete_pass(),
+        );
+
+        let resolutions = classify_archive_sets(&audit, &games, "collection");
+
+        assert_eq!(
+            resolutions[0].state,
+            SetState::NeedsReview(NeedsReviewReason::UnsupportedSetStructure)
+        );
+    }
+
     // -- R2: CRC32-only / filename-only / not-in-DAT never count -----------
 
     #[test]
@@ -1447,14 +2147,17 @@ mod tests {
                     game_name: "Game (World)".to_string(),
                     rom_name: "game.bin".to_string(),
                 }),
+                matched_refs: Vec::new(),
             },
             DatArchiveMemberAudit {
                 evidence: evidence(1, "extra.bin"),
                 verdict: Some(AuditVerdict::NotInDat),
+                matched_refs: Vec::new(),
             },
             DatArchiveMemberAudit {
                 evidence: evidence(2, "unmatched.bin"),
                 verdict: None,
+                matched_refs: Vec::new(),
             },
         ];
         let audit = archive(members, complete_pass());

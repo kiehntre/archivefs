@@ -57,7 +57,7 @@ use crate::dat::classification::{
     ContentEligibility, ContentSelectionPolicy, DatContentClassification, DatContentSummary,
     DatOriginalMetadata, summarize,
 };
-use crate::dat::index::{DatIndex, DatRomRef};
+use crate::dat::index::{DatIndex, DatMemberKey, DatRomRef, MemberLocation};
 use crate::dat::limits::DatLimits;
 use crate::dat::model::{DatGameEntry, ParsedDat};
 use crate::dat::parsers::parse_dat_file;
@@ -243,6 +243,11 @@ pub struct DatArchiveMemberAudit {
     /// remained the same object for the full pass. `None` is not ambiguity;
     /// the accompanying member status explains why matching was not attempted.
     pub verdict: Option<AuditVerdict>,
+    /// Positional DAT candidates from the strongest matching cryptographic
+    /// lookup. Empty means legacy evidence and retains the verdict-name
+    /// fallback; filename-only evidence is never placed here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matched_refs: Vec<DatRomRef>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -631,24 +636,31 @@ fn audit_archives(
                 // must not panic the audit: the source contract is checked
                 // here rather than asserted, so a future format implementation
                 // that breaks it degrades to "not matched", never to a crash.
-                let verdict = if let (false, ArchiveMemberStatus::HashComplete, Some(hashes)) =
-                    (outer_changed, &evidence.status, evidence.hashes.as_ref())
-                {
-                    bytes_hashed = bytes_hashed.saturating_add(evidence.logical_size);
-                    let known = KnownFileEvidence::new(
-                        format!("{}::#{}", path.display(), evidence.index),
-                        &evidence.member_name_display,
-                    )
-                    .with_size(evidence.logical_size)
-                    .with_crc32(&hashes.crc32)
-                    .with_md5(&hashes.md5)
-                    .with_sha1(&hashes.sha1)
-                    .with_sha256(&hashes.sha256);
-                    Some(audit_one(&known, index))
-                } else {
-                    None
-                };
-                DatArchiveMemberAudit { evidence, verdict }
+                let (verdict, matched_refs) =
+                    if let (false, ArchiveMemberStatus::HashComplete, Some(hashes)) =
+                        (outer_changed, &evidence.status, evidence.hashes.as_ref())
+                    {
+                        bytes_hashed = bytes_hashed.saturating_add(evidence.logical_size);
+                        let known = KnownFileEvidence::new(
+                            format!("{}::#{}", path.display(), evidence.index),
+                            &evidence.member_name_display,
+                        )
+                        .with_size(evidence.logical_size)
+                        .with_crc32(&hashes.crc32)
+                        .with_md5(&hashes.md5)
+                        .with_sha1(&hashes.sha1)
+                        .with_sha256(&hashes.sha256);
+                        let verdict = audit_one(&known, index);
+                        let matched_refs = matched_refs_for_verdict(&verdict, &known, index);
+                        (Some(verdict), matched_refs)
+                    } else {
+                        (None, Vec::new())
+                    };
+                DatArchiveMemberAudit {
+                    evidence,
+                    verdict,
+                    matched_refs,
+                }
             })
             .collect();
         let archive_audit = DatArchiveAudit {
@@ -782,8 +794,9 @@ fn annotate_with_policy(
         let candidates: Vec<crate::dat::policy::DatCandidate> = refs
             .iter()
             .filter_map(|rom_ref| {
-                let game = games.get(rom_ref.game_index)?;
-                let rom = game.roms.get(rom_ref.rom_index)?;
+                let key = rom_ref.key();
+                let game = games.get(key.game_index)?;
+                let rom = rom_for_key(games, key)?;
                 Some(candidate_for_rom(
                     game,
                     rom,
@@ -806,6 +819,27 @@ fn annotate_with_policy(
     DatAuditPolicyOutcome {
         source_ordering,
         notes,
+    }
+}
+
+fn rom_for_key(
+    games: &[DatGameEntry],
+    key: DatMemberKey,
+) -> Option<&crate::dat::model::DatRomEntry> {
+    let game = games.get(key.game_index)?;
+    match key.location {
+        MemberLocation::TopLevel { rom_index } => game.roms.get(rom_index),
+        MemberLocation::DataArea {
+            part_index,
+            data_area_index,
+            member_index,
+        } => game
+            .parts
+            .get(part_index)?
+            .data_areas
+            .get(data_area_index)?
+            .roms
+            .get(member_index),
     }
 }
 
@@ -833,6 +867,19 @@ fn verified_candidate_refs(known: &KnownFileEvidence, index: &DatIndex) -> Vec<D
         }
     }
     Vec::new()
+}
+
+fn matched_refs_for_verdict(
+    verdict: &AuditVerdict,
+    known: &KnownFileEvidence,
+    index: &DatIndex,
+) -> Vec<DatRomRef> {
+    match verdict {
+        AuditVerdict::Exact { .. } | AuditVerdict::ExactMultipleCandidates { .. } => {
+            verified_candidate_refs(known, index)
+        }
+        _ => Vec::new(),
+    }
 }
 
 struct LocalScan {
@@ -941,4 +988,63 @@ fn file_name_of(path: &Path) -> String {
 
 fn cancelled(cancel: &AtomicBool) -> bool {
     cancel.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod nested_member_evidence_tests {
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::dat::model::{ChecksumAlgorithm, DatChecksum};
+
+    #[test]
+    fn exact_crypto_verdict_preserves_nested_candidate_refs_but_filename_only_does_not() {
+        let digest = "1111111111111111111111111111111111111111";
+        let key = DatMemberKey {
+            game_index: 0,
+            location: MemberLocation::DataArea {
+                part_index: 1,
+                data_area_index: 2,
+                member_index: 3,
+            },
+        };
+        let candidate = DatRomRef {
+            game_index: 0,
+            game_name: "Software".to_string(),
+            rom_index: 3,
+            member_key: key,
+            rom_name: "nested.bin".to_string(),
+            size_bytes: Some(4),
+            checksums: vec![DatChecksum::parse(ChecksumAlgorithm::Sha1, digest).unwrap()],
+            status: None,
+            merge: None,
+            content_classification: Default::default(),
+            original_metadata: Default::default(),
+        };
+        let index = DatIndex {
+            by_crc32: HashMap::new(),
+            by_md5: HashMap::new(),
+            by_sha1: HashMap::from([(digest.to_string(), vec![candidate])]),
+            by_sha256: HashMap::new(),
+            by_filename: HashMap::new(),
+        };
+        let known = KnownFileEvidence::new("archive.zip::#0", "nested.bin")
+            .with_size(4)
+            .with_sha1(digest);
+        let exact = AuditVerdict::Exact {
+            game_name: "Software".to_string(),
+            rom_name: "nested.bin".to_string(),
+            algorithm: "SHA-1",
+        };
+
+        let matched = matched_refs_for_verdict(&exact, &known, &index);
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].key(), key);
+
+        let filename_only = AuditVerdict::FilenameOnly {
+            game_name: "Software".to_string(),
+            rom_name: "nested.bin".to_string(),
+        };
+        assert!(matched_refs_for_verdict(&filename_only, &known, &index).is_empty());
+    }
 }
