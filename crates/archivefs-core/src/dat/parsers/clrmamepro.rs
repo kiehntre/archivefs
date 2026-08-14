@@ -16,7 +16,7 @@
 //! `device_ref (...)`, `part (...)`, `dataarea (...)`, and `diskarea (...)`
 //! blocks remain intentionally unparsed: the current single-block state
 //! machine cannot represent them without restructuring. Consequently every
-//! emitted game keeps `unsupported_structure = true` and Stage 1 remains
+//! emitted game keeps `unsupported_structure = true` and set classification remains
 //! fail-closed for all ClrMamePro inputs.
 
 use std::fs;
@@ -654,6 +654,9 @@ fn emit_game(
             sample_of: fidelity.sample_of,
             is_bios: fidelity.is_bios,
             runnable: fidelity.runnable,
+            // ClrMamePro has no safely equivalent software-list `supported`
+            // field in the subset this parser understands.
+            supported: None,
             disks: Vec::new(),
             device_refs: Vec::new(),
             samples: Vec::new(),
@@ -667,7 +670,7 @@ fn emit_game(
             comment: None,
             original_metadata: DatOriginalMetadata::default(),
             content_classification: DatContentClassification::unknown(),
-            // Fail-closed for Stage 1 (see `DatGameEntry::unsupported_structure`):
+            // Fail-closed for set completeness (see `DatGameEntry::unsupported_structure`):
             // this parser does not currently detect ClrMamePro `disk (...)`,
             // `sample (...)`, `part (...)`, `dataarea (...)`, or device/
             // dependency-style blocks at all, so it cannot honestly claim

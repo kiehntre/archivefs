@@ -73,6 +73,7 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
     let mut current_game_sample_of: Option<String> = None;
     let mut current_game_is_bios: Option<String> = None;
     let mut current_game_runnable: Option<String> = None;
+    let mut current_game_supported: Option<String> = None;
     let mut current_game_metadata = DatOriginalMetadata::default();
     // Provenance only, never interpreted - see `DatGameEntry::unsupported_structure`.
     let mut current_game_unsupported_structure: bool = false;
@@ -83,7 +84,14 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
     let mut current_bios_sets: Vec<DatBiosSetEntry> = Vec::new();
     let mut current_parts: Vec<DatPartEntry> = Vec::new();
     let mut current_part: Option<DatPartEntry> = None;
+    let mut current_part_depth: Option<usize> = None;
+    let mut current_data_area: Option<DatDataAreaEntry> = None;
+    let mut current_data_area_depth: Option<usize> = None;
+    let mut current_disk_area: Option<DatDiskAreaEntry> = None;
+    let mut current_disk_area_depth: Option<usize> = None;
     let mut current_disk: Option<DatDiskEntry> = None;
+    let mut current_disk_depth: Option<usize> = None;
+    let mut current_rom_count: usize = 0;
     let mut current_rom_name: Option<String> = None;
     let mut current_rom_size: Option<u64> = None;
     let mut current_rom_crc: Option<String> = None;
@@ -150,6 +158,14 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                     "datafile" => {}
                     "game" | "machine" | "software" => {
                         in_game_element = true;
+                        finish_current_structure(
+                            &mut current_disk,
+                            &mut current_disk_area,
+                            &mut current_data_area,
+                            &mut current_part,
+                            &mut current_disks,
+                            &mut current_parts,
+                        );
                         drop_current_game(
                             &mut current_game_name,
                             &mut current_game_desc,
@@ -158,6 +174,7 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                             &mut current_game_sample_of,
                             &mut current_game_is_bios,
                             &mut current_game_runnable,
+                            &mut current_game_supported,
                             &mut current_game_metadata,
                             &mut current_game_unsupported_structure,
                             &mut current_roms,
@@ -222,6 +239,16 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                             &mut warnings,
                             limits.max_warnings,
                         );
+                        current_game_supported = if tag == "software" {
+                            attr_str_opt(
+                                start_bytes,
+                                b"supported",
+                                &mut warnings,
+                                limits.max_warnings,
+                            )
+                        } else {
+                            None
+                        };
                         current_game_desc = None;
                         current_game_metadata = DatOriginalMetadata::default();
                         for (key, attribute) in [
@@ -248,10 +275,17 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                         current_bios_sets = Vec::new();
                         current_parts = Vec::new();
                         current_part = None;
+                        current_part_depth = None;
+                        current_data_area = None;
+                        current_data_area_depth = None;
+                        current_disk_area = None;
+                        current_disk_area_depth = None;
                         current_disk = None;
+                        current_disk_depth = None;
+                        current_rom_count = 0;
                     }
                     "rom" if in_game_element => {
-                        if current_roms.len() >= limits.max_roms_per_entry {
+                        if current_rom_count >= limits.max_roms_per_entry {
                             return Err(ParseError::RomsPerEntryExceeded {
                                 game_name: current_game_name
                                     .clone()
@@ -267,6 +301,16 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                             &mut warnings,
                             limits.max_warnings,
                         )?;
+                        if current_rom_name.is_none() {
+                            record_warning(
+                                &mut warnings,
+                                limits.max_warnings,
+                                "rom_missing_name",
+                                "ROM element missing name; retained for structural classification"
+                                    .to_string(),
+                            );
+                            current_rom_name = Some(String::new());
+                        }
                         current_rom_size =
                             attr_u64(start_bytes, b"size", &mut warnings, limits.max_warnings)?;
                         current_rom_crc = checksum_attr(
@@ -341,15 +385,19 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                         );
                     }
                     "disk" if in_game_element => {
-                        current_game_unsupported_structure = true;
-                        current_disk = Some(parse_disk_entry(
-                            start_bytes,
-                            &mut warnings,
-                            limits.max_warnings,
-                        ));
+                        if current_disk.is_some() {
+                            current_game_unsupported_structure = true;
+                            record_nested_state_warning(&mut warnings, limits.max_warnings, "disk");
+                        } else {
+                            current_disk = Some(parse_disk_entry(
+                                start_bytes,
+                                &mut warnings,
+                                limits.max_warnings,
+                            ));
+                            current_disk_depth = Some(depth);
+                        }
                     }
                     "device_ref" if in_game_element => {
-                        current_game_unsupported_structure = true;
                         current_device_refs.push(DatDeviceRefEntry {
                             name: attr_str_opt(
                                 start_bytes,
@@ -360,7 +408,6 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                         });
                     }
                     "sample" if in_game_element => {
-                        current_game_unsupported_structure = true;
                         current_samples.push(DatSampleEntry {
                             name: attr_str_opt(
                                 start_bytes,
@@ -371,7 +418,6 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                         });
                     }
                     "biosset" if in_game_element => {
-                        current_game_unsupported_structure = true;
                         current_bios_sets.push(parse_bios_set_entry(
                             start_bytes,
                             &mut warnings,
@@ -379,37 +425,62 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                         ));
                     }
                     "part" if in_game_element => {
-                        current_game_unsupported_structure = true;
-                        current_part = Some(parse_part_entry(
-                            start_bytes,
-                            &mut warnings,
-                            limits.max_warnings,
-                        ));
+                        if current_part.is_some() {
+                            current_game_unsupported_structure = true;
+                            record_nested_state_warning(&mut warnings, limits.max_warnings, "part");
+                        } else {
+                            current_part = Some(parse_part_entry(
+                                start_bytes,
+                                &mut warnings,
+                                limits.max_warnings,
+                            ));
+                            current_part_depth = Some(depth);
+                        }
                     }
                     "dataarea" if in_game_element => {
-                        current_game_unsupported_structure = true;
-                        if let Some(part) = current_part.as_mut() {
-                            part.data_areas.push(DatDataAreaEntry {
+                        if current_data_area.is_some() {
+                            current_game_unsupported_structure = true;
+                            record_nested_state_warning(
+                                &mut warnings,
+                                limits.max_warnings,
+                                "dataarea",
+                            );
+                        } else if current_part.is_some() {
+                            current_data_area = Some(DatDataAreaEntry {
                                 name: attr_str_opt(
                                     start_bytes,
                                     b"name",
                                     &mut warnings,
                                     limits.max_warnings,
                                 ),
+                                roms: Vec::new(),
                             });
+                            current_data_area_depth = Some(depth);
+                        } else {
+                            current_game_unsupported_structure = true;
                         }
                     }
                     "diskarea" if in_game_element => {
-                        current_game_unsupported_structure = true;
-                        if let Some(part) = current_part.as_mut() {
-                            part.disk_areas.push(DatDiskAreaEntry {
+                        if current_disk_area.is_some() {
+                            current_game_unsupported_structure = true;
+                            record_nested_state_warning(
+                                &mut warnings,
+                                limits.max_warnings,
+                                "diskarea",
+                            );
+                        } else if current_part.is_some() {
+                            current_disk_area = Some(DatDiskAreaEntry {
                                 name: attr_str_opt(
                                     start_bytes,
                                     b"name",
                                     &mut warnings,
                                     limits.max_warnings,
                                 ),
+                                disks: Vec::new(),
                             });
+                            current_disk_area_depth = Some(depth);
+                        } else {
+                            current_game_unsupported_structure = true;
                         }
                     }
                     "device" if in_game_element => {
@@ -497,7 +568,7 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                     }
                     "rom" => {
                         if let Some(rom_name) = current_rom_name.take() {
-                            current_roms.push(DatRomEntry {
+                            let rom = DatRomEntry {
                                 name: rom_name,
                                 size_bytes: current_rom_size.take(),
                                 crc32: current_rom_crc.take(),
@@ -513,17 +584,45 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                                 optional: current_rom_optional.take(),
                                 bios: current_rom_bios.take(),
                                 region: current_rom_region.take(),
-                            });
+                            };
+                            append_rom(rom, &mut current_data_area, &mut current_roms);
+                            current_rom_count += 1;
                         }
                     }
                     "disk" => {
-                        if let Some(disk) = current_disk.take() {
-                            current_disks.push(disk);
+                        if current_disk_depth == Some(depth + 1) {
+                            if let Some(disk) = current_disk.take() {
+                                append_disk(disk, &mut current_disk_area, &mut current_disks);
+                            }
+                            current_disk_depth = None;
+                        }
+                    }
+                    "dataarea" => {
+                        if current_data_area_depth == Some(depth + 1) {
+                            if let (Some(area), Some(part)) =
+                                (current_data_area.take(), current_part.as_mut())
+                            {
+                                part.data_areas.push(area);
+                            }
+                            current_data_area_depth = None;
+                        }
+                    }
+                    "diskarea" => {
+                        if current_disk_area_depth == Some(depth + 1) {
+                            if let (Some(area), Some(part)) =
+                                (current_disk_area.take(), current_part.as_mut())
+                            {
+                                part.disk_areas.push(area);
+                            }
+                            current_disk_area_depth = None;
                         }
                     }
                     "part" => {
-                        if let Some(part) = current_part.take() {
-                            current_parts.push(part);
+                        if current_part_depth == Some(depth + 1) {
+                            if let Some(part) = current_part.take() {
+                                current_parts.push(part);
+                            }
+                            current_part_depth = None;
                         }
                     }
                     "game" | "machine" | "software" => {
@@ -549,7 +648,7 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                     // built whether or not it carries a name, because an unnamed
                     // game is exactly the case where an unbounded list would be
                     // built without anyone noticing.
-                    if current_roms.len() >= limits.max_roms_per_entry {
+                    if current_rom_count >= limits.max_roms_per_entry {
                         return Err(ParseError::RomsPerEntryExceeded {
                             game_name: current_game_name
                                 .clone()
@@ -572,11 +671,10 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                                 &mut warnings,
                                 limits.max_warnings,
                                 "rom_missing_name",
-                                "ROM element missing required name attribute".to_string(),
+                                "ROM element missing name; retained for structural classification"
+                                    .to_string(),
                             );
-                            text_buf.clear();
-                            buf.clear();
-                            continue;
+                            String::new()
                         }
                     };
                     let size = attr_u64(empty_bytes, b"size", &mut warnings, limits.max_warnings)?;
@@ -631,7 +729,7 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                     let region =
                         attr_str_opt(empty_bytes, b"region", &mut warnings, limits.max_warnings);
 
-                    current_roms.push(DatRomEntry {
+                    let rom = DatRomEntry {
                         name: rom_name,
                         size_bytes: size,
                         crc32: crc,
@@ -647,19 +745,29 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                         optional,
                         bios,
                         region,
-                    });
+                    };
+                    append_rom(rom, &mut current_data_area, &mut current_roms);
+                    current_rom_count += 1;
                 } else if in_game_element {
                     match tag.as_str() {
                         "disk" => {
-                            current_game_unsupported_structure = true;
-                            current_disks.push(parse_disk_entry(
-                                empty_bytes,
-                                &mut warnings,
-                                limits.max_warnings,
-                            ));
+                            if current_disk.is_some() {
+                                current_game_unsupported_structure = true;
+                                record_nested_state_warning(
+                                    &mut warnings,
+                                    limits.max_warnings,
+                                    "disk",
+                                );
+                            } else {
+                                let disk = parse_disk_entry(
+                                    empty_bytes,
+                                    &mut warnings,
+                                    limits.max_warnings,
+                                );
+                                append_disk(disk, &mut current_disk_area, &mut current_disks);
+                            }
                         }
                         "device_ref" => {
-                            current_game_unsupported_structure = true;
                             current_device_refs.push(DatDeviceRefEntry {
                                 name: attr_str_opt(
                                     empty_bytes,
@@ -670,7 +778,6 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                             });
                         }
                         "sample" => {
-                            current_game_unsupported_structure = true;
                             current_samples.push(DatSampleEntry {
                                 name: attr_str_opt(
                                     empty_bytes,
@@ -681,7 +788,6 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                             });
                         }
                         "biosset" => {
-                            current_game_unsupported_structure = true;
                             current_bios_sets.push(parse_bios_set_entry(
                                 empty_bytes,
                                 &mut warnings,
@@ -689,16 +795,30 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                             ));
                         }
                         "part" => {
-                            current_game_unsupported_structure = true;
-                            current_parts.push(parse_part_entry(
-                                empty_bytes,
-                                &mut warnings,
-                                limits.max_warnings,
-                            ));
+                            if current_part.is_some() {
+                                current_game_unsupported_structure = true;
+                                record_nested_state_warning(
+                                    &mut warnings,
+                                    limits.max_warnings,
+                                    "part",
+                                );
+                            } else {
+                                current_parts.push(parse_part_entry(
+                                    empty_bytes,
+                                    &mut warnings,
+                                    limits.max_warnings,
+                                ));
+                            }
                         }
                         "dataarea" => {
-                            current_game_unsupported_structure = true;
-                            if let Some(part) = current_part.as_mut() {
+                            if current_data_area.is_some() {
+                                current_game_unsupported_structure = true;
+                                record_nested_state_warning(
+                                    &mut warnings,
+                                    limits.max_warnings,
+                                    "dataarea",
+                                );
+                            } else if let Some(part) = current_part.as_mut() {
                                 part.data_areas.push(DatDataAreaEntry {
                                     name: attr_str_opt(
                                         empty_bytes,
@@ -706,12 +826,21 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                                         &mut warnings,
                                         limits.max_warnings,
                                     ),
+                                    roms: Vec::new(),
                                 });
+                            } else {
+                                current_game_unsupported_structure = true;
                             }
                         }
                         "diskarea" => {
-                            current_game_unsupported_structure = true;
-                            if let Some(part) = current_part.as_mut() {
+                            if current_disk_area.is_some() {
+                                current_game_unsupported_structure = true;
+                                record_nested_state_warning(
+                                    &mut warnings,
+                                    limits.max_warnings,
+                                    "diskarea",
+                                );
+                            } else if let Some(part) = current_part.as_mut() {
                                 part.disk_areas.push(DatDiskAreaEntry {
                                     name: attr_str_opt(
                                         empty_bytes,
@@ -719,7 +848,10 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                                         &mut warnings,
                                         limits.max_warnings,
                                     ),
+                                    disks: Vec::new(),
                                 });
+                            } else {
+                                current_game_unsupported_structure = true;
                             }
                         }
                         "device" => current_game_unsupported_structure = true,
@@ -837,6 +969,14 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
         buf.clear();
     }
 
+    finish_current_structure(
+        &mut current_disk,
+        &mut current_disk_area,
+        &mut current_data_area,
+        &mut current_part,
+        &mut current_disks,
+        &mut current_parts,
+    );
     drop_current_game(
         &mut current_game_name,
         &mut current_game_desc,
@@ -845,6 +985,7 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
         &mut current_game_sample_of,
         &mut current_game_is_bios,
         &mut current_game_runnable,
+        &mut current_game_supported,
         &mut current_game_metadata,
         &mut current_game_unsupported_structure,
         &mut current_roms,
@@ -885,6 +1026,8 @@ fn parse_disk_entry(
     warnings: &mut Vec<ParseWarning>,
     max_warnings: usize,
 ) -> DatDiskEntry {
+    let writable = attr_str_opt(elem, b"writable", warnings, max_warnings)
+        .or_else(|| attr_str_opt(elem, b"writeable", warnings, max_warnings));
     DatDiskEntry {
         name: attr_str_opt(elem, b"name", warnings, max_warnings),
         sha1: checksum_attr(
@@ -898,7 +1041,7 @@ fn parse_disk_entry(
         merge: attr_str_opt(elem, b"merge", warnings, max_warnings),
         region: attr_str_opt(elem, b"region", warnings, max_warnings),
         index: attr_str_opt(elem, b"index", warnings, max_warnings),
-        writable: attr_str_opt(elem, b"writable", warnings, max_warnings),
+        writable,
         status: attr_str_opt(elem, b"status", warnings, max_warnings),
         optional: attr_str_opt(elem, b"optional", warnings, max_warnings),
     }
@@ -985,6 +1128,64 @@ fn record_note(
     }
 }
 
+fn record_nested_state_warning(warnings: &mut Vec<ParseWarning>, limit: usize, element: &str) {
+    record_warning(
+        warnings,
+        limit,
+        "nested_state_overwrite_blocked",
+        format!(
+            "nested <{element}> start would overwrite an unclosed <{element}>; \
+             the active structure was retained"
+        ),
+    );
+}
+
+fn append_rom(
+    rom: DatRomEntry,
+    current_data_area: &mut Option<DatDataAreaEntry>,
+    game_roms: &mut Vec<DatRomEntry>,
+) {
+    if let Some(area) = current_data_area.as_mut() {
+        area.roms.push(rom);
+    } else {
+        game_roms.push(rom);
+    }
+}
+
+fn append_disk(
+    disk: DatDiskEntry,
+    current_disk_area: &mut Option<DatDiskAreaEntry>,
+    game_disks: &mut Vec<DatDiskEntry>,
+) {
+    if let Some(area) = current_disk_area.as_mut() {
+        area.disks.push(disk);
+    } else {
+        game_disks.push(disk);
+    }
+}
+
+fn finish_current_structure(
+    current_disk: &mut Option<DatDiskEntry>,
+    current_disk_area: &mut Option<DatDiskAreaEntry>,
+    current_data_area: &mut Option<DatDataAreaEntry>,
+    current_part: &mut Option<DatPartEntry>,
+    game_disks: &mut Vec<DatDiskEntry>,
+    parts: &mut Vec<DatPartEntry>,
+) {
+    if let Some(disk) = current_disk.take() {
+        append_disk(disk, current_disk_area, game_disks);
+    }
+    if let (Some(area), Some(part)) = (current_data_area.take(), current_part.as_mut()) {
+        part.data_areas.push(area);
+    }
+    if let (Some(area), Some(part)) = (current_disk_area.take(), current_part.as_mut()) {
+        part.disk_areas.push(area);
+    }
+    if let Some(part) = current_part.take() {
+        parts.push(part);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn drop_current_game(
     name: &mut Option<String>,
@@ -994,6 +1195,7 @@ fn drop_current_game(
     sample_of: &mut Option<String>,
     is_bios: &mut Option<String>,
     runnable: &mut Option<String>,
+    supported: &mut Option<String>,
     metadata: &mut DatOriginalMetadata,
     unsupported_structure: &mut bool,
     roms: &mut Vec<DatRomEntry>,
@@ -1022,6 +1224,7 @@ fn drop_current_game(
             sample_of: sample_of.take(),
             is_bios: is_bios.take(),
             runnable: runnable.take(),
+            supported: supported.take(),
             disks: std::mem::take(disks),
             device_refs: std::mem::take(device_refs),
             samples: std::mem::take(samples),
@@ -1042,6 +1245,7 @@ fn drop_current_game(
         sample_of.take();
         is_bios.take();
         runnable.take();
+        supported.take();
         roms.clear();
         disks.clear();
         device_refs.clear();
@@ -1530,13 +1734,13 @@ mod tests {
 
     // ------------------------------------------------------------------
     // Set-completeness provenance: <disk> presence, loadflag passthrough.
-    // Neither is parsed into a model; both are just recorded so a consumer
-    // downstream (dat::set) can refuse to reason about structure it cannot
-    // see. See DatGameEntry::unsupported_structure / DatRomEntry::loadflag.
+    // Both are retained without interpretation so a consumer downstream
+    // (dat::set) can refuse to reason about structure it does not support.
+    // See DatGameEntry::unsupported_structure / DatRomEntry::loadflag.
     // ------------------------------------------------------------------
 
     #[test]
-    fn self_closing_disk_element_sets_unsupported_structure() {
+    fn self_closing_disk_element_is_fully_preserved() {
         let xml = r#"<?xml version="1.0"?>
 <datafile>
     <game name="Disc Game">
@@ -1546,14 +1750,14 @@ mod tests {
 </datafile>"#;
         let outcome = parse_xml(xml).unwrap();
         assert_eq!(outcome.dat.games.len(), 1);
-        assert!(outcome.dat.games[0].unsupported_structure);
+        assert!(!outcome.dat.games[0].unsupported_structure);
         // The <rom> itself must still parse normally alongside it.
         assert_eq!(outcome.dat.games[0].roms.len(), 1);
         assert_eq!(outcome.dat.games[0].roms[0].name, "game.cue");
     }
 
     #[test]
-    fn start_end_disk_element_sets_unsupported_structure() {
+    fn start_end_disk_element_is_fully_preserved() {
         let xml = r#"<?xml version="1.0"?>
 <datafile>
     <game name="Disc Game">
@@ -1562,7 +1766,7 @@ mod tests {
 </datafile>"#;
         let outcome = parse_xml(xml).unwrap();
         assert_eq!(outcome.dat.games.len(), 1);
-        assert!(outcome.dat.games[0].unsupported_structure);
+        assert!(!outcome.dat.games[0].unsupported_structure);
     }
 
     #[test]
@@ -1578,11 +1782,11 @@ mod tests {
     }
 
     #[test]
-    fn disk_flag_does_not_leak_into_the_next_game() {
+    fn unsupported_structure_flag_does_not_leak_into_the_next_game() {
         let xml = r#"<?xml version="1.0"?>
 <datafile>
-    <game name="Disc Game">
-        <disk name="track1" sha1="da39a3ee5e6b4b0d3255bfef95601890afd80709"/>
+    <game name="Unsupported Game">
+        <device name="unrepresented"/>
     </game>
     <game name="Ordinary Game">
         <rom name="game.bin" size="4" crc="AAAAAAAA"/>
@@ -1598,15 +1802,15 @@ mod tests {
     }
 
     #[test]
-    fn structural_elements_all_set_unsupported_structure() {
-        for tag in [
-            "sample",
-            "part",
-            "dataarea",
-            "diskarea",
-            "device_ref",
-            "device",
-            "biosset",
+    fn only_unrepresented_structural_elements_set_unsupported_structure() {
+        for (tag, expected) in [
+            ("sample", false),
+            ("part", false),
+            ("dataarea", true),
+            ("diskarea", true),
+            ("device_ref", false),
+            ("device", true),
+            ("biosset", false),
         ] {
             let xml = format!(
                 r#"<?xml version="1.0"?>
@@ -1618,9 +1822,9 @@ mod tests {
 </datafile>"#
             );
             let outcome = parse_xml(&xml).unwrap();
-            assert!(
-                outcome.dat.games[0].unsupported_structure,
-                "<{tag}/> must set unsupported_structure"
+            assert_eq!(
+                outcome.dat.games[0].unsupported_structure, expected,
+                "unexpected support capability for <{tag}/>"
             );
         }
     }
@@ -1655,6 +1859,26 @@ mod tests {
         let roms = &outcome.dat.games[0].roms;
         assert_eq!(roms[0].loadflag.as_deref(), Some("fill"));
         assert_eq!(roms[1].loadflag, None);
+    }
+
+    #[test]
+    fn unnamed_non_file_rom_is_retained_for_classification() {
+        let xml = r#"<?xml version="1.0"?>
+<softwarelist name="test">
+    <software name="metadata-only">
+        <part name="cart">
+            <dataarea name="prg">
+                <rom size="4" loadflag="fill" value="ff"/>
+            </dataarea>
+        </part>
+    </software>
+</softwarelist>"#;
+        let outcome = parse_xml(xml).unwrap();
+        let rom = &outcome.dat.games[0].parts[0].data_areas[0].roms[0];
+
+        assert!(rom.name.is_empty());
+        assert_eq!(rom.loadflag.as_deref(), Some("fill"));
+        assert_eq!(rom.value.as_deref(), Some("ff"));
     }
 
     #[test]
@@ -1754,6 +1978,7 @@ mod tests {
     <machine name="clone" cloneof="parent" romof="bios" sampleof="samples" isbios="yes" runnable="no">
         <rom name="program.bin" size="4" crc="AAAAAAAA" offset="1000" loadflag="reload" value="ff" optional="yes" bios="us" region="maincpu"></rom>
         <disk name="disk0" sha1="DA39A3EE5E6B4B0D3255BFEF95601890AFD80709" merge="parent.chd" region="cdrom" index="0" writable="no" status="baddump" optional="yes"></disk>
+        <disk name="disk1" writeable="yes"/>
         <device_ref name="namco51"/>
         <sample name="shot"></sample>
         <biosset name="us" description="US BIOS" default="yes"/>
@@ -1787,25 +2012,34 @@ mod tests {
         assert_eq!(disk.writable.as_deref(), Some("no"));
         assert_eq!(disk.status.as_deref(), Some("baddump"));
         assert_eq!(disk.optional.as_deref(), Some("yes"));
+        assert_eq!(game.disks[1].writable.as_deref(), Some("yes"));
         assert_eq!(game.device_refs[0].name.as_deref(), Some("namco51"));
         assert_eq!(game.samples[0].name.as_deref(), Some("shot"));
         assert_eq!(game.bios_sets[0].name.as_deref(), Some("us"));
         assert_eq!(game.bios_sets[0].description.as_deref(), Some("US BIOS"));
         assert_eq!(game.bios_sets[0].default.as_deref(), Some("yes"));
-        assert!(game.unsupported_structure);
+        assert!(!game.unsupported_structure);
     }
 
     #[test]
-    fn software_part_area_structure_is_scoped_to_its_software() {
+    fn software_part_area_members_retain_parent_linkage_and_game_scope() {
         let xml = r#"<?xml version="1.0"?>
 <softwarelist name="test">
     <software name="structured">
         <part name="cart" interface="nes_cart">
             <dataarea name="prg">
                 <rom name="program.bin" size="4" crc="AAAAAAAA"/>
+                <rom name="program-2.bin" size="8" crc="BBBBBBBB"></rom>
+            </dataarea>
+            <dataarea name="gfx">
+                <rom name="graphics.bin" size="16" crc="CCCCCCCC"/>
             </dataarea>
             <diskarea name="cdrom">
                 <disk name="disc" sha1="DA39A3EE5E6B4B0D3255BFEF95601890AFD80709"/>
+                <disk name="disc-2" sha1="1111111111111111111111111111111111111111"></disk>
+            </diskarea>
+            <diskarea name="harddisk">
+                <disk name="install" sha1="2222222222222222222222222222222222222222"/>
             </diskarea>
         </part>
     </software>
@@ -1819,17 +2053,49 @@ mod tests {
         assert_eq!(structured.parts.len(), 1);
         assert_eq!(structured.parts[0].name.as_deref(), Some("cart"));
         assert_eq!(structured.parts[0].interface.as_deref(), Some("nes_cart"));
+        assert_eq!(structured.parts[0].data_areas.len(), 2);
         assert_eq!(
             structured.parts[0].data_areas[0].name.as_deref(),
             Some("prg")
         );
+        assert_eq!(structured.parts[0].data_areas[0].roms.len(), 2);
+        assert_eq!(
+            structured.parts[0].data_areas[0].roms[0].name,
+            "program.bin"
+        );
+        assert_eq!(
+            structured.parts[0].data_areas[0].roms[1].name,
+            "program-2.bin"
+        );
+        assert_eq!(
+            structured.parts[0].data_areas[1].name.as_deref(),
+            Some("gfx")
+        );
+        assert_eq!(
+            structured.parts[0].data_areas[1].roms[0].name,
+            "graphics.bin"
+        );
+        assert_eq!(structured.parts[0].disk_areas.len(), 2);
         assert_eq!(
             structured.parts[0].disk_areas[0].name.as_deref(),
             Some("cdrom")
         );
-        assert_eq!(structured.roms[0].name, "program.bin");
-        assert_eq!(structured.disks[0].name.as_deref(), Some("disc"));
-        assert!(structured.unsupported_structure);
+        assert_eq!(structured.parts[0].disk_areas[0].disks.len(), 2);
+        assert_eq!(
+            structured.parts[0].disk_areas[0].disks[0].name.as_deref(),
+            Some("disc")
+        );
+        assert_eq!(
+            structured.parts[0].disk_areas[1].name.as_deref(),
+            Some("harddisk")
+        );
+        assert_eq!(
+            structured.parts[0].disk_areas[1].disks[0].name.as_deref(),
+            Some("install")
+        );
+        assert!(structured.roms.is_empty());
+        assert!(structured.disks.is_empty());
+        assert!(!structured.unsupported_structure);
 
         let ordinary = &outcome.dat.games[1];
         assert_eq!(ordinary.roms[0].name, "ordinary.bin");
@@ -1843,6 +2109,106 @@ mod tests {
         assert_eq!(ordinary.is_bios, None);
         assert_eq!(ordinary.runnable, None);
         assert!(!ordinary.unsupported_structure);
+    }
+
+    #[test]
+    fn software_supported_attribute_is_preserved_without_leakage() {
+        let xml = r#"<?xml version="1.0"?>
+<softwarelist name="test">
+    <software name="yes" supported="yes"></software>
+    <software name="partial" supported="partial"></software>
+    <software name="no" supported="no"></software>
+    <software name="absent"></software>
+</softwarelist>"#;
+        let outcome = parse_xml(xml).unwrap();
+
+        assert_eq!(outcome.dat.games[0].supported.as_deref(), Some("yes"));
+        assert_eq!(outcome.dat.games[1].supported.as_deref(), Some("partial"));
+        assert_eq!(outcome.dat.games[2].supported.as_deref(), Some("no"));
+        assert_eq!(outcome.dat.games[3].supported, None);
+    }
+
+    #[test]
+    fn machine_level_roms_and_disks_stay_at_game_level() {
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+    <machine name="machine">
+        <rom name="program.bin" size="4" crc="AAAAAAAA"/>
+        <disk name="drive" sha1="DA39A3EE5E6B4B0D3255BFEF95601890AFD80709"/>
+    </machine>
+</datafile>"#;
+        let outcome = parse_xml(xml).unwrap();
+        let machine = &outcome.dat.games[0];
+        assert_eq!(machine.roms[0].name, "program.bin");
+        assert_eq!(machine.disks[0].name.as_deref(), Some("drive"));
+        assert!(machine.parts.is_empty());
+    }
+
+    #[test]
+    fn malformed_nested_starts_preserve_active_structure_and_fail_closed() {
+        let xml = r#"<?xml version="1.0"?>
+<softwarelist name="test">
+    <software name="malformed">
+        <part name="outer">
+            <part name="ignored-inner"></part>
+            <dataarea name="outer-data">
+                <rom name="before.bin" size="1" crc="AAAAAAAA"/>
+                <dataarea name="ignored-inner-data">
+                    <rom name="during.bin" size="2" crc="BBBBBBBB"/>
+                </dataarea>
+                <rom name="after.bin" size="3" crc="CCCCCCCC"/>
+            </dataarea>
+            <diskarea name="outer-disks">
+                <disk name="outer-disk" sha1="DA39A3EE5E6B4B0D3255BFEF95601890AFD80709">
+                    <disk name="ignored-inner-disk" sha1="1111111111111111111111111111111111111111"></disk>
+                </disk>
+                <disk name="after-disk" sha1="2222222222222222222222222222222222222222"/>
+                <diskarea name="ignored-inner-diskarea"></diskarea>
+            </diskarea>
+        </part>
+    </software>
+</softwarelist>"#;
+        let outcome = parse_xml(xml).unwrap();
+        let game = &outcome.dat.games[0];
+
+        assert!(game.unsupported_structure);
+        assert_eq!(game.parts.len(), 1);
+        assert_eq!(game.parts[0].name.as_deref(), Some("outer"));
+        assert_eq!(game.parts[0].data_areas.len(), 1);
+        assert_eq!(
+            game.parts[0].data_areas[0].name.as_deref(),
+            Some("outer-data")
+        );
+        assert_eq!(
+            game.parts[0].data_areas[0]
+                .roms
+                .iter()
+                .map(|rom| rom.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["before.bin", "during.bin", "after.bin"]
+        );
+        assert_eq!(game.parts[0].disk_areas.len(), 1);
+        assert_eq!(
+            game.parts[0].disk_areas[0].name.as_deref(),
+            Some("outer-disks")
+        );
+        assert_eq!(
+            game.parts[0].disk_areas[0]
+                .disks
+                .iter()
+                .filter_map(|disk| disk.name.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["outer-disk", "after-disk"]
+        );
+        assert_eq!(
+            outcome
+                .warnings
+                .iter()
+                .filter(|warning| warning.code() == "nested_state_overwrite_blocked")
+                .count(),
+            4,
+            "part, dataarea, diskarea, and paired disk overwrites must each be blocked"
+        );
     }
 
     #[test]
