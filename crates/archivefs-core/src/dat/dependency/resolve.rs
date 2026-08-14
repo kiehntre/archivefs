@@ -41,8 +41,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use super::graph::{
-    ChainFault, ChainGuard, DeclaredName, DependencyGraph, IdentityChainGuard, MemberRef, SetRef,
-    declared_name, flag_is_yes,
+    ChainFault, ChainGuard, DeclaredName, DependencyGraph, Flag, IdentityChainGuard, MemberRef,
+    SetRef, declared_name, flag_is_yes, parse_flag,
 };
 use super::{
     DependencyKind, DependencyOutcome, DependencyRequirement, DependencyTarget,
@@ -719,14 +719,7 @@ impl<'a> Resolver<'a> {
         // (a) Declared `<biosset>` names must be usable and unique. A
         // duplicated variant name makes every `bios=` reference to it
         // ambiguous.
-        let mut declared: BTreeMap<&str, usize> = BTreeMap::new();
-        let mut malformed_biosset = false;
-        for bios_set in &game.bios_sets {
-            match declared_name(&bios_set.name) {
-                DeclaredName::Named(name) => *declared.entry(name).or_insert(0) += 1,
-                DeclaredName::Absent | DeclaredName::Malformed => malformed_biosset = true,
-            }
-        }
+        let (declared, malformed_biosset) = biosset_declarations(game);
         if malformed_biosset {
             out.push(DependencyRequirement {
                 kind: DependencyKind::Bios,
@@ -771,27 +764,126 @@ impl<'a> Resolver<'a> {
             });
         }
 
-        // (c) A BIOS-root provider reached through the ROM-source chain must
-        // itself be present, because a set may borrow its BIOS content
-        // without redeclaring it. Sets that *do* redeclare it are already
-        // covered, more precisely, by their `merge=` requirements.
-        if let Some(provider_decl) = self.borrow_provider(index)
-            && let DeclaredName::Named(provider_name) = declared_name(provider_decl)
-            && let SetRef::Unique(provider) = self.graph.resolve_set(provider_name)
-            && flag_is_yes(&self.graph.game(provider).is_bios)
-        {
-            let mut guard = ChainGuard::starting_at(index);
-            out.push(DependencyRequirement {
-                kind: DependencyKind::Bios,
-                target: DependencyTarget::Set {
-                    name: provider_name.to_string(),
-                },
-                outcome: self.set_storage_outcome(provider, &mut guard),
-                via_member: None,
-            });
+        // (c) A BIOS root reached through the ROM-source chain must itself be
+        // present and internally consistent, because a set may borrow its
+        // BIOS content without redeclaring it. Sets that *do* redeclare it
+        // are already covered, more precisely, by their `merge=`
+        // requirements. See `resolve_bios_root`.
+        if let Some(requirement) = self.resolve_bios_root(index) {
+            out.push(requirement);
         }
 
         out
+    }
+
+    /// Walks the ROM-source chain (`romof`, falling back to `cloneof` -
+    /// [`Resolver::borrow_provider`]) from `index` looking for the nearest
+    /// ancestor flagged `isbios="yes"`.
+    ///
+    /// A single hop is not enough: `game -> middle -> bios` is a real MAME
+    /// shape (BIOS-root parents of BIOS-root parents, zero-own-file
+    /// intermediate clones), so the walk continues past every non-BIOS-root
+    /// ancestor - cycle- and depth-guarded exactly like
+    /// [`Resolver::walk_set_chain`] - until it finds one, exhausts the chain,
+    /// or a fault stops it. Returns `None` only when the chain terminates
+    /// with no BIOS root anywhere on it: a set with no BIOS ancestor has no
+    /// BIOS-root dependency to report.
+    ///
+    /// Once found, the root is trusted only when [`Resolver::set_storage_outcome`]
+    /// says so - which itself folds in [`Resolver::bios_declaration_outcome`]
+    /// for whatever target it evaluates, so a root with verified bytes but
+    /// broken `<biosset>`/`bios=` declarations is never trusted just because
+    /// its storage checks out.
+    fn resolve_bios_root(&self, index: usize) -> Option<DependencyRequirement> {
+        let mut guard = ChainGuard::starting_at(index);
+        let mut current = index;
+        loop {
+            let provider_decl = self.borrow_provider(current)?;
+            let target_name = match declared_name(provider_decl) {
+                DeclaredName::Named(name) => name,
+                // `borrow_provider` only ever returns a field it already
+                // confirmed is not `Absent`; a `Malformed` value here is a
+                // real catalogue defect, not "no further ancestor".
+                DeclaredName::Malformed => {
+                    return Some(bios_requirement(
+                        DependencyTarget::Undeclared,
+                        DependencyOutcome::Contradictory,
+                    ));
+                }
+                DeclaredName::Absent => return None,
+            };
+            let target = DependencyTarget::Set {
+                name: target_name.to_string(),
+            };
+            let next = match self.graph.resolve_set(target_name) {
+                SetRef::Unique(next) => next,
+                SetRef::Duplicate => {
+                    return Some(bios_requirement(target, DependencyOutcome::Ambiguous));
+                }
+                SetRef::Absent => {
+                    return Some(bios_requirement(target, DependencyOutcome::Contradictory));
+                }
+            };
+            if let Err(fault) = guard.visit(next) {
+                let outcome = match fault {
+                    ChainFault::Cycle => DependencyOutcome::Cycle,
+                    ChainFault::DepthExceeded => DependencyOutcome::Unsupported,
+                };
+                return Some(bios_requirement(target, outcome));
+            }
+            let next_game = self.graph.game(next);
+            if flag_is_yes(&next_game.is_bios) {
+                // `set_storage_outcome` already folds `bios_declaration_outcome`
+                // for whatever target it evaluates (every target's own BIOS
+                // metadata is part of its closure - see that function), so a
+                // separate combine here would only ever duplicate the same
+                // value it already contributes. One call covers both axes.
+                let mut storage_guard = ChainGuard::starting_at(index);
+                return Some(bios_requirement(
+                    target,
+                    self.set_storage_outcome(next, &mut storage_guard),
+                ));
+            }
+            current = next;
+        }
+    }
+
+    /// Whether one set's own `<biosset>`/`bios=` declarations are internally
+    /// well-formed - independent of any chain, storage, or the requesting
+    /// set's own requirements.
+    ///
+    /// [`Resolver::resolve_bios`] validates the subject's own declarations
+    /// directly (via [`biosset_declarations`], for itemised per-variant
+    /// reporting). This function is the coarser pass/fail form, folded into
+    /// [`Resolver::set_storage_outcome`] so every *target* - a device or a
+    /// BIOS root reached through [`Resolver::resolve_bios_root`] - is
+    /// validated on this axis too, and a provider with verified bytes but
+    /// broken BIOS metadata is never silently treated as satisfying
+    /// anything.
+    fn bios_declaration_outcome(&self, index: usize) -> DependencyOutcome {
+        let game = self.graph.game(index);
+        let (declared, malformed_biosset) = biosset_declarations(game);
+        // A duplicated `<biosset>` name fails closed on its own, whether or
+        // not any `bios=` tag currently references it - an unreferenced
+        // duplicate is exactly the kind of latent defect a later ROM
+        // addition would silently inherit.
+        if malformed_biosset || declared.values().any(|count| *count > 1) {
+            return DependencyOutcome::Contradictory;
+        }
+        let mut worst = DependencyOutcome::Satisfied;
+        for (_, rom) in declared_roms(index, game) {
+            let outcome = match declared_name(&rom.bios) {
+                DeclaredName::Absent => continue,
+                DeclaredName::Malformed => DependencyOutcome::Contradictory,
+                DeclaredName::Named(variant) => match declared.get(variant) {
+                    Some(1) => DependencyOutcome::Satisfied,
+                    Some(_) => DependencyOutcome::Ambiguous,
+                    None => DependencyOutcome::Contradictory,
+                },
+            };
+            worst = combine_worst(worst, outcome);
+        }
+        worst
     }
 
     /// `device_ref` requirements, resolved transitively with a cycle guard.
@@ -840,22 +932,32 @@ impl<'a> Resolver<'a> {
 
     /// One device node's own requirement: it must really be a device, and its
     /// storage (including its own devices and borrows) must be satisfied.
+    ///
+    /// A `device_ref` target is trusted **only** on an explicit,
+    /// unambiguous `isdevice="yes"`. Every other case fails closed:
+    ///
+    /// - `isdevice="no"` or a malformed value directly contradicts the
+    ///   reference - the catalogue itself says this is not (or cannot be
+    ///   confirmed to be) a device.
+    /// - An absent `isdevice` proves nothing either way. Treating that as
+    ///   "probably fine" is exactly how an ordinary game - which most DATs
+    ///   never flag `isdevice` on at all - could silently satisfy a device
+    ///   requirement through its own unrelated storage. It is reported
+    ///   `Unsupported`, not accepted: unproven, not confirmed.
+    /// - `runnable="yes"` (MAME devices are never runnable) or a malformed
+    ///   `runnable` value is likewise never read as "so it must not be
+    ///   runnable" - a value this stage cannot classify is not evidence of
+    ///   anything, and must not stand in for a negative.
     fn device_outcome(&self, device: usize, guard: &mut ChainGuard) -> DependencyOutcome {
         let node = self.graph.game(device);
-        // A `device_ref` that resolves to something the catalogue explicitly
-        // says is not a device, or explicitly says is runnable, is pointing at
-        // a game. Accepting that would let an unrelated game's own storage
-        // satisfy a device requirement. When the catalogue simply omits the
-        // flags - as many non-MAME DATs do - there is nothing to contradict,
-        // and the reference is resolved on its declarations instead.
-        let denies_device = node
-            .is_device
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|value| value.eq_ignore_ascii_case("no"));
-        let claims_runnable = flag_is_yes(&node.runnable);
-        if denies_device || claims_runnable {
-            return DependencyOutcome::Contradictory;
+        match parse_flag(&node.is_device) {
+            Flag::Yes => {}
+            Flag::No | Flag::Malformed => return DependencyOutcome::Contradictory,
+            Flag::Absent => return DependencyOutcome::Unsupported,
+        }
+        match parse_flag(&node.runnable) {
+            Flag::No | Flag::Absent => {}
+            Flag::Yes | Flag::Malformed => return DependencyOutcome::Contradictory,
         }
         self.set_storage_outcome(device, guard)
     }
@@ -992,6 +1094,27 @@ impl<'a> Resolver<'a> {
         // satisfied by a device whose CHD is present but unusable without a
         // parent that is not.
         for requirement in self.resolve_chd_parents(index) {
+            fold(requirement.outcome);
+        }
+
+        // A target's own `<biosset>`/`bios=` declarations must be internally
+        // consistent, independent of any BIOS-root chain: a device or BIOS
+        // provider with verified ROM bytes but a `bios=` tag naming no
+        // declared variant is not a trustworthy target. This is a local,
+        // non-chain-walking check (`bios_declaration_outcome` never calls
+        // `resolve_bios_root`), so folding it here cannot reintroduce the
+        // mutual recursion `resolve_bios_root` already guards against - only
+        // the *originating* subject's own `requirements_for` call walks the
+        // BIOS-root chain, once.
+        fold(self.bios_declaration_outcome(index));
+
+        // Samples have no evidence channel yet (`resolve_samples`), and a
+        // target with only sample requirements and no ROM/disk storage must
+        // not be read as vacuously satisfied merely because it has nothing
+        // else to check - that is precisely how a device whose only
+        // requirement is `sampleof`/`<sample>` would otherwise pass through
+        // as a valid dependency target.
+        for requirement in self.resolve_samples(index) {
             fold(requirement.outcome);
         }
 
@@ -1149,6 +1272,46 @@ impl<'a> Resolver<'a> {
 enum BorrowedMember<'a> {
     Rom(&'a DatRomEntry),
     Disk(&'a DatDiskEntry),
+}
+
+/// Declared `<biosset>` names for one game, and whether any declaration was
+/// itself malformed (absent or empty name).
+///
+/// Shared by the subject set's own per-variant reporting (`resolve_bios`)
+/// and a BIOS-root or device *target*'s pass/fail validity check
+/// (`bios_declaration_outcome`), so the two can never disagree about what
+/// counts as a usable `<biosset>`.
+fn biosset_declarations(game: &DatGameEntry) -> (BTreeMap<&str, usize>, bool) {
+    let mut declared: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut malformed = false;
+    for bios_set in &game.bios_sets {
+        match declared_name(&bios_set.name) {
+            DeclaredName::Named(name) => *declared.entry(name).or_insert(0) += 1,
+            DeclaredName::Absent | DeclaredName::Malformed => malformed = true,
+        }
+    }
+    (declared, malformed)
+}
+
+/// Builds a `Bios`-kind requirement. A small constructor so every exit point
+/// of [`Resolver::resolve_bios_root`] states its target and outcome without
+/// repeating the other three fields.
+fn bios_requirement(target: DependencyTarget, outcome: DependencyOutcome) -> DependencyRequirement {
+    DependencyRequirement {
+        kind: DependencyKind::Bios,
+        target,
+        outcome,
+        via_member: None,
+    }
+}
+
+/// The more-blocking of two outcomes, by [`super::severity`].
+fn combine_worst(a: DependencyOutcome, b: DependencyOutcome) -> DependencyOutcome {
+    if super::severity(b) > super::severity(a) {
+        b
+    } else {
+        a
+    }
 }
 
 /// Whether two ROM declarations state different content under a shared

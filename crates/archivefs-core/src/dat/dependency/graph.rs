@@ -69,17 +69,43 @@ pub(crate) fn declared_name(value: &Option<String>) -> DeclaredName<'_> {
     }
 }
 
+/// A `yes`/`no` style flag, distinguishing every way it can fail to
+/// affirmatively confirm something.
+///
+/// `no`, an absent attribute, and an unrecognised value are three different
+/// facts, not one collapsed `false` - a caller validating a claimed identity
+/// (is this really a device? is this really not runnable?) needs to fail
+/// closed differently for "the catalogue says no" (a contradiction) than for
+/// "the catalogue says nothing" (unproven) than for "the catalogue says
+/// something we don't understand" (malformed). Collapsing all three to one
+/// boolean is exactly how an unconfirmed claim gets silently accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Flag {
+    Yes,
+    No,
+    Absent,
+    /// Present but neither a recognised affirmative nor negative.
+    Malformed,
+}
+
+/// Classifies a raw `yes`/`no` style attribute value.
+pub(crate) fn parse_flag(value: &Option<String>) -> Flag {
+    match value.as_deref().map(str::trim) {
+        None => Flag::Absent,
+        Some(v) if v.eq_ignore_ascii_case("yes") => Flag::Yes,
+        Some(v) if v.eq_ignore_ascii_case("no") => Flag::No,
+        Some(_) => Flag::Malformed,
+    }
+}
+
 /// Whether a raw `yes`/`no` style flag is affirmatively set.
 ///
 /// Anything that is not a recognised affirmative - absent, `no`, or an
 /// unexpected value - is `false`. Callers that need to distinguish "declared
-/// not a device" from "declared something unparseable" inspect the raw field
-/// themselves.
+/// not X" from "declared something unparseable" from "declared nothing at
+/// all" use [`parse_flag`] directly instead.
 pub(crate) fn flag_is_yes(value: &Option<String>) -> bool {
-    value
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|value| value.eq_ignore_ascii_case("yes"))
+    matches!(parse_flag(value), Flag::Yes)
 }
 
 /// How a member-name lookup inside one provider set resolved.

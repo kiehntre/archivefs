@@ -1049,6 +1049,87 @@ mod bios {
         );
     }
 
+    // -- transitive BIOS-root discovery + metadata (independent review
+    // finding 2) --------------------------------------------------------
+
+    #[test]
+    fn a_bios_root_reached_transitively_through_an_intermediate_clone_is_required() {
+        // game -> middle -> bios. `middle` is an ordinary, non-BIOS clone
+        // with no ROMs of its own - the real zero-own-file MAME shape - so
+        // the only way to see the BIOS requirement at all is to walk past
+        // it, not stop at the first hop.
+        let mut middle = game("middle", Vec::new());
+        middle.rom_of = Some("bios".into());
+        let mut leaf = game("game", vec![rom("g.bin", 'g')]);
+        leaf.rom_of = Some("middle".into());
+        let games = vec![bios_root("bios", vec![rom("b.bin", 'b')]), middle, leaf];
+
+        let missing = resolve(&games, &verifying(&games, &[(2, 0)]));
+        assert_eq!(
+            only_outcome(&missing, "game", DependencyKind::Bios),
+            DependencyOutcome::Missing
+        );
+        assert_eq!(missing["game"].0, SetState::Incomplete);
+
+        let present = resolve(&games, &verifying(&games, &[(0, 0), (2, 0)]));
+        assert_eq!(
+            only_outcome(&present, "game", DependencyKind::Bios),
+            DependencyOutcome::Satisfied
+        );
+        assert_eq!(present["game"].0, SetState::Complete);
+    }
+
+    #[test]
+    fn a_bios_provider_with_an_undeclared_bios_tag_cannot_satisfy_the_dependency() {
+        let mut child = game("game", vec![rom("g.bin", 'g')]);
+        child.rom_of = Some("bios".into());
+        let mut root = bios_root("bios", vec![rom("b.bin", 'b')]);
+        // The byte is fully verified; the metadata claiming it is a specific
+        // BIOS variant is broken. Verified bytes must not launder that.
+        root.roms[0].bios = Some("euro".into());
+        let games = vec![root, child];
+        let resolved = resolve(&games, &verifying(&games, &[(0, 0), (1, 0)]));
+        assert_eq!(
+            only_outcome(&resolved, "game", DependencyKind::Bios),
+            DependencyOutcome::Contradictory
+        );
+        assert_ne!(resolved["game"].0, SetState::Complete);
+    }
+
+    #[test]
+    fn a_bios_provider_with_duplicate_biosset_names_cannot_satisfy_the_dependency() {
+        // The duplicate is never referenced by any `bios=` tag - it still
+        // fails closed on its own.
+        let mut child = game("game", vec![rom("g.bin", 'g')]);
+        child.rom_of = Some("bios".into());
+        let mut root = bios_root("bios", vec![rom("b.bin", 'b')]);
+        root.bios_sets = vec![bios_set("euro"), bios_set("euro")];
+        let games = vec![root, child];
+        let resolved = resolve(&games, &verifying(&games, &[(0, 0), (1, 0)]));
+        assert_eq!(
+            only_outcome(&resolved, "game", DependencyKind::Bios),
+            DependencyOutcome::Contradictory
+        );
+        assert_ne!(resolved["game"].0, SetState::Complete);
+    }
+
+    #[test]
+    fn a_bios_root_chain_cycle_terminates_and_is_reported_as_a_cycle() {
+        let mut first = game("a", Vec::new());
+        first.rom_of = Some("b".into());
+        let mut second = game("b", Vec::new());
+        second.rom_of = Some("a".into());
+        let mut leaf = game("game", vec![rom("g.bin", 'g')]);
+        leaf.rom_of = Some("a".into());
+        let games = vec![first, second, leaf];
+        let resolved = resolve(&games, &verifying(&games, &[(2, 0)]));
+        assert_eq!(
+            only_outcome(&resolved, "game", DependencyKind::Bios),
+            DependencyOutcome::Cycle
+        );
+        assert_ne!(resolved["game"].0, SetState::Complete);
+    }
+
     #[test]
     fn bios_storage_presence_is_never_reported_as_a_runnability_claim() {
         // A set can be storage-and-dependency complete under this stage while
@@ -1233,6 +1314,178 @@ mod devices {
             only_outcome(&resolved, "host", DependencyKind::Device),
             DependencyOutcome::Satisfied
         );
+    }
+
+    // -- explicit isdevice policy (independent review finding 1) --------
+
+    #[test]
+    fn a_device_ref_target_with_no_isdevice_declared_at_all_is_unsupported() {
+        // The common non-MAME shape: no `isdevice`, no `runnable` at all.
+        // Absence proves nothing either way and must never be silently
+        // accepted as "yes, this is a device" - an ordinary game with this
+        // exact shape could otherwise satisfy any device requirement through
+        // its own unrelated storage.
+        let mut host = game("host", vec![rom("h.bin", 'h')]);
+        host.device_refs = vec![device_ref("dev")];
+        let games = vec![game("dev", vec![rom("d.bin", 'd')]), host];
+        let resolved = resolve(&games, &verifying(&games, &[(0, 0), (1, 0)]));
+        assert_eq!(
+            only_outcome(&resolved, "host", DependencyKind::Device),
+            DependencyOutcome::Unsupported
+        );
+        assert_ne!(resolved["host"].0, SetState::Complete);
+    }
+
+    #[test]
+    fn a_malformed_isdevice_value_is_contradictory() {
+        let mut host = game("host", vec![rom("h.bin", 'h')]);
+        host.device_refs = vec![device_ref("dev")];
+        let mut target = game("dev", vec![rom("d.bin", 'd')]);
+        target.is_device = Some("maybe".into());
+        let games = vec![target, host];
+        let resolved = resolve(&games, &verifying(&games, &[(0, 0), (1, 0)]));
+        assert_eq!(
+            only_outcome(&resolved, "host", DependencyKind::Device),
+            DependencyOutcome::Contradictory
+        );
+        assert_ne!(resolved["host"].0, SetState::Complete);
+    }
+
+    #[test]
+    fn a_malformed_runnable_value_on_an_explicit_device_is_contradictory() {
+        // isdevice=yes is unambiguous; runnable is not, and a malformed
+        // runnable value must not be read as "so it must not be runnable".
+        let mut host = game("host", vec![rom("h.bin", 'h')]);
+        host.device_refs = vec![device_ref("dev")];
+        let mut target = game("dev", vec![rom("d.bin", 'd')]);
+        target.is_device = Some("yes".into());
+        target.runnable = Some("sometimes".into());
+        let games = vec![target, host];
+        let resolved = resolve(&games, &verifying(&games, &[(0, 0), (1, 0)]));
+        assert_eq!(
+            only_outcome(&resolved, "host", DependencyKind::Device),
+            DependencyOutcome::Contradictory
+        );
+        assert_ne!(resolved["host"].0, SetState::Complete);
+    }
+
+    #[test]
+    fn an_explicit_isdevice_no_target_is_contradictory() {
+        let mut host = game("host", vec![rom("h.bin", 'h')]);
+        host.device_refs = vec![device_ref("dev")];
+        let mut target = game("dev", vec![rom("d.bin", 'd')]);
+        target.is_device = Some("no".into());
+        let games = vec![target, host];
+        let resolved = resolve(&games, &verifying(&games, &[(0, 0), (1, 0)]));
+        assert_eq!(
+            only_outcome(&resolved, "host", DependencyKind::Device),
+            DependencyOutcome::Contradictory
+        );
+        assert_ne!(resolved["host"].0, SetState::Complete);
+    }
+
+    #[test]
+    fn an_explicit_runnable_yes_target_is_contradictory_even_with_isdevice_yes() {
+        let mut host = game("host", vec![rom("h.bin", 'h')]);
+        host.device_refs = vec![device_ref("dev")];
+        let mut target = game("dev", vec![rom("d.bin", 'd')]);
+        target.is_device = Some("yes".into());
+        target.runnable = Some("yes".into());
+        let games = vec![target, host];
+        let resolved = resolve(&games, &verifying(&games, &[(0, 0), (1, 0)]));
+        assert_eq!(
+            only_outcome(&resolved, "host", DependencyKind::Device),
+            DependencyOutcome::Contradictory
+        );
+        assert_ne!(resolved["host"].0, SetState::Complete);
+    }
+
+    #[test]
+    fn explicit_isdevice_yes_with_runnable_no_remains_a_valid_device_target() {
+        // The one shape that must still succeed: an unambiguous, explicit
+        // confirmation on both flags. Case-insensitive, matching every other
+        // yes/no flag this stage parses.
+        let mut host = game("host", vec![rom("h.bin", 'h')]);
+        host.device_refs = vec![device_ref("dev")];
+        let mut target = game("dev", vec![rom("d.bin", 'd')]);
+        target.is_device = Some("YES".into());
+        target.runnable = Some("NO".into());
+        let games = vec![target, host];
+        let resolved = resolve(&games, &verifying(&games, &[(0, 0), (1, 0)]));
+        assert_eq!(
+            only_outcome(&resolved, "host", DependencyKind::Device),
+            DependencyOutcome::Satisfied
+        );
+        assert_eq!(resolved["host"].0, SetState::Complete);
+    }
+
+    // -- dependency-target closure: samples and BIOS metadata (finding 3) --
+
+    #[test]
+    fn a_device_target_with_sampleof_blocks_the_hosts_completion() {
+        let mut host = game("host", vec![rom("h.bin", 'h')]);
+        host.device_refs = vec![device_ref("dev")];
+        let mut target = as_device(game("dev", Vec::new()));
+        target.sample_of = Some("shared".into());
+        let games = vec![target, host];
+        let resolved = resolve(&games, &verifying(&games, &[(1, 0)]));
+        assert_eq!(
+            only_outcome(&resolved, "host", DependencyKind::Device),
+            DependencyOutcome::Unsupported
+        );
+        assert_ne!(resolved["host"].0, SetState::Complete);
+    }
+
+    #[test]
+    fn a_device_target_with_a_declared_sample_blocks_the_hosts_completion() {
+        let mut host = game("host", vec![rom("h.bin", 'h')]);
+        host.device_refs = vec![device_ref("dev")];
+        let mut target = as_device(game("dev", Vec::new()));
+        target.samples = vec![DatSampleEntry {
+            name: Some("payout".into()),
+        }];
+        let games = vec![target, host];
+        let resolved = resolve(&games, &verifying(&games, &[(1, 0)]));
+        assert_eq!(
+            only_outcome(&resolved, "host", DependencyKind::Device),
+            DependencyOutcome::Unsupported
+        );
+        assert_ne!(resolved["host"].0, SetState::Complete);
+    }
+
+    #[test]
+    fn a_device_target_with_broken_bios_metadata_blocks_the_hosts_completion() {
+        // The device's own ROM is fully verified; it just claims a BIOS
+        // variant the device never declares. Verified bytes must not launder
+        // broken metadata.
+        let mut host = game("host", vec![rom("h.bin", 'h')]);
+        host.device_refs = vec![device_ref("dev")];
+        let mut target = as_device(game("dev", vec![rom("d.bin", 'd')]));
+        target.roms[0].bios = Some("euro".into());
+        let games = vec![target, host];
+        let resolved = resolve(&games, &verifying(&games, &[(0, 0), (1, 0)]));
+        assert_eq!(
+            only_outcome(&resolved, "host", DependencyKind::Device),
+            DependencyOutcome::Contradictory
+        );
+        assert_ne!(resolved["host"].0, SetState::Complete);
+    }
+
+    #[test]
+    fn a_transitively_referenced_device_with_a_sample_requirement_blocks_completion() {
+        let mut host = game("host", vec![rom("h.bin", 'h')]);
+        host.device_refs = vec![device_ref("outer")];
+        let mut outer = as_device(game("outer", Vec::new()));
+        outer.device_refs = vec![device_ref("inner")];
+        let mut inner = as_device(game("inner", Vec::new()));
+        inner.sample_of = Some("shared".into());
+        let games = vec![inner, outer, host];
+        let resolved = resolve(&games, &verifying(&games, &[]));
+        assert_eq!(
+            only_outcome(&resolved, "host", DependencyKind::Device),
+            DependencyOutcome::Unsupported
+        );
+        assert_ne!(resolved["host"].0, SetState::Complete);
     }
 
     #[test]
@@ -2022,5 +2275,124 @@ mod false_complete_attacks {
         let games = vec![entry];
         let resolved = resolve(&games, &verifying(&games, &[(0, 0), (0, 1)]));
         assert_not_complete(&resolved, "bios");
+    }
+
+    // -- retry pass after closing the three independent-review findings --
+
+    #[test]
+    fn attack_an_ordinary_game_without_isdevice_flags_cannot_be_used_as_a_device() {
+        let mut host = game("host", vec![rom("h.bin", 'h')]);
+        host.device_refs = vec![device_ref("dev")];
+        let games = vec![game("dev", vec![rom("d.bin", 'd')]), host];
+        let resolved = resolve(&games, &verifying(&games, &[(0, 0), (1, 0)]));
+        assert_not_complete(&resolved, "host");
+    }
+
+    #[test]
+    fn attack_a_malformed_isdevice_target_cannot_be_used_as_a_device() {
+        let mut host = game("host", vec![rom("h.bin", 'h')]);
+        host.device_refs = vec![device_ref("dev")];
+        let mut target = game("dev", vec![rom("d.bin", 'd')]);
+        target.is_device = Some("sorta".into());
+        let games = vec![target, host];
+        let resolved = resolve(&games, &verifying(&games, &[(0, 0), (1, 0)]));
+        assert_not_complete(&resolved, "host");
+    }
+
+    #[test]
+    fn attack_a_malformed_runnable_target_cannot_be_used_as_a_device() {
+        let mut host = game("host", vec![rom("h.bin", 'h')]);
+        host.device_refs = vec![device_ref("dev")];
+        let mut target = game("dev", vec![rom("d.bin", 'd')]);
+        target.is_device = Some("yes".into());
+        target.runnable = Some("kinda".into());
+        let games = vec![target, host];
+        let resolved = resolve(&games, &verifying(&games, &[(0, 0), (1, 0)]));
+        assert_not_complete(&resolved, "host");
+    }
+
+    #[test]
+    fn attack_a_transitive_bios_root_with_missing_storage_cannot_complete() {
+        let mut middle = game("middle", Vec::new());
+        middle.rom_of = Some("bios".into());
+        let mut leaf = game("game", vec![rom("g.bin", 'g')]);
+        leaf.rom_of = Some("middle".into());
+        let mut root = game("bios", vec![rom("b.bin", 'b')]);
+        root.is_bios = Some("yes".into());
+        let games = vec![root, middle, leaf];
+        let resolved = resolve(&games, &verifying(&games, &[(2, 0)]));
+        assert_not_complete(&resolved, "game");
+    }
+
+    #[test]
+    fn attack_a_bios_provider_with_an_undeclared_bios_tag_cannot_complete() {
+        let mut child = game("game", vec![rom("g.bin", 'g')]);
+        child.rom_of = Some("bios".into());
+        let mut root = game("bios", vec![rom("b.bin", 'b')]);
+        root.is_bios = Some("yes".into());
+        root.roms[0].bios = Some("euro".into());
+        let games = vec![root, child];
+        let resolved = resolve(&games, &verifying(&games, &[(0, 0), (1, 0)]));
+        assert_not_complete(&resolved, "game");
+    }
+
+    #[test]
+    fn attack_a_bios_provider_with_duplicate_variants_cannot_complete() {
+        let mut child = game("game", vec![rom("g.bin", 'g')]);
+        child.rom_of = Some("bios".into());
+        let mut root = game("bios", vec![rom("b.bin", 'b')]);
+        root.is_bios = Some("yes".into());
+        root.bios_sets = vec![bios_set("euro"), bios_set("euro")];
+        let games = vec![root, child];
+        let resolved = resolve(&games, &verifying(&games, &[(0, 0), (1, 0)]));
+        assert_not_complete(&resolved, "game");
+    }
+
+    #[test]
+    fn attack_a_device_with_sampleof_only_cannot_satisfy_a_device_requirement() {
+        let mut host = game("host", vec![rom("h.bin", 'h')]);
+        host.device_refs = vec![device_ref("dev")];
+        let mut target = as_device(game("dev", Vec::new()));
+        target.sample_of = Some("shared".into());
+        let games = vec![target, host];
+        let resolved = resolve(&games, &verifying(&games, &[(1, 0)]));
+        assert_not_complete(&resolved, "host");
+    }
+
+    #[test]
+    fn attack_a_device_with_sample_only_cannot_satisfy_a_device_requirement() {
+        let mut host = game("host", vec![rom("h.bin", 'h')]);
+        host.device_refs = vec![device_ref("dev")];
+        let mut target = as_device(game("dev", Vec::new()));
+        target.samples = vec![DatSampleEntry {
+            name: Some("payout".into()),
+        }];
+        let games = vec![target, host];
+        let resolved = resolve(&games, &verifying(&games, &[(1, 0)]));
+        assert_not_complete(&resolved, "host");
+    }
+
+    #[test]
+    fn attack_a_transitive_device_sample_dependency_cannot_complete() {
+        let mut host = game("host", vec![rom("h.bin", 'h')]);
+        host.device_refs = vec![device_ref("outer")];
+        let mut outer = as_device(game("outer", Vec::new()));
+        outer.device_refs = vec![device_ref("inner")];
+        let mut inner = as_device(game("inner", Vec::new()));
+        inner.sample_of = Some("shared".into());
+        let games = vec![inner, outer, host];
+        let resolved = resolve(&games, &verifying(&games, &[]));
+        assert_not_complete(&resolved, "host");
+    }
+
+    #[test]
+    fn attack_verified_physical_storage_does_not_launder_broken_bios_metadata() {
+        let mut host = game("host", vec![rom("h.bin", 'h')]);
+        host.device_refs = vec![device_ref("dev")];
+        let mut target = as_device(game("dev", vec![rom("d.bin", 'd')]));
+        target.roms[0].bios = Some("euro".into());
+        let games = vec![target, host];
+        let resolved = resolve(&games, &verifying(&games, &[(0, 0), (1, 0)]));
+        assert_not_complete(&resolved, "host");
     }
 }
