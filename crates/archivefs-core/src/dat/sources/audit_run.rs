@@ -57,7 +57,8 @@ use crate::dat::classification::{
     ContentEligibility, ContentSelectionPolicy, DatContentClassification, DatContentSummary,
     DatOriginalMetadata, summarize,
 };
-use crate::dat::index::{DatIndex, DatMemberKey, DatRomRef, MemberLocation};
+use crate::dat::disk_audit::{DatDiskAudit, audit_chd_disk, is_chd_path};
+use crate::dat::index::{DatDiskIndex, DatIndex, DatMemberKey, DatRomRef, MemberLocation};
 use crate::dat::limits::DatLimits;
 use crate::dat::model::{DatGameEntry, ParsedDat};
 use crate::dat::parsers::parse_dat_file;
@@ -399,6 +400,7 @@ pub fn run_dat_audit(
     };
 
     let index = DatIndex::build(&catalogue);
+    let disk_index = DatDiskIndex::build(&catalogue);
     let catalogue_entries = catalogue.source.entry_count;
     let catalogue_roms = catalogue.source.rom_count;
     let content_selection = request
@@ -482,6 +484,25 @@ pub fn run_dat_audit(
         }
     }
 
+    // ---- 3.5 CHD disk evidence --------------------------------------------
+    // Deliberately not folded into step 3's loop: a CHD's DAT identity is its
+    // header's `overall_sha1` field, not a hash of the `.chd` file's own
+    // bytes, so this reads a bounded header instead of hashing the file. See
+    // `dat::disk_audit`'s module doc for why this never touches `DatIndex`
+    // (the ROM hash index) or `KnownFileEvidence`/`audit_one`.
+    let mut disk_evidence: Vec<DatDiskAudit> = Vec::new();
+    for path in scan.files.iter().filter(|path| is_chd_path(path)) {
+        if cancelled(cancel) {
+            return Err(DatAuditError::Cancelled);
+        }
+        disk_evidence.push(audit_chd_disk(path, trusted, &disk_index));
+    }
+    // Mirrors `ArchivePassCompletion`: a scan truncated by the file-count/
+    // depth ceiling means some required disk's true presence is unknown, so
+    // nothing this pass touched can be safely called `Complete` (R8 for
+    // disks) - see `dat::set`'s "R9" doc.
+    let disk_scan_complete = !scan.truncated;
+
     // ---- 4. Compare ------------------------------------------------------
     if cancelled(cancel) {
         return Err(DatAuditError::Cancelled);
@@ -493,6 +514,8 @@ pub fn run_dat_audit(
         trusted,
         cancel,
         &index,
+        &disk_evidence,
+        disk_scan_complete,
         &catalogue_games,
         &request.source_id,
     )?;
@@ -565,11 +588,14 @@ fn open_archive_source(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn audit_archives(
     files: &[PathBuf],
     trusted: &TrustedRoots,
     cancel: &AtomicBool,
     index: &DatIndex,
+    disk_evidence: &[DatDiskAudit],
+    disk_scan_complete: bool,
     games: &[DatGameEntry],
     source_id: &str,
 ) -> Result<(Vec<DatArchiveAudit>, u64, Vec<SetResolution>), DatAuditError> {
@@ -674,7 +700,13 @@ fn audit_archives(
         // `games` is the exact parsed instance `index` (above) was built
         // from - see dat::set's "Runtime DAT binding" doc for why this must
         // never be an independently re-parsed slice.
-        sets.extend(classify_archive_sets(&archive_audit, games, source_id));
+        sets.extend(classify_archive_sets(
+            &archive_audit,
+            disk_evidence,
+            disk_scan_complete,
+            games,
+            source_id,
+        ));
         archives.push(archive_audit);
 
         if cancelled(cancel) {

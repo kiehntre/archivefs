@@ -1584,6 +1584,138 @@ fn zip_members_are_matched_individually_but_never_enter_rename_planning() {
     );
 }
 
+/// Builds a syntactically valid 124-byte CHD v5 header with the given
+/// `overall_sha1`, mirroring the fixture in `dat::disk_audit`'s own tests.
+fn synthetic_chd_header(overall_sha1: [u8; 20]) -> Vec<u8> {
+    fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+    }
+    fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
+        bytes[offset..offset + 8].copy_from_slice(&value.to_be_bytes());
+    }
+    let mut bytes = [0_u8; 124];
+    bytes[0..8].copy_from_slice(b"MComprHD");
+    put_u32(&mut bytes, 8, 124);
+    put_u32(&mut bytes, 12, 5);
+    put_u64(&mut bytes, 32, 4096);
+    put_u32(&mut bytes, 56, 0x0002_0000);
+    put_u32(&mut bytes, 60, 0x0000_0800);
+    bytes[84..104].copy_from_slice(&overall_sha1);
+    bytes.to_vec()
+}
+
+#[test]
+fn end_to_end_chd_disk_evidence_reaches_a_complete_mixed_set() {
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipWriter};
+
+    let dir = temp();
+    let dat = write(
+        dir.path(),
+        "disc.dat",
+        r#"<datafile><header><name>Disc catalogue</name></header>
+<game name="Disc Game (World)">
+<rom name="game.cue" size="4" sha1="a94a8fe5ccb19ba61c4c0873d391e987982fbbd3"/>
+<disk name="game" sha1="111111111111111111111111111111111111111a"/>
+</game>
+</datafile>"#,
+    );
+    let library = dir.path().join("library");
+    std::fs::create_dir(&library).unwrap();
+
+    // The ROM half: a ZIP containing the one required rom.
+    let archive = library.join("collection.zip");
+    let mut writer = ZipWriter::new(std::fs::File::create(&archive).unwrap());
+    writer
+        .start_file(
+            "game.cue",
+            SimpleFileOptions::default().compression_method(CompressionMethod::Stored),
+        )
+        .unwrap();
+    std::io::Write::write_all(&mut writer, b"test").unwrap();
+    writer.finish().unwrap();
+
+    // The disk half: a loose .chd whose header `overall_sha1` matches the
+    // DAT's declared disk identity - never a hash of the .chd file's own
+    // bytes.
+    let mut overall_sha1 = [0x11_u8; 20];
+    overall_sha1[19] = 0x1a;
+    std::fs::write(library.join("game.chd"), synthetic_chd_header(overall_sha1)).unwrap();
+
+    let request = DatAuditRequest {
+        source_id: "disc".to_string(),
+        source_display_name: "Disc catalogue".to_string(),
+        dat_path: dat,
+        dat_kind: DatSourceKind::File,
+        scan_root: library,
+        limits: DatLimits::default(),
+        policy: None,
+        platform: None,
+    };
+    let outcome = run_dat_audit(&request, &TrustedRoots::none(), &no_cancel(), &|_| {}).unwrap();
+
+    assert_eq!(outcome.sets.len(), 1);
+    assert_eq!(outcome.sets[0].state, crate::dat::set::SetState::Complete);
+    assert_eq!(outcome.sets[0].disks_required, vec!["game"]);
+    assert_eq!(outcome.sets[0].disks_verified, vec!["game"]);
+}
+
+#[test]
+fn end_to_end_wrong_chd_never_satisfies_the_required_disk_slot() {
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipWriter};
+
+    let dir = temp();
+    let dat = write(
+        dir.path(),
+        "disc.dat",
+        r#"<datafile><header><name>Disc catalogue</name></header>
+<game name="Disc Game (World)">
+<rom name="game.cue" size="4" sha1="a94a8fe5ccb19ba61c4c0873d391e987982fbbd3"/>
+<disk name="game" sha1="111111111111111111111111111111111111111a"/>
+</game>
+</datafile>"#,
+    );
+    let library = dir.path().join("library");
+    std::fs::create_dir(&library).unwrap();
+
+    let archive = library.join("collection.zip");
+    let mut writer = ZipWriter::new(std::fs::File::create(&archive).unwrap());
+    writer
+        .start_file(
+            "game.cue",
+            SimpleFileOptions::default().compression_method(CompressionMethod::Stored),
+        )
+        .unwrap();
+    std::io::Write::write_all(&mut writer, b"test").unwrap();
+    writer.finish().unwrap();
+
+    // A CHD is present, but its overall_sha1 matches nothing in the DAT.
+    let mut unrelated_sha1 = [0x22_u8; 20];
+    unrelated_sha1[19] = 0x2b;
+    std::fs::write(
+        library.join("game.chd"),
+        synthetic_chd_header(unrelated_sha1),
+    )
+    .unwrap();
+
+    let request = DatAuditRequest {
+        source_id: "disc".to_string(),
+        source_display_name: "Disc catalogue".to_string(),
+        dat_path: dat,
+        dat_kind: DatSourceKind::File,
+        scan_root: library,
+        limits: DatLimits::default(),
+        policy: None,
+        platform: None,
+    };
+    let outcome = run_dat_audit(&request, &TrustedRoots::none(), &no_cancel(), &|_| {}).unwrap();
+
+    assert_eq!(outcome.sets.len(), 1);
+    assert_ne!(outcome.sets[0].state, crate::dat::set::SetState::Complete);
+    assert!(outcome.sets[0].disks_verified.is_empty());
+}
+
 #[test]
 fn sevenz_members_are_matched_individually_but_never_enter_rename_planning() {
     use crate::dat::archive::ArchiveMemberStatus;

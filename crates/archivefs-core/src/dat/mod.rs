@@ -35,6 +35,7 @@
 pub mod archive;
 pub mod audit;
 pub mod classification;
+pub mod disk_audit;
 pub mod hash;
 pub mod index;
 pub mod limits;

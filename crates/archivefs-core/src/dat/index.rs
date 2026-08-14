@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use super::classification::{DatContentClassification, DatOriginalMetadata};
-use super::model::{DatChecksum, ParsedDat};
+use super::model::{ChecksumAlgorithm, DatChecksum, ParsedDat};
 
 /// The position of a ROM declaration within its game.
 ///
@@ -57,6 +57,155 @@ impl DatRomRef {
     /// Returns the exact declaration key without involving display names.
     pub fn key(&self) -> DatMemberKey {
         self.member_key
+    }
+}
+
+/// The position of a disk declaration within its game.
+///
+/// Deliberately separate from [`MemberLocation`] even though the shapes
+/// mirror each other: a disk and a ROM are different kinds of catalogue
+/// member with different identity fields (SHA-1 only, never CRC32/MD5/
+/// SHA-256), and keeping the enums distinct means a disk key can never be
+/// compared equal to, or accidentally substituted for, a ROM key even though
+/// both carry a `usize`-shaped position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DiskLocation {
+    TopLevel {
+        disk_index: usize,
+    },
+    DiskArea {
+        part_index: usize,
+        disk_area_index: usize,
+        member_index: usize,
+    },
+}
+
+/// Positional identity for one declared disk slot. Never derived from
+/// `disk_name`: duplicate disk/diskarea names are legal catalogue data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DatDiskKey {
+    pub game_index: usize,
+    pub location: DiskLocation,
+}
+
+/// A reference to one disk in one game entry.
+///
+/// `sha1` is the *only* lookup identity here - deliberately never CRC32/MD5/
+/// SHA-256 (a CHD v5 header exposes no such fields for the disk's own
+/// identity) and never `disk_name` (display metadata only).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatDiskRef {
+    pub game_index: usize,
+    pub game_name: String,
+    pub disk_key: DatDiskKey,
+    pub disk_name: String,
+    /// Normalised lowercase 40-hex SHA-1, the DAT's declared disk identity.
+    pub sha1: String,
+    pub status: Option<String>,
+    pub merge: Option<String>,
+    pub optional: Option<String>,
+}
+
+impl DatDiskRef {
+    /// Returns the exact declaration key without involving display names.
+    pub fn key(&self) -> DatDiskKey {
+        self.disk_key
+    }
+}
+
+/// Index into a parsed DAT file's disk declarations, keyed by SHA-1 only.
+///
+/// Structurally separate from [`DatIndex`]: this type has no CRC32/MD5/
+/// SHA-256/filename map at all, so a disk SHA-1 has nowhere to accidentally
+/// land in the ROM namespace, and a ROM SHA-1 has nowhere to land here. A CHD
+/// v5 header's `overall_sha1` is looked up only against
+/// [`DatDiskIndex::by_disk_sha1`], never against [`DatIndex::by_sha1`].
+#[derive(Debug, Clone, Default)]
+pub struct DatDiskIndex {
+    pub by_disk_sha1: HashMap<String, Vec<DatDiskRef>>,
+}
+
+impl DatDiskIndex {
+    /// Builds a disk index from a parsed DAT file.
+    ///
+    /// Every disk in every game is indexed once by its normalised SHA-1.
+    /// A disk with no SHA-1, or one that is not well-formed hex of the right
+    /// length, is not indexed at all - it can never be looked up, so it can
+    /// never be silently promoted to "present" (fail closed, R5-equivalent
+    /// for disks).
+    pub fn build(dat: &ParsedDat) -> Self {
+        let mut index = Self::default();
+
+        for (game_index, game) in dat.games.iter().enumerate() {
+            for (disk_index, disk) in game.disks.iter().enumerate() {
+                let key = DatDiskKey {
+                    game_index,
+                    location: DiskLocation::TopLevel { disk_index },
+                };
+                index.insert_disk(game_index, &game.name, key, disk);
+            }
+
+            for (part_index, part) in game.parts.iter().enumerate() {
+                for (disk_area_index, area) in part.disk_areas.iter().enumerate() {
+                    for (member_index, disk) in area.disks.iter().enumerate() {
+                        let key = DatDiskKey {
+                            game_index,
+                            location: DiskLocation::DiskArea {
+                                part_index,
+                                disk_area_index,
+                                member_index,
+                            },
+                        };
+                        index.insert_disk(game_index, &game.name, key, disk);
+                    }
+                }
+            }
+        }
+
+        index
+    }
+
+    fn insert_disk(
+        &mut self,
+        game_index: usize,
+        game_name: &str,
+        key: DatDiskKey,
+        disk: &super::model::DatDiskEntry,
+    ) {
+        let Some(raw_sha1) = disk.sha1.as_deref() else {
+            return;
+        };
+        // Reuses the same validated hex normalisation ROM checksums use,
+        // rather than hand-rolling a second, weaker SHA-1 check.
+        let Some(checksum) = DatChecksum::parse(ChecksumAlgorithm::Sha1, raw_sha1) else {
+            return;
+        };
+
+        let disk_ref = DatDiskRef {
+            game_index,
+            game_name: game_name.to_string(),
+            disk_key: key,
+            disk_name: disk.name.clone().unwrap_or_default(),
+            sha1: checksum.value.clone(),
+            status: disk.status.clone(),
+            merge: disk.merge.clone(),
+            optional: disk.optional.clone(),
+        };
+
+        self.by_disk_sha1
+            .entry(checksum.value)
+            .or_default()
+            .push(disk_ref);
+    }
+
+    /// Look up by disk SHA-1 (already-normalised lowercase 40-hex expected;
+    /// non-matching case or malformed input simply misses). Returns
+    /// candidates (empty if none).
+    pub fn lookup_disk_sha1(&self, sha1: &str) -> &[DatDiskRef] {
+        self.by_disk_sha1
+            .get(sha1)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 }
 
@@ -425,6 +574,205 @@ mod tests {
                     },
                 }
             );
+        }
+    }
+
+    mod disk_index {
+        use super::*;
+        use crate::dat::model::{DatDiskAreaEntry, DatDiskEntry, DatPartEntry};
+
+        fn disk(name: &str, sha1: Option<&str>) -> DatDiskEntry {
+            DatDiskEntry {
+                name: Some(name.to_string()),
+                sha1: sha1.map(str::to_string),
+                merge: None,
+                region: None,
+                index: None,
+                writable: None,
+                status: None,
+                optional: None,
+            }
+        }
+
+        fn dat_with_top_level_disk(sha1: Option<&str>) -> ParsedDat {
+            let mut dat = make_dat();
+            dat.games[0].disks = vec![disk("disc1.chd", sha1)];
+            dat
+        }
+
+        #[test]
+        fn top_level_dat_disk_indexed_exactly_once() {
+            let dat = dat_with_top_level_disk(Some("111111111111111111111111111111111111111a"));
+            let index = DatDiskIndex::build(&dat);
+
+            let candidates = index.lookup_disk_sha1("111111111111111111111111111111111111111a");
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(candidates[0].game_name, "Game Alpha");
+            assert_eq!(candidates[0].disk_name, "disc1.chd");
+            assert_eq!(
+                candidates[0].key(),
+                DatDiskKey {
+                    game_index: 0,
+                    location: DiskLocation::TopLevel { disk_index: 0 },
+                }
+            );
+        }
+
+        #[test]
+        fn nested_part_diskarea_disk_indexed_exactly_once_with_correct_location() {
+            let mut dat = make_dat();
+            dat.games[0].parts = vec![DatPartEntry {
+                disk_areas: vec![DatDiskAreaEntry {
+                    disks: vec![disk(
+                        "nested.chd",
+                        Some("222222222222222222222222222222222222222b"),
+                    )],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }];
+
+            let index = DatDiskIndex::build(&dat);
+            let candidates = index.lookup_disk_sha1("222222222222222222222222222222222222222b");
+
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(
+                candidates[0].key(),
+                DatDiskKey {
+                    game_index: 0,
+                    location: DiskLocation::DiskArea {
+                        part_index: 0,
+                        disk_area_index: 0,
+                        member_index: 0,
+                    },
+                }
+            );
+        }
+
+        #[test]
+        fn same_disk_name_in_different_diskareas_stays_distinct_by_position_not_name() {
+            let mut dat = make_dat();
+            dat.games[0].parts = vec![DatPartEntry {
+                disk_areas: vec![
+                    DatDiskAreaEntry {
+                        disks: vec![disk(
+                            "shared-name.chd",
+                            Some("333333333333333333333333333333333333333c"),
+                        )],
+                        ..Default::default()
+                    },
+                    DatDiskAreaEntry {
+                        disks: vec![disk(
+                            "shared-name.chd",
+                            Some("444444444444444444444444444444444444444d"),
+                        )],
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }];
+
+            let index = DatDiskIndex::build(&dat);
+            let first = &index.lookup_disk_sha1("333333333333333333333333333333333333333c")[0];
+            let second = &index.lookup_disk_sha1("444444444444444444444444444444444444444d")[0];
+
+            assert_eq!(
+                first.disk_name, second.disk_name,
+                "names collide on purpose"
+            );
+            assert_ne!(
+                first.key(),
+                second.key(),
+                "position must disambiguate identically-named disks in different diskareas"
+            );
+            assert_eq!(
+                first.key(),
+                DatDiskKey {
+                    game_index: 0,
+                    location: DiskLocation::DiskArea {
+                        part_index: 0,
+                        disk_area_index: 0,
+                        member_index: 0,
+                    },
+                }
+            );
+            assert_eq!(
+                second.key(),
+                DatDiskKey {
+                    game_index: 0,
+                    location: DiskLocation::DiskArea {
+                        part_index: 0,
+                        disk_area_index: 1,
+                        member_index: 0,
+                    },
+                }
+            );
+        }
+
+        #[test]
+        fn malformed_disk_sha1_is_not_indexed() {
+            let dat = dat_with_top_level_disk(Some("not-hex-at-all"));
+            let index = DatDiskIndex::build(&dat);
+
+            assert!(index.by_disk_sha1.is_empty());
+        }
+
+        #[test]
+        fn empty_disk_sha1_is_not_indexed() {
+            let dat = dat_with_top_level_disk(Some(""));
+            let index = DatDiskIndex::build(&dat);
+
+            assert!(index.by_disk_sha1.is_empty());
+        }
+
+        #[test]
+        fn missing_disk_sha1_is_not_indexed() {
+            let dat = dat_with_top_level_disk(None);
+            let index = DatDiskIndex::build(&dat);
+
+            assert!(index.by_disk_sha1.is_empty());
+        }
+
+        #[test]
+        fn uppercase_valid_sha1_is_normalised_to_lowercase() {
+            let dat = dat_with_top_level_disk(Some("111111111111111111111111111111111111111A"));
+            let index = DatDiskIndex::build(&dat);
+
+            assert!(
+                index
+                    .lookup_disk_sha1("111111111111111111111111111111111111111a")
+                    .len()
+                    == 1
+            );
+            assert_eq!(
+                index.by_disk_sha1.keys().next().expect("one key").as_str(),
+                "111111111111111111111111111111111111111a"
+            );
+        }
+
+        #[test]
+        fn rom_and_disk_sharing_one_sha1_string_never_cross_namespaces() {
+            let shared_sha1 = "555555555555555555555555555555555555555e";
+            let mut dat = make_dat();
+            dat.games[0].roms[0].sha1 = Some(shared_sha1.to_string());
+            dat.games[0].disks = vec![disk("disc1.chd", Some(shared_sha1))];
+
+            let rom_index = DatIndex::build(&dat);
+            let disk_index = DatDiskIndex::build(&dat);
+
+            let rom_candidates = rom_index.lookup_sha1(shared_sha1);
+            assert_eq!(rom_candidates.len(), 1);
+            assert_eq!(rom_candidates[0].rom_name, "alpha.bin");
+
+            let disk_candidates = disk_index.lookup_disk_sha1(shared_sha1);
+            assert_eq!(disk_candidates.len(), 1);
+            assert_eq!(disk_candidates[0].disk_name, "disc1.chd");
+
+            // The rom index has no disk-shaped map at all to leak into, and
+            // vice versa - proven structurally, not just by these two
+            // lookups agreeing.
+            assert!(!rom_index.by_sha1.is_empty());
+            assert!(!disk_index.by_disk_sha1.is_empty());
         }
     }
 }
