@@ -260,11 +260,19 @@ impl RepairProposal {
     }
 
     /// Whether the proposal may even be considered for execution: an
-    /// executable action, classified `Safe`, with no blockers. The plan and
-    /// the executor re-check every condition; this is a shorthand for the
-    /// planner's classification, never an override.
+    /// executable action, classified `Safe`, with no blockers, **and** an
+    /// audited source identity. The plan and the executor re-check every
+    /// condition; this is a shorthand for the planner's classification, never
+    /// an override.
+    ///
+    /// An executable proposal without `expected_source_identity` is never
+    /// actionable: execution must never capture "whatever object currently
+    /// exists at the path" as a substitute for audited evidence.
     pub fn actionable(&self) -> bool {
-        self.action.is_executable() && self.safety == SafetyState::Safe && self.blockers.is_empty()
+        self.action.is_executable()
+            && self.safety == SafetyState::Safe
+            && self.blockers.is_empty()
+            && self.expected_source_identity.is_some()
     }
 
     /// A one-line headline for a proposal row.
@@ -328,6 +336,15 @@ mod tests {
 
     #[test]
     fn a_blocked_or_review_proposal_is_not_actionable() {
+        let identity = crate::dat::rename_apply::ObjectIdentity {
+            size_bytes: 10,
+            modified_unix: 1,
+            kind: crate::dat::rename_apply::ObjectKind::RegularFile,
+            #[cfg(unix)]
+            ino: 1,
+            #[cfg(unix)]
+            dev: 1,
+        };
         let base = RepairProposal {
             id: RepairProposalId::new("p1").unwrap(),
             action: RepairAction::RenamePath {
@@ -336,7 +353,7 @@ mod tests {
             source_path: PathBuf::from("/tmp/x/old.bin"),
             reason: "r".to_string(),
             evidence: Vec::new(),
-            expected_source_identity: None,
+            expected_source_identity: Some(identity),
             originating_audit: None,
             safety: SafetyState::Safe,
             blockers: Vec::new(),
@@ -375,6 +392,15 @@ mod tests {
         assert!(
             !RepairProposal {
                 action: RepairAction::Deferred(DeferredActionKind::FetchMissing),
+                ..base.clone()
+            }
+            .actionable()
+        );
+        // An executable proposal without an audited identity is never
+        // actionable: execution must never capture whatever is at the path.
+        assert!(
+            !RepairProposal {
+                expected_source_identity: None,
                 ..base
             }
             .actionable()

@@ -156,12 +156,32 @@ pub fn build_repair_plan(
     mut proposals: Vec<RepairProposal>,
 ) -> RepairPlan {
     proposals.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut conflicts = detect_plan_conflicts(&proposals);
+    sort_conflicts(&mut conflicts);
+
+    RepairPlan {
+        id,
+        generation,
+        created_at_unix,
+        source_scan_id,
+        proposals,
+        conflicts,
+    }
+}
+
+/// Recomputes every global conflict over the given proposals.
+///
+/// This is order-independent and is the authoritative validation the executor
+/// re-runs immediately before transaction construction. The executor never
+/// trusts a plan's *stored* `conflicts` field as authoritative - a mutated or
+/// deserialised plan must be re-checked here.
+pub fn detect_plan_conflicts(proposals: &[RepairProposal]) -> Vec<PlanConflict> {
     let mut conflicts = Vec::new();
 
     // 1. Duplicate proposal ids.
     {
         let mut by_id: BTreeMap<&RepairProposalId, Vec<&RepairProposal>> = BTreeMap::new();
-        for proposal in &proposals {
+        for proposal in proposals {
             by_id.entry(&proposal.id).or_default().push(proposal);
         }
         for (id, group) in by_id {
@@ -178,7 +198,7 @@ pub fn build_repair_plan(
     // 2. Duplicate source (after path normalisation).
     {
         let mut by_source: BTreeMap<PathBuf, Vec<&RepairProposal>> = BTreeMap::new();
-        for proposal in &proposals {
+        for proposal in proposals {
             by_source
                 .entry(normalise_path(&proposal.source_path))
                 .or_default()
@@ -199,10 +219,20 @@ pub fn build_repair_plan(
         }
     }
 
-    // 3. Unsupported proposals (deferred future actions, or anything the
-    //    planner did not classify Safe). These block the batch outright.
-    for proposal in &proposals {
-        if !proposal.actionable() {
+    // 3. Unsupported proposals (deferred future actions, anything the planner
+    //    did not classify Safe, or an executable proposal with no audited
+    //    source identity). These block the batch outright.
+    for proposal in proposals {
+        if proposal.action.is_executable() && proposal.expected_source_identity.is_none() {
+            conflicts.push(PlanConflict {
+                kind: PlanConflictKind::UnsupportedProposal,
+                detail: format!(
+                    "proposal '{}' is executable but has no audited source identity",
+                    proposal.id
+                ),
+                proposal_ids: vec![proposal.id.clone()],
+            });
+        } else if !proposal.actionable() {
             let detail = match &proposal.action {
                 RepairAction::Deferred(kind) => format!(
                     "proposal '{}' requests '{}', which this foundation never executes",
@@ -288,11 +318,15 @@ pub fn build_repair_plan(
     }
 
     // 4d. Parent/child path interference among every source and destination.
-    if let Some(conflict) = find_parent_child_interference(&proposals) {
+    if let Some(conflict) = find_parent_child_interference(proposals) {
         conflicts.push(conflict);
     }
 
-    // Deterministic ordering of conflicts.
+    conflicts
+}
+
+/// Deterministic ordering of conflicts: by kind, then by the joined proposal ids.
+fn sort_conflicts(conflicts: &mut [PlanConflict]) {
     conflicts.sort_by(|a, b| {
         let kind = format!("{:?}", a.kind);
         let other_kind = format!("{:?}", b.kind);
@@ -311,15 +345,6 @@ pub fn build_repair_plan(
                 )
         })
     });
-
-    RepairPlan {
-        id,
-        generation,
-        created_at_unix,
-        source_scan_id,
-        proposals,
-        conflicts,
-    }
 }
 
 /// Normalises a path for *conflict detection only*: the parent directory is
@@ -441,6 +466,8 @@ fn find_parent_child_interference(proposals: &[RepairProposal]) -> Option<PlanCo
             paths.push((normalise_path(destination), proposal));
         }
     }
+    // Deterministic regardless of input order.
+    paths.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.id.cmp(&b.1.id)));
     for i in 0..paths.len() {
         for j in (i + 1)..paths.len() {
             if paths[i].1.id == paths[j].1.id {
@@ -513,7 +540,17 @@ mod tests {
                 RepairEvidenceKind::UserRequestedOrganisation,
                 "test",
             )],
-            expected_source_identity: None,
+            // Test proposals are executable, so they carry a synthetic audited
+            // identity (these are fake paths; nothing is captured).
+            expected_source_identity: Some(crate::dat::rename_apply::ObjectIdentity {
+                size_bytes: 1,
+                modified_unix: 1,
+                kind: crate::dat::rename_apply::ObjectKind::RegularFile,
+                #[cfg(unix)]
+                ino: 1,
+                #[cfg(unix)]
+                dev: 1,
+            }),
             originating_audit: None,
             safety: SafetyState::Safe,
             blockers: Vec::new(),

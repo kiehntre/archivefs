@@ -129,7 +129,7 @@ fn a_needs_review_proposal_cannot_execute() {
     let p = plan(1, vec![reviewed]);
     let report = run_repair_preflight(&p, 1);
     assert_eq!(report.results[0].status, RepairPreflightStatus::NeedsReview);
-    let err = execute_repair_plan(&p, &options(dir.path()), &cancel()).unwrap_err();
+    let err = execute_repair_plan(&p, 1, &options(dir.path()), &cancel()).unwrap_err();
     assert!(matches!(err, RepairExecutionError::NotExecutable { .. }));
 }
 
@@ -144,7 +144,7 @@ fn a_blocked_proposal_cannot_execute() {
     let p = plan(1, vec![blocked]);
     let report = run_repair_preflight(&p, 1);
     assert_eq!(report.results[0].status, RepairPreflightStatus::Blocked);
-    let err = execute_repair_plan(&p, &options(dir.path()), &cancel()).unwrap_err();
+    let err = execute_repair_plan(&p, 1, &options(dir.path()), &cancel()).unwrap_err();
     assert!(matches!(err, RepairExecutionError::NotExecutable { .. }));
 }
 
@@ -161,7 +161,7 @@ fn an_unsupported_future_action_cannot_execute() {
             .iter()
             .any(|c| c.kind == PlanConflictKind::UnsupportedProposal)
     );
-    let err = execute_repair_plan(&p, &options(dir.path()), &cancel()).unwrap_err();
+    let err = execute_repair_plan(&p, 1, &options(dir.path()), &cancel()).unwrap_err();
     assert!(matches!(err, RepairExecutionError::NotExecutable { .. }));
 }
 
@@ -186,7 +186,7 @@ fn same_source_conflict_blocks_execution() {
             .iter()
             .any(|c| c.kind == PlanConflictKind::DuplicateSource)
     );
-    assert!(execute_repair_plan(&p, &options(dir.path()), &cancel()).is_err());
+    assert!(execute_repair_plan(&p, 1, &options(dir.path()), &cancel()).is_err());
     // Nothing may have moved.
     assert!(source.exists());
     assert!(!dir.path().join("A.bin").exists());
@@ -212,7 +212,7 @@ fn same_destination_conflict_blocks_execution() {
             .iter()
             .any(|c| c.kind == PlanConflictKind::DuplicateDestination)
     );
-    assert!(execute_repair_plan(&p, &options(dir.path()), &cancel()).is_err());
+    assert!(execute_repair_plan(&p, 1, &options(dir.path()), &cancel()).is_err());
 }
 
 #[test]
@@ -230,7 +230,7 @@ fn destination_already_exists_conflict_blocks_execution() {
             .iter()
             .any(|c| c.kind == PlanConflictKind::DestinationExists)
     );
-    assert!(execute_repair_plan(&p, &options(dir.path()), &cancel()).is_err());
+    assert!(execute_repair_plan(&p, 1, &options(dir.path()), &cancel()).is_err());
     assert_eq!(std::fs::read(dir.path().join("A.bin")).unwrap(), b"taken");
 }
 
@@ -250,7 +250,7 @@ fn two_proposal_cycle_blocks_execution() {
             .iter()
             .any(|c| c.kind == PlanConflictKind::RenameCycle)
     );
-    assert!(execute_repair_plan(&p, &options(dir.path()), &cancel()).is_err());
+    assert!(execute_repair_plan(&p, 1, &options(dir.path()), &cancel()).is_err());
     assert!(a.exists() && b.exists());
 }
 
@@ -276,7 +276,7 @@ fn three_proposal_cycle_blocks_execution() {
             .iter()
             .any(|c| c.kind == PlanConflictKind::RenameCycle)
     );
-    assert!(execute_repair_plan(&p, &options(dir.path()), &cancel()).is_err());
+    assert!(execute_repair_plan(&p, 1, &options(dir.path()), &cancel()).is_err());
 }
 
 #[test]
@@ -300,7 +300,7 @@ fn parent_child_interference_blocks_execution() {
             .iter()
             .any(|c| c.kind == PlanConflictKind::ParentChildInterference)
     );
-    assert!(execute_repair_plan(&p, &options(dir.path()), &cancel()).is_err());
+    assert!(execute_repair_plan(&p, 1, &options(dir.path()), &cancel()).is_err());
 }
 
 // ---------------------------------------------------------------------------
@@ -322,7 +322,7 @@ fn source_removed_after_proposal_is_refused() {
         report.results[0].status,
         RepairPreflightStatus::MissingSource
     );
-    let err = execute_repair_plan(&p, &options(dir.path()), &cancel()).unwrap_err();
+    let err = execute_repair_plan(&p, 1, &options(dir.path()), &cancel()).unwrap_err();
     assert!(matches!(err, RepairExecutionError::StaleSource { .. }));
 }
 
@@ -342,7 +342,7 @@ fn source_replaced_after_proposal_is_refused() {
         report.results[0].status,
         RepairPreflightStatus::ChangedSourceIdentity
     );
-    assert!(execute_repair_plan(&p, &options(dir.path()), &cancel()).is_err());
+    assert!(execute_repair_plan(&p, 1, &options(dir.path()), &cancel()).is_err());
 }
 
 #[test]
@@ -360,7 +360,7 @@ fn source_identity_changed_is_refused() {
         report.results[0].status,
         RepairPreflightStatus::ChangedSourceIdentity
     );
-    assert!(execute_repair_plan(&p, &options(dir.path()), &cancel()).is_err());
+    assert!(execute_repair_plan(&p, 1, &options(dir.path()), &cancel()).is_err());
 }
 
 #[test]
@@ -379,7 +379,7 @@ fn symlink_substitution_is_refused() {
         report.results[0].status,
         RepairPreflightStatus::ChangedSourceIdentity
     );
-    assert!(execute_repair_plan(&p, &options(dir.path()), &cancel()).is_err());
+    assert!(execute_repair_plan(&p, 1, &options(dir.path()), &cancel()).is_err());
 }
 
 // ---------------------------------------------------------------------------
@@ -393,7 +393,7 @@ fn a_successful_rename_executes_and_reverifies() {
     std::fs::write(&source, b"payload").unwrap();
     let destination = dir.path().join("A.bin");
     let p = plan(1, vec![proposal("a", &source, &destination, true)]);
-    let result = execute_repair_plan(&p, &options(dir.path()), &cancel()).unwrap();
+    let result = execute_repair_plan(&p, 1, &options(dir.path()), &cancel()).unwrap();
     assert!(!source.exists());
     assert_eq!(std::fs::read(&destination).unwrap(), b"payload");
     assert_eq!(result.transaction.state, TransactionState::Applied);
@@ -416,7 +416,7 @@ fn a_successful_same_filesystem_move_executes() {
     std::fs::write(&source, b"payload").unwrap();
     let destination = sub.join("a.bin");
     let p = plan(1, vec![move_proposal("a", &source, &destination, true)]);
-    let result = execute_repair_plan(&p, &options(dir.path()), &cancel()).unwrap();
+    let result = execute_repair_plan(&p, 1, &options(dir.path()), &cancel()).unwrap();
     assert!(!source.exists());
     assert_eq!(std::fs::read(&destination).unwrap(), b"payload");
     assert_eq!(result.transaction.applied_count(), 1);
@@ -440,6 +440,7 @@ fn destination_collision_at_apply_is_refused_and_never_overwrites() {
     std::fs::write(&destination, b"appeared").unwrap();
     let outcome = apply_repair_transaction(&mut crate::repair::execute::RepairApplyExecution {
         transaction: &mut transaction,
+        current_generation: 1,
         options: &options(dir.path()),
         cancel: &cancel(),
     });
@@ -473,7 +474,7 @@ fn exdev_cross_filesystem_move_is_refused() {
             report.results[0].status,
             RepairPreflightStatus::InvalidDestination
         );
-        assert!(execute_repair_plan(&p, &options(dir.path()), &cancel()).is_err());
+        assert!(execute_repair_plan(&p, 1, &options(dir.path()), &cancel()).is_err());
         assert!(source.exists(), "the source must not move");
     }
 }
@@ -492,7 +493,7 @@ fn no_overwrite_ever() {
             .iter()
             .any(|c| c.kind == PlanConflictKind::DestinationExists)
     );
-    assert!(execute_repair_plan(&p, &options(dir.path()), &cancel()).is_err());
+    assert!(execute_repair_plan(&p, 1, &options(dir.path()), &cancel()).is_err());
     assert_eq!(std::fs::read(&destination).unwrap(), b"old");
     assert_eq!(std::fs::read(&source).unwrap(), b"new");
 }
@@ -517,7 +518,7 @@ fn global_preflight_aborts_a_batch_where_any_entry_is_invalid() {
     );
     // Invalidate entry b's source after the plan was built but before apply.
     std::fs::write(&b, b"b changed before apply").unwrap();
-    let err = execute_repair_plan(&p, &options(dir.path()), &cancel()).unwrap_err();
+    let err = execute_repair_plan(&p, 1, &options(dir.path()), &cancel()).unwrap_err();
     assert!(
         matches!(err, RepairExecutionError::StaleSource { .. })
             || matches!(err, RepairExecutionError::Apply(_)),
@@ -534,7 +535,7 @@ fn a_partially_applied_batch_rolls_back_and_reports_partial_result() {
     let dir = tempfile::tempdir().unwrap();
     let (p, a, b, a_dest, b_dest) = two_file_plan(dir.path(), 1);
     // Apply both entries through the real executor.
-    let result = execute_repair_plan(&p, &options(dir.path()), &cancel()).unwrap();
+    let result = execute_repair_plan(&p, 1, &options(dir.path()), &cancel()).unwrap();
     assert_eq!(result.transaction.applied_count(), 2);
     assert!(!a.exists() && !b.exists());
     assert!(a_dest.exists() && b_dest.exists());
@@ -570,7 +571,7 @@ fn a_partially_applied_batch_rolls_back_and_reports_partial_result() {
 fn a_clean_rollback_restores_everything_and_is_idempotent() {
     let dir = tempfile::tempdir().unwrap();
     let (p, a, b, _, _) = two_file_plan(dir.path(), 1);
-    let result = execute_repair_plan(&p, &options(dir.path()), &cancel()).unwrap();
+    let result = execute_repair_plan(&p, 1, &options(dir.path()), &cancel()).unwrap();
     let mut transaction = result.transaction;
     let rollback = rollback_repair_transaction(&mut transaction, dir.path(), &cancel()).unwrap();
     use crate::dat::rename_apply::model::RollbackResult;
@@ -590,7 +591,7 @@ fn rollback_destination_collision_is_reported_explicitly() {
     let destination = dir.path().join("A.bin");
     std::fs::write(&source, b"x").unwrap();
     let p = plan(1, vec![proposal("a", &source, &destination, true)]);
-    let result = execute_repair_plan(&p, &options(dir.path()), &cancel()).unwrap();
+    let result = execute_repair_plan(&p, 1, &options(dir.path()), &cancel()).unwrap();
     // Occupy the original source path; rollback must refuse, not clobber.
     std::fs::write(&source, b"occupied").unwrap();
     let mut transaction = result.transaction;
@@ -616,26 +617,22 @@ fn rollback_destination_collision_is_reported_explicitly() {
 fn dry_run_never_mutates_and_surfaces_all_blockers() {
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("a.bin");
+    let missing = dir.path().join("missing.bin");
     std::fs::write(&source, b"x").unwrap();
-    let p = plan(
-        1,
-        vec![
-            proposal("a", &source, &dir.path().join("A.bin"), true),
-            proposal(
-                "b",
-                &dir.path().join("missing.bin"),
-                &dir.path().join("B.bin"),
-                false,
-            ),
-        ],
-    );
+    std::fs::write(&missing, b"y").unwrap();
+    // Capture both identities while both files exist...
+    let a_proposal = proposal("a", &source, &dir.path().join("A.bin"), true);
+    let b_proposal = proposal("b", &missing, &dir.path().join("B.bin"), true);
+    // ...then remove `missing.bin` so preflight reports it missing.
+    std::fs::remove_file(&missing).unwrap();
+    let p = plan(1, vec![a_proposal, b_proposal]);
     let report = run_repair_preflight(&p, 1);
     assert!(!report.all_ready);
     assert_eq!(report.results.len(), 2);
-    let missing = report
+    let missing_result = report
         .for_proposal(&RepairProposalId::new("b").unwrap())
         .unwrap();
-    assert_eq!(missing.status, RepairPreflightStatus::MissingSource);
+    assert_eq!(missing_result.status, RepairPreflightStatus::MissingSource);
     // Nothing was created or moved.
     assert!(source.exists());
     assert!(!dir.path().join("A.bin").exists());
@@ -782,7 +779,7 @@ fn stale_dat_evidence_fails_repair_preflight() {
         report.results[0].status,
         RepairPreflightStatus::ChangedSourceIdentity
     );
-    let err = execute_repair_plan(&p, &options(dir.path()), &cancel()).unwrap_err();
+    let err = execute_repair_plan(&p, 7, &options(dir.path()), &cancel()).unwrap_err();
     assert!(matches!(err, RepairExecutionError::StaleSource { .. }));
 }
 
@@ -894,10 +891,18 @@ fn replaying_the_same_plan_twice_cannot_mutate_again() {
         1,
         vec![proposal("a", &source, &dir.path().join("A.bin"), true)],
     );
-    let _ = execute_repair_plan(&p, &options(dir.path()), &cancel()).unwrap();
-    // The source is gone; a second run of the same plan must refuse.
-    let err = execute_repair_plan(&p, &options(dir.path()), &cancel()).unwrap_err();
-    assert!(matches!(err, RepairExecutionError::StaleSource { .. }));
+    let _ = execute_repair_plan(&p, 1, &options(dir.path()), &cancel()).unwrap();
+    // The source is gone; a second run of the same plan must refuse before any
+    // mutation - either because the source is stale or because the destination
+    // now exists. Both are refusals, never a re-mutation.
+    let err = execute_repair_plan(&p, 1, &options(dir.path()), &cancel()).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            RepairExecutionError::StaleSource { .. } | RepairExecutionError::NotExecutable { .. }
+        ),
+        "the replayed plan must refuse: {err:?}"
+    );
     assert!(!source.exists());
     assert_eq!(std::fs::read(dir.path().join("A.bin")).unwrap(), b"x");
 }
@@ -917,7 +922,7 @@ fn a_relative_path_escape_cannot_execute() {
         report.results[0].status,
         RepairPreflightStatus::InvalidDestination
     );
-    assert!(execute_repair_plan(&p, &options(dir.path()), &cancel()).is_err());
+    assert!(execute_repair_plan(&p, 1, &options(dir.path()), &cancel()).is_err());
     assert!(source.exists());
 }
 
@@ -930,7 +935,7 @@ fn reverify_detects_a_destination_replaced_after_apply() {
         1,
         vec![proposal("a", &source, &dir.path().join("A.bin"), true)],
     );
-    let result = execute_repair_plan(&p, &options(dir.path()), &cancel()).unwrap();
+    let result = execute_repair_plan(&p, 1, &options(dir.path()), &cancel()).unwrap();
     assert_eq!(result.reverify[0].outcome, RepairReverifyOutcome::Verified);
     // Replace the destination with a different object; re-verify must flag it.
     std::fs::write(
@@ -952,4 +957,167 @@ fn build_refuses_a_plan_with_any_conflict_or_needs_review() {
     let p = plan(1, vec![reviewed]);
     let err = build_repair_transaction(&p).unwrap_err();
     assert!(matches!(err, RepairExecutionError::NotExecutable { .. }));
+}
+
+// ---------------------------------------------------------------------------
+// HOSTILE-REVIEW EXECUTION-VALIDATION GAPS
+// ---------------------------------------------------------------------------
+
+/// HIGH 1: the caller's actual current generation must be supplied and
+/// enforced; it must never be derived from the plan itself.
+#[test]
+fn stale_generation_refuses_before_journal_or_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("a.bin");
+    std::fs::write(&source, b"x").unwrap();
+    let destination = dir.path().join("A.bin");
+    // Plan built at generation 7.
+    let p = plan(7, vec![proposal("a", &source, &destination, true)]);
+    // Execute with the caller's actual current generation 8.
+    let err = execute_repair_plan(&p, 8, &options(dir.path()), &cancel()).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            RepairExecutionError::StalePlan {
+                plan: 7,
+                current: 8
+            }
+        ),
+        "got {err:?}"
+    );
+    // No journal was created and nothing moved.
+    let journal_files: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|e| e == "json"))
+        .collect();
+    assert!(journal_files.is_empty(), "no journal may be created");
+    assert!(source.exists());
+    assert!(!destination.exists());
+}
+
+/// HIGH 2: an executable proposal without audited source identity must be
+/// refused at preflight, plan validation, transaction construction, and
+/// execution - never auto-captured from whatever is at the path.
+#[test]
+fn safe_proposal_without_identity_refuses_before_any_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("a.bin");
+    std::fs::write(&source, b"x").unwrap();
+    let destination = dir.path().join("A.bin");
+    // Safe proposal, but deliberately no audited identity.
+    let p = plan(1, vec![proposal("a", &source, &destination, false)]);
+    // Plan validation flags it as unsupported.
+    assert!(
+        p.conflicts
+            .iter()
+            .any(|c| c.kind == PlanConflictKind::UnsupportedProposal)
+    );
+    assert!(!p.all_executable());
+    // Preflight blocks it.
+    let report = run_repair_preflight(&p, 1);
+    assert_eq!(report.results[0].status, RepairPreflightStatus::Blocked);
+    // The source is replaced after the proposal was created; execution must
+    // refuse on identity, before journal or mutation.
+    std::fs::write(&source, b"a replacement object").unwrap();
+    let err = execute_repair_plan(&p, 1, &options(dir.path()), &cancel()).unwrap_err();
+    assert!(matches!(err, RepairExecutionError::NotExecutable { .. }));
+    let journal_files: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|e| e == "json"))
+        .collect();
+    assert!(journal_files.is_empty(), "no journal may be created");
+    assert_eq!(std::fs::read(&source).unwrap(), b"a replacement object");
+    assert!(!destination.exists());
+}
+
+/// HIGH 3: execution must re-validate destinations itself; a mutated plan
+/// cannot smuggle a `..` destination past the dry-run.
+#[test]
+fn unsafe_dotdot_destination_refused_at_execute() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("a.bin");
+    std::fs::write(&source, b"x").unwrap();
+    let mut escape = proposal("a", &source, &dir.path().join("A.bin"), true);
+    escape.action = RepairAction::RenamePath {
+        destination: dir.path().join("sub").join("..").join("outside.bin"),
+    };
+    let p = plan(1, vec![escape]);
+    // Plan build does not resolve the `..`; execution must refuse.
+    let err = execute_repair_plan(&p, 1, &options(dir.path()), &cancel()).unwrap_err();
+    assert!(matches!(err, RepairExecutionError::Build { .. }), "{err:?}");
+    assert!(source.exists());
+    assert!(!dir.path().join("sub").join("outside.bin").exists());
+    assert!(!dir.path().join("outside.bin").exists());
+}
+
+/// HIGH 3: a RenamePath must never silently become a cross-directory move.
+#[test]
+fn cross_directory_rename_path_refused_at_execute() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    let source = dir.path().join("a.bin");
+    std::fs::write(&source, b"x").unwrap();
+    // RenamePath with a destination in another directory on the same FS.
+    let p = plan(1, vec![proposal("a", &source, &sub.join("A.bin"), true)]);
+    let err = execute_repair_plan(&p, 1, &options(dir.path()), &cancel()).unwrap_err();
+    assert!(matches!(err, RepairExecutionError::Build { .. }), "{err:?}");
+    assert!(source.exists());
+    assert!(!sub.join("A.bin").exists());
+}
+
+/// HIGH 3: a duplicate source introduced *after* the plan was built must be
+/// recomputed and refused at execution, not trusted from stored conflicts.
+#[test]
+fn post_build_duplicate_source_refused_before_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("a.bin");
+    let other = dir.path().join("b.bin");
+    std::fs::write(&source, b"a").unwrap();
+    std::fs::write(&other, b"b").unwrap();
+    let mut p = plan(
+        1,
+        vec![proposal("a", &source, &dir.path().join("A.bin"), true)],
+    );
+    assert!(p.all_executable());
+    // Mutate the plan after it was built: a second proposal on the same source.
+    p.proposals
+        .push(proposal("b", &source, &dir.path().join("B.bin"), true));
+    let err = execute_repair_plan(&p, 1, &options(dir.path()), &cancel()).unwrap_err();
+    assert!(
+        matches!(err, RepairExecutionError::NotExecutable { .. }),
+        "{err:?}"
+    );
+    assert!(source.exists() && other.exists());
+    assert!(!dir.path().join("A.bin").exists());
+    assert!(!dir.path().join("B.bin").exists());
+}
+
+/// HIGH 3: a duplicate destination introduced *after* the plan was built must
+/// be recomputed and refused at execution.
+#[test]
+fn post_build_duplicate_destination_refused_before_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("a.bin");
+    let other = dir.path().join("b.bin");
+    std::fs::write(&source, b"a").unwrap();
+    std::fs::write(&other, b"b").unwrap();
+    let mut p = plan(
+        1,
+        vec![proposal("a", &source, &dir.path().join("A.bin"), true)],
+    );
+    assert!(p.all_executable());
+    // Mutate the plan after it was built: a second proposal on the same
+    // destination.
+    p.proposals
+        .push(proposal("b", &other, &dir.path().join("A.bin"), true));
+    let err = execute_repair_plan(&p, 1, &options(dir.path()), &cancel()).unwrap_err();
+    assert!(
+        matches!(err, RepairExecutionError::NotExecutable { .. }),
+        "{err:?}"
+    );
+    assert!(source.exists() && other.exists());
+    assert!(!dir.path().join("A.bin").exists());
 }

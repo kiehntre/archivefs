@@ -15,7 +15,6 @@
 
 use std::path::PathBuf;
 
-use crate::dat::rename_apply::identity::capture_identity;
 use crate::dat::rename_plan::{ProposalState, RenamePlan, RenameProposal, SourceObjectKind};
 
 use super::plan::{RepairPlan, RepairPlanId, build_repair_plan};
@@ -75,12 +74,11 @@ pub fn repair_proposal_from_suggested_rename(
         ));
     }
 
-    // Strongest identity: the audited identity when present, otherwise a
-    // best-effort build-time capture (documented; never a weakened identity).
-    let expected_source_identity = proposal
-        .audited_identity
-        .clone()
-        .or_else(|| capture_identity(&proposal.source_path).ok());
+    // The audited identity, carried verbatim. Never auto-captured here: an
+    // executable proposal without audited identity is refused by plan
+    // validation, preflight, and execution rather than silently capturing
+    // whatever currently exists at the path.
+    let expected_source_identity = proposal.audited_identity.clone();
 
     Some(RepairProposal {
         id,

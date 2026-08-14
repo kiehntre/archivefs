@@ -37,23 +37,33 @@ use crate::dat::rename_apply::model::{
     EntryState, RenameTransaction, RollbackResult, TransactionEntry, TransactionState,
     TransactionSummary,
 };
-use crate::dat::rename_apply::preflight::DirectoryPolicy;
+use crate::dat::rename_apply::preflight::{DirectoryPolicy, is_safe_basename};
 use crate::dat::rename_apply::rollback::rollback_transaction;
 use crate::dat::sources::now_unix;
 use crate::safe_read::TrustedRoots;
 
-use super::plan::RepairPlan;
+use super::plan::{RepairPlan, detect_plan_conflicts};
+use super::preflight::same_filesystem;
+use super::proposal::{RepairAction, RepairProposal};
 
 /// Why a repair batch could not be built or executed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RepairExecutionError {
-    /// The plan is not fully executable (conflicts, deferred actions, or a
-    /// proposal the planner did not classify `Safe`). Nothing runs.
+    /// The plan is not fully executable: recomputed conflicts, deferred
+    /// actions, proposals the planner did not classify `Safe`, or an
+    /// executable proposal without an audited source identity. Nothing runs.
     NotExecutable { detail: String },
     /// A source's identity changed between plan build and transaction build.
     /// Never silently re-audited under the old proposal.
     StaleSource { source: PathBuf },
-    /// The transaction could not be constructed (e.g. a bad id).
+    /// An executable proposal carried no audited source identity. Execution
+    /// never auto-captures whatever currently exists at the path.
+    MissingIdentity { source: PathBuf },
+    /// The caller's current audit/catalogue generation no longer matches the
+    /// plan's. The plan is stale and is never executed.
+    StalePlan { plan: u64, current: u64 },
+    /// The transaction could not be constructed (e.g. a bad id, or an action
+    /// whose destination violates the action's semantics).
     Build { detail: String },
     /// The underlying rename engine refused the batch.
     Apply(String),
@@ -71,6 +81,16 @@ impl std::fmt::Display for RepairExecutionError {
                 f,
                 "the source '{}' changed since it was proposed; re-audit before executing",
                 source.display()
+            ),
+            Self::MissingIdentity { source } => write!(
+                f,
+                "proposal for '{}' has no audited source identity and can never execute",
+                source.display()
+            ),
+            Self::StalePlan { plan, current } => write!(
+                f,
+                "the repair plan is stale (plan generation {plan}, current generation {current}); \
+                 re-audit before executing"
             ),
             Self::Build { detail } => write!(f, "could not build the repair transaction: {detail}"),
             Self::Apply(detail) => write!(f, "repair apply failed: {detail}"),
@@ -137,20 +157,51 @@ impl RepairReverifyOutcome {
 /// each source's identity **now** (review time). Read-only: no journal is
 /// written and nothing is renamed.
 ///
-/// A proposal whose recorded identity no longer matches the live source fails
-/// the build: the batch is stale and must be re-planned, never executed under
-/// old evidence.
+/// # Execution-time revalidation (never trusts stored plan state)
+///
+/// Immediately before construction this re-computes every global conflict from
+/// the current [`RepairPlan`]'s proposals (a mutated or deserialised plan whose
+/// stored `conflicts`/`SafetyState` were tampered with cannot bypass it),
+/// re-validates each action's destination against its action-kind semantics,
+/// and requires every executable proposal to still be `Safe` **and** to carry
+/// an audited source identity. A proposal whose recorded identity no longer
+/// matches the live source fails the build: the batch is stale and must be
+/// re-planned, never executed under old evidence.
 pub fn build_repair_transaction(
     plan: &RepairPlan,
 ) -> Result<RenameTransaction, RepairExecutionError> {
-    if !plan.all_executable() {
-        return Err(RepairExecutionError::NotExecutable {
-            detail: "the plan has conflicts or contains non-executable proposals".to_string(),
-        });
+    // 1. Recompute global conflicts from the proposals themselves; never trust
+    //    the plan's stored `conflicts` field.
+    let conflicts = detect_plan_conflicts(&plan.proposals);
+    if !conflicts.is_empty() {
+        let detail = conflicts
+            .iter()
+            .map(|conflict| format!("{}: {}", conflict.kind.clone().label(), conflict.detail))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(RepairExecutionError::NotExecutable { detail });
     }
 
     let mut entries = Vec::with_capacity(plan.proposals.len());
-    for proposal in plan.executable_proposals() {
+    for proposal in &plan.proposals {
+        // 2. Require the proposal to still be executable (Safe, no blockers,
+        //    audited identity present).
+        if !proposal.actionable() {
+            return Err(RepairExecutionError::NotExecutable {
+                detail: format!(
+                    "proposal '{}' is not safe to execute (safety = {})",
+                    proposal.id,
+                    proposal.safety.label()
+                ),
+            });
+        }
+        let Some(expected_identity) = proposal.expected_source_identity.as_ref() else {
+            return Err(RepairExecutionError::MissingIdentity {
+                source: proposal.source_path.clone(),
+            });
+        };
+        // 3. Re-validate destination/path semantics per action kind.
+        validate_action(proposal).map_err(|detail| RepairExecutionError::Build { detail })?;
         let Some(destination) = proposal.destination() else {
             return Err(RepairExecutionError::Build {
                 detail: format!(
@@ -177,27 +228,24 @@ pub fn build_repair_transaction(
             });
         };
 
+        // 4. The live source must still be the exact audited object.
         let current = capture_identity(&proposal.source_path).map_err(|_| {
             RepairExecutionError::StaleSource {
                 source: proposal.source_path.clone(),
             }
         })?;
-        let identity = match proposal.expected_source_identity.as_ref() {
-            Some(expected) if !identity_matches(expected, &current) => {
-                return Err(RepairExecutionError::StaleSource {
-                    source: proposal.source_path.clone(),
-                });
-            }
-            Some(expected) => expected.clone(),
-            None => current,
-        };
+        if !identity_matches(expected_identity, &current) {
+            return Err(RepairExecutionError::StaleSource {
+                source: proposal.source_path.clone(),
+            });
+        }
 
         entries.push(TransactionEntry {
             source_path: proposal.source_path.clone(),
             destination_path: destination.clone(),
             original_basename: source_basename,
             proposed_basename: destination_basename,
-            identity,
+            identity: expected_identity.clone(),
             preflight_passed: false,
             preflight_failures: Vec::new(),
             state: EntryState::Planned,
@@ -236,9 +284,15 @@ pub fn build_repair_transaction(
 
 /// Everything `apply_repair_transaction` needs, mirroring the rename engine's
 /// execution struct but carrying an owned transaction.
+///
+/// `current_generation` is the caller's **actual** current audit/catalogue
+/// generation. It is passed through to the rename engine unchanged and is
+/// never derived from the transaction itself, so a plan built for a stale
+/// generation is refused even if nothing else changed.
 #[derive(Debug)]
 pub struct RepairApplyExecution<'a> {
     pub transaction: &'a mut RenameTransaction,
+    pub current_generation: u64,
     pub options: &'a RepairExecutionOptions,
     pub cancel: &'a AtomicBool,
 }
@@ -258,12 +312,11 @@ pub fn apply_repair_transaction(
         .iter()
         .map(|entry| entry.source_path.to_string_lossy().into_owned())
         .collect();
-    let current_generation = execution.transaction.plan_generation;
 
     let mut apply = ApplyExecution {
         transaction: execution.transaction,
         approved_paths,
-        current_generation,
+        current_generation: execution.current_generation,
         trusted: execution.options.trusted.clone(),
         journal_dir: execution.options.journal_dir.clone(),
         hard_conflict_mode: HardConflictMode::AbortAll,
@@ -284,19 +337,97 @@ pub fn apply_repair_transaction(
 }
 
 /// Convenience: builds and applies a repair plan in one step. The transaction
-/// is built (identities captured) and applied (identities re-checked) with no
-/// window for the caller to drift from the plan it approved.
+/// is built (identities captured), revalidated, and applied (identities
+/// re-checked) with no window for the caller to drift from the plan it
+/// approved.
+///
+/// `current_generation` is the caller's actual current audit/catalogue
+/// generation. When it does not equal the plan's generation the batch is
+/// refused **before** any transaction is built, any journal is written, or any
+/// filesystem object is touched.
 pub fn execute_repair_plan(
     plan: &RepairPlan,
+    current_generation: u64,
     options: &RepairExecutionOptions,
     cancel: &AtomicBool,
 ) -> Result<RepairTransactionResult, RepairExecutionError> {
+    if current_generation != plan.generation {
+        return Err(RepairExecutionError::StalePlan {
+            plan: plan.generation,
+            current: current_generation,
+        });
+    }
     let mut transaction = build_repair_transaction(plan)?;
     apply_repair_transaction(&mut RepairApplyExecution {
         transaction: &mut transaction,
+        current_generation,
         options,
         cancel,
     })
+}
+
+/// Re-validates one proposal's destination against its action-kind semantics,
+/// immediately before transaction construction.
+///
+/// - [`RepairAction::RenamePath`]: same directory only - a rename never
+///   silently becomes a cross-directory move.
+/// - [`RepairAction::MovePath`]: same filesystem only, and the destination
+///   directory must already exist - there is no copy/delete fallback.
+/// - Both: absolute path, safe single basename, no `..` components, and the
+///   destination must differ from the source.
+pub(crate) fn validate_action(proposal: &RepairProposal) -> Result<(), String> {
+    let Some(destination) = proposal.destination() else {
+        return Err("executable actions must carry a destination".to_string());
+    };
+    let source = &proposal.source_path;
+
+    if !destination.is_absolute() {
+        return Err("the destination must be an absolute path".to_string());
+    }
+    if destination == source {
+        return Err("the destination must differ from the source".to_string());
+    }
+    if destination
+        .components()
+        .any(|component| component == std::path::Component::ParentDir)
+    {
+        return Err("the destination must not contain '..' components".to_string());
+    }
+    let Some(basename) = destination.file_name().and_then(|name| name.to_str()) else {
+        return Err("the destination must have a usable basename".to_string());
+    };
+    if !is_safe_basename(basename) {
+        return Err("the destination basename is not a safe single component".to_string());
+    }
+
+    match &proposal.action {
+        RepairAction::RenamePath { .. } => {
+            if source.parent() != destination.parent() {
+                return Err(
+                    "RenamePath must stay in the source's exact directory (rename only)"
+                        .to_string(),
+                );
+            }
+        }
+        RepairAction::MovePath { .. } => {
+            if !same_filesystem(source.parent(), destination.parent()) {
+                return Err(
+                    "MovePath must stay on the same filesystem (no copy/delete fallback)"
+                        .to_string(),
+                );
+            }
+            let parent_is_existing_dir = destination
+                .parent()
+                .is_some_and(|parent| std::fs::metadata(parent).is_ok_and(|meta| meta.is_dir()));
+            if !parent_is_existing_dir {
+                return Err("MovePath destination directory must already exist".to_string());
+            }
+        }
+        RepairAction::Deferred(_) => {
+            return Err("deferred actions are never executable".to_string());
+        }
+    }
+    Ok(())
 }
 
 /// Re-verifies every applied destination against the recorded source identity.

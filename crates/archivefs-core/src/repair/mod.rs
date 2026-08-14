@@ -48,7 +48,10 @@ pub use execute::{
     build_repair_transaction, classify_persisted_transactions, execute_repair_plan,
     reverify_transaction, rollback_repair_transaction,
 };
-pub use plan::{PlanConflict, PlanConflictKind, RepairPlan, RepairPlanId, build_repair_plan};
+pub use plan::{
+    PlanConflict, PlanConflictKind, RepairPlan, RepairPlanId, build_repair_plan,
+    detect_plan_conflicts,
+};
 pub use preflight::{
     RepairPreflightReport, RepairPreflightResult, RepairPreflightStatus, run_repair_preflight,
 };

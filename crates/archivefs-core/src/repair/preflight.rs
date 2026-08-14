@@ -13,7 +13,6 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 use crate::dat::rename_apply::identity::{capture_identity, identity_matches};
-use crate::dat::rename_apply::preflight::is_safe_basename;
 
 use super::plan::RepairPlan;
 use super::proposal::{RepairProposalId, SafetyState};
@@ -187,6 +186,16 @@ fn preflight_one(
         );
     }
 
+    // An executable proposal without an audited source identity is blocked:
+    // execution must never capture whatever currently exists at the path as a
+    // substitute for audited evidence.
+    if proposal.expected_source_identity.is_none() {
+        return fail(
+            RepairPreflightStatus::Blocked,
+            "the proposal has no audited source identity and can never execute",
+        );
+    }
+
     if proposal.safety == SafetyState::Blocked || blocked_ids.contains(&proposal.id) {
         let detail = proposal
             .blockers
@@ -235,12 +244,11 @@ fn preflight_one(
         );
     }
 
-    // Destination safety.
-    if !is_valid_destination(&proposal.source_path, destination) {
-        return fail(
-            RepairPreflightStatus::InvalidDestination,
-            "the destination is unsafe, relative, equal to the source, or on a different filesystem",
-        );
+    // Destination safety, including the action-kind semantics (RenamePath
+    // same-directory, MovePath same-filesystem + existing directory), shared
+    // with execution-time validation.
+    if let Err(detail) = super::execute::validate_action(proposal) {
+        return fail(RepairPreflightStatus::InvalidDestination, &detail);
     }
 
     if colliding_ids.contains(&proposal.id)
@@ -258,27 +266,6 @@ fn preflight_one(
         status: RepairPreflightStatus::WouldExecute,
         detail: "all requirements proven at dry-run time".to_string(),
     }
-}
-
-/// Whether `destination` is safe to rename/move to: absolute, a single safe
-/// basename, not equal to the source, no `..` components, and (when both
-/// parents resolve) on the same filesystem.
-fn is_valid_destination(source: &std::path::Path, destination: &std::path::Path) -> bool {
-    if !destination.is_absolute()
-        || destination == source
-        || destination
-            .components()
-            .any(|c| c == std::path::Component::ParentDir)
-    {
-        return false;
-    }
-    let Some(basename) = destination.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-    if !is_safe_basename(basename) {
-        return false;
-    }
-    same_filesystem(source.parent(), destination.parent())
 }
 
 /// Whether a sibling of `destination` differs from it only by case. The
@@ -309,7 +296,11 @@ fn has_case_collision(destination: &std::path::Path, source: &std::path::Path) -
 
 /// Same-filesystem check by device id; a missing directory is treated as
 /// *not* the same filesystem so a move is refused rather than guessed.
-fn same_filesystem(left: Option<&std::path::Path>, right: Option<&std::path::Path>) -> bool {
+/// Same-filesystem check shared by preflight and execution-time validation.
+pub(crate) fn same_filesystem(
+    left: Option<&std::path::Path>,
+    right: Option<&std::path::Path>,
+) -> bool {
     let (Some(left), Some(right)) = (left, right) else {
         return false;
     };
@@ -401,12 +392,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("gone.bin");
         let destination = dir.path().join("A.bin");
-        let p = plan(vec![proposal("a", &source, &destination, false)]);
+        // Capture the identity while the file exists, then remove it: the
+        // source is missing *with* audited identity present.
+        std::fs::write(&source, b"x").unwrap();
+        let p = plan(vec![proposal("a", &source, &destination, true)]);
+        std::fs::remove_file(&source).unwrap();
         let report = run_repair_preflight(&p, 1);
         assert_eq!(
             report.results[0].status,
             RepairPreflightStatus::MissingSource
         );
+    }
+
+    #[test]
+    fn an_executable_proposal_without_identity_is_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("a.bin");
+        std::fs::write(&source, b"x").unwrap();
+        let destination = dir.path().join("A.bin");
+        let p = plan(vec![proposal("a", &source, &destination, false)]);
+        let report = run_repair_preflight(&p, 1);
+        assert_eq!(report.results[0].status, RepairPreflightStatus::Blocked);
     }
 
     #[test]
