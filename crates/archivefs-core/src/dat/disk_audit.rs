@@ -64,8 +64,20 @@ pub struct DatDiskAudit {
     /// header could be read at all.
     pub overall_sha1: Option<String>,
     /// The header's `parent_required()` fact, surfaced but never resolved
-    /// (dependency-chain resolution is Stage 2d's job, not this batch's).
+    /// here (dependency-chain resolution is [`crate::dat::dependency`]'s job).
     pub parent_required: bool,
+    /// The header's normalised lowercase 40-hex `parent_sha1`, present only
+    /// when a parent is actually required and the value is a usable identity.
+    ///
+    /// This is the *parent image's* `overall_sha1`, which is the identity a
+    /// MAME-style DAT `<disk sha1="...">` publishes - so it is comparable
+    /// with [`DatDiskAudit::overall_sha1`] and with the disk index, and with
+    /// nothing else. It is never comparable with `raw_sha1` (the internal
+    /// logical stream) or with any ROM hash. It is put through the same
+    /// [`parse_disk_sha1`] validator every other disk-SHA-1 trust boundary
+    /// uses, so an unset or malformed field becomes `None` rather than a
+    /// lookup key that could collide with another unset field.
+    pub parent_sha1: Option<String>,
     pub verdict: Option<DiskAuditVerdict>,
     pub matched_refs: Vec<DatDiskRef>,
 }
@@ -90,6 +102,7 @@ pub fn audit_chd_disk(
                 chd_path: chd_path.to_path_buf(),
                 overall_sha1: None,
                 parent_required: false,
+                parent_sha1: None,
                 verdict: Some(DiskAuditVerdict::HeaderMalformed(ChdHeaderError::Io(
                     std::io::Error::other(refusal.detail()),
                 ))),
@@ -106,6 +119,7 @@ pub fn audit_chd_disk(
                 chd_path: chd_path.to_path_buf(),
                 overall_sha1: None,
                 parent_required: false,
+                parent_sha1: None,
                 verdict: Some(DiskAuditVerdict::HeaderMalformed(error)),
                 matched_refs: Vec::new(),
             };
@@ -114,6 +128,16 @@ pub fn audit_chd_disk(
 
     let overall_sha1 = hex_lower(&header.overall_sha1);
     let parent_required = header.parent_required();
+    // Only a header that actually declares a parent contributes a parent
+    // identity, and only when that identity survives the shared validator.
+    // A `parent_required` header whose value is unusable stays `true` with a
+    // `None` identity: the dependency exists and is simply unresolvable,
+    // which the resolver must report rather than treat as "no parent".
+    let parent_sha1 = if parent_required {
+        parse_disk_sha1(&hex_lower(&header.parent_sha1))
+    } else {
+        None
+    };
 
     // The same shared validator every disk-SHA1 trust boundary uses: a
     // syntactically valid but all-zero `overall_sha1` (an unset/placeholder
@@ -152,6 +176,7 @@ pub fn audit_chd_disk(
         chd_path: chd_path.to_path_buf(),
         overall_sha1: Some(overall_sha1),
         parent_required,
+        parent_sha1,
         verdict: Some(verdict),
         matched_refs,
     }

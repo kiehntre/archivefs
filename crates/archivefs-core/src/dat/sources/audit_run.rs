@@ -57,6 +57,7 @@ use crate::dat::classification::{
     ContentEligibility, ContentSelectionPolicy, DatContentClassification, DatContentSummary,
     DatOriginalMetadata, summarize,
 };
+use crate::dat::dependency::resolve::{CollectionEvidence, resolve_collection};
 use crate::dat::disk_audit::{DatDiskAudit, audit_chd_disk, is_chd_path};
 use crate::dat::index::{DatDiskIndex, DatIndex, DatMemberKey, DatRomRef, MemberLocation};
 use crate::dat::limits::DatLimits;
@@ -523,7 +524,7 @@ pub fn run_dat_audit(
     }
     on_progress(DatAuditProgress::Comparing { files: known.len() });
     let report = audit_files(&known, &index);
-    let (archives, archive_bytes_hashed, sets) = audit_archives(
+    let (archives, archive_bytes_hashed, mut sets) = audit_archives(
         &scan.files,
         trusted,
         cancel,
@@ -533,6 +534,34 @@ pub fn run_dat_audit(
         &catalogue_games,
         &request.source_id,
     )?;
+
+    // ---- 4b. Resolve dependencies (Stage 2d) -----------------------------
+    // Runs only now, because a dependency is satisfied by evidence that may
+    // live in a completely different archive than the set it belongs to -
+    // a clone's borrowed ROM sits in the parent's archive, a device's ROMs in
+    // the device's, a delta CHD's parent in any `.chd` under the scan root.
+    // Resolving during the archive walk would mean answering "is the provider
+    // present?" before the provider had been looked at.
+    //
+    // `collection_scan_complete` is the switch that stops this stage
+    // asserting an absence it could not have observed: any ceiling, traversal
+    // error, or unfinished archive pass turns every "not found anywhere"
+    // conclusion into `EvidenceUnavailable` instead of `Missing`. Positive
+    // verifications are unaffected, so this can only ever weaken a negative.
+    let collection_scan_complete = disk_scan_complete
+        && archives
+            .iter()
+            .all(|archive| matches!(archive.completion, ArchivePassCompletion::Complete));
+    let dependency_evidence = CollectionEvidence::build(
+        &archives,
+        &disk_evidence,
+        &catalogue_games,
+        collection_scan_complete,
+    );
+    // Downgrade-only: this can preserve or weaken a set's state, never
+    // promote one. See `dat::dependency::apply_dependency_state`.
+    resolve_collection(&mut sets, &catalogue_games, &dependency_evidence);
+
     let content_matches = annotate_content_matches(&report, &known, &index, content_selection);
 
     // ---- 5. Annotate multi-candidate verdicts with the policy -------------

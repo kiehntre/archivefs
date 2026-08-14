@@ -288,6 +288,14 @@ pub struct DatGameEntry {
     pub sample_of: Option<String>,
     #[serde(default)]
     pub is_bios: Option<String>,
+    /// Raw `isdevice` declaration. A `<device_ref>` must resolve to a node
+    /// that declares itself a device; without this field a malformed
+    /// catalogue could point a device requirement at an ordinary game and
+    /// have it silently satisfied by that game's own storage. Captured as the
+    /// raw string so an unexpected value stays visible rather than being
+    /// coerced to `false`.
+    #[serde(default)]
+    pub is_device: Option<String>,
     #[serde(default)]
     pub runnable: Option<String>,
     /// Raw software-list support declaration (`yes`, `partial`, or `no`).

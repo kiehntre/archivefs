@@ -653,6 +653,10 @@ fn emit_game(
             rom_of: fidelity.rom_of,
             sample_of: fidelity.sample_of,
             is_bios: fidelity.is_bios,
+            // ClrMamePro has no device concept at all. Every ClrMamePro game
+            // already carries `unsupported_structure = true`, so no dependency
+            // resolution reaches a confident verdict through one regardless.
+            is_device: None,
             runnable: fidelity.runnable,
             // ClrMamePro has no safely equivalent software-list `supported`
             // field in the subset this parser understands.

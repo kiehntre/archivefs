@@ -147,6 +147,7 @@ use serde::Serialize;
 
 use super::archive::ArchivePassCompletion;
 use super::audit::AuditVerdict;
+use super::dependency::SetDependencyReport;
 use super::disk_audit::{DatDiskAudit, DiskAuditVerdict};
 use super::index::{
     DatDiskKey, DatDiskRef, DatMemberKey, DatRomRef, DiskLocation, MemberLocation, parse_disk_sha1,
@@ -237,6 +238,27 @@ pub enum NeedsReviewReason {
     /// Every member is optional or non-file, with no required or borrowed
     /// storage identity anchoring the set.
     OnlyNonFileOrOptionalMembers,
+    /// Stage 2d could not choose between two or more candidate dependency
+    /// targets - a duplicated set name, a `merge=` matching several
+    /// declarations, or conflicting BIOS/parent-CHD identity. Never resolved
+    /// by picking one.
+    AmbiguousDependency,
+    /// A dependency chain revisited a set already on its own path.
+    DependencyCycle,
+    /// A dependency declaration contradicts itself or the catalogue: a
+    /// self-dependency, a `merge=` naming a member the target set does not
+    /// declare, a `bios=` naming no declared `<biosset>`, a CHD naming itself
+    /// as its own parent, or a merge whose declared checksum disagrees with
+    /// the borrower's.
+    ContradictoryDependencyMetadata,
+    /// The set declares a dependency this stage has no evidence channel for -
+    /// most commonly samples, which are not scanned anywhere in the current
+    /// architecture. Deliberately distinct from `Incomplete`: nothing was
+    /// shown to be absent, only unobservable.
+    UnsupportedDependencyStructure,
+    /// The scan that produced the dependency evidence did not finish, so a
+    /// negative dependency result could not be trusted and was not asserted.
+    DependencyEvidenceIncomplete,
 }
 
 /// One catalogue set's storage-completeness state.
@@ -289,10 +311,21 @@ pub struct SetResolution {
     /// present by header identity (`overall_sha1`).
     pub disks_verified: Vec<String>,
     /// Names from `disks_verified` whose matched CHD reported
-    /// `parent_required() == true`. Surfaced for a future Stage 2d dependency
-    /// pass; never resolved, chased, or allowed to block storage
-    /// completeness here.
+    /// `parent_required() == true`. Surfaced by Stage 2c and consumed by the
+    /// Stage 2d dependency pass; never resolved, chased, or allowed to block
+    /// storage completeness in this module.
     pub disks_parent_required: Vec<String>,
+    /// Stage 2d's dependency resolution for this set.
+    ///
+    /// Filled in by [`crate::dat::dependency::resolve`] *after* every archive
+    /// in a run has been classified, because a dependency is satisfied by
+    /// evidence that may live in an entirely different archive than the one
+    /// this resolution is scoped to (R7). `state` above already has the
+    /// dependency verdict folded in via
+    /// [`crate::dat::dependency::apply_dependency_state`], which is
+    /// downgrade-only; this field is the itemised reason list behind that
+    /// fold.
+    pub dependencies: SetDependencyReport,
 }
 
 /// The conceptual role of one ROM or disk declared by a DAT.
@@ -437,41 +470,35 @@ fn yes_no_marker(value: &Option<String>) -> MarkerValue {
     }
 }
 
+/// What one archive's evidence says about one catalogue set.
+///
+/// `pub(crate)` so [`crate::dat::dependency`] consumes the *same* attribution
+/// this module judges storage with, rather than re-deriving "which members
+/// were verified" from raw verdicts under subtly different trust rules. A
+/// second, divergent implementation of that judgement is exactly how a
+/// dependency could come to be satisfied by evidence storage rejected.
 #[derive(Default)]
-struct TouchedSet {
-    verified_member_keys: HashSet<DatMemberKey>,
-    legacy_verified_rom_names: HashSet<String>,
-    used_legacy_evidence: bool,
-    ambiguous: bool,
+pub(crate) struct TouchedSet {
+    pub(crate) verified_member_keys: HashSet<DatMemberKey>,
+    pub(crate) legacy_verified_rom_names: HashSet<String>,
+    pub(crate) used_legacy_evidence: bool,
+    pub(crate) ambiguous: bool,
     /// Set when any member that touched this set shared its archive-member
     /// index with another member in the same archive's evidence (item 7):
     /// the evidence itself cannot be trusted for this set, independent of
     /// what it appears to say.
-    duplicate_evidence: bool,
+    pub(crate) duplicate_evidence: bool,
 }
 
-/// Classifies every catalogue set touched by one already-audited archive.
+/// Attributes one archive's member evidence to the catalogue sets it touches.
 ///
-/// `games` is the DAT's own game list. It must be the *exact* in-memory
-/// instance the caller used to build the [`crate::dat::index::DatIndex`]
-/// that produced `archive`'s verdicts - never a freshly re-parsed copy of
-/// "the same" DAT file. [`crate::dat::sources::audit_run::run_dat_audit`] is
-/// the only caller and satisfies this by construction (see its own doc);
-/// this function is `pub(crate)` specifically so nothing outside this crate
-/// can hand it an independently-sourced slice and reopen a TOCTOU gap
-/// between what was indexed and what is used to judge completeness.
-///
-/// `source_id` identifies which DAT source `games` came from, completing the
-/// durable [`SetIdentity`]. Only sets with at least one member match in
-/// `archive` are returned (R1) - a DAT can define thousands of sets an
-/// archive says nothing about, and none of them appear.
-pub(crate) fn classify_archive_sets(
+/// Pure and idempotent: it reads `archive` and `games` and allocates a fresh
+/// result, so calling it again for the dependency pass costs a linear walk and
+/// cannot disagree with what storage classification saw.
+pub(crate) fn attribute_archive_members(
     archive: &DatArchiveAudit,
-    disk_evidence: &[DatDiskAudit],
-    disk_scan_complete: bool,
     games: &[DatGameEntry],
-    source_id: &str,
-) -> Vec<SetResolution> {
+) -> BTreeMap<String, TouchedSet> {
     // Item 7: an archive-member index appearing more than once in one
     // archive's evidence is not reachable from the current ZIP/7z producers
     // (each enumerates members once, by construction - see their own
@@ -553,6 +580,33 @@ pub(crate) fn classify_archive_sets(
             _ => {}
         }
     }
+
+    touched
+}
+
+/// Classifies every catalogue set touched by one already-audited archive.
+///
+/// `games` is the DAT's own game list. It must be the *exact* in-memory
+/// instance the caller used to build the [`crate::dat::index::DatIndex`]
+/// that produced `archive`'s verdicts - never a freshly re-parsed copy of
+/// "the same" DAT file. [`crate::dat::sources::audit_run::run_dat_audit`] is
+/// the only caller and satisfies this by construction (see its own doc);
+/// this function is `pub(crate)` specifically so nothing outside this crate
+/// can hand it an independently-sourced slice and reopen a TOCTOU gap
+/// between what was indexed and what is used to judge completeness.
+///
+/// `source_id` identifies which DAT source `games` came from, completing the
+/// durable [`SetIdentity`]. Only sets with at least one member match in
+/// `archive` are returned (R1) - a DAT can define thousands of sets an
+/// archive says nothing about, and none of them appear.
+pub(crate) fn classify_archive_sets(
+    archive: &DatArchiveAudit,
+    disk_evidence: &[DatDiskAudit],
+    disk_scan_complete: bool,
+    games: &[DatGameEntry],
+    source_id: &str,
+) -> Vec<SetResolution> {
+    let touched = attribute_archive_members(archive, games);
 
     let archive_pass_complete = matches!(archive.completion, ArchivePassCompletion::Complete);
     let disk_summary = summarize_disk_evidence(disk_evidence, games);
@@ -717,6 +771,9 @@ pub(crate) fn classify_archive_sets(
                 disks_required,
                 disks_verified,
                 disks_parent_required,
+                // Stage 2c never resolves dependencies; the pass that does
+                // runs once the whole collection has been classified.
+                dependencies: SetDependencyReport::not_evaluated(),
             });
             continue;
         }
@@ -750,6 +807,9 @@ pub(crate) fn classify_archive_sets(
                 disks_required,
                 disks_verified,
                 disks_parent_required,
+                // Stage 2c never resolves dependencies; the pass that does
+                // runs once the whole collection has been classified.
+                dependencies: SetDependencyReport::not_evaluated(),
             });
             continue;
         }
@@ -839,6 +899,7 @@ pub(crate) fn classify_archive_sets(
             disks_required,
             disks_verified,
             disks_parent_required,
+            dependencies: SetDependencyReport::not_evaluated(),
         });
     }
     resolutions
@@ -861,10 +922,17 @@ fn empty_resolution(
         disks_required: Vec::new(),
         disks_verified: Vec::new(),
         disks_parent_required: Vec::new(),
+        dependencies: SetDependencyReport::not_evaluated(),
     }
 }
 
-fn declared_roms(
+/// Every ROM declaration a set owns, with its positional key.
+///
+/// `pub(crate)` so [`crate::dat::dependency`] resolves `merge=` targets
+/// against the *same* declaration set this module judges storage against.
+/// Two independent walks of the same structure could drift apart and let a
+/// dependency be satisfied by a declaration storage never considered.
+pub(crate) fn declared_roms(
     game_index: usize,
     game: &DatGameEntry,
 ) -> impl Iterator<Item = (DatMemberKey, &DatRomEntry)> {
@@ -984,12 +1052,24 @@ fn ref_matches_disk_catalogue(candidate: &DatDiskRef, games: &[DatGameEntry]) ->
 
 /// Per-game-name summary of one run's CHD disk evidence, precomputed once so
 /// the per-game classification loop is a cheap lookup rather than a rescan.
+/// `pub(crate)` so [`crate::dat::dependency`] resolves CHD parent links
+/// against the same verified-disk determination this module uses, instead of
+/// re-deriving "which disk slots were proven" under its own rules.
 #[derive(Default)]
-struct DiskEvidenceSummary {
-    verified: std::collections::HashMap<String, HashSet<DatDiskKey>>,
-    parent_required: std::collections::HashMap<String, HashSet<DatDiskKey>>,
-    ambiguous_games: HashSet<String>,
-    duplicate_evidence_games: HashSet<String>,
+pub(crate) struct DiskEvidenceSummary {
+    pub(crate) verified: std::collections::HashMap<String, HashSet<DatDiskKey>>,
+    pub(crate) parent_required: std::collections::HashMap<String, HashSet<DatDiskKey>>,
+    pub(crate) ambiguous_games: HashSet<String>,
+    pub(crate) duplicate_evidence_games: HashSet<String>,
+    /// For each verified disk slot, the header identity (`overall_sha1`) of
+    /// the CHD that verified it. Populated only alongside `verified`, so a
+    /// slot can never carry an identity it was not proven by.
+    pub(crate) verified_identity: std::collections::HashMap<DatDiskKey, String>,
+    /// For each verified disk slot whose CHD declares a parent, that parent's
+    /// identity - or `None` when the header declared a parent but the value
+    /// was unusable, which is a dependency that exists and cannot be
+    /// resolved, not an absent dependency.
+    pub(crate) verified_parent_identity: std::collections::HashMap<DatDiskKey, Option<String>>,
 }
 
 /// Builds [`DiskEvidenceSummary`] from one run's `disk_evidence`.
@@ -1004,7 +1084,7 @@ struct DiskEvidenceSummary {
 /// in `disk_evidence` (a scanner enumerating the same file twice) taints
 /// every game its evidence names, mirroring the ROM duplicate-archive-index
 /// guard.
-fn summarize_disk_evidence(
+pub(crate) fn summarize_disk_evidence(
     disk_evidence: &[DatDiskAudit],
     games: &[DatGameEntry],
 ) -> DiskEvidenceSummary {
@@ -1033,12 +1113,19 @@ fn summarize_disk_evidence(
                         .entry(only.game_name.clone())
                         .or_default()
                         .insert(only.key());
+                    if let Some(identity) = audit.overall_sha1.as_deref().and_then(parse_disk_sha1)
+                    {
+                        summary.verified_identity.insert(only.key(), identity);
+                    }
                     if audit.parent_required {
                         summary
                             .parent_required
                             .entry(only.game_name.clone())
                             .or_default()
                             .insert(only.key());
+                        summary
+                            .verified_parent_identity
+                            .insert(only.key(), audit.parent_sha1.clone());
                     }
                     if at_duplicate_path {
                         summary
@@ -1173,7 +1260,9 @@ fn ref_checksum_value(candidate: &DatRomRef, algorithm: ChecksumAlgorithm) -> Op
         .map(|checksum| checksum.value.as_str())
 }
 
-fn declared_disks(
+/// Every disk declaration a set owns, with its positional key. `pub(crate)`
+/// for the same reason [`declared_roms`] is.
+pub(crate) fn declared_disks(
     game_index: usize,
     game: &DatGameEntry,
 ) -> impl Iterator<Item = (DatDiskKey, &DatDiskEntry)> {
@@ -2148,6 +2237,9 @@ mod tests {
                 chd_path: path.into(),
                 overall_sha1: Some(disk_ref.sha1.clone()),
                 parent_required,
+                // A parent-declaring header always carries an identity here;
+                // Stage 2d's own tests cover the unusable-identity case.
+                parent_sha1: parent_required.then(|| "b".repeat(40)),
                 verdict: Some(DiskAuditVerdict::Exact {
                     game_name: disk_ref.game_name.clone(),
                     disk_name: disk_ref.disk_name.clone(),
@@ -2162,6 +2254,7 @@ mod tests {
                 chd_path: path.into(),
                 overall_sha1: refs.first().map(|r| r.sha1.clone()),
                 parent_required: false,
+                parent_sha1: None,
                 verdict: Some(DiskAuditVerdict::ExactMultipleCandidates {
                     count: refs.len(),
                     game_names,
@@ -2175,6 +2268,7 @@ mod tests {
                 chd_path: path.into(),
                 overall_sha1: Some(sha1),
                 parent_required: false,
+                parent_sha1: None,
                 verdict: Some(DiskAuditVerdict::NotInDat),
                 matched_refs: Vec::new(),
             }
@@ -2185,6 +2279,7 @@ mod tests {
                 chd_path: path.into(),
                 overall_sha1: None,
                 parent_required: false,
+                parent_sha1: None,
                 verdict: Some(DiskAuditVerdict::HeaderMalformed(
                     ChdHeaderError::InvalidMagic,
                 )),
