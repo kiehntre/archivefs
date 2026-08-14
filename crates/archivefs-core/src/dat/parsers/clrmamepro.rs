@@ -88,6 +88,7 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
     let mut current_rom_status: Option<String> = None;
     let mut current_rom_merge: Option<String> = None;
     let mut current_rom_date: Option<String> = None;
+    let mut current_rom_loadflag: Option<String> = None;
     let mut current_roms: Vec<DatRomEntry> = Vec::new();
 
     for line in &lines {
@@ -138,6 +139,7 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
                 &mut current_rom_status,
                 &mut current_rom_merge,
                 &mut current_rom_date,
+                &mut current_rom_loadflag,
                 &mut current_roms,
                 &mut in_rom,
             );
@@ -206,6 +208,7 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
                     &mut current_rom_status,
                     &mut current_rom_merge,
                     &mut current_rom_date,
+                    &mut current_rom_loadflag,
                     &mut current_roms,
                     &mut in_rom,
                 );
@@ -239,6 +242,7 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
                 &mut current_rom_status,
                 &mut current_rom_merge,
                 &mut current_rom_date,
+                &mut current_rom_loadflag,
                 &mut current_roms,
                 &mut in_rom,
             );
@@ -277,6 +281,7 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
                         &mut current_rom_status,
                         &mut current_rom_merge,
                         &mut current_rom_date,
+                        &mut current_rom_loadflag,
                     );
                 });
             }
@@ -294,6 +299,7 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
                     &mut current_rom_status,
                     &mut current_rom_merge,
                     &mut current_rom_date,
+                    &mut current_rom_loadflag,
                     &mut current_roms,
                     &mut in_rom,
                 );
@@ -314,6 +320,7 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
                     &mut current_rom_status,
                     &mut current_rom_merge,
                     &mut current_rom_date,
+                    &mut current_rom_loadflag,
                 );
             });
         } else if in_game {
@@ -353,6 +360,7 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
         &mut current_rom_status,
         &mut current_rom_merge,
         &mut current_rom_date,
+        &mut current_rom_loadflag,
         &mut current_roms,
         &mut in_rom,
     );
@@ -498,6 +506,7 @@ fn apply_rom_kv(
     status: &mut Option<String>,
     merge: &mut Option<String>,
     date: &mut Option<String>,
+    loadflag: &mut Option<String>,
 ) {
     match key {
         "name" => {
@@ -539,6 +548,10 @@ fn apply_rom_kv(
         "date" => {
             *date = Some(value.to_string());
         }
+        // Raw passthrough only, never interpreted - see `DatRomEntry::loadflag`.
+        "loadflag" => {
+            *loadflag = Some(value.to_string());
+        }
         _ => {}
     }
 }
@@ -554,6 +567,7 @@ fn emit_rom_flush(
     status: &mut Option<String>,
     merge: &mut Option<String>,
     date: &mut Option<String>,
+    loadflag: &mut Option<String>,
     roms: &mut Vec<DatRomEntry>,
     in_rom: &mut bool,
 ) {
@@ -571,6 +585,7 @@ fn emit_rom_flush(
             status: status.take(),
             merge: merge.take(),
             date: date.take(),
+            loadflag: loadflag.take(),
         });
     }
     *in_rom = false;
@@ -605,6 +620,15 @@ fn emit_game(
             comment: None,
             original_metadata: DatOriginalMetadata::default(),
             content_classification: DatContentClassification::unknown(),
+            // Fail-closed for Stage 1 (see `DatGameEntry::unsupported_structure`):
+            // this parser does not currently detect ClrMamePro `disk (...)`,
+            // `sample (...)`, `part (...)`, `dataarea (...)`, or device/
+            // dependency-style blocks at all, so it cannot honestly claim
+            // `false` for any entry - only Logiqx currently proves coverage.
+            // Every set originating here is therefore refused into
+            // NeedsReview by `dat::set` until this parser can prove complete
+            // set-structure observation.
+            unsupported_structure: true,
         });
     }
     Ok(())
@@ -723,6 +747,55 @@ mod tests {
     }
 
     #[test]
+    fn rom_loadflag_is_captured_verbatim() {
+        // Never interpreted downstream - just passed through, same as
+        // status/merge. See DatRomEntry::loadflag.
+        let content = concat!(
+            "clrmamepro (\n",
+            "\tname Test\n",
+            ")\n",
+            "game (\n",
+            "\tname \"mame-set\"\n",
+            "\trom ( name fill.bin size 4 crc AAAAAAAA loadflag fill )\n",
+            "\trom ( name cpu.bin size 4 crc BBBBBBBB )\n",
+            ")\n"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("loadflag.dat");
+        std::fs::write(&path, content).unwrap();
+        let limits = DatLimits::default();
+        let result = parse_clrmamepro(&path, limits).unwrap();
+        let roms = &result.dat.games[0].roms;
+        assert_eq!(roms[0].loadflag.as_deref(), Some("fill"));
+        assert_eq!(roms[1].loadflag, None);
+    }
+
+    #[test]
+    fn every_game_entry_is_fail_closed_as_unsupported_structure() {
+        // Stage 1 rule: this parser cannot prove full set-structure coverage
+        // for any entry (no disk/sample/part/dataarea/device detection at
+        // all), so every entry it produces claims unsupported_structure
+        // unconditionally - even a perfectly ordinary single-ROM game - so
+        // `dat::set` refuses every ClrMamePro-sourced set into NeedsReview
+        // rather than risking a false Complete on unproven coverage.
+        let content = concat!(
+            "clrmamepro (\n",
+            "\tname Test\n",
+            ")\n",
+            "game (\n",
+            "\tname \"Test Game\"\n",
+            "\trom ( name test.bin size 1024 crc DEADBEEF )\n",
+            ")\n"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.dat");
+        std::fs::write(&path, content).unwrap();
+        let limits = DatLimits::default();
+        let result = parse_clrmamepro(&path, limits).unwrap();
+        assert!(result.dat.games[0].unsupported_structure);
+    }
+
+    #[test]
     fn tosec_ecosystem_detected_in_header() {
         let content = "clrmamepro (\n\tname TOSEC (2024-01-01)\n)\n";
         let dir = tempfile::tempdir().unwrap();
@@ -798,6 +871,7 @@ mod tests {
         let mut status = None;
         let mut merge = None;
         let mut date = None;
+        let mut loadflag = None;
         apply_kvs("name test.bin size 1024 crc DEADBEEF", &mut |k, v| {
             apply_rom_kv(
                 k,
@@ -811,6 +885,7 @@ mod tests {
                 &mut status,
                 &mut merge,
                 &mut date,
+                &mut loadflag,
             );
         });
         assert_eq!(name, Some("test.bin".into()));
@@ -829,6 +904,7 @@ mod tests {
         let mut status = None;
         let mut merge = None;
         let mut date = None;
+        let mut loadflag = None;
         apply_kvs(
             "name \"Super Mario (World)\" size 4096 crc ABCD1234",
             &mut |k, v| {
@@ -844,6 +920,7 @@ mod tests {
                     &mut status,
                     &mut merge,
                     &mut date,
+                    &mut loadflag,
                 );
             },
         );

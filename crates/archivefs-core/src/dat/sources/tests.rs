@@ -1673,6 +1673,74 @@ fn sevenz_members_are_matched_individually_but_never_enter_rename_planning() {
 }
 
 #[test]
+fn set_completeness_evidence_never_enters_rename_planning() {
+    use crate::dat::rename_plan::{RenamePlanContext, build_rename_plan};
+    use crate::dat::set::SetState;
+    use sevenz_rust2::{ArchiveEntry, ArchiveWriter};
+    use std::io::Cursor;
+
+    let dir = temp();
+    let dat_path = write(
+        dir.path(),
+        "set.dat",
+        r#"<datafile><header><name>Set completeness catalogue</name></header>
+<game name="Game (World)">
+<rom name="game.cue" size="4" sha1="a94a8fe5ccb19ba61c4c0873d391e987982fbbd3"/>
+<rom name="game (Track 1).bin" size="3" sha1="a9993e364706816aba3e25717850c26c9cd0d89d"/>
+</game>
+</datafile>"#,
+    );
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    let archive_path = roms.join("collection.7z");
+    let mut writer = ArchiveWriter::new(std::fs::File::create(&archive_path).unwrap()).unwrap();
+    for (name, contents) in [
+        ("game.cue", b"test".as_slice()),
+        ("game (Track 1).bin", b"abc".as_slice()),
+    ] {
+        let mut entry = ArchiveEntry::new();
+        entry.name = name.to_string();
+        entry.has_stream = true;
+        entry.size = contents.len() as u64;
+        writer
+            .push_archive_entry(entry, Some(Cursor::new(contents)))
+            .unwrap();
+    }
+    writer.finish().unwrap();
+
+    let request = DatAuditRequest {
+        source_id: "set-completeness".to_string(),
+        source_display_name: "Set completeness catalogue".to_string(),
+        dat_path: dat_path.clone(),
+        dat_kind: DatSourceKind::File,
+        scan_root: roms,
+        limits: DatLimits::default(),
+        policy: None,
+        platform: None,
+    };
+    let outcome = run_dat_audit(&request, &TrustedRoots::none(), &no_cancel(), &|_| {}).unwrap();
+    assert_eq!(outcome.archives.len(), 1);
+
+    // `run_dat_audit` computes set-completeness itself, bound to the exact
+    // `ParsedDat` instance it indexed - `dat::set::classify_archive_sets` is
+    // `pub(crate)` precisely so nothing outside this crate (and no test
+    // pretending to be an external caller) can hand it an independently
+    // re-parsed games slice and reopen the TOCTOU gap that would create.
+    assert_eq!(outcome.sets.len(), 1);
+    assert_eq!(outcome.sets[0].state, SetState::Complete);
+
+    // The set evidence above is never fed back into `outcome.report`, and
+    // `build_rename_plan` only ever reads `outcome.report` - so a set that
+    // Stage 1 itself calls `Complete` must still produce zero proposals.
+    let plan =
+        build_rename_plan(&outcome, &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+    assert!(
+        plan.proposals.is_empty(),
+        "set-completeness evidence must never produce rename proposals"
+    );
+}
+
+#[test]
 fn games_only_keeps_the_full_catalogue_and_audit_semantics() {
     use crate::dat::classification::ContentSelectionPolicy;
     use crate::dat::policy::{DatPolicyConfig, resolve};

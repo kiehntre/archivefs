@@ -2698,6 +2698,7 @@ fn minimal_outcome() -> DatAuditOutcome {
             summary: AuditSummary::default(),
         },
         archives: Vec::new(),
+        sets: Vec::new(),
         unhashed: Vec::new(),
         files_scanned: 2,
         bytes_hashed: 4,

@@ -59,10 +59,11 @@ use crate::dat::classification::{
 };
 use crate::dat::index::{DatIndex, DatRomRef};
 use crate::dat::limits::DatLimits;
-use crate::dat::model::ParsedDat;
+use crate::dat::model::{DatGameEntry, ParsedDat};
 use crate::dat::parsers::parse_dat_file;
 use crate::dat::policy::candidate::candidate_for_rom;
 use crate::dat::policy::evaluate::{CandidateResolution, EffectiveDatPolicy, rank_candidates};
+use crate::dat::set::{SetResolution, classify_archive_sets};
 use crate::identity_source::hashing::{HashRefusal, hash_file_reporting};
 use crate::safe_read::TrustedRoots;
 
@@ -201,6 +202,12 @@ pub struct DatAuditOutcome {
     /// `report` and cannot turn a member name into a filesystem rename.
     #[serde(default)]
     pub archives: Vec<DatArchiveAudit>,
+    /// Stage 1 set-completeness resolutions derived from `archives`, bound to
+    /// the exact `ParsedDat` instance this run indexed - see
+    /// `dat::set`'s "Runtime DAT binding" doc. Also deliberately separate
+    /// from `report`: never consumed by rename planning.
+    #[serde(default)]
+    pub sets: Vec<SetResolution>,
     pub unhashed: Vec<UnhashedFile>,
     pub files_scanned: usize,
     pub bytes_hashed: u64,
@@ -391,17 +398,15 @@ pub fn run_dat_audit(
         .map(|policy| policy.content_selection)
         .unwrap_or(ContentSelectionPolicy::AllEntries);
     let catalogue_content = summarize(&catalogue.games, content_selection);
-    // The parsed games are kept when a policy is supplied: the candidate
-    // ranking needs each candidate's region/language/revision/parent metadata,
-    // which only the game entries carry. Otherwise they are dropped so a
-    // 500,000-entry catalogue is not held twice.
-    let taken_games = std::mem::take(&mut catalogue.games);
+    // Always retained now, not just when a policy is supplied: this is the
+    // exact parsed instance `index` (above) was built from, and
+    // `audit_archives` below binds `dat::set`'s completeness classification
+    // to this same instance rather than letting anything reparse the DAT
+    // file independently - see `dat::set`'s "Runtime DAT binding" doc. The
+    // policy-ranking path further down reads the identical `Vec`, not a
+    // second copy.
+    let catalogue_games = std::mem::take(&mut catalogue.games);
     drop(catalogue);
-    let catalogue_games: Vec<_> = if request.policy.is_some() {
-        taken_games
-    } else {
-        Vec::new()
-    };
 
     on_progress(DatAuditProgress::CatalogueReady {
         entries: catalogue_entries,
@@ -474,7 +479,14 @@ pub fn run_dat_audit(
     }
     on_progress(DatAuditProgress::Comparing { files: known.len() });
     let report = audit_files(&known, &index);
-    let (archives, archive_bytes_hashed) = audit_archives(&scan.files, trusted, cancel, &index)?;
+    let (archives, archive_bytes_hashed, sets) = audit_archives(
+        &scan.files,
+        trusted,
+        cancel,
+        &index,
+        &catalogue_games,
+        &request.source_id,
+    )?;
     let content_matches = annotate_content_matches(&report, &known, &index, content_selection);
 
     // ---- 5. Annotate multi-candidate verdicts with the policy -------------
@@ -510,6 +522,7 @@ pub fn run_dat_audit(
         truncated: scan.truncated,
         report,
         archives,
+        sets,
         unhashed,
         bytes_hashed,
         archive_bytes_hashed,
@@ -548,9 +561,12 @@ fn audit_archives(
     trusted: &TrustedRoots,
     cancel: &AtomicBool,
     index: &DatIndex,
-) -> Result<(Vec<DatArchiveAudit>, u64), DatAuditError> {
+    games: &[DatGameEntry],
+    source_id: &str,
+) -> Result<(Vec<DatArchiveAudit>, u64, Vec<SetResolution>), DatAuditError> {
     let mut archives = Vec::new();
     let mut bytes_hashed = 0_u64;
+    let mut sets = Vec::new();
     let mut run_budget = ArchiveRunBudget::new(MAX_ARCHIVE_RUN_LOGICAL_BYTES);
 
     for path in files
@@ -618,19 +634,24 @@ fn audit_archives(
                 DatArchiveMemberAudit { evidence, verdict }
             })
             .collect();
-        archives.push(DatArchiveAudit {
+        let archive_audit = DatArchiveAudit {
             archive_path: path.clone(),
             format: source.archive_format().to_string(),
             total_members: pass.total_members,
             completion: pass.completion,
             members,
-        });
+        };
+        // `games` is the exact parsed instance `index` (above) was built
+        // from - see dat::set's "Runtime DAT binding" doc for why this must
+        // never be an independently re-parsed slice.
+        sets.extend(classify_archive_sets(&archive_audit, games, source_id));
+        archives.push(archive_audit);
 
         if cancelled(cancel) {
             return Err(DatAuditError::Cancelled);
         }
     }
-    Ok((archives, bytes_hashed))
+    Ok((archives, bytes_hashed, sets))
 }
 
 fn is_zip_path(path: &Path) -> bool {

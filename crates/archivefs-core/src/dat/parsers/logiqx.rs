@@ -68,6 +68,8 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
     let mut current_game_desc: Option<String> = None;
     let mut current_game_clone_of: Option<String> = None;
     let mut current_game_metadata = DatOriginalMetadata::default();
+    // Provenance only, never interpreted - see `DatGameEntry::unsupported_structure`.
+    let mut current_game_unsupported_structure: bool = false;
     let mut current_roms: Vec<DatRomEntry> = Vec::new();
     let mut current_rom_name: Option<String> = None;
     let mut current_rom_size: Option<u64> = None;
@@ -78,6 +80,8 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
     let mut current_rom_status: Option<String> = None;
     let mut current_rom_merge: Option<String> = None;
     let mut current_rom_date: Option<String> = None;
+    // Raw passthrough only - see `DatRomEntry::loadflag`.
+    let mut current_rom_loadflag: Option<String> = None;
 
     let mut text_buf = String::new();
     let mut depth: usize = 0;
@@ -133,6 +137,7 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                             &mut current_game_desc,
                             &mut current_game_clone_of,
                             &mut current_game_metadata,
+                            &mut current_game_unsupported_structure,
                             &mut current_roms,
                             &mut games,
                         );
@@ -251,6 +256,25 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                             attr_str_opt(start_bytes, b"merge", &mut warnings, limits.max_warnings);
                         current_rom_date =
                             attr_str_opt(start_bytes, b"date", &mut warnings, limits.max_warnings);
+                        current_rom_loadflag = attr_str_opt(
+                            start_bytes,
+                            b"loadflag",
+                            &mut warnings,
+                            limits.max_warnings,
+                        );
+                    }
+                    // Never parsed into a model: presence alone is recorded
+                    // on the enclosing game so a consumer that cannot reason
+                    // about structure beyond plain <rom> children knows
+                    // `roms` is not proven to be the whole picture. See
+                    // `DatGameEntry::unsupported_structure`. This list is
+                    // deliberately not exhaustive of every DTD variant - it
+                    // covers what is safely, cheaply detectable by tag name
+                    // alone; `<part>`/`<dataarea>` nest inside `<rom>`-like
+                    // structures in some schemas and are caught here at the
+                    // point they'd appear as their own element.
+                    "disk" | "sample" | "part" | "dataarea" | "device_ref" | "device" => {
+                        current_game_unsupported_structure = true;
                     }
                     _ => {}
                 }
@@ -344,6 +368,7 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                                 status: current_rom_status.take(),
                                 merge: current_rom_merge.take(),
                                 date: current_rom_date.take(),
+                                loadflag: current_rom_loadflag.take(),
                             });
                         }
                     }
@@ -439,6 +464,8 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                         attr_str_opt(empty_bytes, b"merge", &mut warnings, limits.max_warnings);
                     let date =
                         attr_str_opt(empty_bytes, b"date", &mut warnings, limits.max_warnings);
+                    let loadflag =
+                        attr_str_opt(empty_bytes, b"loadflag", &mut warnings, limits.max_warnings);
 
                     current_roms.push(DatRomEntry {
                         name: rom_name,
@@ -450,7 +477,16 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                         status,
                         merge,
                         date,
+                        loadflag,
                     });
+                } else if matches!(
+                    tag.as_str(),
+                    "disk" | "sample" | "part" | "dataarea" | "device_ref" | "device"
+                ) {
+                    // Most real Logiqx DATs write these self-closing, same as
+                    // `<rom>` above - see the combined arm in the Start-event
+                    // match for what this flag means.
+                    current_game_unsupported_structure = true;
                 }
                 text_buf.clear();
             }
@@ -568,6 +604,7 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
         &mut current_game_desc,
         &mut current_game_clone_of,
         &mut current_game_metadata,
+        &mut current_game_unsupported_structure,
         &mut current_roms,
         &mut games,
     );
@@ -656,9 +693,14 @@ fn drop_current_game(
     desc: &mut Option<String>,
     clone_of: &mut Option<String>,
     metadata: &mut DatOriginalMetadata,
+    has_disk: &mut bool,
     roms: &mut Vec<DatRomEntry>,
     games: &mut Vec<DatGameEntry>,
 ) {
+    // Taken unconditionally, not just on the `Some(name)` path below: this is
+    // what resets the flag for the *next* game regardless of whether the
+    // just-finished one ever got a name.
+    let had_unsupported_structure = std::mem::take(has_disk);
     if let Some(game_name) = name.take() {
         games.push(DatGameEntry {
             name: game_name,
@@ -674,6 +716,7 @@ fn drop_current_game(
             comment: None,
             original_metadata: std::mem::take(metadata),
             content_classification: DatContentClassification::unknown(),
+            unsupported_structure: had_unsupported_structure,
         });
     }
 }
@@ -1153,6 +1196,142 @@ mod tests {
             Some("989f62a6457bd8c1f32b7bc60ceb6cdf307be855")
         );
         assert_eq!(game.roms[2].size_bytes, Some(37867200));
+    }
+
+    // ------------------------------------------------------------------
+    // Set-completeness provenance: <disk> presence, loadflag passthrough.
+    // Neither is parsed into a model; both are just recorded so a consumer
+    // downstream (dat::set) can refuse to reason about structure it cannot
+    // see. See DatGameEntry::unsupported_structure / DatRomEntry::loadflag.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn self_closing_disk_element_sets_unsupported_structure() {
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+    <game name="Disc Game">
+        <rom name="game.cue" size="4" crc="AAAAAAAA"/>
+        <disk name="game (Track 1)" sha1="da39a3ee5e6b4b0d3255bfef95601890afd80709"/>
+    </game>
+</datafile>"#;
+        let outcome = parse_xml(xml).unwrap();
+        assert_eq!(outcome.dat.games.len(), 1);
+        assert!(outcome.dat.games[0].unsupported_structure);
+        // The <rom> itself must still parse normally alongside it.
+        assert_eq!(outcome.dat.games[0].roms.len(), 1);
+        assert_eq!(outcome.dat.games[0].roms[0].name, "game.cue");
+    }
+
+    #[test]
+    fn start_end_disk_element_sets_unsupported_structure() {
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+    <game name="Disc Game">
+        <disk name="game (Track 1)" sha1="da39a3ee5e6b4b0d3255bfef95601890afd80709"></disk>
+    </game>
+</datafile>"#;
+        let outcome = parse_xml(xml).unwrap();
+        assert_eq!(outcome.dat.games.len(), 1);
+        assert!(outcome.dat.games[0].unsupported_structure);
+    }
+
+    #[test]
+    fn game_without_disk_children_leaves_unsupported_structure_false() {
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+    <game name="Ordinary Game">
+        <rom name="game.bin" size="4" crc="AAAAAAAA"/>
+    </game>
+</datafile>"#;
+        let outcome = parse_xml(xml).unwrap();
+        assert!(!outcome.dat.games[0].unsupported_structure);
+    }
+
+    #[test]
+    fn disk_flag_does_not_leak_into_the_next_game() {
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+    <game name="Disc Game">
+        <disk name="track1" sha1="da39a3ee5e6b4b0d3255bfef95601890afd80709"/>
+    </game>
+    <game name="Ordinary Game">
+        <rom name="game.bin" size="4" crc="AAAAAAAA"/>
+    </game>
+</datafile>"#;
+        let outcome = parse_xml(xml).unwrap();
+        assert_eq!(outcome.dat.games.len(), 2);
+        assert!(outcome.dat.games[0].unsupported_structure);
+        assert!(
+            !outcome.dat.games[1].unsupported_structure,
+            "unsupported_structure must reset per game, not stick from a previous one"
+        );
+    }
+
+    #[test]
+    fn sample_part_dataarea_and_device_elements_all_set_unsupported_structure() {
+        for tag in ["sample", "part", "dataarea", "device_ref", "device"] {
+            let xml = format!(
+                r#"<?xml version="1.0"?>
+<datafile>
+    <game name="G">
+        <rom name="g.bin" size="4" crc="AAAAAAAA"/>
+        <{tag} name="whatever"/>
+    </game>
+</datafile>"#
+            );
+            let outcome = parse_xml(&xml).unwrap();
+            assert!(
+                outcome.dat.games[0].unsupported_structure,
+                "<{tag}/> must set unsupported_structure"
+            );
+        }
+    }
+
+    #[test]
+    fn a_genuinely_unrecognised_element_does_not_set_unsupported_structure() {
+        // Contrast with the test above: an element name this parser has
+        // never heard of (not one of the specific structural tags it
+        // detects) must not be treated as unsupported structure - only the
+        // named list is, everything else is ordinary "unknown, ignored" XML.
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+    <game name="G">
+        <rom name="g.bin" size="4" crc="AAAAAAAA"/>
+        <totally_made_up_tag name="whatever"/>
+    </game>
+</datafile>"#;
+        let outcome = parse_xml(xml).unwrap();
+        assert!(!outcome.dat.games[0].unsupported_structure);
+    }
+
+    #[test]
+    fn self_closing_rom_loadflag_is_captured_verbatim() {
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+    <game name="mame-set">
+        <rom name="fill.bin" size="4" crc="AAAAAAAA" loadflag="fill"/>
+        <rom name="cpu.bin" size="4" crc="BBBBBBBB"/>
+    </game>
+</datafile>"#;
+        let outcome = parse_xml(xml).unwrap();
+        let roms = &outcome.dat.games[0].roms;
+        assert_eq!(roms[0].loadflag.as_deref(), Some("fill"));
+        assert_eq!(roms[1].loadflag, None);
+    }
+
+    #[test]
+    fn start_end_rom_loadflag_is_captured_verbatim() {
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+    <game name="mame-set">
+        <rom name="reload.bin" size="4" crc="AAAAAAAA" loadflag="reload"></rom>
+    </game>
+</datafile>"#;
+        let outcome = parse_xml(xml).unwrap();
+        assert_eq!(
+            outcome.dat.games[0].roms[0].loadflag.as_deref(),
+            Some("reload")
+        );
     }
 
     // ------------------------------------------------------------------
