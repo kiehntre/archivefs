@@ -90,6 +90,8 @@ pub mod dat;
 
 pub mod disk_format;
 
+pub mod repair;
+
 pub mod safe_read;
 
 pub mod platform;
