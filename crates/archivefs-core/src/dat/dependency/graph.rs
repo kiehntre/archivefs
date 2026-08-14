@@ -98,16 +98,6 @@ pub(crate) fn parse_flag(value: &Option<String>) -> Flag {
     }
 }
 
-/// Whether a raw `yes`/`no` style flag is affirmatively set.
-///
-/// Anything that is not a recognised affirmative - absent, `no`, or an
-/// unexpected value - is `false`. Callers that need to distinguish "declared
-/// not X" from "declared something unparseable" from "declared nothing at
-/// all" use [`parse_flag`] directly instead.
-pub(crate) fn flag_is_yes(value: &Option<String>) -> bool {
-    matches!(parse_flag(value), Flag::Yes)
-}
-
 /// How a member-name lookup inside one provider set resolved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MemberRef<K> {

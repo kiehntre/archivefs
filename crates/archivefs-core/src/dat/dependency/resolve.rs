@@ -42,7 +42,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use super::graph::{
     ChainFault, ChainGuard, DeclaredName, DependencyGraph, Flag, IdentityChainGuard, MemberRef,
-    SetRef, declared_name, flag_is_yes, parse_flag,
+    SetRef, declared_name, parse_flag,
 };
 use super::{
     DependencyKind, DependencyOutcome, DependencyRequirement, DependencyTarget,
@@ -832,19 +832,28 @@ impl<'a> Resolver<'a> {
                 return Some(bios_requirement(target, outcome));
             }
             let next_game = self.graph.game(next);
-            if flag_is_yes(&next_game.is_bios) {
-                // `set_storage_outcome` already folds `bios_declaration_outcome`
-                // for whatever target it evaluates (every target's own BIOS
-                // metadata is part of its closure - see that function), so a
-                // separate combine here would only ever duplicate the same
-                // value it already contributes. One call covers both axes.
-                let mut storage_guard = ChainGuard::starting_at(index);
-                return Some(bios_requirement(
-                    target,
-                    self.set_storage_outcome(next, &mut storage_guard),
-                ));
+            if next_game.unsupported_structure {
+                return Some(bios_requirement(target, DependencyOutcome::Unsupported));
             }
-            current = next;
+            match parse_flag(&next_game.is_bios) {
+                Flag::Yes => {
+                    // `set_storage_outcome` already folds
+                    // `bios_declaration_outcome` for whatever target it
+                    // evaluates (every target's own BIOS metadata is part of
+                    // its closure - see that function), so a separate combine
+                    // here would only duplicate the same value it already
+                    // contributes. One call covers both axes.
+                    let mut storage_guard = ChainGuard::starting_at(index);
+                    return Some(bios_requirement(
+                        target,
+                        self.set_storage_outcome(next, &mut storage_guard),
+                    ));
+                }
+                Flag::No | Flag::Absent => current = next,
+                Flag::Malformed => {
+                    return Some(bios_requirement(target, DependencyOutcome::Contradictory));
+                }
+            }
         }
     }
 

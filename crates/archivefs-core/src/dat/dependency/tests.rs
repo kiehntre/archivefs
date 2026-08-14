@@ -1080,6 +1080,89 @@ mod bios {
     }
 
     #[test]
+    fn a_malformed_intermediate_bios_flag_blocks_the_transitive_chain() {
+        let mut middle = game("middle", Vec::new());
+        middle.is_bios = Some("maybe".into());
+        middle.rom_of = Some("bios".into());
+        let mut leaf = game("game", vec![rom("g.bin", 'g')]);
+        leaf.rom_of = Some("middle".into());
+        let games = vec![bios_root("bios", vec![rom("b.bin", 'b')]), middle, leaf];
+
+        let resolved = resolve(&games, &verifying(&games, &[(0, 0), (2, 0)]));
+        assert_eq!(
+            only_outcome(&resolved, "game", DependencyKind::Bios),
+            DependencyOutcome::Contradictory
+        );
+        assert_ne!(resolved["game"].0, SetState::Complete);
+    }
+
+    #[test]
+    fn an_unsupported_intermediate_node_blocks_the_transitive_bios_chain() {
+        let mut middle = game("middle", Vec::new());
+        middle.unsupported_structure = true;
+        middle.rom_of = Some("bios".into());
+        let mut leaf = game("game", vec![rom("g.bin", 'g')]);
+        leaf.rom_of = Some("middle".into());
+        let games = vec![bios_root("bios", vec![rom("b.bin", 'b')]), middle, leaf];
+
+        let resolved = resolve(&games, &verifying(&games, &[(0, 0), (2, 0)]));
+        assert_eq!(
+            only_outcome(&resolved, "game", DependencyKind::Bios),
+            DependencyOutcome::Unsupported
+        );
+        assert_ne!(resolved["game"].0, SetState::Complete);
+    }
+
+    #[test]
+    fn a_malformed_direct_bios_provider_flag_blocks_the_chain() {
+        let mut provider = game("bios", vec![rom("b.bin", 'b')]);
+        provider.is_bios = Some("maybe".into());
+        let mut leaf = game("game", vec![rom("g.bin", 'g')]);
+        leaf.rom_of = Some("bios".into());
+        let games = vec![provider, leaf];
+
+        let resolved = resolve(&games, &verifying(&games, &[(0, 0), (1, 0)]));
+        assert_eq!(
+            only_outcome(&resolved, "game", DependencyKind::Bios),
+            DependencyOutcome::Contradictory
+        );
+        assert_ne!(resolved["game"].0, SetState::Complete);
+    }
+
+    #[test]
+    fn an_unsupported_bios_root_blocks_the_chain() {
+        let mut root = bios_root("bios", vec![rom("b.bin", 'b')]);
+        root.unsupported_structure = true;
+        let mut leaf = game("game", vec![rom("g.bin", 'g')]);
+        leaf.rom_of = Some("bios".into());
+        let games = vec![root, leaf];
+
+        let resolved = resolve(&games, &verifying(&games, &[(0, 0), (1, 0)]));
+        assert_eq!(
+            only_outcome(&resolved, "game", DependencyKind::Bios),
+            DependencyOutcome::Unsupported
+        );
+        assert_ne!(resolved["game"].0, SetState::Complete);
+    }
+
+    #[test]
+    fn an_explicit_non_bios_intermediate_still_reaches_a_valid_bios_root() {
+        let mut middle = game("middle", Vec::new());
+        middle.is_bios = Some("no".into());
+        middle.rom_of = Some("bios".into());
+        let mut leaf = game("game", vec![rom("g.bin", 'g')]);
+        leaf.rom_of = Some("middle".into());
+        let games = vec![bios_root("bios", vec![rom("b.bin", 'b')]), middle, leaf];
+
+        let resolved = resolve(&games, &verifying(&games, &[(0, 0), (2, 0)]));
+        assert_eq!(
+            only_outcome(&resolved, "game", DependencyKind::Bios),
+            DependencyOutcome::Satisfied
+        );
+        assert_eq!(resolved["game"].0, SetState::Complete);
+    }
+
+    #[test]
     fn a_bios_provider_with_an_undeclared_bios_tag_cannot_satisfy_the_dependency() {
         let mut child = game("game", vec![rom("g.bin", 'g')]);
         child.rom_of = Some("bios".into());
