@@ -620,11 +620,11 @@ pub(crate) fn classify_archive_sets(
 
         let members_verified: Vec<String> = classified_roms
             .iter()
-            .filter_map(|(key, rom, class)| {
-                (*class == MemberClass::PhysicalRequired
-                    && member_slot_verified(&touch, *key, &rom.name))
-                .then(|| rom.name.clone())
+            .filter(|(key, rom, class)| {
+                *class == MemberClass::PhysicalRequired
+                    && member_slot_verified(&touch, *key, &rom.name)
             })
+            .map(|(_, rom, _)| rom.name.clone())
             .collect();
 
         // S2c transition 1: an incomplete archive pass invalidates confidence
