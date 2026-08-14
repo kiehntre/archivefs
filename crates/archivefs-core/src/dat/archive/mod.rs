@@ -24,8 +24,10 @@ use std::sync::atomic::AtomicBool;
 use serde::Serialize;
 
 pub mod chd;
+pub mod external_process;
 pub mod hash;
 pub mod limits;
+pub mod rar;
 pub mod sevenz;
 pub mod sevenz_preflight;
 pub mod zip;
