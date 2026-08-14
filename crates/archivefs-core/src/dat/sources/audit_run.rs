@@ -226,6 +226,10 @@ pub struct DatAuditOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DatArchiveAudit {
     pub archive_path: PathBuf,
+    /// Identity of the exact outer object whose completed member pass produced
+    /// this evidence. Missing for failed/incomplete opens and legacy fixtures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outer_identity: Option<crate::dat::rename_apply::ObjectIdentity>,
     pub format: String,
     pub total_members: usize,
     pub completion: ArchivePassCompletion,
@@ -579,6 +583,7 @@ fn audit_archives(
         // The format label for a source-open failure is inferred from the
         // extension alone, since no `ArchiveMemberSource` exists yet to ask.
         let format_guess = if is_zip_path(path) { "zip" } else { "7z" };
+        let identity_before = crate::dat::rename_apply::capture_identity(path).ok();
         let mut source = match open_archive_source(path, trusted, ArchiveLimits::default(), cancel)
         {
             Ok(source) => source,
@@ -586,6 +591,7 @@ fn audit_archives(
             Err(error) => {
                 archives.push(DatArchiveAudit {
                     archive_path: path.clone(),
+                    outer_identity: None,
                     format: format_guess.to_string(),
                     total_members: 0,
                     completion: ArchivePassCompletion::Incomplete {
@@ -599,7 +605,18 @@ fn audit_archives(
             }
         };
 
-        let pass = source.verify_all(cancel, &mut run_budget);
+        let mut pass = source.verify_all(cancel, &mut run_budget);
+        let identity_after = crate::dat::rename_apply::capture_identity(path).ok();
+        let stable_outer_identity = identity_before.filter(|before| {
+            identity_after
+                .as_ref()
+                .is_some_and(|after| crate::dat::rename_apply::identity_matches(before, after))
+        });
+        if stable_outer_identity.is_none() {
+            pass.completion = ArchivePassCompletion::Incomplete {
+                reason: ArchivePassStopReason::OuterFileChanged,
+            };
+        }
         let outer_changed = matches!(
             pass.completion,
             ArchivePassCompletion::Incomplete {
@@ -636,6 +653,7 @@ fn audit_archives(
             .collect();
         let archive_audit = DatArchiveAudit {
             archive_path: path.clone(),
+            outer_identity: stable_outer_identity,
             format: source.archive_format().to_string(),
             total_members: pass.total_members,
             completion: pass.completion,

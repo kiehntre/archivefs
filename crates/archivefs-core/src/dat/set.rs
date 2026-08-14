@@ -5,10 +5,11 @@
 //! which catalogue sets its members touch and whether each is complete —
 //! using nothing but evidence [`crate::dat::sources::audit_run::run_dat_audit`]
 //! already produced. It never hashes anything, never opens an archive, never
-//! calls into [`crate::dat::archive`] or a ZIP/7z reader, and its output is
-//! never consumed by [`crate::dat::rename_plan`] — set evidence and rename
-//! planning are deliberately disjoint, exactly as archive-member evidence
-//! and rename planning already are.
+//! calls into [`crate::dat::archive`] or a ZIP/7z reader. A `Complete`
+//! resolution may be consumed by [`crate::dat::rename_plan`] only for the
+//! narrow, fail-closed purpose of naming the outer archive after an additional
+//! one-to-one whole-archive attribution check. Archive-member paths and names
+//! never become member-level rename proposals.
 //!
 //! # Scope (Stage 1)
 //!
@@ -118,7 +119,8 @@
 //! - Any change to [`crate::dat::archive`], ZIP/7z sources, or the archive
 //!   evidence shape.
 //! - MAME set verification (gated on the parser work R5 refuses around).
-//! - Any rename, coordinated or otherwise, driven by set state.
+//! - Any member-level or inner-archive rename. The only rename consumer is the
+//!   separately gated outer-archive proposal described above.
 //! - Clone/parent merge-mode semantics, BIOS dependency tracking, multi-disc
 //!   or game-scope aggregation, and CHD-reconstruction completeness.
 
@@ -639,6 +641,7 @@ mod tests {
         let total_members = members.len();
         DatArchiveAudit {
             archive_path: "collection.7z".into(),
+            outer_identity: None,
             format: "7z".to_string(),
             total_members,
             completion,

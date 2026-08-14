@@ -1673,7 +1673,7 @@ fn sevenz_members_are_matched_individually_but_never_enter_rename_planning() {
 }
 
 #[test]
-fn set_completeness_evidence_never_enters_rename_planning() {
+fn set_completeness_evidence_drives_only_the_outer_archive_rename_never_a_member() {
     use crate::dat::rename_plan::{RenamePlanContext, build_rename_plan};
     use crate::dat::set::SetState;
     use sevenz_rust2::{ArchiveEntry, ArchiveWriter};
@@ -1729,15 +1729,40 @@ fn set_completeness_evidence_never_enters_rename_planning() {
     assert_eq!(outcome.sets.len(), 1);
     assert_eq!(outcome.sets[0].state, SetState::Complete);
 
-    // The set evidence above is never fed back into `outcome.report`, and
-    // `build_rename_plan` only ever reads `outcome.report` - so a set that
-    // Stage 1 itself calls `Complete` must still produce zero proposals.
+    // The set evidence above is never fed back into `outcome.report` - the
+    // outer-archive rename path reads `outcome.archives`/`outcome.sets`
+    // directly, entirely separate from the flat per-file report the
+    // loose-file rename path reads. A `Complete` set now legitimately
+    // produces exactly ONE proposal - a rename of the *outer* archive path,
+    // named from the DAT set/game name - and critically, never a proposal
+    // for either member individually: no member name may ever become a
+    // rename source or a rename target.
     let plan =
         build_rename_plan(&outcome, &RenamePlanContext { generation: 1 }, &no_cancel()).unwrap();
+    assert_eq!(plan.proposals.len(), 1);
+    let proposal = &plan.proposals[0];
     assert!(
-        plan.proposals.is_empty(),
-        "set-completeness evidence must never produce rename proposals"
+        proposal.is_outer_archive,
+        "the one proposal a Complete set produces must be the outer-archive rename"
     );
+    assert_eq!(proposal.source_path, archive_path);
+    assert_eq!(proposal.game_name.as_deref(), Some("Game (World)"));
+    assert_eq!(
+        proposal.rom_name, None,
+        "an outer-archive proposal names no single rom"
+    );
+    for member_name in ["game.cue", "game (Track 1).bin"] {
+        assert_ne!(
+            proposal.source_path.file_name().unwrap().to_str().unwrap(),
+            member_name,
+            "no archive member may itself become a rename source"
+        );
+        assert_ne!(
+            proposal.proposed_basename.as_deref(),
+            Some(member_name),
+            "no archive member's name may become a rename target"
+        );
+    }
 }
 
 #[test]

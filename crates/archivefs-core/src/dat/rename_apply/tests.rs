@@ -55,6 +55,8 @@ fn proposal(source: &str, current: &str, proposed: &str, state: ProposalState) -
         extension_status: None,
         sanitisation_notes: Vec::new(),
         actionable: state == ProposalState::Suggested,
+        audited_identity: None,
+        is_outer_archive: false,
     }
 }
 
@@ -2406,4 +2408,206 @@ fn crash_during_rollback_is_reconciled_honestly() {
     assert!(source.exists());
     assert!(!destination.exists());
     assert_eq!(std::fs::read(&source).unwrap(), contents);
+}
+
+// ---------------------------------------------------------------------------
+// Outer archive rename: the executor is content-agnostic, so a proposal
+// pointing at a real .zip file is applied and rolled back exactly like any
+// other regular file - these tests prove that with a real archive rather
+// than an arbitrary fixture, and prove its bytes and member list survive
+// completely untouched.
+// ---------------------------------------------------------------------------
+
+/// Writes a real, valid, multi-member ZIP to `path` and returns its exact
+/// bytes and its member name list, for later identity comparison.
+fn write_real_zip(path: &Path) -> (Vec<u8>, Vec<String>) {
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipWriter};
+
+    let mut writer = ZipWriter::new(std::fs::File::create(path).unwrap());
+    let members = ["game.cue", "game (Track 1).bin", "game (Track 2).bin"];
+    for name in members {
+        writer
+            .start_file(
+                name,
+                SimpleFileOptions::default().compression_method(CompressionMethod::Stored),
+            )
+            .unwrap();
+        writer.write_all(b"member contents").unwrap();
+    }
+    writer.finish().unwrap();
+    let bytes = std::fs::read(path).unwrap();
+    (bytes, members.iter().map(|name| name.to_string()).collect())
+}
+
+/// The exact member-name list of a ZIP at `path`, in archive order.
+fn zip_member_names(path: &Path) -> Vec<String> {
+    let file = std::fs::File::open(path).unwrap();
+    let mut archive = zip::ZipArchive::new(file).unwrap();
+    (0..archive.len())
+        .map(|index| archive.by_index(index).unwrap().name().to_string())
+        .collect()
+}
+
+fn outer_archive_proposal(source: &str, current: &str, proposed: &str) -> RenameProposal {
+    let mut proposal = proposal(source, current, proposed, ProposalState::Suggested);
+    proposal.rom_name = None;
+    proposal.game_name = Some("Sonic the Hedgehog (USA, Europe)".to_string());
+    proposal.verdict_label = "Set complete".to_string();
+    proposal.audited_identity = capture_identity(Path::new(source)).ok();
+    proposal.is_outer_archive = true;
+    proposal
+}
+
+#[test]
+fn outer_transaction_construction_refuses_an_object_replaced_after_planning() {
+    let dir = tempfile::tempdir().unwrap();
+    let roms = dir.path().join("roms");
+    std::fs::create_dir_all(&roms).unwrap();
+    let source = write(&roms, "old.zip");
+    let proposal = outer_archive_proposal(source.to_str().unwrap(), "old.zip", "Game (World).zip");
+    let plan = plan(vec![proposal], 1, &roms);
+
+    std::fs::remove_file(&source).unwrap();
+    std::fs::write(&source, b"replacement archive").unwrap();
+
+    let error = build_transaction(&plan, &approved_of(&[&source]), 1).unwrap_err();
+    assert_eq!(error, ApplyError::NothingApproved);
+}
+
+#[test]
+fn an_outer_zip_rename_applies_with_archive_bytes_and_members_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let roms = dir.path().join("roms");
+    std::fs::create_dir_all(&roms).unwrap();
+    let source = roms.join("bad_old_name.zip");
+    let (original_bytes, original_members) = write_real_zip(&source);
+    let journal = dir.path().join("journal");
+    std::fs::create_dir_all(&journal).unwrap();
+
+    let proposals = vec![outer_archive_proposal(
+        source.to_str().unwrap(),
+        "bad_old_name.zip",
+        "Sonic the Hedgehog (USA, Europe).zip",
+    )];
+    let plan = plan(proposals, 1, &roms);
+    let cancel = no_cancel();
+    let outcome = apply(
+        &plan,
+        approved_of(&[&source]),
+        TrustedRoots::from_paths([&roms]),
+        &journal,
+        HardConflictMode::AbortAll,
+        &cancel,
+    )
+    .unwrap();
+
+    assert_eq!(outcome.transaction.state, TransactionState::Applied);
+    assert!(!source.exists());
+    let destination = roms.join("Sonic the Hedgehog (USA, Europe).zip");
+    assert!(destination.exists());
+
+    // Bytes are exactly identical - the executor never opened the archive,
+    // only renamed the path.
+    assert_eq!(
+        std::fs::read(&destination).unwrap(),
+        original_bytes,
+        "archive bytes must be byte-for-byte identical after an outer rename"
+    );
+    // The member list - names, order, count - is exactly identical.
+    assert_eq!(
+        zip_member_names(&destination),
+        original_members,
+        "no inner member name may change from an outer archive rename"
+    );
+}
+
+#[test]
+fn an_outer_archive_rollback_restores_the_original_path_and_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let roms = dir.path().join("roms");
+    std::fs::create_dir_all(&roms).unwrap();
+    let source = roms.join("bad_old_name.7z");
+    // A real ZIP written under a `.7z` name is fine here: rollback only
+    // cares about path/identity, never archive-format internals.
+    let (original_bytes, original_members) = write_real_zip(&source);
+    let journal = dir.path().join("journal");
+    std::fs::create_dir_all(&journal).unwrap();
+
+    let proposals = vec![outer_archive_proposal(
+        source.to_str().unwrap(),
+        "bad_old_name.7z",
+        "Golden Axe (Europe).7z",
+    )];
+    let plan = plan(proposals, 1, &roms);
+    let cancel = no_cancel();
+    let outcome = apply(
+        &plan,
+        approved_of(&[&source]),
+        TrustedRoots::from_paths([&roms]),
+        &journal,
+        HardConflictMode::AbortAll,
+        &cancel,
+    )
+    .unwrap();
+    let mut tx = outcome.transaction;
+    assert!(roms.join("Golden Axe (Europe).7z").exists());
+
+    let rollback = rollback_transaction(&mut tx, &journal, &cancel).unwrap();
+
+    assert_eq!(rollback.result, RollbackResult::FullyRolledBack);
+    assert_eq!(rollback.transaction.state, TransactionState::RolledBack);
+    assert!(source.exists(), "the original path is restored");
+    assert!(!roms.join("Golden Axe (Europe).7z").exists());
+    assert_eq!(
+        std::fs::read(&source).unwrap(),
+        original_bytes,
+        "archive bytes must be byte-for-byte identical after rollback"
+    );
+    assert_eq!(zip_member_names(&source), original_members);
+}
+
+#[test]
+fn an_outer_archive_rename_refuses_safely_on_an_existing_destination() {
+    let dir = tempfile::tempdir().unwrap();
+    let roms = dir.path().join("roms");
+    std::fs::create_dir_all(&roms).unwrap();
+    let source = roms.join("bad_old_name.zip");
+    let (original_bytes, _) = write_real_zip(&source);
+    // The proposed canonical name already exists.
+    let (existing_bytes, _) = write_real_zip(&roms.join("Sonic the Hedgehog (USA, Europe).zip"));
+    let journal = dir.path().join("journal");
+    std::fs::create_dir_all(&journal).unwrap();
+
+    let proposals = vec![outer_archive_proposal(
+        source.to_str().unwrap(),
+        "bad_old_name.zip",
+        "Sonic the Hedgehog (USA, Europe).zip",
+    )];
+    let plan = plan(proposals, 1, &roms);
+    let cancel = no_cancel();
+    let error = apply(
+        &plan,
+        approved_of(&[&source]),
+        TrustedRoots::from_paths([&roms]),
+        &journal,
+        HardConflictMode::AbortAll,
+        &cancel,
+    )
+    .unwrap_err();
+
+    // AbortAll: a hard conflict prevents the batch from starting at all - no
+    // partial mutation, no overwrite, source untouched.
+    assert!(matches!(error, ApplyError::HardConflicts(_)));
+    assert!(
+        source.exists(),
+        "the source must not be moved on a refused rename"
+    );
+    assert_eq!(std::fs::read(&source).unwrap(), original_bytes);
+    assert_eq!(
+        std::fs::read(roms.join("Sonic the Hedgehog (USA, Europe).zip")).unwrap(),
+        existing_bytes,
+        "the pre-existing destination archive must not be overwritten"
+    );
 }

@@ -9,6 +9,9 @@
 
 use std::collections::BTreeMap;
 
+use std::collections::HashMap;
+use std::path::PathBuf;
+
 use super::model::{CollisionInfo, CollisionKind, ProposalState, RenameProposal};
 
 /// The basenames present in one directory, in exact and case-folded form.
@@ -138,6 +141,33 @@ pub fn detect_proposal_collisions(proposals: &mut [RenameProposal]) {
     }
 }
 
+/// Refuses every actionable proposal when one exact source path appears more
+/// than once. Approval is keyed by source path, so allowing two destinations
+/// for one source would make one approval authorize two transaction entries.
+pub fn detect_duplicate_sources(proposals: &mut [RenameProposal]) {
+    let mut by_source: HashMap<PathBuf, Vec<usize>> = HashMap::new();
+    for (index, proposal) in proposals.iter().enumerate() {
+        by_source
+            .entry(proposal.source_path.clone())
+            .or_default()
+            .push(index);
+    }
+
+    for group in by_source.values().filter(|group| group.len() > 1) {
+        for &index in group {
+            proposals[index].collision = Some(CollisionInfo {
+                kind: CollisionKind::DuplicateSource,
+                colliding_with: Some(proposals[index].current_basename.clone()),
+                colliding_is_symlink: false,
+                detail: "another proposal targets a different rename for this same source path"
+                    .to_string(),
+            });
+            proposals[index].state = ProposalState::Conflict;
+            proposals[index].actionable = false;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,6 +199,8 @@ mod tests {
             extension_status: None,
             sanitisation_notes: Vec::new(),
             actionable: true,
+            audited_identity: None,
+            is_outer_archive: false,
         }
     }
 

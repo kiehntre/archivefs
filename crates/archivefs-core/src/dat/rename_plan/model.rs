@@ -120,6 +120,8 @@ pub enum CollisionKind {
     CaseCollision,
     /// Two proposals in the same directory would produce the same name.
     TwoProposalsSameTarget,
+    /// Two actionable proposals refer to the same physical source path.
+    DuplicateSource,
 }
 
 impl CollisionKind {
@@ -128,6 +130,7 @@ impl CollisionKind {
             Self::ExistingTarget => "Target already exists",
             Self::CaseCollision => "Case-only collision",
             Self::TwoProposalsSameTarget => "Two proposals, one target",
+            Self::DuplicateSource => "Two proposals, one source",
         }
     }
 }
@@ -216,6 +219,18 @@ pub struct RenameProposal {
     /// Whether a future apply stage could act on this proposal. True only for
     /// `Suggested` proposals with no collision.
     pub actionable: bool,
+    /// Filesystem identity captured for the exact outer archive whose members
+    /// were audited. `None` for ordinary loose-file proposals.
+    pub audited_identity: Option<crate::dat::rename_apply::ObjectIdentity>,
+    /// Whether this proposal renames an outer `.zip`/`.7z` archive as a
+    /// whole, derived from Stage 1 set-completeness evidence
+    /// ([`crate::dat::set::SetResolution`]) rather than a per-file DAT
+    /// match. `false` for every ordinary loose-file proposal. The apply
+    /// machinery treats both identically - a rename is a rename of
+    /// whatever regular file `source_path` names - this field exists only
+    /// so a consumer (the GUI, tests) can tell the two provenances apart
+    /// without inferring it from the absence of `rom_name`.
+    pub is_outer_archive: bool,
 }
 
 impl RenameProposal {
