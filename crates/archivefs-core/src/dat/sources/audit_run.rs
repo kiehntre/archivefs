@@ -461,6 +461,21 @@ pub fn run_dat_audit(
         if is_chd_path(path) {
             continue;
         }
+        // A `.rar`'s outer container bytes are never loose-hashed: RAR is
+        // the one format whose evidence must come exclusively through the
+        // fd-pinned archive provider (`audit_archives` below), which is the
+        // only path that can fail closed on an unsupported/unavailable/
+        // corrupt archive. Loose-hashing the raw container here would let
+        // its bytes reach `audit_one` and, on a coincidental (or crafted)
+        // hash collision with a declared DAT ROM, produce a loose `Exact`
+        // verdict and a loose rename proposal - a bypass of the archive
+        // trust boundary that stands regardless of whether the RAR itself
+        // ever verified anything. The file is still visible to the scan
+        // (`files_scanned` counts it) and still dispatched to
+        // `audit_archives` below; it is only absent from `known`/`report`.
+        if is_rar_path(path) {
+            continue;
+        }
         let file_name = file_name_of(path);
         on_progress(DatAuditProgress::Hashing {
             index: position + 1,

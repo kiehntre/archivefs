@@ -182,7 +182,6 @@ pub fn run_supervised(
     let mut stdout_total = 0_u64;
     let mut stdout_eof = false;
     let mut stderr_eof = false;
-    let mut status = None;
     let mut buffer = [0_u8; CHUNK_BYTES];
 
     loop {
@@ -225,21 +224,25 @@ pub fn run_supervised(
             }
         }
 
-        if status.is_none() {
-            status = match child.try_wait() {
-                Ok(status) => status,
+        // Do not reap the process-group leader while either pipe remains
+        // open. A descendant may have inherited stdout/stderr after the
+        // direct child exited; reaping the leader here would release its PID
+        // for reuse and make `terminate_and_reap` deliberately skip the
+        // process-group kill on a later timeout. Keeping the leader unreaped
+        // keeps its process-group identity safely killable until all writers
+        // have closed their pipes or an error path terminates the group.
+        if stdout_eof && stderr_eof {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    child.disarm();
+                    return Ok(ProcessOutcome {
+                        status,
+                        stderr: stderr_bytes,
+                    });
+                }
+                Ok(None) => {}
                 Err(error) => return Err(child.cleanup_error(io_error(error))),
-            };
-        }
-        if stdout_eof
-            && stderr_eof
-            && let Some(status) = status
-        {
-            child.disarm();
-            return Ok(ProcessOutcome {
-                status,
-                stderr: stderr_bytes,
-            });
+            }
         }
         thread::sleep(POLL_INTERVAL);
     }
@@ -372,6 +375,30 @@ fn io_error(error: io::Error) -> ProcessError {
 mod tests {
     use super::*;
 
+    fn read_pid(path: &std::path::Path) -> libc::pid_t {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .parse::<libc::pid_t>()
+            .unwrap()
+    }
+
+    fn process_exists(pid: libc::pid_t) -> bool {
+        // SAFETY: signal zero performs existence/permission checking only;
+        // it never delivers a signal or changes the target process.
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            return true;
+        }
+        io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+
+    fn wait_for_process_exit(pid: libc::pid_t) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while process_exists(pid) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        !process_exists(pid)
+    }
+
     fn run(command: Command, timeout: Duration) -> Result<(ProcessOutcome, Vec<u8>), ProcessError> {
         let mut collected = Vec::new();
         let outcome = run_supervised(
@@ -470,6 +497,53 @@ mod tests {
         // Give the (now-killed) grandchild a moment, then confirm no
         // lingering `sleep 30` from this test remains reachable via /proc.
         std::thread::sleep(Duration::from_millis(100));
+    }
+
+    #[test]
+    fn exited_parent_with_pipe_holding_descendant_is_still_killable_on_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_pid_path = dir.path().join("parent.pid");
+        let descendant_pid_path = dir.path().join("descendant.pid");
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(
+                "printf '%s' \"$$\" > \"$1\"; sleep 30 & \
+                 printf '%s' \"$!\" > \"$2\"; exit 0",
+            )
+            .arg("sh")
+            .arg(&parent_pid_path)
+            .arg(&descendant_pid_path);
+
+        let result = run(command, Duration::from_millis(200));
+        let parent_pid = read_pid(&parent_pid_path);
+        let descendant_pid = read_pid(&descendant_pid_path);
+
+        assert!(
+            matches!(
+                &result,
+                Err(ProcessError::Timeout | ProcessError::CleanupFailure { .. })
+            ),
+            "a descendant-held pipe must time out, never succeed: {result:?}"
+        );
+        assert!(
+            wait_for_process_exit(parent_pid),
+            "the direct child {parent_pid} was not reaped"
+        );
+        let descendant_gone = wait_for_process_exit(descendant_pid);
+        if !descendant_gone {
+            // Keep a failing regression from leaking its deliberately long-
+            // lived helper into later tests.
+            // SAFETY: this PID was written by the test's own child moments
+            // ago and is used only after the supervisor has returned.
+            unsafe {
+                libc::kill(descendant_pid, libc::SIGKILL);
+            }
+        }
+        assert!(
+            descendant_gone,
+            "the pipe-holding descendant {descendant_pid} survived cleanup"
+        );
     }
 
     #[test]

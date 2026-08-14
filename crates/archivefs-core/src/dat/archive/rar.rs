@@ -1169,13 +1169,27 @@ impl ArchiveMemberSource for RarArchiveSource {
         self.session.members.len()
     }
 
-    /// Every member failure that is not clearly confined to that one
-    /// member's own content (backend/process/consistency failures, as
-    /// opposed to a wrong hash or a nonzero 7-Zip exit for that member
-    /// alone) aborts the whole pass as `Incomplete` rather than continuing:
-    /// unlike ZIP's independently-seekable members, a RAR member failure
-    /// that is not obviously content-local gives no assurance the rest of
-    /// the archive can still be read reliably through the same backend.
+    /// Completeness is coverage, not DAT attribution: a pass is `Complete`
+    /// only when *every* member reached [`ArchiveMemberStatus::HashComplete`]:
+    /// a member that is empty, refused by a limit, left `NotVerified` for
+    /// lack of an unambiguous DAT candidate, or that failed verification, is
+    /// exactly as much "not fully accounted for" as a cancelled or
+    /// backend-failed pass. This is deliberately stricter than ZIP/7z's own
+    /// "independent members, per-member Corrupt" model: unlike a ZIP central
+    /// directory, nothing here proves the rest of a RAR archive is still
+    /// safe to examine after any surprise, so the conservative default is
+    /// coverage over optimism. `SizeMismatch`/`HashMismatch` are the only
+    /// statuses ever treated as content-local (continue examining other
+    /// members): both are reachable from [`RarSession::read_member`] only
+    /// *after* the extraction child already exited 0 and every relist/
+    /// selection consistency check already passed, so they can only mean
+    /// this one member's own bytes disagreed - never an infrastructure or
+    /// consistency failure. `BackendFailure` is deliberately NOT treated as
+    /// content-local: [`RarSession::read_member`]'s relist step can itself
+    /// raise a raw listing-backend failure that is indistinguishable at this
+    /// layer from a nonzero extraction exit, so it is conservatively
+    /// bucketed as an archive-wide failure (aborts the pass) rather than
+    /// assumed to be this one member's content.
     fn verify_all(
         &mut self,
         cancel: &AtomicBool,
@@ -1195,16 +1209,19 @@ impl ArchiveMemberSource for RarArchiveSource {
 
             if member.size == 0 {
                 members.push(self.evidence(&member, ArchiveMemberStatus::EmptyFile, None));
+                completion = mark_incomplete_once(
+                    completion,
+                    member.stable_index,
+                    ArchiveMemberStatus::EmptyFile,
+                );
                 continue;
             }
             if member.size > self.limits.max_member_logical_bytes {
-                members.push(self.evidence(
-                    &member,
-                    ArchiveMemberStatus::RefusedLimits {
-                        reason: "member size",
-                    },
-                    None,
-                ));
+                let status = ArchiveMemberStatus::RefusedLimits {
+                    reason: "member size",
+                };
+                members.push(self.evidence(&member, status.clone(), None));
+                completion = mark_incomplete_once(completion, member.stable_index, status);
                 continue;
             }
             let Some(candidate) = self
@@ -1212,13 +1229,11 @@ impl ArchiveMemberSource for RarArchiveSource {
                 .get(member.stable_index)
                 .and_then(Option::as_ref)
             else {
-                members.push(self.evidence(
-                    &member,
-                    ArchiveMemberStatus::NotVerified {
-                        reason: "no unambiguous DAT candidate for this filename",
-                    },
-                    None,
-                ));
+                let status = ArchiveMemberStatus::NotVerified {
+                    reason: "no unambiguous DAT candidate for this filename",
+                };
+                members.push(self.evidence(&member, status.clone(), None));
+                completion = mark_incomplete_once(completion, member.stable_index, status);
                 continue;
             };
             if !run_budget.try_charge(member.size) {
@@ -1248,31 +1263,31 @@ impl ArchiveMemberSource for RarArchiveSource {
                         Some(result.hashes),
                     ));
                 }
-                Err(
-                    error @ (RarError::BackendFailure { .. }
-                    | RarError::SizeMismatch { .. }
-                    | RarError::HashMismatch),
-                ) => {
-                    // Confined to this one member's own content: 7-Zip
-                    // reported a decode/exit failure, a byte-count
-                    // disagreement, or a hash disagreement for exactly this
-                    // member. Independent members remain worth examining.
-                    members.push(self.evidence(
-                        &member,
-                        ArchiveMemberStatus::Corrupt {
-                            detail: error.to_string(),
-                        },
-                        None,
-                    ));
+                Err(error) if member_error_is_content_local(&error) => {
+                    // Content-local by construction: `validate_extraction`
+                    // only reaches either of these checks after the
+                    // extraction child already exited 0 and every relist/
+                    // selection consistency check already passed - so this
+                    // can only mean this one member's own bytes disagreed
+                    // with either the declared size or the DAT candidate's
+                    // hash. Independent members remain worth examining, but
+                    // the pass itself can never be `Complete` once any
+                    // member fails to verify - see this method's own doc.
+                    let status = ArchiveMemberStatus::Corrupt {
+                        detail: error.to_string(),
+                    };
+                    members.push(self.evidence(&member, status.clone(), None));
+                    completion = mark_incomplete_once(completion, member.stable_index, status);
                 }
                 Err(error) => {
-                    // Everything else (relist/selection drift, timeout,
-                    // process/IO failure, cleanup failure, or any defensive
-                    // case that should not be reachable given the inputs
-                    // this loop constructs) is not confined to this one
-                    // member - it means the backend or the pinned source
-                    // itself is no longer trustworthy for the rest of this
-                    // pass. Never represented as a verified member; the
+                    // Everything else - a nonzero extraction exit
+                    // (`BackendFailure`, not provably content-local: see
+                    // this method's own doc), relist/selection drift,
+                    // timeout, process/IO failure, cleanup failure, or any
+                    // defensive case that should not be reachable given the
+                    // inputs this loop constructs - is conservatively
+                    // treated as archive-wide, not confined to this one
+                    // member. Never represented as a verified member; the
                     // whole pass is marked incomplete instead of silently
                     // continuing against a possibly-wedged backend.
                     completion = ArchivePassCompletion::Incomplete {
@@ -1291,6 +1306,42 @@ impl ArchiveMemberSource for RarArchiveSource {
             completion,
         }
     }
+}
+
+/// Downgrades `completion` to `Incomplete { MemberRefused }` for `index`/
+/// `status`, unless it is already `Incomplete` for a different (and
+/// necessarily higher-priority, since it already caused a `break`) reason -
+/// never lets a later, merely-informational downgrade overwrite an already-
+/// recorded abort reason.
+fn mark_incomplete_once(
+    completion: ArchivePassCompletion,
+    index: usize,
+    status: ArchiveMemberStatus,
+) -> ArchivePassCompletion {
+    match completion {
+        ArchivePassCompletion::Complete => ArchivePassCompletion::Incomplete {
+            reason: ArchivePassStopReason::MemberRefused { index, status },
+        },
+        already_incomplete => already_incomplete,
+    }
+}
+
+/// Whether a [`RarSession::read_member`] failure is provably confined to
+/// that one member's own content, rather than the archive/backend as a
+/// whole. Only `SizeMismatch` and `HashMismatch` qualify: both are reachable
+/// solely from `validate_extraction`'s checks *after* the extraction child
+/// already exited 0 and every relist/selection consistency check already
+/// passed (see `RarSession::read_member`'s own source), so they can only
+/// mean this one member's own bytes disagreed. Every other variant -
+/// including `BackendFailure`, which `RarSession::read_member`'s relist step
+/// can itself raise from a raw listing-backend failure indistinguishable at
+/// this layer from a nonzero extraction exit - is conservatively treated as
+/// not proven content-local.
+fn member_error_is_content_local(error: &RarError) -> bool {
+    matches!(
+        error,
+        RarError::SizeMismatch { .. } | RarError::HashMismatch
+    )
 }
 
 fn rar_open_error(error: RarError) -> ArchiveMemberSourceError {
@@ -2109,7 +2160,7 @@ mod tests {
         use crate::dat::archive::limits::ArchiveLimits;
         use crate::dat::archive::{
             ArchiveMemberSource, ArchiveMemberSourceError, ArchiveMemberStatus,
-            ArchivePassCompletion, ArchiveRunBudget,
+            ArchivePassCompletion, ArchivePassStopReason, ArchiveRunBudget,
         };
         use crate::dat::index::{DatIndex, DatMemberKey, DatRomRef, MemberLocation};
         use crate::dat::model::{ChecksumAlgorithm, DatChecksum};
@@ -2207,7 +2258,7 @@ mod tests {
         }
 
         #[test]
-        fn ambiguous_filename_candidates_leave_the_member_unverified_not_guessed() {
+        fn ambiguous_filename_candidates_leave_the_member_unverified_and_poison_the_pass() {
             let backend = provider();
             let index = index_by_filename(
                 "helloworld.txt",
@@ -2239,7 +2290,6 @@ mod tests {
 
             let outcome = source.verify_all(&no_cancel(), &mut unlimited_budget());
 
-            assert_eq!(outcome.completion, ArchivePassCompletion::Complete);
             let member = &outcome.members[0];
             assert!(
                 matches!(member.status, ArchiveMemberStatus::NotVerified { .. }),
@@ -2247,6 +2297,19 @@ mod tests {
                 member.status
             );
             assert!(member.hashes.is_none());
+            // A member left unverified is not "fully accounted for" -
+            // completeness is coverage, not DAT attribution (see
+            // `verify_all`'s own doc); the whole pass must reflect that.
+            assert!(
+                matches!(
+                    outcome.completion,
+                    ArchivePassCompletion::Incomplete {
+                        reason: ArchivePassStopReason::MemberRefused { .. }
+                    }
+                ),
+                "an unverified member must poison the pass, not leave it Complete: {:?}",
+                outcome.completion
+            );
         }
 
         #[test]
@@ -2275,6 +2338,12 @@ mod tests {
                 "a CRC32-only candidate must never gate `read_member`: {:?}",
                 member.status
             );
+            assert!(matches!(
+                outcome.completion,
+                ArchivePassCompletion::Incomplete {
+                    reason: ArchivePassStopReason::MemberRefused { .. }
+                }
+            ));
         }
 
         #[test]
@@ -2301,10 +2370,16 @@ mod tests {
                 outcome.members[0].status,
                 ArchiveMemberStatus::NotVerified { .. }
             ));
+            assert!(matches!(
+                outcome.completion,
+                ArchivePassCompletion::Incomplete {
+                    reason: ArchivePassStopReason::MemberRefused { .. }
+                }
+            ));
         }
 
         #[test]
-        fn wrong_strong_hash_candidate_fails_closed_as_corrupt_and_pass_stays_complete() {
+        fn wrong_strong_hash_candidate_fails_closed_as_corrupt_and_poisons_the_pass() {
             let backend = provider();
             let index = index_by_filename(
                 "helloworld.txt",
@@ -2330,13 +2405,25 @@ mod tests {
             let outcome = source.verify_all(&no_cancel(), &mut unlimited_budget());
 
             // A single member's own content disagreeing with its one DAT
-            // candidate is confined to that member - the pass itself is
-            // still `Complete` (there was nothing else to examine), but the
-            // member is never verified evidence.
-            assert_eq!(outcome.completion, ArchivePassCompletion::Complete);
+            // candidate is content-local (`SizeMismatch`/`HashMismatch` are
+            // only reachable after the extraction child already exited 0
+            // and every relist/selection check already passed), so it is
+            // `Corrupt`, not an archive-wide abort - but it still means the
+            // member was never fully accounted for, so the pass itself can
+            // never be `Complete`.
             let member = &outcome.members[0];
             assert!(matches!(member.status, ArchiveMemberStatus::Corrupt { .. }));
             assert!(member.hashes.is_none());
+            assert!(
+                matches!(
+                    outcome.completion,
+                    ArchivePassCompletion::Incomplete {
+                        reason: ArchivePassStopReason::MemberRefused { .. }
+                    }
+                ),
+                "a content-mismatched member must still poison the pass: {:?}",
+                outcome.completion
+            );
         }
 
         #[test]
@@ -2540,6 +2627,275 @@ mod tests {
             assert!(is_nested_name("INNER.RAR"));
             assert!(!is_nested_name("plain.bin"));
             assert!(!is_nested_name("no-extension"));
+        }
+
+        // -- Finding 2 (independent integration review): pass completeness -
+
+        #[test]
+        fn only_size_and_hash_mismatch_are_ever_treated_as_content_local() {
+            // Exhaustive, deterministic proof of the bucketing rule
+            // `verify_all` relies on - no real backend interaction needed.
+            assert!(member_error_is_content_local(&RarError::SizeMismatch {
+                declared: 4,
+                received: 2
+            }));
+            assert!(member_error_is_content_local(&RarError::HashMismatch));
+
+            for other in [
+                RarError::BackendFailure {
+                    status: Some(1),
+                    detail: "nonzero exit".to_string(),
+                },
+                RarError::SelectionChanged,
+                RarError::Timeout,
+                RarError::Io {
+                    detail: "broken pipe".to_string(),
+                },
+                RarError::CleanupFailure {
+                    detail: "kill failed".to_string(),
+                },
+                RarError::ProcessOutputLimit { limit: 1024 },
+                RarError::OutputLimitExceeded { limit: 1024 },
+                RarError::MemberNotFound { stable_index: 0 },
+                RarError::MemberTooLarge {
+                    declared: 4,
+                    limit: 2,
+                },
+                RarError::InvalidProcessLimits,
+                RarError::InvalidExpectedHash {
+                    detail: "no strong hash".to_string(),
+                },
+                RarError::ZeroSizedMember { stable_index: 0 },
+            ] {
+                assert!(
+                    !member_error_is_content_local(&other),
+                    "{other:?} must not be treated as content-local"
+                );
+            }
+        }
+
+        /// A minimal, real `RarArchiveSource` around one synthetic member
+        /// that never actually reaches `read_member` - `member.size == 0`
+        /// short-circuits before any extraction is attempted, so no
+        /// relist/consistency machinery is exercised at all. The file
+        /// handle itself is real (`open_pinned` against a genuine fixture);
+        /// only the member listing is hand-built, to isolate exactly the
+        /// completeness bookkeeping under test.
+        fn source_with_synthetic_members(members: Vec<RarMember>) -> RarArchiveSource {
+            let file = open_pinned(&fixture("test_read_format_rar5_stored.rar")).unwrap();
+            let opened_at = fstat_snapshot(&file).unwrap();
+            let session = RarSession {
+                executable: provider().executable().to_path_buf(),
+                process_limits: ProcessLimits::default(),
+                archive_path: fixture("test_read_format_rar5_stored.rar"),
+                file,
+                opened_at,
+                archive: RarArchiveMetadata {
+                    archive_type: "Rar5".to_string(),
+                    solid: false,
+                    encrypted: false,
+                    multivolume: false,
+                    volumes: 1,
+                    offset: 0,
+                },
+                members,
+            };
+            let candidates = session.members.iter().map(|_| None).collect();
+            RarArchiveSource {
+                session,
+                limits: ArchiveLimits::default(),
+                candidates,
+                member_timeout: short_timeout(),
+            }
+        }
+
+        fn synthetic_member(stable_index: usize, path: &str, size: u64) -> RarMember {
+            RarMember {
+                stable_index,
+                path: path.to_string(),
+                size,
+                packed_size: Some(size),
+                encrypted: false,
+                solid: false,
+                split_before: false,
+                split_after: false,
+                method: "RAR5(1M)".to_string(),
+                crc: None,
+            }
+        }
+
+        #[test]
+        fn a_zero_sized_member_alone_never_lets_the_pass_complete() {
+            let mut source =
+                source_with_synthetic_members(vec![synthetic_member(0, "empty.bin", 0)]);
+
+            let outcome = source.verify_all(&no_cancel(), &mut unlimited_budget());
+
+            assert_eq!(outcome.members[0].status, ArchiveMemberStatus::EmptyFile);
+            assert!(matches!(
+                outcome.completion,
+                ArchivePassCompletion::Incomplete {
+                    reason: ArchivePassStopReason::MemberRefused { .. }
+                }
+            ));
+        }
+
+        #[test]
+        fn a_member_over_the_declared_size_limit_never_lets_the_pass_complete() {
+            let backend = provider();
+            let index = index_by_filename(
+                "helloworld.txt",
+                vec![rom_ref(
+                    "Hello World",
+                    "helloworld.txt",
+                    vec![DatChecksum::parse(ChecksumAlgorithm::Sha1, HELLOWORLD_SHA1).unwrap()],
+                )],
+            );
+            let mut source = RarArchiveSource::open(
+                &fixture("test_read_format_rar5_stored.rar"),
+                &backend,
+                &index,
+                ArchiveLimits {
+                    max_member_logical_bytes: 10, // the real member is 29 bytes
+                    ..ArchiveLimits::default()
+                },
+                short_timeout(),
+                short_timeout(),
+            )
+            .unwrap();
+
+            let outcome = source.verify_all(&no_cancel(), &mut unlimited_budget());
+
+            assert!(matches!(
+                outcome.members[0].status,
+                ArchiveMemberStatus::RefusedLimits { .. }
+            ));
+            assert!(matches!(
+                outcome.completion,
+                ArchivePassCompletion::Incomplete {
+                    reason: ArchivePassStopReason::MemberRefused { .. }
+                }
+            ));
+        }
+
+        #[test]
+        fn an_archive_wide_read_member_failure_aborts_the_pass_as_incomplete_not_corrupt() {
+            // Deliberately corrupt the session's own remembered listing (an
+            // extra entry `read_member`'s relist can never see) - the
+            // hardened, already-reviewed consistency check inside
+            // `RarSession::read_member` then genuinely, deterministically
+            // fails every call through this session with `SelectionChanged`,
+            // exactly the class of failure this test targets: not provably
+            // confined to one member's content, so it must abort the whole
+            // pass rather than being reported as a per-member `Corrupt`.
+            let backend = provider();
+            let mut session = backend
+                .open(
+                    &fixture("test_read_format_rar5_stored.rar"),
+                    short_timeout(),
+                )
+                .unwrap();
+            let real_member = session.members[0].clone();
+            session.members.push(synthetic_member(1, "phantom.bin", 4));
+            let index = index_by_filename(
+                "helloworld.txt",
+                vec![rom_ref(
+                    "Hello World",
+                    "helloworld.txt",
+                    vec![DatChecksum::parse(ChecksumAlgorithm::Sha1, HELLOWORLD_SHA1).unwrap()],
+                )],
+            );
+            let candidates = vec![candidate_hashes_for(&index, &real_member.path), None];
+            let mut source = RarArchiveSource {
+                session,
+                limits: ArchiveLimits::default(),
+                candidates,
+                member_timeout: short_timeout(),
+            };
+
+            let outcome = source.verify_all(&no_cancel(), &mut unlimited_budget());
+
+            assert!(
+                outcome
+                    .members
+                    .iter()
+                    .all(|member| member.status != ArchiveMemberStatus::HashComplete),
+                "a corrupted session listing must never yield a verified member: {:?}",
+                outcome.members
+            );
+            assert!(
+                matches!(
+                    outcome.completion,
+                    ArchivePassCompletion::Incomplete {
+                        reason: ArchivePassStopReason::SourceError { .. }
+                    }
+                ),
+                "an archive-wide read_member failure must abort as SourceError, not a per-member \
+                 MemberRefused: {:?}",
+                outcome.completion
+            );
+        }
+
+        #[test]
+        fn one_verified_member_alongside_an_unverified_sibling_never_completes() {
+            let backend = provider();
+            // Only `test1.bin` gets a real, matching candidate; the other
+            // three genuinely exist in the archive but have no DAT
+            // declaration at all, so they are left `NotVerified` - none of
+            // this requires touching `session.members`, so `test1.bin`'s own
+            // `read_member` call is entirely real and unaffected.
+            let index = index_by_filename(
+                "test1.bin",
+                vec![rom_ref(
+                    "Test One",
+                    "test1.bin",
+                    vec![
+                        DatChecksum::parse(
+                            ChecksumAlgorithm::Md5,
+                            "b0ee823da852a3d713823eb5d04760bb",
+                        )
+                        .unwrap(),
+                        DatChecksum::parse(
+                            ChecksumAlgorithm::Sha1,
+                            "e6d444eac448f176cb9f8a1db5674df32f24e163",
+                        )
+                        .unwrap(),
+                    ],
+                )],
+            );
+            let mut source = open_source(
+                &fixture("test_read_format_rar5_multiple_files.rar"),
+                &backend,
+                &index,
+            )
+            .unwrap();
+
+            let outcome = source.verify_all(&no_cancel(), &mut unlimited_budget());
+
+            assert_eq!(outcome.members.len(), 4);
+            assert_eq!(
+                outcome.members[0].status,
+                ArchiveMemberStatus::HashComplete,
+                "test1.bin genuinely verified through a real, uncorrupted session"
+            );
+            assert!(
+                outcome.members[1..]
+                    .iter()
+                    .all(|member| matches!(member.status, ArchiveMemberStatus::NotVerified { .. })),
+                "{:?}",
+                outcome.members
+            );
+            assert!(
+                matches!(
+                    outcome.completion,
+                    ArchivePassCompletion::Incomplete {
+                        reason: ArchivePassStopReason::MemberRefused { .. }
+                    }
+                ),
+                "one verified member cannot make a pass Complete while a sibling remains \
+                 unverified: {:?}",
+                outcome.completion
+            );
         }
     }
 }

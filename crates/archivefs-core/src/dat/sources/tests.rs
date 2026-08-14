@@ -2518,10 +2518,15 @@ fn rar_member_reaches_set_complete_and_only_the_outer_archive_becomes_rename_eli
         outcome.archives[0].members[0].evidence.status,
         crate::dat::archive::ArchiveMemberStatus::HashComplete
     );
-    // The outer .rar is also scanned and hashed as one ordinary physical
-    // file, exactly like ZIP/7z - its internal member content is never
-    // additionally represented as a loose-ROM report row.
-    assert_eq!(outcome.report.entries.len(), 1);
+    // Unlike ZIP/7z, the outer .rar container is deliberately never
+    // loose-hashed at all (see `is_rar_path`'s exclusion in `run_dat_audit`
+    // step 3) - its bytes must never be able to reach a loose `audit_one`
+    // verdict independent of whether the RAR archive itself verified.
+    assert_eq!(outcome.report.entries.len(), 0);
+    assert_eq!(
+        outcome.files_scanned, 1,
+        "the .rar is still counted as scanned"
+    );
 
     assert_eq!(outcome.sets.len(), 1);
     assert_eq!(outcome.sets[0].state, SetState::Complete);
@@ -2801,5 +2806,274 @@ fn a_corrupt_rar_never_downgrades_an_unrelated_zip_in_the_same_audit() {
         zip_set.state,
         SetState::Complete,
         "a failure confined to the RAR archive must never downgrade the unrelated ZIP set"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Finding 1 (independent integration review): a .rar's outer container
+// bytes must never reach the loose-file audit path at all, regardless of
+// whether the archive itself is unsupported, provider-unavailable, or
+// corrupt - that would be a bypass of the archive trust boundary.
+// ---------------------------------------------------------------------
+
+// The whole 109-byte `test_read_format_rar5_stored.rar` fixture's own
+// digest, computed once out-of-band - used as a deliberately-planted DAT
+// declaration for the *outer container*, never a real ROM's content hash.
+const RAR_CONTAINER_SHA1: &str = "368ec4034514bbb45e0469030edcdbf7f2557ec7";
+
+fn assert_outer_rar_digest_never_reaches_loose_evidence(
+    dir: &TempDir,
+    rar_path: &Path,
+    dat_source_id: &str,
+) {
+    let dat_path = write(
+        dir.path(),
+        "container.dat",
+        &format!(
+            r#"<datafile><header><name>Container-digest bait</name></header>
+<game name="Bait"><rom name="bait.bin" size="109" sha1="{RAR_CONTAINER_SHA1}"/></game>
+</datafile>"#
+        ),
+    );
+    let request = DatAuditRequest {
+        source_id: dat_source_id.to_string(),
+        source_display_name: "Container-digest bait".to_string(),
+        dat_path,
+        dat_kind: DatSourceKind::File,
+        scan_root: rar_path.parent().unwrap().to_path_buf(),
+        limits: DatLimits::default(),
+        policy: None,
+        platform: None,
+    };
+    let outcome = run_dat_audit(&request, &TrustedRoots::none(), &no_cancel(), &|_| {}).unwrap();
+
+    // The outer container's bytes never became loose evidence at all, so
+    // there is nothing for `audit_one` to have matched Exact against.
+    assert_eq!(
+        outcome.report.entries.len(),
+        0,
+        "a .rar must never produce a loose report row"
+    );
+    assert!(
+        outcome
+            .report
+            .entries
+            .iter()
+            .all(|entry| !matches!(entry.verdict, crate::dat::audit::AuditVerdict::Exact { .. })),
+        "no loose Exact verdict may ever come from a RAR container's own bytes"
+    );
+
+    let plan = crate::dat::rename_plan::build_rename_plan(
+        &outcome,
+        &crate::dat::rename_plan::RenamePlanContext { generation: 1 },
+        &no_cancel(),
+    )
+    .unwrap();
+    assert!(
+        plan.proposals.is_empty(),
+        "no loose or outer-archive rename proposal may come from the container-digest bait: {:?}",
+        plan.proposals
+    );
+
+    assert!(
+        outcome.archives[0].completion != crate::dat::archive::ArchivePassCompletion::Complete,
+        "the archive pass itself must not be Complete for this fixture"
+    );
+    assert!(
+        outcome
+            .sets
+            .iter()
+            .all(|set| set.state != crate::dat::set::SetState::Complete),
+        "no set may reach Complete from the container-hash bait"
+    );
+}
+
+#[test]
+fn unsupported_rar_container_digest_never_becomes_a_loose_exact_match() {
+    let dir = temp();
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    let rar_path = roms.join("collection.rar");
+    // RAR4: refused by the provider before any member is ever listed.
+    std::fs::copy(
+        rar_fixture("test_read_format_rar_compress_best.rar"),
+        &rar_path,
+    )
+    .unwrap();
+
+    // This fixture's own bytes are a different file, so pair it with a DAT
+    // that declares ITS digest instead - the point under test is the same
+    // either way: the archive is unsupported, and its outer bytes must
+    // still never surface as loose evidence.
+    let dat_path = write(
+        dir.path(),
+        "container.dat",
+        r#"<datafile><header><name>Unsupported container bait</name></header>
+<game name="Bait"><rom name="bait.bin" size="4" sha1="a94a8fe5ccb19ba61c4c0873d391e987982fbbd3"/></game>
+</datafile>"#,
+    );
+    let request = DatAuditRequest {
+        source_id: "rar4-bait".to_string(),
+        source_display_name: "Unsupported container bait".to_string(),
+        dat_path,
+        dat_kind: DatSourceKind::File,
+        scan_root: roms,
+        limits: DatLimits::default(),
+        policy: None,
+        platform: None,
+    };
+    let outcome = run_dat_audit(&request, &TrustedRoots::none(), &no_cancel(), &|_| {}).unwrap();
+
+    assert_eq!(outcome.report.entries.len(), 0);
+    assert!(outcome.archives[0].completion != crate::dat::archive::ArchivePassCompletion::Complete);
+    assert!(
+        outcome
+            .sets
+            .iter()
+            .all(|set| set.state != crate::dat::set::SetState::Complete)
+    );
+}
+
+#[test]
+fn corrupt_rar_container_digest_never_becomes_a_loose_exact_match() {
+    let dir = temp();
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    let rar_path = roms.join("collection.rar");
+    // Not a RAR at all: refused at the earliest signature check, before any
+    // process is even spawned - still must never loose-hash.
+    std::fs::write(&rar_path, b"this is not a rar archive, just plain bytes").unwrap();
+
+    assert_outer_rar_digest_never_reaches_loose_evidence(&dir, &rar_path, "rar-corrupt-bait");
+}
+
+#[test]
+fn exact_rar_container_digest_bait_matches_the_real_fixture_and_still_never_loose_matches() {
+    let dir = temp();
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    let rar_path = roms.join("collection.rar");
+    std::fs::copy(rar_fixture("test_read_format_rar5_stored.rar"), &rar_path).unwrap();
+
+    // Here the DAT-declared digest genuinely equals this exact fixture's
+    // own container bytes (`RAR_CONTAINER_SHA1`) - the strongest form of
+    // the bait, since a bug that let the outer bytes loose-hash would
+    // produce a real `Exact` here, not merely fail to mismatch.
+    assert_outer_rar_digest_never_reaches_loose_evidence(&dir, &rar_path, "rar-exact-bait");
+}
+
+#[test]
+fn uppercase_rar_extension_is_also_excluded_from_loose_hashing_and_still_dispatches() {
+    let dir = temp();
+    let dat_path = write(
+        dir.path(),
+        "rar.dat",
+        &format!(
+            r#"<datafile><header><name>Uppercase RAR catalogue</name></header>
+<game name="Hello World (Demo)">
+<rom name="helloworld.txt" size="29" sha1="{RAR_HELLOWORLD_SHA1}"/>
+</game>
+</datafile>"#
+        ),
+    );
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    let archive_path = roms.join("COLLECTION.RAR");
+    std::fs::copy(
+        rar_fixture("test_read_format_rar5_stored.rar"),
+        &archive_path,
+    )
+    .unwrap();
+
+    let request = DatAuditRequest {
+        source_id: "rar-uppercase".to_string(),
+        source_display_name: "Uppercase RAR catalogue".to_string(),
+        dat_path,
+        dat_kind: DatSourceKind::File,
+        scan_root: roms,
+        limits: DatLimits::default(),
+        policy: None,
+        platform: None,
+    };
+    let outcome = run_dat_audit(&request, &TrustedRoots::none(), &no_cancel(), &|_| {}).unwrap();
+
+    // Never loose-hashed...
+    assert_eq!(outcome.report.entries.len(), 0);
+    // ...but still fully dispatched and verified through the RAR archive
+    // path, exactly as the lowercase-extension happy path is.
+    assert_eq!(outcome.archives.len(), 1);
+    assert_eq!(outcome.archives[0].format, "rar");
+    assert_eq!(
+        outcome.archives[0].completion,
+        crate::dat::archive::ArchivePassCompletion::Complete
+    );
+    assert_eq!(outcome.sets.len(), 1);
+    assert_eq!(outcome.sets[0].state, crate::dat::set::SetState::Complete);
+}
+
+#[test]
+fn a_verified_rar_member_alongside_an_unverified_sibling_never_reaches_set_complete() {
+    let dir = temp();
+    // The DAT only declares the game satisfied by `test1.bin`; the archive
+    // itself genuinely also contains three siblings the DAT knows nothing
+    // about. `test1.bin` verifies for real; the other three are left
+    // `NotVerified`. Coverage, not DAT attribution, is what completeness
+    // means here (see `RarArchiveSource::verify_all`'s own doc) - so the
+    // archive pass, and therefore this set, must not reach Complete.
+    let dat_path = write(
+        dir.path(),
+        "rar.dat",
+        r#"<datafile><header><name>Partial coverage catalogue</name></header>
+<game name="Test One">
+<rom name="test1.bin" size="4096" md5="b0ee823da852a3d713823eb5d04760bb" sha1="e6d444eac448f176cb9f8a1db5674df32f24e163"/>
+</game>
+</datafile>"#,
+    );
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    std::fs::copy(
+        rar_fixture("test_read_format_rar5_multiple_files.rar"),
+        roms.join("collection.rar"),
+    )
+    .unwrap();
+
+    let request = DatAuditRequest {
+        source_id: "rar-partial-coverage".to_string(),
+        source_display_name: "Partial coverage catalogue".to_string(),
+        dat_path,
+        dat_kind: DatSourceKind::File,
+        scan_root: roms,
+        limits: DatLimits::default(),
+        policy: None,
+        platform: None,
+    };
+    let outcome = run_dat_audit(&request, &TrustedRoots::none(), &no_cancel(), &|_| {}).unwrap();
+
+    assert_eq!(outcome.archives[0].members.len(), 4);
+    assert_eq!(
+        outcome.archives[0].members[0].evidence.status,
+        crate::dat::archive::ArchiveMemberStatus::HashComplete,
+        "test1.bin genuinely verified"
+    );
+    assert!(
+        outcome.archives[0].members[1..]
+            .iter()
+            .all(|member| matches!(
+                member.evidence.status,
+                crate::dat::archive::ArchiveMemberStatus::NotVerified { .. }
+            ))
+    );
+    assert_ne!(
+        outcome.archives[0].completion,
+        crate::dat::archive::ArchivePassCompletion::Complete,
+        "one verified member cannot make the archive pass Complete while siblings remain unverified"
+    );
+    assert!(
+        outcome
+            .sets
+            .iter()
+            .all(|set| set.state != crate::dat::set::SetState::Complete),
+        "the set cannot Complete off a partial archive pass: {:?}",
+        outcome.sets
     );
 }
