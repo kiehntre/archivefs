@@ -113,6 +113,29 @@ impl DatDiskRef {
     }
 }
 
+/// The one validation a disk identity SHA-1 must pass at every trust
+/// boundary that reads one: [`DatDiskIndex::build`], disk catalogue
+/// revalidation, disk member-shape validation, and CHD header evidence
+/// before it is used as a lookup key.
+///
+/// Canonical hex syntax/length (via [`DatChecksum::parse`]) is necessary but
+/// not sufficient: an all-zero digest (`"0"` repeated forty times) is a
+/// placeholder/sentinel value, never a real SHA-1 of anything. Treating it
+/// as a genuine identity would let a DAT's unset disk SHA-1 and a CHD
+/// header's unset `overall_sha1` match each other and manufacture a false
+/// `Complete` - the exact false-positive this function exists to refuse.
+///
+/// Returns the normalised (trimmed, lowercase) value on success, `None`
+/// otherwise. Never partially validates: a caller either gets a genuine
+/// identity or nothing.
+pub fn parse_disk_sha1(raw: &str) -> Option<String> {
+    let checksum = DatChecksum::parse(ChecksumAlgorithm::Sha1, raw)?;
+    if checksum.value.bytes().all(|byte| byte == b'0') {
+        return None;
+    }
+    Some(checksum.value)
+}
+
 /// Index into a parsed DAT file's disk declarations, keyed by SHA-1 only.
 ///
 /// Structurally separate from [`DatIndex`]: this type has no CRC32/MD5/
@@ -129,10 +152,11 @@ impl DatDiskIndex {
     /// Builds a disk index from a parsed DAT file.
     ///
     /// Every disk in every game is indexed once by its normalised SHA-1.
-    /// A disk with no SHA-1, or one that is not well-formed hex of the right
-    /// length, is not indexed at all - it can never be looked up, so it can
-    /// never be silently promoted to "present" (fail closed, R5-equivalent
-    /// for disks).
+    /// A disk with no SHA-1, one that is not well-formed hex of the right
+    /// length, or an all-zero placeholder digest ([`parse_disk_sha1`]) is
+    /// not indexed at all - it can never be looked up, so it can never be
+    /// silently promoted to "present" (fail closed, R5-equivalent for
+    /// disks).
     pub fn build(dat: &ParsedDat) -> Self {
         let mut index = Self::default();
 
@@ -175,9 +199,9 @@ impl DatDiskIndex {
         let Some(raw_sha1) = disk.sha1.as_deref() else {
             return;
         };
-        // Reuses the same validated hex normalisation ROM checksums use,
-        // rather than hand-rolling a second, weaker SHA-1 check.
-        let Some(checksum) = DatChecksum::parse(ChecksumAlgorithm::Sha1, raw_sha1) else {
+        // The one shared validator every disk-SHA1 trust boundary uses -
+        // canonical hex syntax/length, and never the all-zero placeholder.
+        let Some(sha1) = parse_disk_sha1(raw_sha1) else {
             return;
         };
 
@@ -186,16 +210,13 @@ impl DatDiskIndex {
             game_name: game_name.to_string(),
             disk_key: key,
             disk_name: disk.name.clone().unwrap_or_default(),
-            sha1: checksum.value.clone(),
+            sha1: sha1.clone(),
             status: disk.status.clone(),
             merge: disk.merge.clone(),
             optional: disk.optional.clone(),
         };
 
-        self.by_disk_sha1
-            .entry(checksum.value)
-            .or_default()
-            .push(disk_ref);
+        self.by_disk_sha1.entry(sha1).or_default().push(disk_ref);
     }
 
     /// Look up by disk SHA-1 (already-normalised lowercase 40-hex expected;
@@ -731,6 +752,29 @@ mod tests {
             let index = DatDiskIndex::build(&dat);
 
             assert!(index.by_disk_sha1.is_empty());
+        }
+
+        #[test]
+        fn all_zero_disk_sha1_is_never_indexed() {
+            // Syntactically valid (40 lowercase hex chars) but the sentinel/
+            // unset value, never a genuine content digest - independent
+            // review's concrete false-Complete finding.
+            let dat = dat_with_top_level_disk(Some(&"0".repeat(40)));
+            let index = DatDiskIndex::build(&dat);
+
+            assert!(index.by_disk_sha1.is_empty());
+            assert!(index.lookup_disk_sha1(&"0".repeat(40)).is_empty());
+        }
+
+        #[test]
+        fn parse_disk_sha1_rejects_all_zero_but_accepts_a_genuine_digest() {
+            assert_eq!(super::parse_disk_sha1(&"0".repeat(40)), None);
+            assert_eq!(super::parse_disk_sha1("not-hex-at-all"), None);
+            assert_eq!(super::parse_disk_sha1(""), None);
+            assert_eq!(
+                super::parse_disk_sha1("111111111111111111111111111111111111111A"),
+                Some("111111111111111111111111111111111111111a".to_string())
+            );
         }
 
         #[test]

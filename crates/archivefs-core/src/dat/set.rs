@@ -54,7 +54,11 @@
 //!   parent-chain resolution is Stage 2d's job. Disk evidence in this batch
 //!   only *verifies slots for sets already touched by ROM evidence*; a game
 //!   declaring disks and no ROMs at all is not yet reachable through this
-//!   entry point (see the module's "What this batch does not attempt").
+//!   entry point (see the module's "What this batch does not attempt"). An
+//!   incomplete disk scan (`disk_scan_complete = false`) blocks `Complete`
+//!   only for a set that actually declares a required disk - it never
+//!   downgrades an unrelated ROM-only set just because some other directory
+//!   in the same scan had a traversal error.
 //! - **ClrMamePro is fail-closed unconditionally.** That parser does not
 //!   currently detect *any* of the structure above - no disk/sample/part/
 //!   dataarea/device detection at all - so it cannot honestly claim `false`
@@ -144,8 +148,10 @@ use serde::Serialize;
 use super::archive::ArchivePassCompletion;
 use super::audit::AuditVerdict;
 use super::disk_audit::{DatDiskAudit, DiskAuditVerdict};
-use super::index::{DatDiskKey, DatDiskRef, DatMemberKey, DatRomRef, DiskLocation, MemberLocation};
-use super::model::{ChecksumAlgorithm, DatChecksum, DatDiskEntry, DatGameEntry, DatRomEntry};
+use super::index::{
+    DatDiskKey, DatDiskRef, DatMemberKey, DatRomRef, DiskLocation, MemberLocation, parse_disk_sha1,
+};
+use super::model::{ChecksumAlgorithm, DatDiskEntry, DatGameEntry, DatRomEntry};
 use super::sources::audit_run::DatArchiveAudit;
 
 /// Durable identity for one catalogue set.
@@ -549,10 +555,6 @@ pub(crate) fn classify_archive_sets(
     }
 
     let archive_pass_complete = matches!(archive.completion, ArchivePassCompletion::Complete);
-    // R8 extended to disks: a partial CHD scan means some required disk's
-    // true presence is unknown, so nothing it touched can be safely called
-    // `Complete` either - same reasoning as a partial archive pass.
-    let pass_complete = archive_pass_complete && disk_scan_complete;
     let disk_summary = summarize_disk_evidence(disk_evidence, games);
 
     let mut resolutions = Vec::with_capacity(touched.len());
@@ -579,7 +581,7 @@ pub(crate) fn classify_archive_sets(
             [] => continue,
             [only] => *only,
             _ => {
-                let reason = if pass_complete {
+                let reason = if archive_pass_complete {
                     NeedsReviewReason::DuplicateGameName
                 } else {
                     NeedsReviewReason::PartialArchivePass
@@ -690,10 +692,18 @@ pub(crate) fn classify_archive_sets(
             .map(|(_, rom, _)| rom.name.clone())
             .collect();
 
-        // S2c transition 1: an incomplete archive pass (ROM or disk)
-        // invalidates confidence in every later catalogue/evidence decision.
-        // Lists remain available for diagnostics, but cannot affect the
-        // verdict.
+        // S2c transition 1: an incomplete archive pass invalidates confidence
+        // in every later catalogue/evidence decision, for every set it
+        // touched. An incomplete *disk* scan is scoped more narrowly: it
+        // only means "some required disk's true presence is unknown", so it
+        // only invalidates confidence for a set that actually declares a
+        // required disk. A traversal error under an unrelated directory
+        // must not silently downgrade an unrelated ROM-only set that has no
+        // disk requirement at all to sit alongside. Lists remain available
+        // for diagnostics either way, but cannot affect the verdict.
+        let disk_scan_gate_applies = !disks_required.is_empty();
+        let pass_complete =
+            archive_pass_complete && (disk_scan_complete || !disk_scan_gate_applies);
         if !pass_complete {
             resolutions.push(SetResolution {
                 identity,
@@ -967,8 +977,8 @@ fn ref_matches_disk_catalogue(candidate: &DatDiskRef, games: &[DatGameEntry]) ->
             && disk
                 .sha1
                 .as_deref()
-                .and_then(|raw| DatChecksum::parse(ChecksumAlgorithm::Sha1, raw))
-                .is_some_and(|checksum| checksum.value == candidate.sha1)
+                .and_then(parse_disk_sha1)
+                .is_some_and(|sha1| sha1 == candidate.sha1)
     })
 }
 
@@ -1220,13 +1230,15 @@ fn has_unsupported_member_shape(
         MemberClass::UnverifiableNodump | MemberClass::KnownBad => rom.name.trim().is_empty(),
         MemberClass::NonFile | MemberClass::Contradictory | MemberClass::UnknownLoadflag => false,
     });
-    // A physical/optional disk with no name, or no well-formed SHA-1, is an
-    // uninterpretable catalogue entry - not "missing", which would let it
-    // silently fall through to `Incomplete` as if CHD evidence could ever
-    // exist for it. `Borrowed` is deliberately excluded from the SHA-1
-    // requirement (unlike the ROM check above): a merged disk's own DAT
-    // entry legitimately declares no SHA-1 of its own, and Borrowed disks
-    // are never looked up against CHD evidence in this batch regardless.
+    // A physical/optional disk with no name, or no genuine SHA-1 identity
+    // (well-formed hex, and not the all-zero placeholder - `parse_disk_sha1`
+    // rejects both), is an uninterpretable catalogue entry - not "missing",
+    // which would let it silently fall through to `Incomplete` as if CHD
+    // evidence could ever exist for it. `Borrowed` is deliberately excluded
+    // from the SHA-1 requirement (unlike the ROM check above): a merged
+    // disk's own DAT entry legitimately declares no SHA-1 of its own, and
+    // Borrowed disks are never looked up against CHD evidence in this batch
+    // regardless.
     let invalid_disk = disks.iter().any(|(_, disk, class)| {
         let unnamed = disk
             .name
@@ -1234,12 +1246,7 @@ fn has_unsupported_member_shape(
             .is_none_or(|name| name.trim().is_empty());
         match class {
             MemberClass::PhysicalRequired | MemberClass::OptionalPhysical => {
-                unnamed
-                    || disk
-                        .sha1
-                        .as_deref()
-                        .and_then(|raw| DatChecksum::parse(ChecksumAlgorithm::Sha1, raw))
-                        .is_none()
+                unnamed || disk.sha1.as_deref().and_then(parse_disk_sha1).is_none()
             }
             MemberClass::Borrowed | MemberClass::UnverifiableNodump | MemberClass::KnownBad => {
                 unnamed
@@ -2291,6 +2298,56 @@ mod tests {
             assert_eq!(
                 resolutions[0].state,
                 SetState::NeedsReview(NeedsReviewReason::PartialArchivePass)
+            );
+        }
+
+        // Scoping regression: a traversal error somewhere unrelated in the
+        // disk scan must not downgrade a ROM-only set that declares no disk
+        // requirement at all. `disk_scan_complete = false` only invalidates
+        // confidence for sets that actually have a required disk slot.
+        #[test]
+        fn incomplete_disk_scan_does_not_downgrade_an_unrelated_rom_only_set() {
+            let disc = disc_game("Disc Game", "disc.cue", "game", &disk_sha1('d'));
+            let rom_only = game("Rom Only Game", vec![rom("rom_only.bin", None)]);
+            let games = vec![disc, rom_only];
+            let audit = archive(
+                vec![
+                    exact_member(0, "disc.cue", "Disc Game", "disc.cue"),
+                    exact_member(1, "rom_only.bin", "Rom Only Game", "rom_only.bin"),
+                ],
+                complete_pass(),
+            );
+            let disk_evidence = vec![exact_disk_audit(
+                "/lib/game.chd",
+                disk_ref_for(0, &games[0], 0),
+                false,
+            )];
+
+            // disk_scan_complete = false: the disk half of the walk hit a
+            // traversal error somewhere.
+            let resolutions =
+                classify_archive_sets(&audit, &disk_evidence, false, &games, "collection");
+
+            let disc_state = &resolutions
+                .iter()
+                .find(|r| r.identity.game_name == "Disc Game")
+                .unwrap()
+                .state;
+            let rom_only_state = &resolutions
+                .iter()
+                .find(|r| r.identity.game_name == "Rom Only Game")
+                .unwrap()
+                .state;
+
+            assert_eq!(
+                *disc_state,
+                SetState::NeedsReview(NeedsReviewReason::PartialArchivePass),
+                "the disk-requiring set is correctly blocked by the incomplete disk scan"
+            );
+            assert_eq!(
+                *rom_only_state,
+                SetState::Complete,
+                "a set with no disk requirement must not be downgraded by an unrelated disk scan failure"
             );
         }
 

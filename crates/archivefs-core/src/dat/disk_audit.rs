@@ -18,7 +18,7 @@
 use std::path::{Path, PathBuf};
 
 use super::archive::chd::{ChdHeaderError, read_chd_v5_header};
-use super::index::{DatDiskIndex, DatDiskRef};
+use super::index::{DatDiskIndex, DatDiskRef, parse_disk_sha1};
 use crate::safe_read::{TrustedRoots, open_bounded_read};
 
 /// The outcome of matching one CHD's header identity against the DAT's
@@ -114,7 +114,18 @@ pub fn audit_chd_disk(
 
     let overall_sha1 = hex_lower(&header.overall_sha1);
     let parent_required = header.parent_required();
-    let candidates = index.lookup_disk_sha1(&overall_sha1);
+
+    // The same shared validator every disk-SHA1 trust boundary uses: a
+    // syntactically valid but all-zero `overall_sha1` (an unset/placeholder
+    // header field, never a real content digest) must never become a lookup
+    // key. Without this, an unset DAT disk SHA-1 and an unset CHD
+    // `overall_sha1` would match each other and manufacture a false
+    // `Exact`. Treated as `NotInDat`: the narrowest existing verdict that
+    // asserts no positive evidence, never a new "no identity" variant.
+    let candidates = match parse_disk_sha1(&overall_sha1) {
+        Some(ref valid_sha1) => index.lookup_disk_sha1(valid_sha1),
+        None => &[],
+    };
 
     let (verdict, matched_refs) = match candidates.len() {
         0 => (DiskAuditVerdict::NotInDat, Vec::new()),
@@ -320,6 +331,33 @@ mod tests {
         let audit = audit_chd_disk(&path, &TrustedRoots::none(), &index);
 
         assert!(matches!(audit.verdict, Some(DiskAuditVerdict::NotInDat)));
+        assert!(audit.matched_refs.is_empty());
+    }
+
+    #[test]
+    fn all_zero_overall_sha1_never_returns_exact_even_when_dat_disk_sha1_is_also_zero() {
+        let dir = tempdir().unwrap();
+        // A CHD header whose overall_sha1 is all-zero (unset/placeholder),
+        // and a DAT that (also, independently) declares an all-zero disk
+        // SHA-1 for its one entry - the exact concrete false-Complete
+        // scenario the independent review found: two "no identity"
+        // sentinels must never be treated as matching each other.
+        let bytes = synthetic_chd_header([0x00; 20], PARENT_SHA1_ZERO);
+        let path = write_chd(dir.path(), "disc.chd", &bytes);
+
+        let dat = dat_with_disks(vec![("Game", vec![disk("disc.chd", 0x00)])]);
+        let index = DatDiskIndex::build(&dat);
+        // The all-zero DAT entry was never indexed at all (proven
+        // separately in `dat::index`'s own tests); confirm that
+        // independently here too.
+        assert!(index.by_disk_sha1.is_empty());
+
+        let audit = audit_chd_disk(&path, &TrustedRoots::none(), &index);
+
+        assert!(
+            !matches!(audit.verdict, Some(DiskAuditVerdict::Exact { .. })),
+            "an all-zero overall_sha1 must never produce Exact"
+        );
         assert!(audit.matched_refs.is_empty());
     }
 
