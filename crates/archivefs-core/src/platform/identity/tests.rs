@@ -94,6 +94,7 @@ fn dat_outcome(platform: Option<&str>, verdict: AuditVerdict) -> DatAuditOutcome
             summary: AuditSummary::default(),
         },
         archives: Vec::new(),
+        sets: Vec::new(),
         unhashed: Vec::new(),
         files_scanned: 1,
         bytes_hashed: 123,

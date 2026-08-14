@@ -129,7 +129,7 @@ impl DatChecksum {
 }
 
 /// One ROM entry within a game entry.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DatRomEntry {
     pub name: String,
     pub size_bytes: Option<u64>,
@@ -140,6 +140,18 @@ pub struct DatRomEntry {
     pub status: Option<String>,
     pub merge: Option<String>,
     pub date: Option<String>,
+    /// Raw `loadflag` value, when the DAT declares one (Logiqx `<rom
+    /// loadflag="...">`, ClrMamePro `loadflag value`).
+    ///
+    /// Not interpreted: this is provenance, not an operational model. MAME
+    /// uses `loadflag` to mark ROM entries that are not an ordinary physical
+    /// dump at all - `fill`/`reload`/`continue` describe how to synthesize
+    /// or reuse bytes rather than a file to locate - and this codebase has
+    /// no logic anywhere that understands what to do with any `loadflag`
+    /// value. A consumer that needs to know "is this an ordinary physical
+    /// ROM" should treat `Some(_)` here as "no", regardless of the value.
+    #[serde(default)]
+    pub loadflag: Option<String>,
 }
 
 impl DatRomEntry {
@@ -174,7 +186,7 @@ impl DatRomEntry {
 }
 
 /// One game entry from a DAT file.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DatGameEntry {
     pub name: String,
     pub description: Option<String>,
@@ -193,6 +205,28 @@ pub struct DatGameEntry {
     /// Derived EmuWiz annotation. Never changes upstream identity semantics.
     #[serde(default)]
     pub content_classification: DatContentClassification,
+    /// Whether the source parser detected structure or a relationship on
+    /// this entry that it does not fully observe - a `<disk>`, `<sample>`,
+    /// `<part>`, `<dataarea>`, or device/dependency-style child (Logiqx) -
+    /// **or** cannot prove the absence of such structure at all (every
+    /// entry the ClrMamePro parser produces).
+    ///
+    /// This is a capability/provenance signal, not a parsed model: nothing
+    /// in this codebase interprets what any of these elements mean, and
+    /// this flag never distinguishes which one was seen. It exists so a
+    /// consumer that cannot safely reason about structure beyond plain
+    /// `<rom>` children - `dat::set`'s Stage 1 completeness classifier,
+    /// currently - can tell that `roms` is not proven to be the whole
+    /// picture of this entry's real content, and refuse to guess.
+    ///
+    /// `false` is a positive claim ("this parser looked, and found only
+    /// ordinary `<rom>` children"), never a default assumed in the absence
+    /// of evidence. Every entry the ClrMamePro parser produces sets this
+    /// `true` unconditionally: that parser does not currently attempt to
+    /// detect any of this structure, so it cannot honestly claim `false`
+    /// for anything.
+    #[serde(default)]
+    pub unsupported_structure: bool,
 }
 
 impl DatGameEntry {

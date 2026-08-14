@@ -47,4 +47,5 @@ mod regression;
 pub mod rename_apply;
 pub mod rename_plan;
 pub mod rom_organisation;
+pub mod set;
 pub mod sources;

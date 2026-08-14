@@ -229,6 +229,7 @@ fn dat_with(roms: Vec<(&str, DatRomEntry)>) -> ParsedDat {
                 comment: None,
                 original_metadata: Default::default(),
                 content_classification: Default::default(),
+                unsupported_structure: false,
             })
             .collect(),
     }
@@ -245,6 +246,7 @@ fn rom(name: &str, crc: Option<&str>, md5: Option<&str>, size: Option<u64>) -> D
         status: None,
         merge: None,
         date: None,
+        loadflag: None,
     }
 }
 

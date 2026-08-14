@@ -551,6 +551,7 @@ mod tests {
                 summary: AuditSummary::default(),
             },
             archives: Vec::new(),
+            sets: Vec::new(),
             unhashed: Vec::new(),
             files_scanned: 0,
             bytes_hashed: 0,

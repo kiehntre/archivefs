@@ -388,6 +388,7 @@ mod tests {
                     status: None,
                     merge: None,
                     date: None,
+                    loadflag: None,
                 }],
                 clone_of: None,
                 sample_of: None,
@@ -399,6 +400,7 @@ mod tests {
                 comment: None,
                 original_metadata: Default::default(),
                 content_classification: Default::default(),
+                unsupported_structure: false,
             }],
         };
         DatIndex::build(&dat)

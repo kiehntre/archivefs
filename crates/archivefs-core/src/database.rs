@@ -9086,6 +9086,7 @@ mod tests {
                 summary: AuditSummary::default(),
             },
             archives: Vec::new(),
+            sets: Vec::new(),
             unhashed: Vec::new(),
             files_scanned: 1,
             bytes_hashed: archive.size_bytes.unwrap_or(0),
