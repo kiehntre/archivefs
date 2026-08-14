@@ -250,6 +250,8 @@ pub struct DatBiosSetEntry {
 pub struct DatDataAreaEntry {
     #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
+    pub roms: Vec<DatRomEntry>,
 }
 
 /// A software-list disk area. Member interpretation remains deferred.
@@ -257,6 +259,8 @@ pub struct DatDataAreaEntry {
 pub struct DatDiskAreaEntry {
     #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
+    pub disks: Vec<DatDiskEntry>,
 }
 
 /// One software-list part and the structural areas declared inside it.
@@ -286,6 +290,10 @@ pub struct DatGameEntry {
     pub is_bios: Option<String>,
     #[serde(default)]
     pub runnable: Option<String>,
+    /// Raw software-list support declaration (`yes`, `partial`, or `no`).
+    /// Preserved as provenance; no completeness semantics are applied yet.
+    #[serde(default)]
+    pub supported: Option<String>,
     #[serde(default)]
     pub disks: Vec<DatDiskEntry>,
     #[serde(default)]
@@ -308,19 +316,17 @@ pub struct DatGameEntry {
     /// Derived EmuWiz annotation. Never changes upstream identity semantics.
     #[serde(default)]
     pub content_classification: DatContentClassification,
-    /// Whether the source parser detected structure that Stage 1 does not
-    /// interpret, or cannot prove the absence of such structure at all.
+    /// Whether the source parser detected structure it could not preserve or
+    /// cannot prove the absence of at all.
     ///
     /// This remains a capability signal even when the raw elements are
-    /// preserved by the additive Stage 2a model. It exists so a
-    /// consumer that cannot safely reason about structure beyond plain
-    /// `<rom>` children - `dat::set`'s Stage 1 completeness classifier,
-    /// currently - can tell that `roms` is not proven to be the whole
-    /// picture of this entry's real content, and refuse to guess.
+    /// preserved by the additive Stage 2 model. Fully represented disks,
+    /// parts, areas, samples, BIOS declarations, and device references do not
+    /// set it; malformed nesting and unrepresented structures still do.
     ///
-    /// `false` is a positive claim ("this parser looked, and found only
-    /// ordinary `<rom>` children"), never a default assumed in the absence
-    /// of evidence. Every entry the ClrMamePro parser produces sets this
+    /// `false` is a positive claim that the parser preserved every structural
+    /// element it recognizes, never a default assumed without evidence. Every
+    /// entry the ClrMamePro parser produces sets this
     /// `true` unconditionally: that parser does not currently attempt to
     /// detect any of this structure, so it cannot honestly claim `false`
     /// for anything.
@@ -344,5 +350,21 @@ pub struct ParsedDat {
 impl ParsedDat {
     pub fn total_roms(&self) -> usize {
         self.games.iter().map(|g| g.rom_count()).sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DatDataAreaEntry, DatDiskAreaEntry};
+
+    #[test]
+    fn area_member_vectors_default_when_deserializing_older_data() {
+        let data_area: DatDataAreaEntry =
+            serde_json::from_str(r#"{"name":"prg"}"#).expect("data area should deserialize");
+        let disk_area: DatDiskAreaEntry =
+            serde_json::from_str(r#"{"name":"cdrom"}"#).expect("disk area should deserialize");
+
+        assert!(data_area.roms.is_empty());
+        assert!(disk_area.disks.is_empty());
     }
 }

@@ -1,4 +1,4 @@
-//! Read-only, format-agnostic DAT set-completeness classification (Stage 1).
+//! Read-only, format-agnostic DAT storage-completeness classification (Stage 2c).
 //!
 //! A **catalogue set** is one DAT `<game>` entry; its members are the entry's
 //! `<rom>` children. This module answers, for one already-audited archive,
@@ -11,7 +11,7 @@
 //! one-to-one whole-archive attribution check. Archive-member paths and names
 //! never become member-level rename proposals.
 //!
-//! # Scope (Stage 1)
+//! # Scope
 //!
 //! Implements the "minimum safe completeness rules" from
 //! `docs/research/SET_COMPLETENESS_MILESTONE_RESEARCH.md` §2:
@@ -34,29 +34,13 @@
 //!   read as "incomplete" on its own), but its mere presence in the DAT
 //!   entry - whether or not this archive happens to contain a member for it
 //!   - makes the set [`SetState::BadMetadata`].
-//! - **R5 — structurally unsupported sets fail closed.** [`SetState::Complete`]
-//!   is allowed only for parser shapes Stage 1 explicitly understands.
-//!   `<part>` and `<dataarea>` are not parsed by this codebase, and every
-//!   structural/relationship signal Stage 1 does track is a provenance
-//!   marker only, never interpreted (see
-//!   [`crate::dat::model::DatGameEntry::unsupported_structure`] and
-//!   [`crate::dat::model::DatRomEntry::loadflag`]). A set is refused into
-//!   [`NeedsReviewReason::UnsupportedSetStructure`], rather than guessed at,
-//!   when its DAT entry: sets `unsupported_structure` (Logiqx: a `<disk>`,
-//!   `<sample>`, `<part>`, `<dataarea>`, or device/dependency-style child was
-//!   detected; ClrMamePro: *unconditionally*, on every entry - see below);
-//!   declares `clone_of` or `sample_of` (a clone/parent relationship Stage 1
-//!   does not implement merge-mode semantics for); contains a `<rom>` with no
-//!   name, no declared size, or no hash; contains a `<rom>` carrying any
-//!   `loadflag` value at all (not just `fill`/`reload` - this codebase
-//!   cannot distinguish a physical-content loadflag from a non-physical one,
-//!   so every value is treated the same, conservatively); contains a `<rom>`
-//!   with a `merge` reference (it belongs to another set's rename group, a
-//!   relationship this module does not model); contains a `<rom>` whose
-//!   trimmed, case-insensitive `status` is a non-empty value that is neither
-//!   `nodump` nor `baddump` (an unrecognised status is never assumed
-//!   ordinary); or declares the same rom name more than once (a single
-//!   verified member could otherwise satisfy two distinct required slots).
+//! - **R5 — classification and unsupported shapes fail closed.** ROMs and
+//!   disks are classified by [`MemberClass`]. Contradictory flags, unknown
+//!   loadflags, malformed member metadata, duplicate evidence-bearing ROM
+//!   names, parser-reported unrepresented structure, and physical disks whose
+//!   presence cannot be established by the ROM evidence stream all refuse a
+//!   confident verdict. Software-list part/dataarea/diskarea ownership is
+//!   traversed without flattening.
 //! - **ClrMamePro is fail-closed unconditionally.** That parser does not
 //!   currently detect *any* of the structure above - no disk/sample/part/
 //!   dataarea/device detection at all - so it cannot honestly claim `false`
@@ -78,7 +62,7 @@
 //! - **R7 — per-archive only.** This module takes one archive's evidence at
 //!   a time and never aggregates across archives; a set split across two
 //!   archives is judged independently in each. Multi-disc/game-scope
-//!   aggregation is explicitly out of Stage 1.
+//!   aggregation is explicitly out of this storage-scoped stage.
 //! - **R8 — a partial pass forbids `Complete` for every set it touches.** Any
 //!   [`ArchivePassCompletion`] other than `Complete` — cancelled, budget-cut,
 //!   a refused member, or the outer file changing mid-pass — means some
@@ -114,7 +98,7 @@
 //! now resolves all of it toward the strictly safer reading stated in R4
 //! above: any DAT-listed baddump, matched or not, blocks `Complete`.
 //!
-//! # What Stage 1 deliberately does not attempt
+//! # What Stage 2c deliberately does not attempt
 //!
 //! - Any change to [`crate::dat::archive`], ZIP/7z sources, or the archive
 //!   evidence shape.
@@ -131,7 +115,7 @@ use serde::Serialize;
 
 use super::archive::ArchivePassCompletion;
 use super::audit::AuditVerdict;
-use super::model::{DatGameEntry, DatRomEntry};
+use super::model::{DatDiskEntry, DatGameEntry, DatRomEntry};
 use super::sources::audit_run::DatArchiveAudit;
 
 /// Durable identity for one catalogue set.
@@ -187,15 +171,14 @@ pub enum NeedsReviewReason {
     /// A member's cryptographic hash matched more than one DAT entry; this
     /// set is one of the candidates and cannot be ruled in or out (R2).
     AmbiguousMemberAttribution,
-    /// The set's DAT entry contains a rom with no name, no declared size, or
-    /// no hash at all - the honest Stage 1 fallback for set shapes this
-    /// parser cannot see fully yet (R5).
+    /// The parser or member shape cannot be represented or verified safely,
+    /// including physical disks until CHD-aware presence evidence exists.
     UnsupportedSetStructure,
     /// The archive's own pass did not finish examining every member, so some
     /// member this set might need was never actually checked (R8).
     PartialArchivePass,
     /// The touched `game_name` is not unique in the DAT: two or more entries
-    /// share it, and Stage 1 has no durable, non-positional way to tell them
+    /// share it, and this stage has no durable, non-positional way to tell them
     /// apart (`SetIdentity` is deliberately never a positional index).
     /// Neither/none of the ambiguous candidates is resolved.
     DuplicateGameName,
@@ -204,19 +187,32 @@ pub enum NeedsReviewReason {
     /// (each enumerates members once, by construction) - this is a defensive
     /// check against a future or malformed producer, not a live case.
     DuplicateArchiveEvidence,
+    /// Mutually exclusive member markers were declared together, or another
+    /// classification field was malformed and cannot be interpreted safely.
+    ContradictoryMemberFlags,
+    /// A ROM carries a loadflag outside the documented software-list set.
+    UnknownLoadflag,
+    /// The software list marks this entry unsupported or partially supported,
+    /// or supplies a malformed support value.
+    UnsupportedSoftware,
+    /// The entry declares no ROMs or disks, so there is no storage set to
+    /// classify.
+    NoDeclaredMembers,
+    /// Every member is optional or non-file, with no required or borrowed
+    /// storage identity anchoring the set.
+    OnlyNonFileOrOptionalMembers,
 }
 
-/// One catalogue set's Stage 1 completeness state.
+/// One catalogue set's storage-completeness state.
 ///
 /// `Complete` is deliberately the least reachable state: every other variant
 /// is what a mixed or partial result degrades to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SetState {
-    /// Every required (non-`nodump`, non-`baddump`) rom was verified present,
-    /// no `nodump` rom exists in the entry, no `baddump` rom exists in the
-    /// entry (matched or not), no member's attribution was ambiguous, and
-    /// the archive pass completed.
+    /// Every locally required physical member was strongly verified, or the
+    /// set declares only borrowed members. This is storage completeness only;
+    /// it does not claim dependencies are resolved or the software runnable.
     Complete,
     /// At least one required rom is absent or was not verified, and nothing
     /// else disqualifies the set outright.
@@ -225,14 +221,14 @@ pub enum SetState {
     NeedsReview(NeedsReviewReason),
 }
 
-/// One `<rom>` that flagged `BadMetadata`, and why.
+/// One ROM or disk that flagged `BadMetadata`, and why.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SetBadMember {
     pub rom_name: String,
     pub reason: BadMetadataReason,
 }
 
-/// One catalogue set's Stage 1 resolution, scoped to a single archive (R7).
+/// One catalogue set's storage resolution, scoped to a single archive (R7).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SetResolution {
     pub identity: SetIdentity,
@@ -246,6 +242,156 @@ pub struct SetResolution {
     /// The subset of `members_required` this archive verified present.
     pub members_verified: Vec<String>,
     pub members_bad: Vec<SetBadMember>,
+    /// Optional physical members that this archive strongly verified.
+    pub members_optional: Vec<String>,
+    /// ROM or disk members borrowed from a parent/dependency set. Resolution
+    /// of those dependencies is deferred to Stage 2d.
+    pub members_borrowed: Vec<String>,
+    /// Physical disks declared locally. S2c cannot verify their presence with
+    /// the current ROM-oriented evidence stream, so such sets fail closed.
+    pub disks_required: Vec<String>,
+}
+
+/// The conceptual role of one ROM or disk declared by a DAT.
+///
+/// Stage 2b classifies provenance; Stage 2c consumes these values to decide
+/// storage completeness without resolving runtime dependencies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemberClass {
+    PhysicalRequired,
+    OptionalPhysical,
+    Borrowed,
+    NonFile,
+    UnverifiableNodump,
+    KnownBad,
+    Contradictory,
+    UnknownLoadflag,
+}
+
+const NON_FILE_LOADFLAGS: &[&str] = &["fill", "reload", "reload_plain", "continue", "ignore"];
+
+const PHYSICAL_LOADFLAGS: &[&str] = &[
+    "load16_byte",
+    "load16_word",
+    "load16_word_swap",
+    "load32_byte",
+    "load32_word",
+    "load32_word_swap",
+    "load32_dword",
+    "load64_word",
+    "load64_word_swap",
+];
+
+/// Classifies one ROM using the Stage 2b precedence table.
+///
+/// This is intentionally a pure function. Invalid empty/unknown status,
+/// optional, or merge values map to [`MemberClass::Contradictory`] so malformed
+/// provenance cannot silently become an ordinary physical member.
+pub fn classify_rom_member(rom: &DatRomEntry) -> MemberClass {
+    let loadflag = rom.loadflag.as_deref().map(str::trim);
+    let is_non_file = loadflag.is_some_and(|value| {
+        NON_FILE_LOADFLAGS
+            .iter()
+            .any(|known| value.eq_ignore_ascii_case(known))
+    });
+
+    if is_non_file && rom.merge.is_some() {
+        return MemberClass::Contradictory;
+    }
+    if is_non_file {
+        return MemberClass::NonFile;
+    }
+    if let Some(loadflag) = loadflag
+        && !PHYSICAL_LOADFLAGS
+            .iter()
+            .any(|known| loadflag.eq_ignore_ascii_case(known))
+    {
+        return MemberClass::UnknownLoadflag;
+    }
+
+    match ordinary_status(&rom.status) {
+        StatusValue::NoDump => return MemberClass::UnverifiableNodump,
+        StatusValue::BadDump => return MemberClass::KnownBad,
+        StatusValue::Malformed => return MemberClass::Contradictory,
+        StatusValue::Ordinary => {}
+    }
+
+    match nonempty_marker(&rom.merge) {
+        MarkerValue::Present => return MemberClass::Borrowed,
+        MarkerValue::Malformed => return MemberClass::Contradictory,
+        MarkerValue::Absent => {}
+    }
+
+    match yes_no_marker(&rom.optional) {
+        MarkerValue::Present => MemberClass::OptionalPhysical,
+        MarkerValue::Malformed => MemberClass::Contradictory,
+        MarkerValue::Absent => MemberClass::PhysicalRequired,
+    }
+}
+
+/// Classifies one disk using the Stage 2b disk precedence table.
+pub fn classify_disk_member(disk: &DatDiskEntry) -> MemberClass {
+    match ordinary_status(&disk.status) {
+        StatusValue::NoDump => return MemberClass::UnverifiableNodump,
+        StatusValue::BadDump => return MemberClass::KnownBad,
+        StatusValue::Malformed => return MemberClass::Contradictory,
+        StatusValue::Ordinary => {}
+    }
+
+    match nonempty_marker(&disk.merge) {
+        MarkerValue::Present => return MemberClass::Borrowed,
+        MarkerValue::Malformed => return MemberClass::Contradictory,
+        MarkerValue::Absent => {}
+    }
+
+    match yes_no_marker(&disk.optional) {
+        MarkerValue::Present => MemberClass::OptionalPhysical,
+        MarkerValue::Malformed => MemberClass::Contradictory,
+        MarkerValue::Absent => MemberClass::PhysicalRequired,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum StatusValue {
+    Ordinary,
+    NoDump,
+    BadDump,
+    Malformed,
+}
+
+#[derive(Clone, Copy)]
+enum MarkerValue {
+    Absent,
+    Present,
+    Malformed,
+}
+
+fn ordinary_status(value: &Option<String>) -> StatusValue {
+    match value.as_deref().map(str::trim) {
+        None => StatusValue::Ordinary,
+        Some(value) if value.eq_ignore_ascii_case("good") => StatusValue::Ordinary,
+        Some(value) if value.eq_ignore_ascii_case("nodump") => StatusValue::NoDump,
+        Some(value) if value.eq_ignore_ascii_case("baddump") => StatusValue::BadDump,
+        Some(_) => StatusValue::Malformed,
+    }
+}
+
+fn nonempty_marker(value: &Option<String>) -> MarkerValue {
+    match value.as_deref().map(str::trim) {
+        None => MarkerValue::Absent,
+        Some("") => MarkerValue::Malformed,
+        Some(_) => MarkerValue::Present,
+    }
+}
+
+fn yes_no_marker(value: &Option<String>) -> MarkerValue {
+    match value.as_deref().map(str::trim) {
+        None => MarkerValue::Absent,
+        Some(value) if value.eq_ignore_ascii_case("yes") => MarkerValue::Present,
+        Some(value) if value.eq_ignore_ascii_case("no") => MarkerValue::Absent,
+        Some(_) => MarkerValue::Malformed,
+    }
 }
 
 #[derive(Default)]
@@ -348,118 +494,82 @@ pub(crate) fn classify_archive_sets(
             [] => continue,
             [only] => *only,
             _ => {
-                resolutions.push(SetResolution {
+                let reason = if archive_pass_complete {
+                    NeedsReviewReason::DuplicateGameName
+                } else {
+                    NeedsReviewReason::PartialArchivePass
+                };
+                resolutions.push(empty_resolution(
                     identity,
-                    archive_path: archive.archive_path.clone(),
-                    state: SetState::NeedsReview(NeedsReviewReason::DuplicateGameName),
-                    members_required: Vec::new(),
-                    members_verified: Vec::new(),
-                    members_bad: Vec::new(),
-                });
+                    &archive.archive_path,
+                    SetState::NeedsReview(reason),
+                ));
                 continue;
             }
         };
 
-        // R5 / item 3 / item 6: a rom with no name, no declared size, or no
-        // hash at all means this set's true membership cannot be reasoned
-        // about honestly. `unsupported_structure` and `loadflag` are
-        // provenance-only markers (see their doc comments on
-        // `DatGameEntry`/`DatRomEntry`): neither is interpreted here beyond
-        // "this entry has structure Stage 1 does not safely understand". A
-        // duplicate required rom name is also refused here rather than
-        // risked (one verified member could otherwise satisfy two distinct
-        // DAT entries that happen to share a name), as is any clone/parent
-        // relationship (`clone_of`/`sample_of`) or `merge` reference - Stage
-        // 1 implements none of MAME's merge-mode semantics, so a rom that
-        // belongs to another set's rename group must not be silently
-        // treated as an ordinary standalone rom - and any rom whose
-        // `status` is a non-empty value this module does not recognise
-        // (trimmed, case-insensitive) at all.
-        let unsupported_structure = game.unsupported_structure
-            || game.clone_of.is_some()
-            || game.sample_of.is_some()
-            || game.roms.iter().any(|rom| {
-                rom.name.trim().is_empty()
-                    || rom.size_bytes.is_none()
-                    || rom.checksums().is_empty()
-                    || rom.loadflag.is_some()
-                    || rom.merge.is_some()
-                    || has_unrecognised_status(rom)
-            })
-            || has_duplicate_rom_names(game);
-        if unsupported_structure {
-            resolutions.push(SetResolution {
-                identity,
-                archive_path: archive.archive_path.clone(),
-                state: SetState::NeedsReview(NeedsReviewReason::UnsupportedSetStructure),
-                members_required: Vec::new(),
-                members_verified: Vec::new(),
-                members_bad: Vec::new(),
-            });
-            continue;
-        }
-
-        // Item 7: the evidence itself is not trustworthy for this set,
-        // independent of what any individual verdict claims.
-        if touch.duplicate_evidence {
-            resolutions.push(SetResolution {
-                identity,
-                archive_path: archive.archive_path.clone(),
-                state: SetState::NeedsReview(NeedsReviewReason::DuplicateArchiveEvidence),
-                members_required: required_rom_names(game),
-                members_verified: verified_required_names(game, &touch.verified_rom_names),
-                members_bad: Vec::new(),
-            });
-            continue;
-        }
-
-        if touch.ambiguous {
-            resolutions.push(SetResolution {
-                identity,
-                archive_path: archive.archive_path.clone(),
-                state: SetState::NeedsReview(NeedsReviewReason::AmbiguousMemberAttribution),
-                members_required: required_rom_names(game),
-                members_verified: verified_required_names(game, &touch.verified_rom_names),
-                members_bad: Vec::new(),
-            });
-            continue;
-        }
+        let classified_roms: Vec<(&DatRomEntry, MemberClass)> = declared_roms(game)
+            .map(|rom| (rom, classify_rom_member(rom)))
+            .collect();
+        let classified_disks: Vec<(&DatDiskEntry, MemberClass)> = declared_disks(game)
+            .map(|disk| (disk, classify_disk_member(disk)))
+            .collect();
 
         let mut members_required = Vec::new();
+        let mut members_optional = Vec::new();
+        let mut members_borrowed = Vec::new();
+        let mut disks_required = Vec::new();
         let mut members_bad = Vec::new();
-        let mut all_required_present = true;
+        let mut has_contradictory = false;
+        let mut has_unknown_loadflag = false;
+        let mut has_non_file_or_optional = false;
 
-        for rom in &game.roms {
-            // Item 6: trimmed before comparison. By this point
-            // `has_unrecognised_status` above has already refused the whole
-            // set if any rom's trimmed status were anything other than
-            // empty/absent/nodump/baddump, so only those four shapes can
-            // reach here.
-            match rom.status.as_deref().map(str::trim) {
-                Some(status) if status.eq_ignore_ascii_case("nodump") => {
+        for (rom, class) in &classified_roms {
+            match class {
+                MemberClass::PhysicalRequired => members_required.push(rom.name.clone()),
+                MemberClass::OptionalPhysical => {
+                    has_non_file_or_optional = true;
+                    if touch.verified_rom_names.contains(&rom.name) {
+                        members_optional.push(rom.name.clone());
+                    }
+                }
+                MemberClass::Borrowed => members_borrowed.push(rom.name.clone()),
+                MemberClass::NonFile => has_non_file_or_optional = true,
+                MemberClass::UnverifiableNodump => {
                     members_bad.push(SetBadMember {
                         rom_name: rom.name.clone(),
                         reason: BadMetadataReason::NoDump,
                     });
                 }
-                Some(status) if status.eq_ignore_ascii_case("baddump") => {
-                    // Conservative Stage 1 rule: any baddump rom the DAT
-                    // lists for this set blocks Complete, matched or not.
-                    // The catalogue already knows this content is bad; an
-                    // archive that simply never contains a member for it is
-                    // not thereby "more complete" than one that does. Still
-                    // excluded from `members_required` (R4's note) - its
-                    // absence alone is not "incomplete", it is bad metadata.
+                MemberClass::KnownBad => {
                     members_bad.push(SetBadMember {
                         rom_name: rom.name.clone(),
                         reason: BadMetadataReason::BadDump,
                     });
                 }
-                _ => {
-                    members_required.push(rom.name.clone());
-                    if !touch.verified_rom_names.contains(&rom.name) {
-                        all_required_present = false;
-                    }
+                MemberClass::Contradictory => has_contradictory = true,
+                MemberClass::UnknownLoadflag => has_unknown_loadflag = true,
+            }
+        }
+
+        for (disk, class) in &classified_disks {
+            let name = disk.name.clone().unwrap_or_default();
+            match class {
+                MemberClass::PhysicalRequired => disks_required.push(name),
+                MemberClass::OptionalPhysical => has_non_file_or_optional = true,
+                MemberClass::Borrowed => members_borrowed.push(name),
+                MemberClass::UnverifiableNodump => members_bad.push(SetBadMember {
+                    rom_name: name,
+                    reason: BadMetadataReason::NoDump,
+                }),
+                MemberClass::KnownBad => members_bad.push(SetBadMember {
+                    rom_name: name,
+                    reason: BadMetadataReason::BadDump,
+                }),
+                MemberClass::Contradictory => has_contradictory = true,
+                MemberClass::NonFile | MemberClass::UnknownLoadflag => {
+                    // Disk classification never produces these variants.
+                    has_contradictory = true;
                 }
             }
         }
@@ -470,6 +580,78 @@ pub(crate) fn classify_archive_sets(
             .cloned()
             .collect();
 
+        // S2c transition 1: an incomplete archive pass invalidates confidence
+        // in every later catalogue/evidence decision. Lists remain available
+        // for diagnostics, but cannot affect the verdict.
+        if !archive_pass_complete {
+            resolutions.push(SetResolution {
+                identity,
+                archive_path: archive.archive_path.clone(),
+                state: SetState::NeedsReview(NeedsReviewReason::PartialArchivePass),
+                members_required,
+                members_verified,
+                members_bad: Vec::new(),
+                members_optional,
+                members_borrowed,
+                disks_required,
+            });
+            continue;
+        }
+
+        // S2c transition 2: state is determined by evidence integrity before
+        // any classification refusal. Member lists are still surfaced for
+        // continuity with Stage 1 diagnostics.
+        let evidence_refusal = if touch.duplicate_evidence {
+            Some(NeedsReviewReason::DuplicateArchiveEvidence)
+        } else if touch.ambiguous {
+            Some(NeedsReviewReason::AmbiguousMemberAttribution)
+        } else {
+            None
+        };
+        if let Some(reason) = evidence_refusal {
+            resolutions.push(SetResolution {
+                identity,
+                archive_path: archive.archive_path.clone(),
+                state: SetState::NeedsReview(reason),
+                members_required,
+                members_verified,
+                members_bad: Vec::new(),
+                members_optional,
+                members_borrowed,
+                disks_required,
+            });
+            continue;
+        }
+
+        // S2c transition 3: classification contradictions are more specific
+        // than the general structural refusal below.
+        let classification_refusal = if has_contradictory {
+            Some(NeedsReviewReason::ContradictoryMemberFlags)
+        } else if has_unknown_loadflag {
+            Some(NeedsReviewReason::UnknownLoadflag)
+        } else {
+            None
+        };
+
+        // Physical disks require CHD-aware presence evidence that the current
+        // ROM verdict stream cannot provide. Guessing from a filename (MAME
+        // disk names may omit `.chd`) would create false Complete verdicts.
+        let unsupported_structure = game.unsupported_structure
+            || has_unsupported_member_shape(&classified_roms, &classified_disks)
+            || has_duplicate_evidence_names(&classified_roms)
+            || !disks_required.is_empty();
+
+        let supported_refusal = match game.supported.as_deref().map(str::trim) {
+            None => None,
+            Some(value) if value.eq_ignore_ascii_case("yes") => None,
+            Some(value)
+                if value.eq_ignore_ascii_case("no") || value.eq_ignore_ascii_case("partial") =>
+            {
+                Some(NeedsReviewReason::UnsupportedSoftware)
+            }
+            Some(_) => Some(NeedsReviewReason::UnsupportedSoftware),
+        };
+
         let has_nodump = members_bad
             .iter()
             .any(|bad| bad.reason == BadMetadataReason::NoDump);
@@ -477,15 +659,30 @@ pub(crate) fn classify_archive_sets(
             .iter()
             .any(|bad| bad.reason == BadMetadataReason::BadDump);
 
-        // Order matches the research's state machine (§4) exactly: a partial
-        // pass is checked first because it can invalidate confidence in
-        // every later check, not just "is a member missing".
-        let state = if !archive_pass_complete {
-            SetState::NeedsReview(NeedsReviewReason::PartialArchivePass)
+        let no_declared_members = classified_roms.is_empty() && classified_disks.is_empty();
+        let only_non_file_or_optional = members_required.is_empty()
+            && members_borrowed.is_empty()
+            && has_non_file_or_optional
+            && !has_nodump
+            && !has_baddump;
+        let all_required_present = members_required
+            .iter()
+            .all(|name| touch.verified_rom_names.contains(name));
+
+        let state = if let Some(reason) = classification_refusal {
+            SetState::NeedsReview(reason)
+        } else if unsupported_structure {
+            SetState::NeedsReview(NeedsReviewReason::UnsupportedSetStructure)
+        } else if let Some(reason) = supported_refusal {
+            SetState::NeedsReview(reason)
         } else if has_nodump {
             SetState::BadMetadata(BadMetadataReason::NoDump)
         } else if has_baddump {
             SetState::BadMetadata(BadMetadataReason::BadDump)
+        } else if no_declared_members {
+            SetState::NeedsReview(NeedsReviewReason::NoDeclaredMembers)
+        } else if only_non_file_or_optional {
+            SetState::NeedsReview(NeedsReviewReason::OnlyNonFileOrOptionalMembers)
         } else if !all_required_present {
             SetState::Incomplete
         } else {
@@ -499,62 +696,82 @@ pub(crate) fn classify_archive_sets(
             members_required,
             members_verified,
             members_bad,
+            members_optional,
+            members_borrowed,
+            disks_required,
         });
     }
     resolutions
 }
 
-/// Whether `game` declares the same rom name more than once.
-///
-/// A single verified archive member is keyed by DAT rom name (see the module
-/// doc); if the DAT itself lists a name twice, one member matching that name
-/// would otherwise silently satisfy both slots, even when the archive only
-/// truly contains one of the two "required" copies. Treated as unsupported
-/// structure (R5) rather than guessed at - this is malformed/unusual DAT
-/// data, not a shape Stage 1 has a safe answer for.
-fn has_duplicate_rom_names(game: &DatGameEntry) -> bool {
-    let mut seen = HashSet::with_capacity(game.roms.len());
-    game.roms.iter().any(|rom| !seen.insert(rom.name.as_str()))
-}
-
-/// Whether `rom`'s status (trimmed, case-insensitive) is a non-empty value
-/// this module does not recognise.
-///
-/// Item 6: an absent status and an empty-after-trim status are both treated
-/// as "ordinary" (no metadata claim at all), exactly as before. `nodump` and
-/// `baddump` are the only non-empty values Stage 1 understands. Anything
-/// else - a typo, a value from a DAT dialect this codebase has never seen,
-/// deliberately malformed input - is not silently assumed ordinary; the
-/// whole set fails closed into `UnsupportedSetStructure` instead.
-fn has_unrecognised_status(rom: &DatRomEntry) -> bool {
-    match rom.status.as_deref().map(str::trim) {
-        None => false,
-        Some(status) => {
-            !status.is_empty()
-                && !status.eq_ignore_ascii_case("nodump")
-                && !status.eq_ignore_ascii_case("baddump")
-        }
+fn empty_resolution(
+    identity: SetIdentity,
+    archive_path: &std::path::Path,
+    state: SetState,
+) -> SetResolution {
+    SetResolution {
+        identity,
+        archive_path: archive_path.to_path_buf(),
+        state,
+        members_required: Vec::new(),
+        members_verified: Vec::new(),
+        members_bad: Vec::new(),
+        members_optional: Vec::new(),
+        members_borrowed: Vec::new(),
+        disks_required: Vec::new(),
     }
 }
 
-/// Rom names required for `Complete` (excludes `nodump`/`baddump`), DAT order.
-fn required_rom_names(game: &DatGameEntry) -> Vec<String> {
-    game.roms
-        .iter()
-        .filter(|rom| {
-            !rom.status.as_deref().is_some_and(|status| {
-                status.eq_ignore_ascii_case("nodump") || status.eq_ignore_ascii_case("baddump")
-            })
-        })
-        .map(|rom| rom.name.clone())
-        .collect()
+fn declared_roms(game: &DatGameEntry) -> impl Iterator<Item = &DatRomEntry> {
+    game.roms.iter().chain(
+        game.parts
+            .iter()
+            .flat_map(|part| part.data_areas.iter().flat_map(|area| area.roms.iter())),
+    )
 }
 
-fn verified_required_names(game: &DatGameEntry, verified: &HashSet<String>) -> Vec<String> {
-    required_rom_names(game)
-        .into_iter()
-        .filter(|name| verified.contains(name))
-        .collect()
+fn declared_disks(game: &DatGameEntry) -> impl Iterator<Item = &DatDiskEntry> {
+    game.disks.iter().chain(
+        game.parts
+            .iter()
+            .flat_map(|part| part.disk_areas.iter().flat_map(|area| area.disks.iter())),
+    )
+}
+
+fn has_unsupported_member_shape(
+    roms: &[(&DatRomEntry, MemberClass)],
+    disks: &[(&DatDiskEntry, MemberClass)],
+) -> bool {
+    let invalid_rom = roms.iter().any(|(rom, class)| match class {
+        MemberClass::PhysicalRequired | MemberClass::OptionalPhysical | MemberClass::Borrowed => {
+            rom.name.trim().is_empty() || rom.size_bytes.is_none() || rom.checksums().is_empty()
+        }
+        MemberClass::UnverifiableNodump | MemberClass::KnownBad => rom.name.trim().is_empty(),
+        MemberClass::NonFile | MemberClass::Contradictory | MemberClass::UnknownLoadflag => false,
+    });
+    let invalid_disk = disks.iter().any(|(disk, _)| {
+        disk.name
+            .as_deref()
+            .is_none_or(|name| name.trim().is_empty())
+    });
+    invalid_rom || invalid_disk
+}
+
+/// Prevents one exact ROM verdict from satisfying two file-bearing slots.
+/// Unnamed/non-file instructions are deliberately excluded: they require no
+/// archive evidence and commonly repeat an empty name in software lists.
+fn has_duplicate_evidence_names(roms: &[(&DatRomEntry, MemberClass)]) -> bool {
+    let mut seen = HashSet::with_capacity(roms.len());
+    roms.iter()
+        .filter(|(_, class)| {
+            matches!(
+                class,
+                MemberClass::PhysicalRequired
+                    | MemberClass::OptionalPhysical
+                    | MemberClass::Borrowed
+            )
+        })
+        .any(|(rom, _)| !seen.insert(rom.name.as_str()))
 }
 
 #[cfg(test)]
@@ -563,8 +780,209 @@ mod tests {
     use crate::dat::archive::{
         ArchiveMemberEvidence, ArchiveMemberHashes, ArchiveMemberStatus, ArchivePassStopReason,
     };
-    use crate::dat::model::DatRomEntry;
+    use crate::dat::model::{DatDataAreaEntry, DatPartEntry, DatRomEntry};
     use crate::dat::sources::audit_run::DatArchiveMemberAudit;
+
+    mod member_classification {
+        use super::*;
+
+        fn classified_rom(
+            loadflag: Option<&str>,
+            status: Option<&str>,
+            merge: Option<&str>,
+            optional: Option<&str>,
+        ) -> DatRomEntry {
+            DatRomEntry {
+                name: "member.bin".to_string(),
+                loadflag: loadflag.map(str::to_string),
+                status: status.map(str::to_string),
+                merge: merge.map(str::to_string),
+                optional: optional.map(str::to_string),
+                ..Default::default()
+            }
+        }
+
+        fn classified_disk(
+            status: Option<&str>,
+            merge: Option<&str>,
+            optional: Option<&str>,
+        ) -> DatDiskEntry {
+            DatDiskEntry {
+                name: Some("member.chd".to_string()),
+                status: status.map(str::to_string),
+                merge: merge.map(str::to_string),
+                optional: optional.map(str::to_string),
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn ordinary_rom_is_physical_required() {
+            assert_eq!(
+                classify_rom_member(&classified_rom(None, None, None, None)),
+                MemberClass::PhysicalRequired
+            );
+            assert_eq!(
+                classify_rom_member(&classified_rom(None, Some("GOOD"), None, Some("no"))),
+                MemberClass::PhysicalRequired
+            );
+        }
+
+        #[test]
+        fn every_documented_physical_loadflag_stays_physical_required() {
+            for loadflag in PHYSICAL_LOADFLAGS {
+                assert_eq!(
+                    classify_rom_member(&classified_rom(Some(loadflag), None, None, None)),
+                    MemberClass::PhysicalRequired,
+                    "{loadflag} must describe a physical ROM"
+                );
+            }
+        }
+
+        #[test]
+        fn every_documented_non_file_loadflag_is_non_file() {
+            for loadflag in NON_FILE_LOADFLAGS {
+                assert_eq!(
+                    classify_rom_member(&classified_rom(Some(loadflag), None, None, None)),
+                    MemberClass::NonFile,
+                    "{loadflag} must not claim a physical file"
+                );
+            }
+        }
+
+        #[test]
+        fn unknown_loadflag_fails_closed() {
+            assert_eq!(
+                classify_rom_member(&classified_rom(Some("bogus"), None, None, None)),
+                MemberClass::UnknownLoadflag
+            );
+            assert_eq!(
+                classify_rom_member(&classified_rom(Some("  "), None, None, None)),
+                MemberClass::UnknownLoadflag
+            );
+        }
+
+        #[test]
+        fn merge_classifies_rom_as_borrowed() {
+            assert_eq!(
+                classify_rom_member(&classified_rom(None, None, Some("parent.bin"), None)),
+                MemberClass::Borrowed
+            );
+        }
+
+        #[test]
+        fn merge_with_non_file_loadflag_is_contradictory() {
+            assert_eq!(
+                classify_rom_member(&classified_rom(
+                    Some("fill"),
+                    None,
+                    Some("parent.bin"),
+                    None,
+                )),
+                MemberClass::Contradictory
+            );
+        }
+
+        #[test]
+        fn optional_yes_classifies_rom_as_optional_physical() {
+            assert_eq!(
+                classify_rom_member(&classified_rom(None, None, None, Some("YES"))),
+                MemberClass::OptionalPhysical
+            );
+        }
+
+        #[test]
+        fn rom_dump_statuses_are_case_insensitive() {
+            assert_eq!(
+                classify_rom_member(&classified_rom(None, Some("NoDump"), None, None)),
+                MemberClass::UnverifiableNodump
+            );
+            assert_eq!(
+                classify_rom_member(&classified_rom(None, Some("BADdump"), None, None)),
+                MemberClass::KnownBad
+            );
+        }
+
+        #[test]
+        fn rom_dump_status_precedes_merge_and_optional() {
+            assert_eq!(
+                classify_rom_member(&classified_rom(
+                    None,
+                    Some("nodump"),
+                    Some("parent.bin"),
+                    Some("yes"),
+                )),
+                MemberClass::UnverifiableNodump
+            );
+            assert_eq!(
+                classify_rom_member(&classified_rom(
+                    None,
+                    Some("baddump"),
+                    Some("parent.bin"),
+                    Some("yes"),
+                )),
+                MemberClass::KnownBad
+            );
+        }
+
+        #[test]
+        fn malformed_rom_status_optional_and_merge_fail_closed() {
+            for rom in [
+                classified_rom(None, Some(""), None, None),
+                classified_rom(None, Some("mystery"), None, None),
+                classified_rom(None, None, None, Some("")),
+                classified_rom(None, None, None, Some("maybe")),
+                classified_rom(None, None, Some(""), None),
+            ] {
+                assert_eq!(classify_rom_member(&rom), MemberClass::Contradictory);
+            }
+        }
+
+        #[test]
+        fn disk_classification_uses_status_merge_optional_precedence() {
+            assert_eq!(
+                classify_disk_member(&classified_disk(None, None, None)),
+                MemberClass::PhysicalRequired
+            );
+            assert_eq!(
+                classify_disk_member(&classified_disk(None, None, Some("yes"))),
+                MemberClass::OptionalPhysical
+            );
+            assert_eq!(
+                classify_disk_member(&classified_disk(None, Some("parent.chd"), Some("yes"))),
+                MemberClass::Borrowed
+            );
+            assert_eq!(
+                classify_disk_member(&classified_disk(
+                    Some("nodump"),
+                    Some("parent.chd"),
+                    Some("yes"),
+                )),
+                MemberClass::UnverifiableNodump
+            );
+            assert_eq!(
+                classify_disk_member(&classified_disk(
+                    Some("baddump"),
+                    Some("parent.chd"),
+                    Some("yes"),
+                )),
+                MemberClass::KnownBad
+            );
+        }
+
+        #[test]
+        fn malformed_disk_status_optional_and_merge_fail_closed() {
+            for disk in [
+                classified_disk(Some(""), None, None),
+                classified_disk(Some("mystery"), None, None),
+                classified_disk(None, None, Some("")),
+                classified_disk(None, None, Some("maybe")),
+                classified_disk(None, Some(""), None),
+            ] {
+                assert_eq!(classify_disk_member(&disk), MemberClass::Contradictory);
+            }
+        }
+    }
 
     fn rom(name: &str, status: Option<&str>) -> DatRomEntry {
         DatRomEntry {
@@ -864,14 +1282,13 @@ mod tests {
     }
 
     #[test]
-    fn a_game_with_disk_entries_can_never_become_complete() {
-        // Every visible <rom> is genuinely present and verified; the entry
-        // also had <disk> children the parser could not represent. Even
-        // though `roms` alone looks completely satisfied, the set must not
-        // be reported Complete - `roms` is known to not be the whole
-        // picture for this entry.
+    fn a_physical_disk_fails_closed_without_chd_presence_evidence() {
         let mut disc_game = game("Disc Game (World)", vec![rom("game.cue", None)]);
-        disc_game.unsupported_structure = true;
+        disc_game.disks.push(DatDiskEntry {
+            name: Some("game".to_string()),
+            sha1: Some("da39a3ee5e6b4b0d3255bfef95601890afd80709".to_string()),
+            ..Default::default()
+        });
         let games = vec![disc_game];
         let members = vec![exact_member(0, "game.cue", "Disc Game (World)", "game.cue")];
         let audit = archive(members, complete_pass());
@@ -882,17 +1299,61 @@ mod tests {
         assert_eq!(
             resolutions[0].state,
             SetState::NeedsReview(NeedsReviewReason::UnsupportedSetStructure),
-            "a DAT entry with <disk> children must never reach Complete from its <rom>s alone"
+            "ROM evidence cannot safely prove CHD presence"
         );
+        assert_eq!(resolutions[0].disks_required, vec!["game"]);
     }
 
     #[test]
-    fn a_rom_with_any_loadflag_value_can_never_become_complete() {
-        // Deliberately not "fill" or "reload" specifically: this codebase
-        // cannot tell a non-physical loadflag from a physical one, so every
-        // value is treated the same, conservatively. The rom otherwise has
-        // full, well-formed name/size/hash metadata and IS verified present
-        // - only the loadflag marks it as not an ordinary physical ROM.
+    fn borrowed_and_bad_metadata_disks_use_storage_classification() {
+        let cases = [
+            (
+                DatDiskEntry {
+                    name: Some("parent-disk".to_string()),
+                    merge: Some("parent.chd".to_string()),
+                    ..Default::default()
+                },
+                SetState::Complete,
+            ),
+            (
+                DatDiskEntry {
+                    name: Some("unknown-disk".to_string()),
+                    status: Some("nodump".to_string()),
+                    ..Default::default()
+                },
+                SetState::BadMetadata(BadMetadataReason::NoDump),
+            ),
+            (
+                DatDiskEntry {
+                    name: Some("bad-disk".to_string()),
+                    status: Some("baddump".to_string()),
+                    ..Default::default()
+                },
+                SetState::BadMetadata(BadMetadataReason::BadDump),
+            ),
+        ];
+
+        for (disk, expected) in cases {
+            let disk_name = disk.name.clone().unwrap();
+            let mut disk_game = game("Disk Metadata", vec![rom("anchor.bin", None)]);
+            disk_game.disks.push(disk);
+            let games = vec![disk_game];
+            let audit = archive(
+                vec![exact_member(0, "anchor.bin", "Disk Metadata", "anchor.bin")],
+                complete_pass(),
+            );
+
+            let resolutions = classify_archive_sets(&audit, &games, "collection");
+
+            assert_eq!(resolutions[0].state, expected);
+            if expected == SetState::Complete {
+                assert_eq!(resolutions[0].members_borrowed, vec![disk_name]);
+            }
+        }
+    }
+
+    #[test]
+    fn a_non_file_loadflag_is_excluded_from_required_members() {
         let mut fill_rom = rom("fill.bin", None);
         fill_rom.loadflag = Some("fill".to_string());
         let games = vec![game("mame-set", vec![fill_rom, rom("gfx.bin", None)])];
@@ -905,12 +1366,9 @@ mod tests {
         let resolutions = classify_archive_sets(&audit, &games, "collection");
 
         assert_eq!(resolutions.len(), 1);
-        assert_eq!(
-            resolutions[0].state,
-            SetState::NeedsReview(NeedsReviewReason::UnsupportedSetStructure),
-            "a rom with any loadflag value must never reach Complete, even when it has \
-             complete-looking name/size/hash metadata and was itself verified present"
-        );
+        assert_eq!(resolutions[0].state, SetState::Complete);
+        assert_eq!(resolutions[0].members_required, vec!["gfx.bin"]);
+        assert_eq!(resolutions[0].members_verified, vec!["gfx.bin"]);
     }
 
     #[test]
@@ -1060,7 +1518,7 @@ mod tests {
     }
 
     #[test]
-    fn a_clone_of_relationship_refuses_the_set() {
+    fn clone_relationship_is_deferred_without_blocking_storage_complete() {
         let mut clone_game = game("Clone (USA)", vec![rom("game.bin", None)]);
         clone_game.clone_of = Some("Parent (World)".to_string());
         let games = vec![clone_game];
@@ -1070,15 +1528,11 @@ mod tests {
         let resolutions = classify_archive_sets(&audit, &games, "collection");
 
         assert_eq!(resolutions.len(), 1);
-        assert_eq!(
-            resolutions[0].state,
-            SetState::NeedsReview(NeedsReviewReason::UnsupportedSetStructure),
-            "Stage 1 implements no clone/parent merge-mode semantics"
-        );
+        assert_eq!(resolutions[0].state, SetState::Complete);
     }
 
     #[test]
-    fn a_sample_of_relationship_refuses_the_set() {
+    fn sample_relationship_is_deferred_without_blocking_storage_complete() {
         let mut sample_game = game("Game With Samples", vec![rom("game.bin", None)]);
         sample_game.sample_of = Some("samples".to_string());
         let games = vec![sample_game];
@@ -1088,14 +1542,11 @@ mod tests {
         let resolutions = classify_archive_sets(&audit, &games, "collection");
 
         assert_eq!(resolutions.len(), 1);
-        assert_eq!(
-            resolutions[0].state,
-            SetState::NeedsReview(NeedsReviewReason::UnsupportedSetStructure)
-        );
+        assert_eq!(resolutions[0].state, SetState::Complete);
     }
 
     #[test]
-    fn a_rom_merge_reference_refuses_the_set() {
+    fn all_borrowed_merged_clone_is_storage_complete_and_surfaces_dependency() {
         let mut merged_rom = rom("shared.bin", None);
         merged_rom.merge = Some("parent.bin".to_string());
         let games = vec![game("Merged Set", vec![merged_rom])];
@@ -1105,11 +1556,206 @@ mod tests {
         let resolutions = classify_archive_sets(&audit, &games, "collection");
 
         assert_eq!(resolutions.len(), 1);
+        assert_eq!(resolutions[0].state, SetState::Complete);
+        assert!(resolutions[0].members_required.is_empty());
+        assert_eq!(resolutions[0].members_borrowed, vec!["shared.bin"]);
+    }
+
+    #[test]
+    fn optional_absence_does_not_make_a_required_set_incomplete() {
+        let mut optional = rom("bonus.bin", None);
+        optional.optional = Some("yes".to_string());
+        let games = vec![game("Optional Set", vec![rom("game.bin", None), optional])];
+        let audit = archive(
+            vec![exact_member(0, "game.bin", "Optional Set", "game.bin")],
+            complete_pass(),
+        );
+
+        let resolutions = classify_archive_sets(&audit, &games, "collection");
+
+        assert_eq!(resolutions[0].state, SetState::Complete);
+        assert_eq!(resolutions[0].members_required, vec!["game.bin"]);
+        assert!(resolutions[0].members_optional.is_empty());
+    }
+
+    #[test]
+    fn verified_optional_member_is_surfaced_separately() {
+        let mut optional = rom("bonus.bin", None);
+        optional.optional = Some("yes".to_string());
+        let games = vec![game("Optional Set", vec![rom("game.bin", None), optional])];
+        let audit = archive(
+            vec![
+                exact_member(0, "game.bin", "Optional Set", "game.bin"),
+                exact_member(1, "bonus.bin", "Optional Set", "bonus.bin"),
+            ],
+            complete_pass(),
+        );
+
+        let resolutions = classify_archive_sets(&audit, &games, "collection");
+
+        assert_eq!(resolutions[0].state, SetState::Complete);
+        assert_eq!(resolutions[0].members_verified, vec!["game.bin"]);
+        assert_eq!(resolutions[0].members_optional, vec!["bonus.bin"]);
+    }
+
+    #[test]
+    fn optional_member_cannot_satisfy_a_required_slot_with_the_same_name() {
+        let mut optional = rom("same.bin", None);
+        optional.optional = Some("yes".to_string());
+        let games = vec![game(
+            "Duplicate Role",
+            vec![rom("same.bin", None), optional],
+        )];
+        let audit = archive(
+            vec![exact_member(0, "same.bin", "Duplicate Role", "same.bin")],
+            complete_pass(),
+        );
+
+        let resolutions = classify_archive_sets(&audit, &games, "collection");
+
         assert_eq!(
             resolutions[0].state,
-            SetState::NeedsReview(NeedsReviewReason::UnsupportedSetStructure),
-            "a rom belonging to another set's rename group must not be treated as ordinary"
+            SetState::NeedsReview(NeedsReviewReason::UnsupportedSetStructure)
         );
+    }
+
+    #[test]
+    fn split_clone_is_complete_when_unique_rom_is_verified() {
+        let mut borrowed = rom("shared.bin", None);
+        borrowed.merge = Some("parent.bin".to_string());
+        let games = vec![game("Split Clone", vec![rom("unique.bin", None), borrowed])];
+        let audit = archive(
+            vec![exact_member(0, "unique.bin", "Split Clone", "unique.bin")],
+            complete_pass(),
+        );
+
+        let resolutions = classify_archive_sets(&audit, &games, "collection");
+
+        assert_eq!(resolutions[0].state, SetState::Complete);
+        assert_eq!(resolutions[0].members_required, vec!["unique.bin"]);
+        assert_eq!(resolutions[0].members_borrowed, vec!["shared.bin"]);
+    }
+
+    #[test]
+    fn nested_dataarea_rom_participates_without_flattening() {
+        let mut software = game("Nested Software", Vec::new());
+        software.parts.push(DatPartEntry {
+            name: Some("cart".to_string()),
+            data_areas: vec![DatDataAreaEntry {
+                name: Some("prg".to_string()),
+                roms: vec![rom("program.bin", None)],
+            }],
+            ..Default::default()
+        });
+        let games = vec![software];
+        let audit = archive(
+            vec![exact_member(
+                0,
+                "program.bin",
+                "Nested Software",
+                "program.bin",
+            )],
+            complete_pass(),
+        );
+
+        let resolutions = classify_archive_sets(&audit, &games, "collection");
+
+        assert_eq!(resolutions[0].state, SetState::Complete);
+        assert_eq!(resolutions[0].members_required, vec!["program.bin"]);
+    }
+
+    #[test]
+    fn unknown_loadflag_uses_specific_needs_review_reason() {
+        let mut unknown = rom("game.bin", None);
+        unknown.loadflag = Some("mystery".to_string());
+        let games = vec![game("Unknown Load", vec![unknown])];
+        let audit = archive(
+            vec![exact_member(0, "game.bin", "Unknown Load", "game.bin")],
+            complete_pass(),
+        );
+
+        let resolutions = classify_archive_sets(&audit, &games, "collection");
+
+        assert_eq!(
+            resolutions[0].state,
+            SetState::NeedsReview(NeedsReviewReason::UnknownLoadflag)
+        );
+    }
+
+    #[test]
+    fn non_file_with_merge_uses_specific_contradiction_reason() {
+        let mut contradictory = rom("fill.bin", None);
+        contradictory.loadflag = Some("fill".to_string());
+        contradictory.merge = Some("parent.bin".to_string());
+        let games = vec![game("Contradictory", vec![contradictory])];
+        let audit = archive(
+            vec![exact_member(0, "fill.bin", "Contradictory", "fill.bin")],
+            complete_pass(),
+        );
+
+        let resolutions = classify_archive_sets(&audit, &games, "collection");
+
+        assert_eq!(
+            resolutions[0].state,
+            SetState::NeedsReview(NeedsReviewReason::ContradictoryMemberFlags)
+        );
+    }
+
+    #[test]
+    fn touched_entry_with_no_declared_members_needs_review() {
+        let games = vec![game("Empty Set", Vec::new())];
+        let audit = archive(
+            vec![exact_member(0, "orphan.bin", "Empty Set", "orphan.bin")],
+            complete_pass(),
+        );
+
+        let resolutions = classify_archive_sets(&audit, &games, "collection");
+
+        assert_eq!(
+            resolutions[0].state,
+            SetState::NeedsReview(NeedsReviewReason::NoDeclaredMembers)
+        );
+    }
+
+    #[test]
+    fn only_optional_and_non_file_members_need_review() {
+        let mut optional = rom("bonus.bin", None);
+        optional.optional = Some("yes".to_string());
+        let mut fill = rom("", None);
+        fill.loadflag = Some("fill".to_string());
+        let games = vec![game("Metadata Only", vec![optional, fill])];
+        let audit = archive(
+            vec![exact_member(0, "bonus.bin", "Metadata Only", "bonus.bin")],
+            complete_pass(),
+        );
+
+        let resolutions = classify_archive_sets(&audit, &games, "collection");
+
+        assert_eq!(
+            resolutions[0].state,
+            SetState::NeedsReview(NeedsReviewReason::OnlyNonFileOrOptionalMembers)
+        );
+    }
+
+    #[test]
+    fn unsupported_and_malformed_software_support_values_fail_closed() {
+        for supported in ["no", "partial", "mystery", ""] {
+            let mut software = game("Software", vec![rom("game.bin", None)]);
+            software.supported = Some(supported.to_string());
+            let games = vec![software];
+            let audit = archive(
+                vec![exact_member(0, "game.bin", "Software", "game.bin")],
+                complete_pass(),
+            );
+
+            let resolutions = classify_archive_sets(&audit, &games, "collection");
+
+            assert_eq!(
+                resolutions[0].state,
+                SetState::NeedsReview(NeedsReviewReason::UnsupportedSoftware),
+                "supported={supported:?} must fail closed"
+            );
+        }
     }
 
     #[test]
@@ -1173,15 +1819,13 @@ mod tests {
         assert_eq!(resolutions.len(), 1);
         assert_eq!(
             resolutions[0].state,
-            SetState::NeedsReview(NeedsReviewReason::UnsupportedSetStructure),
+            SetState::NeedsReview(NeedsReviewReason::ContradictoryMemberFlags),
             "an unrecognised status value must fail closed, not be assumed an ordinary rom"
         );
     }
 
     #[test]
-    fn an_empty_status_string_is_treated_as_ordinary() {
-        // Contrast with the test above: empty-after-trim is "no status
-        // claim at all", same as an absent status - not unrecognised.
+    fn an_empty_status_string_fails_closed() {
         let games = vec![game("Game (World)", vec![rom("game.bin", Some("   "))])];
         let members = vec![exact_member(0, "game.bin", "Game (World)", "game.bin")];
         let audit = archive(members, complete_pass());
@@ -1189,7 +1833,10 @@ mod tests {
         let resolutions = classify_archive_sets(&audit, &games, "collection");
 
         assert_eq!(resolutions.len(), 1);
-        assert_eq!(resolutions[0].state, SetState::Complete);
+        assert_eq!(
+            resolutions[0].state,
+            SetState::NeedsReview(NeedsReviewReason::ContradictoryMemberFlags)
+        );
     }
 
     #[test]

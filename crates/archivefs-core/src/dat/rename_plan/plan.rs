@@ -1548,6 +1548,9 @@ mod tests {
             members_required: members.clone(),
             members_verified: members,
             members_bad: Vec::new(),
+            members_optional: Vec::new(),
+            members_borrowed: Vec::new(),
+            disks_required: Vec::new(),
         }
     }
 
