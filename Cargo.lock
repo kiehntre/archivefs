@@ -135,6 +135,7 @@ dependencies = [
  "image",
  "log",
  "rfd",
+ "serde_json",
  "time",
 ]
 

@@ -51,8 +51,9 @@ use super::adapter::repair_proposal_from_suggested_rename;
 use super::execute::{
     RepairExecutionError, RepairExecutionOptions, RepairTransactionResult, execute_repair_plan,
 };
-use super::plan::{RepairPlan, RepairPlanId, build_repair_plan};
+use super::plan::{RepairPlan, RepairPlanId, build_repair_plan, select_repair_plan_subset};
 use super::preflight::{RepairPreflightReport, run_repair_preflight};
+use super::proposal::RepairProposalId;
 
 /// The organisation profile a whole-library scan plans for.
 ///
@@ -718,6 +719,106 @@ pub fn apply_saved_plan(
     options: &RepairExecutionOptions,
     cancel: &AtomicBool,
 ) -> Result<RepairTransactionResult, ApplySavedPlanError> {
+    // Re-run the authoritative scan over the trusted inputs. The trusted roots
+    // come from `options`, never from the saved plan.
+    let fresh = rescan_for_saved_plan(saved, root, dat, &options.trusted, cancel)
+        .map_err(ApplySavedPlanError::Scan)?;
+
+    // Re-prove: the saved plan must be independently reproducible.
+    re_prove_saved_plan(saved, &fresh).map_err(ApplySavedPlanError::NotAuthorized)?;
+
+    // Execute the freshly authorized plan (not the saved plan's proposals).
+    execute_repair_plan(&fresh.repair_plan, current_generation, options, cancel)
+        .map_err(ApplySavedPlanError::Execute)
+}
+
+/// Why a user-selected subset of a saved plan could not be independently
+/// re-proven and applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApplySavedPlanSelectedError {
+    /// The authoritative re-scan failed.
+    Scan(LibraryScanError),
+    /// The saved plan's executable proposals could not be independently
+    /// reproduced from the trusted scan inputs. Nothing was executed. Exactly
+    /// the same full-plan check [`apply_saved_plan`] performs — selection
+    /// never weakens it.
+    NotAuthorized(String),
+    /// The selected ids could not be resolved into a safe, executable subset
+    /// of the freshly proven plan: empty selection, an unknown id, a
+    /// duplicate id, a not-Safe proposal, or any conflict anywhere in the
+    /// fresh plan (even one that does not touch a selected proposal).
+    InvalidSelection(String),
+    /// The Repair Center executor refused the freshly re-proven subset.
+    Execute(RepairExecutionError),
+}
+
+impl std::fmt::Display for ApplySavedPlanSelectedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Scan(error) => write!(f, "re-scan failed: {error}"),
+            Self::NotAuthorized(detail) => write!(f, "saved plan is not authorized: {detail}"),
+            Self::InvalidSelection(detail) => {
+                write!(
+                    f,
+                    "selected proposals could not be safely applied: {detail}"
+                )
+            }
+            Self::Execute(error) => write!(f, "repair apply failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ApplySavedPlanSelectedError {}
+
+/// Applies only a caller-selected subset of a saved plan's proposals, through
+/// the same full-plan trust boundary [`apply_saved_plan`] uses.
+///
+/// The saved plan is *never* executed directly and selection is *never*
+/// resolved against saved-plan data:
+///
+/// 1. The authoritative scan is re-run from `root` and `dat` (never the saved
+///    plan's recorded paths).
+/// 2. The **entire** saved plan is re-proven against that fresh scan via
+///    [`re_prove_saved_plan`] — unchanged, unweakened. A tampered saved
+///    proposal refuses here even if it was never selected.
+/// 3. Only once the full plan is proven equivalent are `selected_ids`
+///    resolved — against the **fresh** plan's proposals only
+///    ([`select_repair_plan_subset`]), never against the saved JSON.
+/// 4. The resulting subset [`RepairPlan`] is executed through the ordinary
+///    Repair Center executor, with every identity, conflict, journal,
+///    rollback, and reverify guarantee intact.
+pub fn apply_saved_plan_selected(
+    saved: &LibraryRepairPlan,
+    root: &Path,
+    dat: &Path,
+    current_generation: u64,
+    selected_ids: &[RepairProposalId],
+    options: &RepairExecutionOptions,
+    cancel: &AtomicBool,
+) -> Result<RepairTransactionResult, ApplySavedPlanSelectedError> {
+    let fresh = rescan_for_saved_plan(saved, root, dat, &options.trusted, cancel)
+        .map_err(ApplySavedPlanSelectedError::Scan)?;
+
+    re_prove_saved_plan(saved, &fresh).map_err(ApplySavedPlanSelectedError::NotAuthorized)?;
+
+    let subset_plan = select_repair_plan_subset(&fresh.repair_plan, selected_ids)
+        .map_err(ApplySavedPlanSelectedError::InvalidSelection)?;
+
+    execute_repair_plan(&subset_plan, current_generation, options, cancel)
+        .map_err(ApplySavedPlanSelectedError::Execute)
+}
+
+/// Builds the [`LibraryScanRequest`] a saved plan's re-scan needs and runs it.
+/// Shared by [`apply_saved_plan`] and [`apply_saved_plan_selected`] so both
+/// re-scan from exactly the same trusted `root`/`dat`, never the saved plan's
+/// recorded paths.
+fn rescan_for_saved_plan(
+    saved: &LibraryRepairPlan,
+    root: &Path,
+    dat: &Path,
+    trusted: &TrustedRoots,
+    cancel: &AtomicBool,
+) -> Result<LibraryScanOutcome, LibraryScanError> {
     let dat_kind = if std::fs::metadata(dat).is_ok_and(|meta| meta.is_dir()) {
         DatSourceKind::Folder
     } else {
@@ -732,16 +833,5 @@ pub fn apply_saved_plan(
         limits: DatLimits::default(),
         profile: RepairProfile::CanonicalInPlace,
     };
-
-    // Re-run the authoritative scan over the trusted inputs. The trusted roots
-    // come from `options`, never from the saved plan.
-    let fresh = run_library_scan(&request, &options.trusted, cancel, &|_| {})
-        .map_err(ApplySavedPlanError::Scan)?;
-
-    // Re-prove: the saved plan must be independently reproducible.
-    re_prove_saved_plan(saved, &fresh).map_err(ApplySavedPlanError::NotAuthorized)?;
-
-    // Execute the freshly authorized plan (not the saved plan's proposals).
-    execute_repair_plan(&fresh.repair_plan, current_generation, options, cancel)
-        .map_err(ApplySavedPlanError::Execute)
+    run_library_scan(&request, trusted, cancel, &|_| {})
 }
