@@ -83,6 +83,7 @@ mod bsfree;
 mod cheat_source;
 mod dat;
 mod platform_artwork;
+mod repair;
 mod retroarch_cheat_cache;
 mod retroarch_cheat_setup;
 mod retroarch_cheat_sources;
@@ -400,6 +401,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         "rom-organise" => {
             rom_organise::run(args.collect())?;
+        }
+        "repair" => {
+            repair::run(args.collect())?;
         }
         "pcsx2-patch-preview" => {
             let mut input_args = args.collect::<Vec<_>>();

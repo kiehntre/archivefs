@@ -35,6 +35,7 @@
 
 pub mod adapter;
 pub mod execute;
+pub mod library;
 pub mod plan;
 pub mod preflight;
 pub mod proposal;
@@ -42,11 +43,20 @@ pub mod proposal;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod library_tests;
+
 pub use execute::{
     RepairApplyExecution, RepairExecutionError, RepairExecutionOptions, RepairRecoveryReport,
     RepairReverifyEntry, RepairReverifyOutcome, RepairTransactionResult, apply_repair_transaction,
     build_repair_transaction, classify_persisted_transactions, execute_repair_plan,
     reverify_transaction, rollback_repair_transaction,
+};
+pub use library::{
+    ApplySavedPlanError, LibraryRepairPlan, LibraryRepairReport, LibraryScanError,
+    LibraryScanOutcome, LibraryScanRequest, PlanItem, RepairProfile, ReportCounts, SetItem,
+    apply_library_repair_plan, apply_saved_plan, build_library_repair_report, plan_file_from_scan,
+    preview_library_repair_plan, re_prove_saved_plan, run_library_scan,
 };
 pub use plan::{
     PlanConflict, PlanConflictKind, RepairPlan, RepairPlanId, build_repair_plan,
