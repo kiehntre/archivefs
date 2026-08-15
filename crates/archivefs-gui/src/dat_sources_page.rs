@@ -3492,6 +3492,7 @@ fn archive_member_status_label(
         }
         ArchiveMemberStatus::RefusedLimits { reason } => format!("Refused: {reason}"),
         ArchiveMemberStatus::Corrupt { detail } => format!("Corrupt: {detail}"),
+        ArchiveMemberStatus::NotVerified { reason } => format!("Not verified: {reason}"),
     }
 }
 

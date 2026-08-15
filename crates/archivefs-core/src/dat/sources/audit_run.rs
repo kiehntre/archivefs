@@ -41,11 +41,13 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use serde::Serialize;
 
 use super::{DatSourceKind, validation};
 use crate::dat::archive::limits::{ArchiveLimits, MAX_ARCHIVE_RUN_LOGICAL_BYTES};
+use crate::dat::archive::rar::{RarArchiveSource, RarError, RarProvider};
 use crate::dat::archive::sevenz::SevenZArchiveSource;
 use crate::dat::archive::zip::ZipArchiveSource;
 use crate::dat::archive::{
@@ -459,6 +461,21 @@ pub fn run_dat_audit(
         if is_chd_path(path) {
             continue;
         }
+        // A `.rar`'s outer container bytes are never loose-hashed: RAR is
+        // the one format whose evidence must come exclusively through the
+        // fd-pinned archive provider (`audit_archives` below), which is the
+        // only path that can fail closed on an unsupported/unavailable/
+        // corrupt archive. Loose-hashing the raw container here would let
+        // its bytes reach `audit_one` and, on a coincidental (or crafted)
+        // hash collision with a declared DAT ROM, produce a loose `Exact`
+        // verdict and a loose rename proposal - a bypass of the archive
+        // trust boundary that stands regardless of whether the RAR itself
+        // ever verified anything. The file is still visible to the scan
+        // (`files_scanned` counts it) and still dispatched to
+        // `audit_archives` below; it is only absent from `known`/`report`.
+        if is_rar_path(path) {
+            continue;
+        }
         let file_name = file_name_of(path);
         on_progress(DatAuditProgress::Hashing {
             index: position + 1,
@@ -606,17 +623,35 @@ pub fn run_dat_audit(
     })
 }
 
+/// How long one RAR-backend capability probe (`RarProvider::discover`) may
+/// take. Run at most once per [`audit_archives`] call - see its "RAR
+/// backend discovery" note.
+const RAR_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long one RAR archive-listing/relisting child may take.
+const RAR_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long one RAR member-extraction child may take.
+const RAR_MEMBER_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Opens the right [`ArchiveMemberSource`] for `path`'s extension.
 ///
 /// Returned as `Box<dyn ArchiveMemberSource>` precisely so the caller below
 /// does not need to know which format it is holding: the trait is
 /// object-safe for exactly this reason (see its doc). Dispatch is by
 /// extension only - this never sniffs file contents to pick a format.
+///
+/// `rar_provider` is `None` only when this path is not a `.rar` (the RAR
+/// branch below is the only one that reads it); when it *is* a `.rar` and
+/// discovery already ran for this audit but found no capable backend, the
+/// discovery failure itself (never a panic, never a silent skip) is what is
+/// returned as [`ArchiveMemberSourceError::Unsupported`].
+#[allow(clippy::too_many_arguments)]
 fn open_archive_source(
     path: &Path,
     trusted: &TrustedRoots,
     limits: ArchiveLimits,
     cancel: &AtomicBool,
+    index: &DatIndex,
+    rar_provider: Option<&Result<RarProvider, RarError>>,
 ) -> Result<Box<dyn ArchiveMemberSource>, ArchiveMemberSourceError> {
     if is_zip_path(path) {
         ZipArchiveSource::open(path, trusted, limits, cancel)
@@ -624,6 +659,29 @@ fn open_archive_source(
     } else if is_sevenz_path(path) {
         SevenZArchiveSource::open(path, trusted, limits, cancel)
             .map(|source| Box::new(source) as Box<dyn ArchiveMemberSource>)
+    } else if is_rar_path(path) {
+        let provider = match rar_provider {
+            Some(Ok(provider)) => provider,
+            Some(Err(error)) => {
+                return Err(ArchiveMemberSourceError::Unsupported {
+                    detail: format!("no capable RAR backend is available: {error}"),
+                });
+            }
+            None => {
+                return Err(ArchiveMemberSourceError::Unsupported {
+                    detail: "RAR backend was not probed for this run".to_string(),
+                });
+            }
+        };
+        RarArchiveSource::open(
+            path,
+            provider,
+            index,
+            limits,
+            RAR_OPEN_TIMEOUT,
+            RAR_MEMBER_TIMEOUT,
+        )
+        .map(|source| Box::new(source) as Box<dyn ArchiveMemberSource>)
     } else {
         Err(ArchiveMemberSourceError::Unsupported {
             detail: "unrecognised archive extension".to_string(),
@@ -646,20 +704,41 @@ fn audit_archives(
     let mut bytes_hashed = 0_u64;
     let mut sets = Vec::new();
     let mut run_budget = ArchiveRunBudget::new(MAX_ARCHIVE_RUN_LOGICAL_BYTES);
+    // RAR backend discovery (a real child-process spawn + capability parse,
+    // unlike ZIP/7z which never need external-binary discovery at all) runs
+    // at most once per audit run, lazily, and only if a `.rar` is actually
+    // present - never probed when a library has none, so RAR support being
+    // absent costs nothing when it is never used.
+    let mut rar_provider: Option<Result<RarProvider, RarError>> = None;
 
     for path in files
         .iter()
-        .filter(|path| is_zip_path(path) || is_sevenz_path(path))
+        .filter(|path| is_zip_path(path) || is_sevenz_path(path) || is_rar_path(path))
     {
         if cancelled(cancel) {
             return Err(DatAuditError::Cancelled);
         }
         // The format label for a source-open failure is inferred from the
         // extension alone, since no `ArchiveMemberSource` exists yet to ask.
-        let format_guess = if is_zip_path(path) { "zip" } else { "7z" };
+        let format_guess = if is_zip_path(path) {
+            "zip"
+        } else if is_sevenz_path(path) {
+            "7z"
+        } else {
+            "rar"
+        };
+        if is_rar_path(path) && rar_provider.is_none() {
+            rar_provider = Some(RarProvider::discover(RAR_DISCOVERY_TIMEOUT));
+        }
         let identity_before = crate::dat::rename_apply::capture_identity(path).ok();
-        let mut source = match open_archive_source(path, trusted, ArchiveLimits::default(), cancel)
-        {
+        let mut source = match open_archive_source(
+            path,
+            trusted,
+            ArchiveLimits::default(),
+            cancel,
+            index,
+            rar_provider.as_ref(),
+        ) {
             Ok(source) => source,
             Err(ArchiveMemberSourceError::Cancelled) => return Err(DatAuditError::Cancelled),
             Err(error) => {
@@ -769,6 +848,12 @@ fn is_sevenz_path(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("7z"))
+}
+
+fn is_rar_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("rar"))
 }
 
 fn annotate_content_matches(
@@ -1222,5 +1307,119 @@ mod local_scan_traversal_tests {
 
         assert!(scan.scan_complete);
         assert!(!scan.truncated);
+    }
+}
+
+#[cfg(test)]
+mod rar_dispatch_tests {
+    use super::*;
+
+    fn empty_index() -> DatIndex {
+        DatIndex {
+            by_crc32: std::collections::HashMap::new(),
+            by_md5: std::collections::HashMap::new(),
+            by_sha1: std::collections::HashMap::new(),
+            by_sha256: std::collections::HashMap::new(),
+            by_filename: std::collections::HashMap::new(),
+        }
+    }
+
+    fn no_cancel() -> AtomicBool {
+        AtomicBool::new(false)
+    }
+
+    /// `Box<dyn ArchiveMemberSource>` is not `Debug` (the trait does not
+    /// require it), so `Result::unwrap_err` cannot be used directly on
+    /// `open_archive_source`'s return value.
+    fn expect_error(
+        result: Result<Box<dyn ArchiveMemberSource>, ArchiveMemberSourceError>,
+    ) -> ArchiveMemberSourceError {
+        match result {
+            Ok(_) => panic!("expected an error, got a constructed ArchiveMemberSource"),
+            Err(error) => error,
+        }
+    }
+
+    #[test]
+    fn is_rar_path_is_case_insensitive_and_extension_only() {
+        assert!(is_rar_path(Path::new("game.rar")));
+        assert!(is_rar_path(Path::new("game.RAR")));
+        assert!(is_rar_path(Path::new("game.Rar")));
+        assert!(!is_rar_path(Path::new("game.zip")));
+        assert!(!is_rar_path(Path::new("game.7z")));
+        assert!(!is_rar_path(Path::new("game.rar.bak")));
+        assert!(!is_rar_path(Path::new("rar")));
+    }
+
+    #[test]
+    fn a_rar_path_is_never_dispatched_to_zip_or_sevenz() {
+        // `open_archive_source`'s three branches are mutually exclusive by
+        // construction (`if`/`else if`/`else if`), so a `.rar` path can only
+        // ever reach the RAR branch - proven here by giving it no RAR
+        // provider at all and confirming the failure is the RAR-specific
+        // "not probed" refusal, not a ZIP/7z parser error (which would mean
+        // it fell through to the wrong branch).
+        let index = empty_index();
+        let error = expect_error(open_archive_source(
+            Path::new("/nonexistent/does-not-matter.rar"),
+            &TrustedRoots::none(),
+            ArchiveLimits::default(),
+            &no_cancel(),
+            &index,
+            None,
+        ));
+        assert_eq!(
+            error,
+            ArchiveMemberSourceError::Unsupported {
+                detail: "RAR backend was not probed for this run".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn a_rar_path_with_a_failed_discovery_refuses_as_unsupported_never_corrupt() {
+        // Provider-unavailable must never be reported as archive corruption
+        // or bad ROM data - it is reported as `Unsupported`, the same
+        // fail-closed shape `audit_archives` already turns into
+        // `ArchivePassCompletion::Incomplete { SourceError }` for any format,
+        // never `Complete`.
+        let index = empty_index();
+        let discovery = Err(RarError::BackendNotFound);
+        let error = expect_error(open_archive_source(
+            Path::new("/nonexistent/does-not-matter.rar"),
+            &TrustedRoots::none(),
+            ArchiveLimits::default(),
+            &no_cancel(),
+            &index,
+            Some(&discovery),
+        ));
+        assert!(matches!(
+            error,
+            ArchiveMemberSourceError::Unsupported { .. }
+        ));
+    }
+
+    #[test]
+    fn a_missing_provider_is_not_treated_as_a_missing_file() {
+        // Even a path that does not exist on disk must fail with the RAR
+        // "no provider" reason, not an I/O error - `open_archive_source`
+        // resolves the provider *before* touching the filesystem for RAR,
+        // exactly mirroring how ZIP/7z fail on a bad path only after their
+        // own `open_bounded_read`.
+        let index = empty_index();
+        let error = expect_error(open_archive_source(
+            Path::new("/definitely/does/not/exist/anywhere.rar"),
+            &TrustedRoots::none(),
+            ArchiveLimits::default(),
+            &no_cancel(),
+            &index,
+            None,
+        ));
+        assert_eq!(
+            error,
+            ArchiveMemberSourceError::Unsupported {
+                detail: "RAR backend was not probed for this run".to_string()
+            }
+        );
     }
 }

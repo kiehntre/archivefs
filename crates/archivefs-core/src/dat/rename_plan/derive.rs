@@ -118,14 +118,15 @@ pub fn derive_proposed_basename(rom_name: &str, source_basename: &str) -> Derive
 /// set/game name (`"Sonic the Hedgehog (USA, Europe)"`) has no extension of
 /// its own at all. The source archive's extension is instead preserved
 /// unconditionally, exactly as written (`.zip` stays `.zip`, `.7z` stays
-/// `.7z`, and an unusual original case like `.ZIP` is not normalised).
+/// `.7z`, `.rar` stays `.rar`, and an unusual original case like `.ZIP` is
+/// not normalised).
 pub fn derive_outer_archive_basename(set_name: &str, source_basename: &str) -> DeriveOutcome {
     let trimmed = set_name.trim();
     if let Some(rejected) = reject_unsafe_component(trimmed, "DAT set name") {
         return rejected;
     }
     let lower = trimmed.to_ascii_lowercase();
-    if lower.ends_with(".zip") || lower.ends_with(".7z") {
+    if lower.ends_with(".zip") || lower.ends_with(".7z") || lower.ends_with(".rar") {
         return DeriveOutcome::Blocked(
             "the DAT set name already ends in an archive extension; refusing to reinterpret it"
                 .to_string(),

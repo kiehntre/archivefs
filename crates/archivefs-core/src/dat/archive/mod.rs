@@ -24,8 +24,10 @@ use std::sync::atomic::AtomicBool;
 use serde::Serialize;
 
 pub mod chd;
+pub mod external_process;
 pub mod hash;
 pub mod limits;
+pub mod rar;
 pub mod sevenz;
 pub mod sevenz_preflight;
 pub mod zip;
@@ -61,6 +63,15 @@ pub enum ArchiveMemberStatus {
     RefusedLimits { reason: &'static str },
     /// The member or its archive is corrupt (checksum/decode failure).
     Corrupt { detail: String },
+    /// No single DAT candidate could be selected to verify this member
+    /// against (no filename match, or the filename matches several DAT
+    /// entries whose hashes disagree). Content is never guessed at and never
+    /// hashed speculatively; the member is left unverified rather than
+    /// picking a candidate to test it against. Used by formats whose backend
+    /// requires an expected hash *before* streaming a member (see
+    /// [`super::rar`]), unlike ZIP/7z, which hash every member unconditionally
+    /// and match afterward.
+    NotVerified { reason: &'static str },
 }
 
 /// Format-neutral per-member evidence produced by an [`ArchiveMemberSource`].
@@ -276,6 +287,9 @@ mod tests {
             ArchiveMemberStatus::Corrupt {
                 detail: "bad crc".into(),
             },
+            ArchiveMemberStatus::NotVerified {
+                reason: "ambiguous DAT candidates",
+            },
         ];
         let mut saw = Vec::new();
         for s in statuses {
@@ -287,9 +301,10 @@ mod tests {
                 ArchiveMemberStatus::UnsupportedCodec { .. } => "codec",
                 ArchiveMemberStatus::RefusedLimits { .. } => "limits",
                 ArchiveMemberStatus::Corrupt { .. } => "corrupt",
+                ArchiveMemberStatus::NotVerified { .. } => "not_verified",
             };
             saw.push(label);
         }
-        assert_eq!(saw.len(), 7);
+        assert_eq!(saw.len(), 8);
     }
 }
