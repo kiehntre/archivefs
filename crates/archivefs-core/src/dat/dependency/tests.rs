@@ -31,7 +31,10 @@ use crate::dat::model::{
     ChecksumAlgorithm, DatBiosSetEntry, DatChecksum, DatDeviceRefEntry, DatDiskEntry, DatGameEntry,
     DatRomEntry, DatSampleEntry,
 };
-use crate::dat::set::{BadMetadataReason, NeedsReviewReason, SetIdentity, SetResolution, SetState};
+use crate::dat::set::{
+    BadMetadataReason, NeedsReviewReason, SetIdentity, SetResolution, SetState,
+    classify_archive_sets,
+};
 use crate::dat::sources::audit_run::{DatArchiveAudit, DatArchiveMemberAudit};
 
 // ---------------------------------------------------------------- helpers --
@@ -708,6 +711,228 @@ mod clone_and_rom_source {
         }
         let resolved = resolve(&games, &nothing_found(&games));
         assert_eq!(state_of(&resolved, "s0"), DependencyState::Unsupported);
+    }
+}
+
+// ------------------------------------------------ No-Intro cloneofid (by id) --
+
+mod cloneofid_resolution {
+    use super::*;
+
+    fn with_id(mut entry: DatGameEntry, id: &str) -> DatGameEntry {
+        entry.id = Some(id.to_string());
+        entry
+    }
+
+    #[test]
+    fn a_cloneofid_reference_resolves_against_the_parents_id() {
+        // Real No-Intro shape: `cloneofid="0272"` names another entry's
+        // `<game id="0272">`, not a `<game name="0272">`. `resolve_set` must
+        // try the id index, not just fail the name lookup.
+        let parent = with_id(
+            game("Phantasy Star (USA, Europe)", vec![rom("p.bin", 'a')]),
+            "0272",
+        );
+        let mut clone = with_id(
+            game(
+                "Phantasy Star (World) (En) (Sega Ages)",
+                vec![rom("c.bin", 'c')],
+            ),
+            "0658",
+        );
+        clone.clone_of = Some("0272".into());
+        let games = vec![parent, clone];
+
+        let resolved = resolve(&games, &verifying(&games, &[(0, 0), (1, 0)]));
+        assert_eq!(
+            only_outcome(
+                &resolved,
+                "Phantasy Star (World) (En) (Sega Ages)",
+                DependencyKind::ParentSet
+            ),
+            DependencyOutcome::Satisfied
+        );
+        assert_eq!(
+            resolved["Phantasy Star (World) (En) (Sega Ages)"].0,
+            SetState::Complete
+        );
+    }
+
+    #[test]
+    fn a_cloneofid_reference_with_the_parent_missing_is_reported_missing() {
+        // `cloneofid`/`clone_of` alone is a hierarchy claim, not a storage
+        // claim - resolving it only proves the parent *exists* in the
+        // catalogue (see `DependencyKind::ParentSet`'s docs). "The parent's
+        // storage is missing" is exercised the same way it already is for a
+        // name-resolved provider: through a borrowed (`merge=`) member,
+        // whose provider here is reached by id via `romof`/`cloneofid`'s
+        // shared `resolve_set` path rather than by name.
+        let parent = with_id(
+            game("Phantasy Star (USA, Europe)", vec![rom("shared.bin", 'a')]),
+            "0272",
+        );
+        let mut clone = with_id(
+            game(
+                "Phantasy Star (World) (En) (Sega Ages)",
+                vec![merged_rom("shared.bin", 'a', "shared.bin")],
+            ),
+            "0658",
+        );
+        clone.rom_of = Some("0272".into());
+        let games = vec![parent, clone];
+
+        // The provider's own declaration was never verified.
+        let resolved = resolve(&games, &nothing_found(&games));
+        assert_eq!(
+            only_outcome(
+                &resolved,
+                "Phantasy Star (World) (En) (Sega Ages)",
+                DependencyKind::MergedRom
+            ),
+            DependencyOutcome::Missing
+        );
+        assert_eq!(
+            resolved["Phantasy Star (World) (En) (Sega Ages)"].0,
+            SetState::Incomplete
+        );
+    }
+
+    #[test]
+    fn an_id_reference_matching_nothing_stays_contradictory() {
+        let mut clone = game("child", vec![rom("c.bin", 'c')]);
+        clone.clone_of = Some("9999".into());
+        let games = vec![clone];
+        let resolved = resolve(&games, &verifying(&games, &[(0, 0)]));
+        assert_eq!(
+            only_outcome(&resolved, "child", DependencyKind::ParentSet),
+            DependencyOutcome::Contradictory
+        );
+        assert_ne!(resolved["child"].0, SetState::Complete);
+    }
+
+    #[test]
+    fn a_name_match_and_a_different_ids_match_is_ambiguous() {
+        // "target" is a set NAME, and separately "target" is also a
+        // different set's ID. Neither the parser nor the resolver may
+        // silently pick one - a real collision between the two identity
+        // spaces is exactly the case this stage must refuse.
+        let by_name = game("target", vec![rom("n.bin", 'a')]);
+        let by_id = with_id(game("other", vec![rom("i.bin", 'b')]), "target");
+        let mut clone = game("child", vec![rom("c.bin", 'c')]);
+        clone.clone_of = Some("target".into());
+        let games = vec![by_name, by_id, clone];
+
+        let resolved = resolve(&games, &verifying(&games, &[(0, 0), (1, 0), (2, 0)]));
+        assert_eq!(
+            only_outcome(&resolved, "child", DependencyKind::ParentSet),
+            DependencyOutcome::Ambiguous
+        );
+        assert_eq!(
+            resolved["child"].0,
+            SetState::NeedsReview(NeedsReviewReason::AmbiguousDependency)
+        );
+    }
+
+    #[test]
+    fn a_duplicated_id_is_ambiguous_never_resolved_by_order() {
+        let first = with_id(game("first", vec![rom("a.bin", 'a')]), "dup");
+        let second = with_id(game("second", vec![rom("b.bin", 'b')]), "dup");
+        let mut clone = game("child", vec![rom("c.bin", 'c')]);
+        clone.clone_of = Some("dup".into());
+        let games = vec![first, second, clone];
+
+        let resolved = resolve(&games, &verifying(&games, &[(0, 0), (1, 0), (2, 0)]));
+        assert_eq!(
+            only_outcome(&resolved, "child", DependencyKind::ParentSet),
+            DependencyOutcome::Ambiguous
+        );
+    }
+
+    #[test]
+    fn a_valid_unique_name_is_never_overridden_by_an_unrelated_duplicated_id() {
+        // "parent" is a perfectly good, unique NAME match. A completely
+        // unrelated pair of entries elsewhere in the catalogue happens to
+        // share "parent" as their `id` - that ambiguity belongs to whoever
+        // references it *as an id*, not to a reference that already resolved
+        // cleanly by name.
+        let parent = game("parent", vec![rom("p.bin", 'a')]);
+        let id_dup_one = with_id(game("decoy-one", vec![rom("d1.bin", 'x')]), "parent");
+        let id_dup_two = with_id(game("decoy-two", vec![rom("d2.bin", 'y')]), "parent");
+        let mut clone = game("child", vec![rom("c.bin", 'c')]);
+        clone.clone_of = Some("parent".into());
+        let games = vec![parent, id_dup_one, id_dup_two, clone];
+
+        let resolved = resolve(&games, &verifying(&games, &[(0, 0), (3, 0)]));
+        assert_eq!(
+            only_outcome(&resolved, "child", DependencyKind::ParentSet),
+            DependencyOutcome::Satisfied
+        );
+        assert_eq!(resolved["child"].0, SetState::Complete);
+    }
+
+    #[test]
+    fn no_intro_real_world_shape_id_cloneofid_and_verified_status_together() {
+        // Minimal end-to-end fixture shaped exactly like the real DAT that
+        // exposed both bugs: a parent with a No-Intro `id`, a clone
+        // referencing it via `cloneofid`, and every rom using
+        // `status="verified"` instead of "good". Neither bug alone explains
+        // this DAT's behaviour, so this test runs the *real* Stage 2c
+        // classifier (`classify_archive_sets`, which is where
+        // `status="verified"` is interpreted) chained into the *real* Stage
+        // 2d resolver (`resolve_collection`, where `cloneofid` is resolved
+        // by id) - not the seeded-storage `resolve()` helper the other tests
+        // in this file use, which would make the declared status inert.
+        let parent = with_id(
+            game(
+                "Phantasy Star (USA, Europe)",
+                vec![DatRomEntry {
+                    status: Some("verified".into()),
+                    ..rom("phantasy-star-parent.bin", 'a')
+                }],
+            ),
+            "0272",
+        );
+        let mut clone = with_id(
+            game(
+                "Phantasy Star (World) (En) (Sega Ages)",
+                vec![DatRomEntry {
+                    status: Some("verified".into()),
+                    ..rom("phantasy-star-clone.bin", 'c')
+                }],
+            ),
+            "0658",
+        );
+        clone.clone_of = Some("0272".into());
+        let games = vec![parent, clone];
+
+        let members = vec![
+            member(0, vec![top_ref(0, &games, 0)]),
+            member(1, vec![top_ref(1, &games, 0)]),
+        ];
+        let archive_audit = archive(members);
+
+        // Real Stage 2c: both roms are only "verified", never "good" - this
+        // is where fix #1 is exercised.
+        let mut resolutions =
+            classify_archive_sets(&archive_audit, &[], true, &games, "collection");
+        assert_eq!(resolutions.len(), 2);
+        assert!(
+            resolutions.iter().all(|r| r.state == SetState::Complete),
+            "status=\"verified\" must classify as ordinary storage: {resolutions:#?}"
+        );
+
+        // Real Stage 2d: the clone's `cloneofid` must resolve against the
+        // parent's `id`, not fail as an unmatched name - this is where fix
+        // #2 is exercised.
+        let evidence = CollectionEvidence::build(&[archive_audit], &[], &games, true);
+        resolve_collection(&mut resolutions, &games, &evidence);
+
+        let clone_result = resolutions
+            .iter()
+            .find(|r| r.identity.game_name == "Phantasy Star (World) (En) (Sega Ages)")
+            .expect("clone set was classified");
+        assert_eq!(clone_result.state, SetState::Complete);
+        assert_eq!(clone_result.dependencies.state, DependencyState::Satisfied);
     }
 }
 

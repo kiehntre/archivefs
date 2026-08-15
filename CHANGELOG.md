@@ -11,7 +11,12 @@ user-facing effect could not be confirmed from its message and diff alone,
 this file describes only what the code and history actually show, rather than
 guessing at intent, dates, or scope.
 
-## v0.7.2-alpha (unreleased)
+## v0.8.0-alpha (unreleased)
+
+Development for the next alpha is underway; entries will be recorded here as
+they land.
+
+## v0.7.2-alpha (2026-08-13)
 
 Archive-aware DAT verification release ("Alpha 1.2"). See
 [`docs/releases/v0.7.2-alpha.md`](docs/releases/v0.7.2-alpha.md) for concise

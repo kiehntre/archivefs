@@ -447,6 +447,14 @@ fn ordinary_status(value: &Option<String>) -> StatusValue {
     match value.as_deref().map(str::trim) {
         None => StatusValue::Ordinary,
         Some(value) if value.eq_ignore_ascii_case("good") => StatusValue::Ordinary,
+        // No-Intro DATs use `status="verified"` on essentially every dumped
+        // ROM (their equivalent of a confirmed-good dump) instead of `good`.
+        // It carries the same classification meaning here: an ordinary,
+        // physically-required member whose presence must still be proven by
+        // real hash evidence - `verified` never substitutes for that
+        // evidence, it only stops a legitimate No-Intro status value from
+        // being treated as unrecognised metadata.
+        Some(value) if value.eq_ignore_ascii_case("verified") => StatusValue::Ordinary,
         Some(value) if value.eq_ignore_ascii_case("nodump") => StatusValue::NoDump,
         Some(value) if value.eq_ignore_ascii_case("baddump") => StatusValue::BadDump,
         Some(_) => StatusValue::Malformed,
@@ -1504,6 +1512,39 @@ mod tests {
             assert_eq!(
                 classify_rom_member(&classified_rom(None, Some("BADdump"), None, None)),
                 MemberClass::KnownBad
+            );
+        }
+
+        #[test]
+        fn no_intro_verified_status_classifies_as_ordinary_physical_required() {
+            // No-Intro's confirmed-good-dump status, distinct from MAME's
+            // "good" but meaning the same thing for classification purposes.
+            assert_eq!(
+                classify_rom_member(&classified_rom(None, Some("verified"), None, None)),
+                MemberClass::PhysicalRequired
+            );
+            assert_eq!(
+                classify_rom_member(&classified_rom(None, Some("VERIFIED"), None, None)),
+                MemberClass::PhysicalRequired
+            );
+        }
+
+        #[test]
+        fn a_disk_with_verified_status_classifies_as_ordinary_physical_required() {
+            // Both classifiers share `ordinary_status`; this pins that a disk
+            // gets the same treatment as a rom rather than trusting the
+            // sharing informally.
+            assert_eq!(
+                classify_disk_member(&classified_disk(Some("verified"), None, None)),
+                MemberClass::PhysicalRequired
+            );
+        }
+
+        #[test]
+        fn a_genuinely_unknown_status_still_fails_closed() {
+            assert_eq!(
+                classify_rom_member(&classified_rom(None, Some("mystery"), None, None)),
+                MemberClass::Contradictory
             );
         }
 
@@ -3323,12 +3364,12 @@ mod tests {
 
     #[test]
     fn an_unrecognised_status_value_refuses_the_set() {
-        // Not "nodump" or "baddump" - some other value this module has never
-        // seen (a typo, a DAT dialect extension). Must not be silently
-        // assumed ordinary.
+        // Not "nodump", "baddump", or "verified" - some other value this
+        // module has never seen (a typo, a DAT dialect extension). Must not
+        // be silently assumed ordinary.
         let games = vec![game(
             "Game (World)",
-            vec![rom("game.bin", None), rom("weird.bin", Some("verified"))],
+            vec![rom("game.bin", None), rom("weird.bin", Some("mystery"))],
         )];
         let members = vec![
             exact_member(0, "game.bin", "Game (World)", "game.bin"),
@@ -3344,6 +3385,51 @@ mod tests {
             SetState::NeedsReview(NeedsReviewReason::ContradictoryMemberFlags),
             "an unrecognised status value must fail closed, not be assumed an ordinary rom"
         );
+    }
+
+    #[test]
+    fn a_no_intro_verified_rom_reaches_complete_when_actually_verified() {
+        // status="verified" must behave exactly like "good": it does not
+        // grant Complete by itself, only by the same real hash evidence any
+        // other physical rom needs.
+        let games = vec![game(
+            "Game (World)",
+            vec![rom("game.bin", Some("verified"))],
+        )];
+        let members = vec![exact_member(0, "game.bin", "Game (World)", "game.bin")];
+        let audit = archive(members, complete_pass());
+
+        let resolutions = classify_archive_sets(&audit, &[], true, &games, "collection");
+
+        assert_eq!(resolutions.len(), 1);
+        assert_eq!(resolutions[0].state, SetState::Complete);
+    }
+
+    #[test]
+    fn a_no_intro_verified_rom_without_evidence_stays_incomplete() {
+        // The other half of "verified never substitutes for evidence": one
+        // rom is verified and matched (so the set is touched at all, per
+        // R1), the other is verified but never matched by any member. The
+        // declared status alone must not paper over the missing evidence.
+        let games = vec![game(
+            "Game (World)",
+            vec![
+                rom("present.bin", Some("verified")),
+                rom("missing.bin", Some("verified")),
+            ],
+        )];
+        let members = vec![exact_member(
+            0,
+            "present.bin",
+            "Game (World)",
+            "present.bin",
+        )];
+        let audit = archive(members, complete_pass());
+
+        let resolutions = classify_archive_sets(&audit, &[], true, &games, "collection");
+
+        assert_eq!(resolutions.len(), 1);
+        assert_eq!(resolutions[0].state, SetState::Incomplete);
     }
 
     #[test]

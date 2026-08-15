@@ -647,6 +647,9 @@ fn emit_game(
         }
         games.push(DatGameEntry {
             name: game_name,
+            // ClrMamePro has no `id`/`cloneofid` concept in the subset this
+            // parser understands.
+            id: None,
             description: desc.take(),
             roms: std::mem::take(roms),
             clone_of: clone_of.take(),

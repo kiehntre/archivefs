@@ -9,6 +9,17 @@
 //! - A name that resolves to exactly one catalogue entry is a usable
 //!   reference. A name that resolves to two or more is [`SetRef::Duplicate`]
 //!   and is never resolved by taking the first - array order is not identity.
+//! - Some catalogues (No-Intro) reference a parent by a second identity
+//!   instead of a name: `cloneofid="0272"` names another entry's `<game
+//!   id="0272">`, not a `<game name="0272">`. [`DependencyGraph::resolve_set`]
+//!   is the single place both identities are tried, so every existing caller
+//!   (clone/ROM-source chains, `merge=` providers, device/BIOS-root lookups)
+//!   inherits ID resolution automatically rather than needing its own
+//!   special case. A name match always wins over an ID match when both exist
+//!   and agree; when they exist and *disagree*, or when an ID string is
+//!   itself duplicated, that is exactly as unresolvable as a duplicated name
+//!   and reuses [`SetRef::Duplicate`] rather than inventing a second kind of
+//!   ambiguity a caller would have to handle separately.
 //! - A name that resolves to nothing is [`SetRef::Absent`]. It is reported,
 //!   never read as "there is no requirement".
 //! - A declared-but-empty name is [`DeclaredName::Malformed`], kept distinct
@@ -40,12 +51,17 @@ use crate::dat::set::{declared_disks, declared_roms};
 /// rather than recursing on untrusted input.
 pub(crate) const MAX_DEPENDENCY_DEPTH: usize = 64;
 
-/// The result of turning a declared set name into a catalogue reference.
+/// The result of turning a declared set reference (a name, or an ID such as
+/// `cloneofid`) into a catalogue entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SetRef {
     Unique(usize),
-    /// Two or more entries share this name. Unresolvable without positional
-    /// identity, which this stage deliberately does not use for dependencies.
+    /// Unresolvable without positional identity, which this stage
+    /// deliberately does not use for dependencies. Covers every kind of
+    /// collision [`DependencyGraph::resolve_set`] can find: two or more
+    /// entries sharing the reference as a name, two or more sharing it as an
+    /// `id`, or a name match and an `id` match that disagree about which
+    /// entry the reference means.
     Duplicate,
     Absent,
 }
@@ -109,49 +125,98 @@ pub(crate) enum MemberRef<K> {
     Absent,
 }
 
-/// Name-indexed view over one parsed catalogue.
+/// Name- and ID-indexed view over one parsed catalogue.
 pub(crate) struct DependencyGraph<'a> {
     games: &'a [DatGameEntry],
-    by_name: HashMap<&'a str, NameSlot>,
+    by_name: HashMap<&'a str, EntrySlot>,
+    by_id: HashMap<&'a str, EntrySlot>,
 }
 
 #[derive(Clone, Copy)]
-enum NameSlot {
+enum EntrySlot {
     Unique(usize),
     Duplicate,
 }
 
 impl<'a> DependencyGraph<'a> {
-    /// Indexes every entry by its declared name, recording collisions rather
-    /// than letting the last writer win.
+    /// Indexes every entry by its declared name and, separately, by its
+    /// declared `id`, recording collisions in either index rather than
+    /// letting the last writer win.
     pub(crate) fn build(games: &'a [DatGameEntry]) -> Self {
-        let mut by_name: HashMap<&'a str, NameSlot> = HashMap::with_capacity(games.len());
+        let mut by_name: HashMap<&'a str, EntrySlot> = HashMap::with_capacity(games.len());
+        let mut by_id: HashMap<&'a str, EntrySlot> = HashMap::new();
         for (index, game) in games.iter().enumerate() {
             let name = game.name.trim();
-            if name.is_empty() {
-                // An unnamed entry cannot be the target of any declared
-                // reference, so it is simply not addressable. It is still a
-                // set in its own right and is resolved normally as a subject.
-                continue;
+            if !name.is_empty() {
+                by_name
+                    .entry(name)
+                    .and_modify(|slot| *slot = EntrySlot::Duplicate)
+                    .or_insert(EntrySlot::Unique(index));
             }
-            by_name
-                .entry(name)
-                .and_modify(|slot| *slot = NameSlot::Duplicate)
-                .or_insert(NameSlot::Unique(index));
+            // An unnamed or un-identified entry cannot be the target of any
+            // declared reference, so it is simply not addressable that way.
+            // It is still a set in its own right and is resolved normally as
+            // a subject.
+            if let Some(id) = game
+                .id
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            {
+                by_id
+                    .entry(id)
+                    .and_modify(|slot| *slot = EntrySlot::Duplicate)
+                    .or_insert(EntrySlot::Unique(index));
+            }
         }
-        Self { games, by_name }
+        Self {
+            games,
+            by_name,
+            by_id,
+        }
     }
 
     pub(crate) fn game(&self, index: usize) -> &'a DatGameEntry {
         &self.games[index]
     }
 
-    /// Resolves a declared set name to at most one catalogue entry.
-    pub(crate) fn resolve_set(&self, name: &str) -> SetRef {
-        match self.by_name.get(name.trim()) {
-            Some(NameSlot::Unique(index)) => SetRef::Unique(*index),
-            Some(NameSlot::Duplicate) => SetRef::Duplicate,
-            None => SetRef::Absent,
+    /// Resolves a declared set reference - a name, or (when no name matches)
+    /// an `id` such as a No-Intro `cloneofid` target - to at most one
+    /// catalogue entry.
+    ///
+    /// A name match always takes precedence over an ID match: an ID index is
+    /// a fallback for references a name lookup cannot explain, never a
+    /// competing authority that could override a perfectly good name
+    /// resolution. The one exception is disagreement, not precedence - see
+    /// the cases below.
+    pub(crate) fn resolve_set(&self, reference: &str) -> SetRef {
+        let key = reference.trim();
+        match (self.by_name.get(key).copied(), self.by_id.get(key).copied()) {
+            // A duplicated name is unresolvable on its own; an ID match
+            // (agreeing, disagreeing, or itself ambiguous) cannot rescue it.
+            (Some(EntrySlot::Duplicate), _) => SetRef::Duplicate,
+            (Some(EntrySlot::Unique(by_name)), Some(EntrySlot::Unique(by_id))) => {
+                if by_name == by_id {
+                    // The same string happens to be both this entry's name
+                    // and its id (or another entry's id happens to equal it
+                    // while still pointing at the same entry) - harmless
+                    // agreement, not a coincidence worth refusing.
+                    SetRef::Unique(by_name)
+                } else {
+                    // The reference names one entry and identifies a
+                    // *different* one. Silently preferring either would be
+                    // exactly the guess this stage forbids.
+                    SetRef::Duplicate
+                }
+            }
+            // A valid unique name is never overridden by an ID collision
+            // elsewhere in the catalogue.
+            (Some(EntrySlot::Unique(by_name)), None | Some(EntrySlot::Duplicate)) => {
+                SetRef::Unique(by_name)
+            }
+            (None, Some(EntrySlot::Unique(by_id))) => SetRef::Unique(by_id),
+            (None, Some(EntrySlot::Duplicate)) => SetRef::Duplicate,
+            (None, None) => SetRef::Absent,
         }
     }
 

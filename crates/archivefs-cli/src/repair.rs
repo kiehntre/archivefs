@@ -274,20 +274,34 @@ fn format_report(plan: &LibraryRepairPlan) -> String {
     );
     let _ = writeln!(out, "  Scan root: {}", plan.scan_root);
     let _ = writeln!(out, "  Generation: {}", plan.generation);
-    let _ = writeln!(out, "  Files scanned: {}", plan.files_scanned);
     let _ = writeln!(
         out,
         "  Truncated: {}",
         if plan.truncated { "yes" } else { "no" }
     );
     let _ = writeln!(out);
+    let _ = writeln!(out, "  Files encountered:   {}", plan.files_scanned);
+    let _ = writeln!(out, "  DAT candidates:      {}", counts.dat_candidates);
+    let _ = writeln!(out, "  Ignored ancillary:   {}", counts.ignored_ancillary);
+    if !plan.report.ignored_ancillary_by_extension.is_empty() {
+        let _ = writeln!(out, "    by extension:");
+        for (extension, count) in &plan.report.ignored_ancillary_by_extension {
+            let _ = writeln!(out, "      {extension}: {count}");
+        }
+    }
+    let _ = writeln!(out);
     let _ = writeln!(out, "Counts:");
     let _ = writeln!(out, "  Complete sets: {}", counts.complete_sets);
     let _ = writeln!(out, "  Incomplete sets: {}", counts.incomplete_sets);
     let _ = writeln!(out, "  Bad metadata sets: {}", counts.bad_metadata_sets);
     let _ = writeln!(out, "  NeedsReview sets: {}", counts.needs_review_sets);
-    let _ = writeln!(out, "  Safe repairs: {}", counts.safe_repairs);
     let _ = writeln!(out, "  Already canonical: {}", counts.already_canonical);
+    let _ = writeln!(out, "  Safe repairs: {}", counts.safe_repairs);
+    let _ = writeln!(
+        out,
+        "  Unmatched candidates: {}",
+        counts.unmatched_candidates
+    );
     let _ = writeln!(out, "  NeedsReview: {}", counts.needs_review);
     let _ = writeln!(out, "  Blocked: {}", counts.blocked_repair);
     let _ = writeln!(out, "  Unsupported: {}", counts.unsupported);

@@ -329,6 +329,232 @@ fn unhashed_evidence_is_surfaced_and_never_becomes_a_safe_repair() {
     );
 }
 
+// ---------------------------------------------------------------------
+// Files-encountered / DAT-candidate / ignored-ancillary reporting
+// ---------------------------------------------------------------------
+
+/// A library with one loose ROM needing a rename, one already-canonical ZIP,
+/// and four ancillary (non-DAT) files across three extensions: 2 png, 1 pdf,
+/// 1 txt. Mirrors the real shape that motivated this reporting split - a
+/// scraper-managed frontend directory sitting next to the actual dumps.
+fn candidate_and_ancillary_fixture(dir: &Path) -> (PathBuf, PathBuf) {
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipWriter};
+
+    let dat = write(
+        dir,
+        "mixed.dat",
+        format!(
+            r#"<datafile><header><name>Mixed</name></header>
+<game name="Super Game (World)"><rom name="super.bin" size="4" sha1="{SHA1_TEST}"/></game>
+<game name="Archive Game (World)"><rom name="arch.rom" size="3" sha1="{SHA1_ABC}"/></game>
+</datafile>"#
+        )
+        .as_bytes(),
+    );
+    let roms = dir.join("roms");
+    std::fs::create_dir(&roms).unwrap();
+
+    // Loose ROM under the wrong name: one safe repair.
+    write(&roms, "wrongname.bin", b"test");
+
+    // Already-canonical ZIP: one archive candidate, no proposal.
+    let archive = roms.join("Archive Game (World).zip");
+    let mut writer = ZipWriter::new(std::fs::File::create(&archive).unwrap());
+    writer
+        .start_file(
+            "arch.rom",
+            SimpleFileOptions::default().compression_method(CompressionMethod::Stored),
+        )
+        .unwrap();
+    writer.write_all(b"abc").unwrap();
+    writer.finish().unwrap();
+
+    // Ancillary, non-DAT files: never referenced by the DAT at all.
+    write(&roms, "cover.png", b"\x89PNGfake-cover-bytes");
+    write(&roms, "cover2.png", b"\x89PNGanother-cover");
+    write(&roms, "manual.pdf", b"%PDF-fake-manual-bytes");
+    write(&roms, "info.txt", b"just some notes");
+
+    (dat, roms)
+}
+
+// N1. ancillary files contribute to files encountered but not DAT candidates
+#[test]
+fn ancillary_files_count_toward_files_encountered_but_not_dat_candidates() {
+    let dir = temp();
+    let (dat, roms) = candidate_and_ancillary_fixture(dir.path());
+
+    let outcome = scan(&dat, &roms);
+
+    // 2 DAT-relevant files (loose rom + zip) + 4 ancillary = 6 walked files.
+    assert_eq!(outcome.audit.files_scanned, 6);
+    assert_eq!(outcome.report.counts.dat_candidates, 2);
+    assert!(
+        outcome.report.counts.dat_candidates < outcome.audit.files_scanned,
+        "the ancillary files must not inflate the candidate count"
+    );
+}
+
+// N2. candidate count matches the actual DAT-relevant files
+#[test]
+fn dat_candidate_count_matches_the_actual_dat_relevant_files() {
+    let dir = temp();
+    let (dat, roms) = candidate_and_ancillary_fixture(dir.path());
+
+    let outcome = scan(&dat, &roms);
+
+    // One loose rom, one archive - both genuinely DAT-relevant, regardless
+    // of the archive's own outer-container bytes never matching anything.
+    assert_eq!(outcome.report.counts.dat_candidates, 2);
+}
+
+// N3. ignored ancillary count is correct
+#[test]
+fn ignored_ancillary_count_is_correct() {
+    let dir = temp();
+    let (dat, roms) = candidate_and_ancillary_fixture(dir.path());
+
+    let outcome = scan(&dat, &roms);
+
+    assert_eq!(outcome.report.counts.ignored_ancillary, 4);
+    assert_eq!(
+        outcome.audit.files_scanned,
+        outcome.report.counts.dat_candidates + outcome.report.counts.ignored_ancillary,
+        "every walked file must land in exactly one of the two buckets"
+    );
+}
+
+// N4. extension breakdown is correct
+#[test]
+fn ignored_ancillary_extension_breakdown_is_correct() {
+    let dir = temp();
+    let (dat, roms) = candidate_and_ancillary_fixture(dir.path());
+
+    let outcome = scan(&dat, &roms);
+
+    let breakdown = &outcome.report.ignored_ancillary_by_extension;
+    assert_eq!(breakdown.get("png").copied(), Some(2));
+    assert_eq!(breakdown.get("pdf").copied(), Some(1));
+    assert_eq!(breakdown.get("txt").copied(), Some(1));
+    assert_eq!(
+        breakdown.len(),
+        3,
+        "no extra or missing extensions: {breakdown:?}"
+    );
+    let total: usize = breakdown.values().sum();
+    assert_eq!(total, outcome.report.counts.ignored_ancillary);
+}
+
+// N5. existing complete/repair/canonical counts are unchanged by ancillary files
+#[test]
+fn existing_counts_are_unaffected_by_ancillary_files() {
+    let dir = temp();
+    let (dat, roms) = candidate_and_ancillary_fixture(dir.path());
+
+    let outcome = scan(&dat, &roms);
+
+    // `complete_sets` is archive-scoped (`dat::set::classify_archive_sets`
+    // runs per opened archive): only the zip contributes here. The loose
+    // rom's completeness shows up through the rename plan's own safe-repair
+    // state, not through `audit.sets` - unaffected either way by the
+    // ancillary files, which is what this test actually pins.
+    assert_eq!(outcome.report.counts.complete_sets, 1);
+    assert_eq!(outcome.report.counts.safe_repairs, 1);
+    assert_eq!(outcome.report.counts.already_canonical, 1);
+    assert_eq!(outcome.report.counts.incomplete_sets, 0);
+    assert_eq!(outcome.report.counts.needs_review, 0);
+    assert_eq!(outcome.report.counts.blocked_repair, 0);
+    assert_eq!(outcome.report.counts.unsupported, 0);
+    // The new accounting reconciles exactly with the pre-existing buckets:
+    // every DAT candidate is either the safe repair or the already-canonical
+    // archive, so nothing is left unaccounted for.
+    assert_eq!(outcome.report.counts.unmatched_candidates, 0);
+}
+
+// N6. JSON compatibility is preserved for old saved plans
+#[test]
+fn a_plan_saved_before_the_new_fields_existed_still_deserialises() {
+    // The exact shape `ReportCounts`/`LibraryRepairReport` had before this
+    // batch - no `dat_candidates`, `ignored_ancillary`,
+    // `unmatched_candidates`, or `ignored_ancillary_by_extension` at all.
+    let old_counts_json = r#"{
+        "complete_sets": 2,
+        "incomplete_sets": 0,
+        "bad_metadata_sets": 0,
+        "needs_review_sets": 0,
+        "safe_repairs": 1,
+        "already_canonical": 1,
+        "needs_review": 0,
+        "blocked_repair": 0,
+        "unsupported": 0,
+        "scan_errors": 0
+    }"#;
+    let counts: crate::repair::library::ReportCounts =
+        serde_json::from_str(old_counts_json).expect("an old ReportCounts document still parses");
+    assert_eq!(counts.complete_sets, 2);
+    assert_eq!(counts.dat_candidates, 0);
+    assert_eq!(counts.ignored_ancillary, 0);
+    assert_eq!(counts.unmatched_candidates, 0);
+
+    let old_report_json = r#"{
+        "counts": {
+            "complete_sets": 0, "incomplete_sets": 0, "bad_metadata_sets": 0,
+            "needs_review_sets": 0, "safe_repairs": 0, "already_canonical": 0,
+            "needs_review": 0, "blocked_repair": 0, "unsupported": 0, "scan_errors": 0
+        },
+        "complete_sets": [], "incomplete_sets": [], "bad_metadata_sets": [],
+        "needs_review_sets": [], "needs_review": [], "blocked": [],
+        "unsupported": [], "scan_errors": []
+    }"#;
+    let report: crate::repair::library::LibraryRepairReport =
+        serde_json::from_str(old_report_json).expect("an old report document still parses");
+    assert!(report.ignored_ancillary_by_extension.is_empty());
+
+    // And the new shape round-trips through serde without loss.
+    let dir = temp();
+    let (dat, roms) = candidate_and_ancillary_fixture(dir.path());
+    let plan = saved_plan(&dat, &roms);
+    let text = serde_json::to_string(&plan).expect("a new plan serialises");
+    let round_tripped: LibraryRepairPlan =
+        serde_json::from_str(&text).expect("a new plan deserialises");
+    assert_eq!(round_tripped, plan);
+}
+
+// N7. no mutation path is involved in computing the new counts
+#[test]
+fn computing_the_new_counts_never_mutates_the_library() {
+    let dir = temp();
+    let (dat, roms) = candidate_and_ancillary_fixture(dir.path());
+    let mut before: Vec<(PathBuf, Vec<u8>)> = std::fs::read_dir(&roms)
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            let bytes = std::fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect();
+    before.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let outcome = scan(&dat, &roms);
+    // Sanity: the new counting logic actually ran (non-trivial counts), not
+    // a vacuous pass over an empty directory.
+    assert_eq!(outcome.report.counts.ignored_ancillary, 4);
+
+    let mut after: Vec<(PathBuf, Vec<u8>)> = std::fs::read_dir(&roms)
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            let bytes = std::fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect();
+    after.sort_by(|a, b| a.0.cmp(&b.0));
+
+    assert_eq!(before, after, "the read-only scan must not touch any file");
+}
+
 // H. stale source after plan -> apply refuses
 #[test]
 fn a_stale_source_refuses_apply() {

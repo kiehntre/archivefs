@@ -163,6 +163,38 @@ pub struct ReportCounts {
     pub blocked_repair: usize,
     pub unsupported: usize,
     pub scan_errors: usize,
+    /// Files the scan considered relevant to the DAT: every archive the audit
+    /// opened ([`crate::dat::sources::audit_run::DatAuditOutcome::archives`],
+    /// regardless of what its own outer-container bytes hashed to - an
+    /// archive is a candidate because of its *member* evidence, not its
+    /// container hash) plus every other walked file whose own content
+    /// produced some positive audit verdict. The complement of
+    /// [`Self::ignored_ancillary`] within `files_scanned`.
+    ///
+    /// Additive field (absent in a plan saved before this field existed
+    /// deserialises as `0`, not a panic).
+    #[serde(default)]
+    pub dat_candidates: usize,
+    /// Walked files this scan positively determined are **not** DAT-relevant:
+    /// not an archive the audit opened, and their own content matched
+    /// nothing in the catalogue (`AuditVerdict::NotInDat` /
+    /// `NoUsableEvidence`). Never a guess - a file this stage cannot prove
+    /// either way (for example one excluded from the flat report entirely,
+    /// such as a CHD) is counted as a DAT candidate by default, not ancillary.
+    ///
+    /// Additive field, defaults to `0` for an old saved plan.
+    #[serde(default)]
+    pub ignored_ancillary: usize,
+    /// `dat_candidates` minus every candidate this report already accounts
+    /// for elsewhere (already-canonical, a safe repair, needs-review,
+    /// blocked, or unsupported). Purely arithmetic over counts this same
+    /// function already computed - not a new classification pass - so it
+    /// stays `0` whenever the existing buckets are exhaustive, and only ever
+    /// surfaces a real accounting gap rather than fabricating one.
+    ///
+    /// Additive field, defaults to `0` for an old saved plan.
+    #[serde(default)]
+    pub unmatched_candidates: usize,
 }
 
 /// The categorised, non-executable half of a scan report.
@@ -182,6 +214,15 @@ pub struct LibraryRepairReport {
     /// Unhashed files, unreadable catalogues, and truncation — surfaced, never
     /// hidden, so a partial scan can never be mistaken for a clean one.
     pub scan_errors: Vec<String>,
+    /// Lowercase file extension (no leading dot; `"(none)"` when absent) to
+    /// count, for every file [`ReportCounts::ignored_ancillary`] counted.
+    /// Deterministically ordered (`BTreeMap`) so text and JSON output are
+    /// stable across runs. Never used to decide anything - a breakdown of an
+    /// already-computed count, not a second classification of the files.
+    ///
+    /// Additive field, defaults to empty for an old saved plan.
+    #[serde(default)]
+    pub ignored_ancillary_by_extension: std::collections::BTreeMap<String, usize>,
 }
 
 /// The serialisable plan document written to `--plan-out` and read back by
@@ -374,6 +415,47 @@ pub fn build_library_repair_report(
 ) -> LibraryRepairReport {
     let mut report = LibraryRepairReport::default();
 
+    // Files encountered vs DAT-relevant vs ignored ancillary. Derived purely
+    // from evidence the audit already produced - no new file walk, no new
+    // hashing, no change to matching semantics.
+    //
+    // An archive (zip/7z/rar) the audit opened is a DAT candidate because of
+    // its *member* evidence, even though its own outer-container bytes were
+    // also hashed into `audit.report` and will almost always show
+    // `NotInDat` there (a compressed container's raw bytes never equal an
+    // uncompressed ROM's declared hash) - so archive paths are excluded from
+    // the ancillary count by construction, not by verdict.
+    //
+    // A file this stage cannot see at all in `audit.report.entries` (a CHD,
+    // audited only through header identity, never through this flat pass)
+    // is counted as a DAT candidate by default: this reporting layer proves
+    // "ancillary" only from a positive `NotInDat`/`NoUsableEvidence`
+    // verdict, and never treats "absent from this list" as "junk".
+    let archive_paths: std::collections::HashSet<&Path> = audit
+        .archives
+        .iter()
+        .map(|archive| archive.archive_path.as_path())
+        .collect();
+    for entry in &audit.report.entries {
+        if archive_paths.contains(Path::new(entry.local_path.as_str())) {
+            continue;
+        }
+        if matches!(
+            entry.verdict,
+            crate::dat::audit::AuditVerdict::NotInDat
+                | crate::dat::audit::AuditVerdict::NoUsableEvidence
+        ) {
+            report.counts.ignored_ancillary += 1;
+            *report
+                .ignored_ancillary_by_extension
+                .entry(ancillary_extension(&entry.local_path))
+                .or_insert(0) += 1;
+        }
+    }
+    report.counts.dat_candidates = audit
+        .files_scanned
+        .saturating_sub(report.counts.ignored_ancillary);
+
     // Per-file classification from the hardened rename plan. Only `Suggested`
     // proposals become executable; every other state is surfaced verbatim.
     for proposal in &rename_plan.proposals {
@@ -473,7 +555,33 @@ pub fn build_library_repair_report(
     // adapter drops any Suggested proposal it refused, e.g. a missing identity).
     report.counts.safe_repairs = repair_plan.proposals.len();
 
+    // Purely arithmetic, over counts this function already finished
+    // computing above: any DAT candidate not already accounted for by one of
+    // the existing buckets. Not a new classification pass, so it cannot
+    // disagree with them - it can only surface a real gap if one exists.
+    let accounted_for = report
+        .counts
+        .already_canonical
+        .saturating_add(report.counts.safe_repairs)
+        .saturating_add(report.counts.needs_review)
+        .saturating_add(report.counts.blocked_repair)
+        .saturating_add(report.counts.unsupported);
+    report.counts.unmatched_candidates = report.counts.dat_candidates.saturating_sub(accounted_for);
+
     report
+}
+
+/// The lowercase extension (no leading dot) of a walked file path, for the
+/// ignored-ancillary breakdown. `"(none)"` when the file has none - kept
+/// distinct from any real extension string rather than dropped, so a
+/// dotless ancillary file is still accounted for in the total.
+fn ancillary_extension(path: &str) -> String {
+    Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .filter(|ext| !ext.is_empty())
+        .map(|ext| ext.to_ascii_lowercase())
+        .unwrap_or_else(|| "(none)".to_string())
 }
 
 /// Builds the serialisable plan document from a completed scan.
