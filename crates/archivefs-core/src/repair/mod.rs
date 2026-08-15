@@ -53,14 +53,15 @@ pub use execute::{
     reverify_transaction, rollback_repair_transaction,
 };
 pub use library::{
-    ApplySavedPlanError, LibraryRepairPlan, LibraryRepairReport, LibraryScanError,
-    LibraryScanOutcome, LibraryScanRequest, PlanItem, RepairProfile, ReportCounts, SetItem,
-    apply_library_repair_plan, apply_saved_plan, build_library_repair_report, plan_file_from_scan,
-    preview_library_repair_plan, re_prove_saved_plan, run_library_scan,
+    ApplySavedPlanError, ApplySavedPlanSelectedError, LibraryRepairPlan, LibraryRepairReport,
+    LibraryScanError, LibraryScanOutcome, LibraryScanRequest, PlanItem, RepairProfile,
+    ReportCounts, SetItem, apply_library_repair_plan, apply_saved_plan, apply_saved_plan_selected,
+    build_library_repair_report, plan_file_from_scan, preview_library_repair_plan,
+    re_prove_saved_plan, run_library_scan,
 };
 pub use plan::{
     PlanConflict, PlanConflictKind, RepairPlan, RepairPlanId, build_repair_plan,
-    detect_plan_conflicts,
+    detect_plan_conflicts, select_repair_plan_subset,
 };
 pub use preflight::{
     RepairPreflightReport, RepairPreflightResult, RepairPreflightStatus, run_repair_preflight,

@@ -5,12 +5,19 @@
 //! ```text
 //! emuwiz-cli repair scan  --root <dir> --dat <file> [--plan-out <json>] [--json]
 //! emuwiz-cli repair plan  --plan <json> [--json]
-//! emuwiz-cli repair apply --plan <json> --root <dir> --dat <file> --generation <n> [--journal-dir <dir>]
+//! emuwiz-cli repair apply --plan <json> --root <dir> --dat <file> --generation <n> \
+//!     [--journal-dir <dir>] [--proposal-id <id> ...]
 //! ```
 //!
 //! `scan` is read-only by default: it audits, plans, and previews, and only
 //! mutates when given an explicit `apply`. The CLI never calls `fs::rename`
 //! directly — every mutation goes through the Repair Center executor.
+//!
+//! `apply` applies the whole freshly re-proven plan by default. One or more
+//! `--proposal-id <id>` flags switch to [`apply_saved_plan_selected`]: the
+//! full saved plan is still re-proven against the fresh scan exactly as
+//! before, and only then are the given ids resolved against the fresh plan
+//! and executed.
 
 use std::path::{Path, PathBuf};
 
@@ -19,9 +26,10 @@ use archivefs_core::dat::rename_apply::journal::default_rename_transaction_dir;
 use archivefs_core::dat::sources::{DatSourceKind, suggest_display_name};
 use archivefs_core::repair::execute::RepairExecutionOptions;
 use archivefs_core::repair::library::{
-    LibraryRepairPlan, RepairProfile, apply_saved_plan, plan_file_from_scan,
-    preview_library_repair_plan, run_library_scan,
+    LibraryRepairPlan, RepairProfile, apply_saved_plan, apply_saved_plan_selected,
+    plan_file_from_scan, preview_library_repair_plan, run_library_scan,
 };
+use archivefs_core::repair::proposal::RepairProposalId;
 use archivefs_core::safe_read::TrustedRoots;
 
 pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
@@ -155,6 +163,7 @@ fn run_apply(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let generation = take_u64_value(&mut args, "--generation")?
         .ok_or("repair apply requires --generation <n> (the current audit generation)")?;
     let journal_dir = take_path_value(&mut args, "--journal-dir")?;
+    let proposal_ids = take_repeated_string_values(&mut args, "--proposal-id")?;
     if !args.is_empty() {
         return Err(format!("repair apply does not accept {args:?}").into());
     }
@@ -174,9 +183,21 @@ fn run_apply(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let cancel = std::sync::atomic::AtomicBool::new(false);
 
     // Re-scan with the trusted inputs, re-prove the saved plan against the fresh
-    // scan, and execute the freshly authorized plan. `--generation` is the
+    // scan, and execute the freshly authorized plan (or, when `--proposal-id`
+    // is given, only the selected fresh proposals). `--generation` is the
     // caller's independent assertion of the current generation.
-    let result = apply_saved_plan(&plan, &root, &dat, generation, &options, &cancel)?;
+    let result = if proposal_ids.is_empty() {
+        apply_saved_plan(&plan, &root, &dat, generation, &options, &cancel)?
+    } else {
+        let selected: Vec<RepairProposalId> = proposal_ids
+            .into_iter()
+            .map(|raw| {
+                RepairProposalId::new(raw.clone())
+                    .ok_or_else(|| format!("--proposal-id '{raw}' is not a valid proposal id"))
+            })
+            .collect::<Result<_, _>>()?;
+        apply_saved_plan_selected(&plan, &root, &dat, generation, &selected, &options, &cancel)?
+    };
 
     let rolled_back = matches!(
         result.summary.rollback,
@@ -390,6 +411,30 @@ fn take_string_value(
     Ok(Some(value))
 }
 
+/// Collects every occurrence of a repeated flag (e.g. `--proposal-id a
+/// --proposal-id b`), removing them from `args` and preserving the order the
+/// caller passed them in. Selection *execution* order is decided later from
+/// the fresh plan, never from this order.
+fn take_repeated_string_values(
+    args: &mut Vec<String>,
+    flag: &str,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut values = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == flag {
+            if i + 1 >= args.len() {
+                return Err(format!("{flag} requires a value").into());
+            }
+            args.remove(i);
+            values.push(args.remove(i));
+        } else {
+            i += 1;
+        }
+    }
+    Ok(values)
+}
+
 fn take_path_value(
     args: &mut Vec<String>,
     flag: &str,
@@ -568,5 +613,124 @@ mod tests {
         ])
         .unwrap_err();
         assert!(error.to_string().contains("not implemented"), "{error}");
+    }
+
+    const SHA1_ABC: &str = "a9993e364706816aba3e25717850c26c9cd0d89d";
+
+    /// A two-game DAT + two wrongly-named loose ROMs, for `--proposal-id`
+    /// selected-apply tests.
+    fn two_proposal_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let dat = dir.path().join("two.dat");
+        std::fs::write(
+            &dat,
+            format!(
+                r#"<datafile><header><name>Two</name></header>
+<game name="Alpha"><rom name="alpha.bin" size="4" sha1="{SHA1_TEST}"/></game>
+<game name="Beta"><rom name="beta.bin" size="3" sha1="{SHA1_ABC}"/></game>
+</datafile>"#
+            ),
+        )
+        .unwrap();
+        let roms = dir.path().join("roms");
+        std::fs::create_dir(&roms).unwrap();
+        std::fs::write(roms.join("a.bin"), b"test").unwrap();
+        std::fs::write(roms.join("b.bin"), b"abc").unwrap();
+        (dir, dat, roms)
+    }
+
+    #[test]
+    fn repeated_proposal_id_applies_only_the_selected_proposal() {
+        let (dir, dat, roms) = two_proposal_fixture();
+        let plan_path = dir.path().join("plan.json");
+
+        run(vec![
+            "scan".into(),
+            "--root".into(),
+            roms.display().to_string(),
+            "--dat".into(),
+            dat.display().to_string(),
+            "--plan-out".into(),
+            plan_path.display().to_string(),
+        ])
+        .unwrap();
+
+        let plan: LibraryRepairPlan =
+            serde_json::from_str(&std::fs::read_to_string(&plan_path).unwrap()).unwrap();
+        let beta_id = plan
+            .repair_plan
+            .proposals
+            .iter()
+            .find(|p| p.source_path.file_name().unwrap() == "b.bin")
+            .expect("a beta proposal exists")
+            .id
+            .as_str()
+            .to_string();
+
+        run(vec![
+            "apply".into(),
+            "--plan".into(),
+            plan_path.display().to_string(),
+            "--root".into(),
+            roms.display().to_string(),
+            "--dat".into(),
+            dat.display().to_string(),
+            "--generation".into(),
+            plan.generation.to_string(),
+            "--journal-dir".into(),
+            dir.path().join("journal").display().to_string(),
+            "--proposal-id".into(),
+            beta_id,
+        ])
+        .unwrap();
+
+        assert!(roms.join("beta.bin").exists(), "the selected rename ran");
+        assert!(
+            roms.join("a.bin").exists(),
+            "the unselected rom is untouched"
+        );
+        assert!(
+            !roms.join("alpha.bin").exists(),
+            "the unselected rename did not run"
+        );
+    }
+
+    #[test]
+    fn an_unknown_proposal_id_refuses_before_mutation() {
+        let (dir, dat, roms) = two_proposal_fixture();
+        let plan_path = dir.path().join("plan.json");
+
+        run(vec![
+            "scan".into(),
+            "--root".into(),
+            roms.display().to_string(),
+            "--dat".into(),
+            dat.display().to_string(),
+            "--plan-out".into(),
+            plan_path.display().to_string(),
+        ])
+        .unwrap();
+        let plan: LibraryRepairPlan =
+            serde_json::from_str(&std::fs::read_to_string(&plan_path).unwrap()).unwrap();
+
+        let error = run(vec![
+            "apply".into(),
+            "--plan".into(),
+            plan_path.display().to_string(),
+            "--root".into(),
+            roms.display().to_string(),
+            "--dat".into(),
+            dat.display().to_string(),
+            "--generation".into(),
+            plan.generation.to_string(),
+            "--journal-dir".into(),
+            dir.path().join("journal").display().to_string(),
+            "--proposal-id".into(),
+            "does-not-exist".into(),
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("does not exist"), "{error}");
+        assert!(roms.join("a.bin").exists());
+        assert!(roms.join("b.bin").exists());
     }
 }

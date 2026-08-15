@@ -141,6 +141,7 @@ pub(crate) mod dat_sources_page;
 pub mod game_presentation;
 pub(crate) mod gamer_artwork;
 pub(crate) mod home_page;
+pub(crate) mod repair_review_page;
 pub(crate) mod rom_organisation_page;
 pub(crate) mod romm_browse;
 pub(crate) mod romm_config;
@@ -2948,6 +2949,11 @@ enum MainView {
     /// Canonical organisation: planning and (only after explicit approval)
     /// applying moves of identified games into a configured master ROM root.
     CanonicalOrganisation,
+    /// Repair Review: preview-only review of a saved whole-library repair
+    /// plan. Loads a `LibraryRepairPlan` produced by the CLI's
+    /// `repair scan --plan-out` contract and shows its proposals. Nothing is
+    /// applied from this page.
+    RepairReview,
     /// The registered DAT catalogues: which local DAT files and folders
     /// EmuWiz can check a library against. Its own destination for the
     /// same reason Cheat Sources is: it is configuration that outlives any
@@ -3186,12 +3192,13 @@ impl ArchiveInspectorState {
 }
 
 const DEFAULT_INSPECTOR_PATH_COLUMN_WIDTH: f32 = 520.0;
-const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 14] = [
+const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 15] = [
     (MainView::Home, "Home"),
     (MainView::Mount, "Mount"),
     (MainView::Selected, "Selected"),
     (MainView::CheatsMods, "Cheats & Mods"),
     (MainView::CheatSources, "Cheat Sources"),
+    (MainView::RepairReview, "Repair Review"),
     (MainView::DatSources, "DAT Sources"),
     (MainView::ActiveMounts, "Active Mounts"),
     (MainView::Library, "Library"),
@@ -3262,6 +3269,7 @@ fn main_view_title(view: MainView) -> &'static str {
         MainView::CheatsMods => "Cheats & Mods",
         MainView::CheatSources => "Cheat Sources",
         MainView::CanonicalOrganisation => "Canonical organisation",
+        MainView::RepairReview => "Repair Review",
         MainView::DatSources => "DAT Sources",
         MainView::ActiveMounts => "Active Mounts",
         MainView::Doctor => "Doctor",
@@ -3287,6 +3295,7 @@ fn main_view_content_width(view: MainView) -> ui_layout::ContentWidth {
         | MainView::HistoryLogs => ui_layout::ContentWidth::Wide,
         MainView::CheatSources
         | MainView::CanonicalOrganisation
+        | MainView::RepairReview
         | MainView::DatSources
         | MainView::Doctor
         | MainView::Settings
@@ -3619,6 +3628,9 @@ struct ArchiveFsApp {
     /// user has not visited.
     cheat_sources_page: Option<cheat_sources_page::CheatSourcesPageState>,
     rom_organisation_page: Option<rom_organisation_page::RomOrganisationPageState>,
+    /// The Repair Review page, loaded lazily on first visit. Preview-only;
+    /// it never applies anything.
+    repair_review_page: Option<repair_review_page::RepairReviewPageState>,
     /// Unsubmitted Cheat Sources text and disclosure state. Held here rather
     /// than in the page state because none of it is policy - see
     /// `CheatSourcesPageUi`.
@@ -3972,6 +3984,7 @@ impl ArchiveFsApp {
             database_generation,
             cheat_sources_page: None,
             rom_organisation_page: None,
+            repair_review_page: None,
             cheat_sources_ui: cheat_sources_page::CheatSourcesPageUi::default(),
             dat_sources_page: None,
             dat_sources_ui: dat_sources_page::DatSourcesPageUi::default(),
@@ -4895,6 +4908,13 @@ impl ArchiveFsApp {
             .rom_organisation_page
             .get_or_insert_with(rom_organisation_page::RomOrganisationPageState::load);
         rom_organisation_page::show_rom_organisation_page(ui, page);
+    }
+
+    fn show_repair_review_page(&mut self, ui: &mut egui::Ui) {
+        let page = self
+            .repair_review_page
+            .get_or_insert_with(repair_review_page::RepairReviewPageState::default);
+        repair_review_page::show_repair_review_page(ui, page);
     }
 
     fn show_cheat_sources_page(&mut self, ui: &mut egui::Ui) {
@@ -14370,6 +14390,11 @@ impl ArchiveFsApp {
 
                 if self.view == MainView::CanonicalOrganisation {
                     self.show_rom_organisation_page(ui);
+                    return;
+                }
+
+                if self.view == MainView::RepairReview {
+                    self.show_repair_review_page(ui);
                     return;
                 }
 
@@ -53733,6 +53758,7 @@ $Instant Growth [Nayr]\n";
             // and loading it here would read the real per-user preferences.
             cheat_sources_page: None,
             rom_organisation_page: None,
+            repair_review_page: None,
             cheat_sources_ui: cheat_sources_page::CheatSourcesPageUi::default(),
             dat_sources_page: None,
             dat_sources_ui: dat_sources_page::DatSourcesPageUi::default(),

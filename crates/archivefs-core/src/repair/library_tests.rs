@@ -14,11 +14,12 @@ use crate::dat::rename_apply::identity::capture_identity;
 use crate::dat::sources::DatSourceKind;
 use crate::repair::execute::{RepairExecutionError, RepairExecutionOptions, RepairReverifyOutcome};
 use crate::repair::library::{
-    ApplySavedPlanError, LibraryRepairPlan, LibraryScanRequest, RepairProfile,
-    apply_library_repair_plan, apply_saved_plan, plan_file_from_scan, run_library_scan,
+    ApplySavedPlanError, ApplySavedPlanSelectedError, LibraryRepairPlan, LibraryScanRequest,
+    RepairProfile, apply_library_repair_plan, apply_saved_plan, apply_saved_plan_selected,
+    plan_file_from_scan, run_library_scan,
 };
 use crate::repair::plan::{PlanConflict, PlanConflictKind};
-use crate::repair::proposal::{RepairAction, SafetyState};
+use crate::repair::proposal::{RepairAction, RepairProposalId, SafetyState};
 use crate::safe_read::TrustedRoots;
 
 /// The SHA-1 of `b"test"` (4 bytes), used across DAT fixtures.
@@ -93,6 +94,32 @@ fn single_rom_dat(dir: &Path) -> PathBuf {
         )
         .as_bytes(),
     )
+}
+
+/// SHA-1 of `b"xyz"` (3 bytes).
+const SHA1_XYZ: &str = "66b27417d37e024c46526c2f6d358a754fc552f3";
+
+/// A three-game DAT + three wrongly-named loose ROMs, so a scan of it
+/// produces exactly three independent, non-conflicting Safe proposals.
+fn three_proposal_fixture(dir: &Path) -> (PathBuf, PathBuf) {
+    let dat = write(
+        dir,
+        "three.dat",
+        format!(
+            r#"<datafile><header><name>Three</name></header>
+<game name="Alpha"><rom name="alpha.bin" size="4" sha1="{SHA1_TEST}"/></game>
+<game name="Beta"><rom name="beta.bin" size="3" sha1="{SHA1_ABC}"/></game>
+<game name="Gamma"><rom name="gamma.bin" size="3" sha1="{SHA1_XYZ}"/></game>
+</datafile>"#
+        )
+        .as_bytes(),
+    );
+    let roms = dir.join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    write(&roms, "a.bin", b"test");
+    write(&roms, "b.bin", b"abc");
+    write(&roms, "c.bin", b"xyz");
+    (dat, roms)
 }
 
 // A. canonical loose ROM safe rename
@@ -1017,4 +1044,353 @@ fn refusal_happens_before_journal_or_mutation() {
     assert_eq!(journal_entries, 0, "no journal file was written");
     assert!(roms.join("wrongname.bin").exists());
     assert!(!roms.join("attacker.bin").exists());
+}
+
+// ---------------------------------------------------------------------------
+// apply_saved_plan_selected: safe selected-proposal apply.
+// ---------------------------------------------------------------------------
+
+/// Finds the fresh (not saved-JSON) proposal id whose source basename matches,
+/// by re-running the same scan the trust boundary itself re-runs. Tests never
+/// hand-guess proposal ids: they resolve them exactly as a caller must.
+fn proposal_id_for(dat: &Path, roms: &Path, source_basename: &str) -> RepairProposalId {
+    let outcome = scan(dat, roms);
+    outcome
+        .repair_plan
+        .proposals
+        .iter()
+        .find(|p| p.source_path.file_name().unwrap() == source_basename)
+        .expect("a proposal for the given source exists")
+        .id
+        .clone()
+}
+
+// 1. selecting one known proposal: only that fresh proposal executes.
+#[test]
+fn selecting_one_proposal_executes_only_that_one() {
+    let dir = temp();
+    let (dat, roms) = three_proposal_fixture(dir.path());
+    let plan = saved_plan(&dat, &roms);
+    assert_eq!(plan.safe_repair_count(), 3);
+
+    let beta_id = proposal_id_for(&dat, &roms, "b.bin");
+
+    let result = apply_saved_plan_selected(
+        &plan,
+        &roms,
+        &dat,
+        plan.generation,
+        std::slice::from_ref(&beta_id),
+        &options(dir.path()),
+        &no_cancel(),
+    )
+    .expect("the selected proposal applies");
+    assert_eq!(result.summary.applied, 1);
+    assert!(roms.join("beta.bin").exists());
+    // Unselected files are untouched.
+    assert!(roms.join("a.bin").exists(), "unselected source untouched");
+    assert!(roms.join("c.bin").exists(), "unselected source untouched");
+    assert!(!roms.join("alpha.bin").exists());
+    assert!(!roms.join("gamma.bin").exists());
+}
+
+// 2. selecting multiple known proposals executes exactly those.
+#[test]
+fn selecting_multiple_proposals_executes_exactly_those() {
+    let dir = temp();
+    let (dat, roms) = three_proposal_fixture(dir.path());
+    let plan = saved_plan(&dat, &roms);
+
+    let alpha_id = proposal_id_for(&dat, &roms, "a.bin");
+    let gamma_id = proposal_id_for(&dat, &roms, "c.bin");
+
+    let result = apply_saved_plan_selected(
+        &plan,
+        &roms,
+        &dat,
+        plan.generation,
+        &[alpha_id, gamma_id],
+        &options(dir.path()),
+        &no_cancel(),
+    )
+    .expect("both selected proposals apply");
+    assert_eq!(result.summary.applied, 2);
+    assert!(roms.join("alpha.bin").exists());
+    assert!(roms.join("gamma.bin").exists());
+    // Beta was never selected.
+    assert!(roms.join("b.bin").exists(), "unselected source untouched");
+    assert!(!roms.join("beta.bin").exists());
+}
+
+// 3. an unknown selected id refuses before any mutation.
+#[test]
+fn an_unknown_selected_id_refuses_before_mutation() {
+    let dir = temp();
+    let (dat, roms) = three_proposal_fixture(dir.path());
+    let plan = saved_plan(&dat, &roms);
+    let bogus = RepairProposalId::new("does-not-exist").unwrap();
+
+    let error = apply_saved_plan_selected(
+        &plan,
+        &roms,
+        &dat,
+        plan.generation,
+        &[bogus],
+        &options(dir.path()),
+        &no_cancel(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, ApplySavedPlanSelectedError::InvalidSelection(_)),
+        "{error:?}"
+    );
+    assert!(roms.join("a.bin").exists());
+    assert!(roms.join("b.bin").exists());
+    assert!(roms.join("c.bin").exists());
+}
+
+// 4. an empty selection is refused explicitly.
+#[test]
+fn an_empty_selection_refuses_explicitly() {
+    let dir = temp();
+    let (dat, roms) = three_proposal_fixture(dir.path());
+    let plan = saved_plan(&dat, &roms);
+
+    let error = apply_saved_plan_selected(
+        &plan,
+        &roms,
+        &dat,
+        plan.generation,
+        &[],
+        &options(dir.path()),
+        &no_cancel(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, ApplySavedPlanSelectedError::InvalidSelection(ref detail) if detail.contains("no proposals were selected")),
+        "{error:?}"
+    );
+    assert!(roms.join("a.bin").exists());
+    assert!(roms.join("b.bin").exists());
+    assert!(roms.join("c.bin").exists());
+}
+
+// 5. a tampered saved proposal still refuses even when it is NOT selected:
+//    selection must never weaken the full-plan re-proof.
+#[test]
+fn a_tampered_unselected_proposal_still_refuses() {
+    let dir = temp();
+    let (dat, roms) = three_proposal_fixture(dir.path());
+    let mut plan = saved_plan(&dat, &roms);
+    let beta_id = proposal_id_for(&dat, &roms, "b.bin");
+
+    // Tamper the "alpha" proposal's destination, but only select "beta".
+    for proposal in &mut plan.repair_plan.proposals {
+        if proposal.source_path.file_name().unwrap() == "a.bin"
+            && let RepairAction::RenamePath { destination } = &mut proposal.action
+        {
+            *destination = roms.join("attacker.bin");
+        }
+    }
+
+    let error = apply_saved_plan_selected(
+        &plan,
+        &roms,
+        &dat,
+        plan.generation,
+        std::slice::from_ref(&beta_id),
+        &options(dir.path()),
+        &no_cancel(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, ApplySavedPlanSelectedError::NotAuthorized(_)),
+        "{error:?}"
+    );
+    assert!(roms.join("a.bin").exists(), "nothing was renamed");
+    assert!(roms.join("b.bin").exists(), "nothing was renamed");
+    assert!(!roms.join("attacker.bin").exists());
+    assert!(!roms.join("beta.bin").exists());
+}
+
+// 6. a tampered *selected* proposal refuses.
+#[test]
+fn a_tampered_selected_proposal_refuses() {
+    let dir = temp();
+    let (dat, roms) = three_proposal_fixture(dir.path());
+    let mut plan = saved_plan(&dat, &roms);
+    let beta_id = proposal_id_for(&dat, &roms, "b.bin");
+
+    for proposal in &mut plan.repair_plan.proposals {
+        if proposal.source_path.file_name().unwrap() == "b.bin"
+            && let RepairAction::RenamePath { destination } = &mut proposal.action
+        {
+            *destination = roms.join("attacker.bin");
+        }
+    }
+
+    let error = apply_saved_plan_selected(
+        &plan,
+        &roms,
+        &dat,
+        plan.generation,
+        std::slice::from_ref(&beta_id),
+        &options(dir.path()),
+        &no_cancel(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, ApplySavedPlanSelectedError::NotAuthorized(_)),
+        "{error:?}"
+    );
+    assert!(roms.join("b.bin").exists(), "nothing was renamed");
+    assert!(!roms.join("attacker.bin").exists());
+}
+
+// 7. a changed root refuses.
+#[test]
+fn a_changed_root_refuses_selected_apply() {
+    let dir = temp();
+    let (dat, roms) = three_proposal_fixture(dir.path());
+    let plan = saved_plan(&dat, &roms);
+    let beta_id = proposal_id_for(&dat, &roms, "b.bin");
+
+    // A different (but scannable) root: same file layout, different path, so
+    // the scan itself succeeds and only the scan-root identity mismatches.
+    let other_root = dir.path().join("other-roms");
+    std::fs::create_dir(&other_root).unwrap();
+    write(&other_root, "a.bin", b"test");
+    write(&other_root, "b.bin", b"abc");
+    write(&other_root, "c.bin", b"xyz");
+
+    let error = apply_saved_plan_selected(
+        &plan,
+        &other_root,
+        &dat,
+        plan.generation,
+        std::slice::from_ref(&beta_id),
+        &options(dir.path()),
+        &no_cancel(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, ApplySavedPlanSelectedError::NotAuthorized(_)),
+        "{error:?}"
+    );
+    assert!(roms.join("b.bin").exists());
+}
+
+// 8. a changed DAT/generation refuses.
+#[test]
+fn a_changed_generation_refuses_selected_apply() {
+    let dir = temp();
+    let (dat, roms) = three_proposal_fixture(dir.path());
+    let plan = saved_plan(&dat, &roms);
+    let beta_id = proposal_id_for(&dat, &roms, "b.bin");
+
+    let error = apply_saved_plan_selected(
+        &plan,
+        &roms,
+        &dat,
+        plan.generation.wrapping_add(1),
+        std::slice::from_ref(&beta_id),
+        &options(dir.path()),
+        &no_cancel(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            ApplySavedPlanSelectedError::Execute(RepairExecutionError::StalePlan { .. })
+        ),
+        "{error:?}"
+    );
+    assert!(roms.join("b.bin").exists());
+}
+
+// 9. a stale source identity refuses.
+#[test]
+fn a_stale_selected_source_identity_refuses() {
+    let dir = temp();
+    let (dat, roms) = three_proposal_fixture(dir.path());
+    let plan = saved_plan(&dat, &roms);
+    let beta_id = proposal_id_for(&dat, &roms, "b.bin");
+
+    // Mutate the live source after the plan was saved but before apply.
+    std::fs::write(roms.join("b.bin"), b"changed-content-same-name").unwrap();
+
+    let error = apply_saved_plan_selected(
+        &plan,
+        &roms,
+        &dat,
+        plan.generation,
+        std::slice::from_ref(&beta_id),
+        &options(dir.path()),
+        &no_cancel(),
+    )
+    .unwrap_err();
+    // The fresh re-scan no longer classifies "b.bin" as the same Safe repair
+    // (its content, and therefore its DAT match, changed), so the saved plan
+    // is no longer reproducible.
+    assert!(
+        matches!(error, ApplySavedPlanSelectedError::NotAuthorized(_)),
+        "{error:?}"
+    );
+}
+
+// 10. duplicate/ambiguous selected ids fail closed.
+#[test]
+fn duplicate_selected_ids_fail_closed() {
+    let dir = temp();
+    let (dat, roms) = three_proposal_fixture(dir.path());
+    let plan = saved_plan(&dat, &roms);
+    let beta_id = proposal_id_for(&dat, &roms, "b.bin");
+
+    let error = apply_saved_plan_selected(
+        &plan,
+        &roms,
+        &dat,
+        plan.generation,
+        &[beta_id.clone(), beta_id],
+        &options(dir.path()),
+        &no_cancel(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, ApplySavedPlanSelectedError::InvalidSelection(_)),
+        "{error:?}"
+    );
+    assert!(roms.join("b.bin").exists());
+}
+
+// 11. subset execution still uses the normal transaction + reverify path.
+#[test]
+fn subset_execution_uses_the_normal_transaction_and_reverify_path() {
+    let dir = temp();
+    let (dat, roms) = three_proposal_fixture(dir.path());
+    let plan = saved_plan(&dat, &roms);
+    let beta_id = proposal_id_for(&dat, &roms, "b.bin");
+
+    let journal_dir = dir.path().join("journal");
+    let result = apply_saved_plan_selected(
+        &plan,
+        &roms,
+        &dat,
+        plan.generation,
+        std::slice::from_ref(&beta_id),
+        &options(dir.path()),
+        &no_cancel(),
+    )
+    .expect("the selected proposal applies");
+
+    // A real journaled transaction was written.
+    let journal_entries = std::fs::read_dir(&journal_dir)
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+    assert_eq!(journal_entries, 1, "a journal file was written");
+
+    // Reverify ran and confirmed the applied destination.
+    assert_eq!(result.reverify.len(), 1);
+    assert_eq!(result.reverify[0].outcome, RepairReverifyOutcome::Verified);
+    assert_eq!(result.reverify[0].destination_path, roms.join("beta.bin"));
 }

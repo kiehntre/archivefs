@@ -325,6 +325,87 @@ pub fn detect_plan_conflicts(proposals: &[RepairProposal]) -> Vec<PlanConflict> 
     conflicts
 }
 
+/// Builds an executable subset of a freshly authorized [`RepairPlan`],
+/// containing only the proposals named by `selected_ids`.
+///
+/// This exists for "apply selected proposals" flows: `fresh` must already be
+/// the plan an authoritative re-scan produced (never a saved/deserialised
+/// plan taken on trust). Filtering to a subset can only ever *hide* a
+/// conflict that involves an excluded proposal — it can never resolve one —
+/// so this refuses unless `fresh` itself is already entirely conflict-free
+/// ([`detect_plan_conflicts`] recomputed here, never trusting a stored
+/// `conflicts` field). Selection order does not matter: the subset is built
+/// in `fresh`'s own deterministic (id-sorted) order.
+///
+/// Fails closed on: an empty selection, a selected id absent from `fresh`, a
+/// duplicate id within `selected_ids`, or any conflict anywhere in `fresh`
+/// (even one that does not touch a selected proposal — an unrelated conflict
+/// means `fresh` was not the clean, fully-authorized plan this function
+/// requires).
+pub fn select_repair_plan_subset(
+    fresh: &RepairPlan,
+    selected_ids: &[RepairProposalId],
+) -> Result<RepairPlan, String> {
+    if selected_ids.is_empty() {
+        return Err("no proposals were selected".to_string());
+    }
+
+    let mut seen: BTreeMap<&RepairProposalId, ()> = BTreeMap::new();
+    for id in selected_ids {
+        if seen.insert(id, ()).is_some() {
+            return Err(format!("proposal id '{id}' was selected more than once"));
+        }
+    }
+
+    // The fresh plan must already be entirely conflict-free. A subset is only
+    // ever as safe as the full plan it was drawn from: never trust the plan's
+    // stored `conflicts` field, and never assume that dropping unselected
+    // proposals can turn an unsafe full plan into a safe subset.
+    let conflicts = detect_plan_conflicts(&fresh.proposals);
+    if !conflicts.is_empty() {
+        let detail = conflicts
+            .iter()
+            .map(|conflict| format!("{}: {}", conflict.kind.clone().label(), conflict.detail))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(format!(
+            "the fresh plan has unresolved conflicts, so no subset of it can be safely selected: {detail}"
+        ));
+    }
+
+    let by_id: BTreeMap<&RepairProposalId, &RepairProposal> =
+        fresh.proposals.iter().map(|p| (&p.id, p)).collect();
+    for id in selected_ids {
+        let Some(proposal) = by_id.get(id) else {
+            return Err(format!(
+                "selected proposal id '{id}' does not exist in the fresh proven plan"
+            ));
+        };
+        if !proposal.actionable() {
+            return Err(format!(
+                "selected proposal '{id}' is not safe to execute (safety = {})",
+                proposal.safety.label()
+            ));
+        }
+    }
+
+    let selected_set: std::collections::BTreeSet<&RepairProposalId> = selected_ids.iter().collect();
+    let subset: Vec<RepairProposal> = fresh
+        .proposals
+        .iter()
+        .filter(|proposal| selected_set.contains(&proposal.id))
+        .cloned()
+        .collect();
+
+    Ok(build_repair_plan(
+        fresh.id.clone(),
+        fresh.generation,
+        fresh.created_at_unix,
+        fresh.source_scan_id.clone(),
+        subset,
+    ))
+}
+
 /// Deterministic ordering of conflicts: by kind, then by the joined proposal ids.
 fn sort_conflicts(conflicts: &mut [PlanConflict]) {
     conflicts.sort_by(|a, b| {
@@ -783,5 +864,79 @@ mod tests {
                 .iter()
                 .any(|c| c.kind == PlanConflictKind::RenameCycle)
         );
+    }
+
+    #[test]
+    fn selecting_a_subset_of_a_clean_plan_keeps_only_the_selected_proposals() {
+        let p = plan(
+            "p",
+            vec![
+                proposal("a", "/tmp/roms/a.bin", Some("/tmp/roms/A.bin")),
+                proposal("b", "/tmp/roms/b.bin", Some("/tmp/roms/B.bin")),
+                proposal("c", "/tmp/roms/c.bin", Some("/tmp/roms/C.bin")),
+            ],
+        );
+        let subset = select_repair_plan_subset(
+            &p,
+            &[
+                RepairProposalId::new("c").unwrap(),
+                RepairProposalId::new("a").unwrap(),
+            ],
+        )
+        .unwrap();
+        // Fresh-plan order, not caller order.
+        assert_eq!(subset.proposals.len(), 2);
+        assert_eq!(subset.proposals[0].id.as_str(), "a");
+        assert_eq!(subset.proposals[1].id.as_str(), "c");
+        assert!(!subset.has_conflicts());
+        assert!(subset.all_executable());
+    }
+
+    #[test]
+    fn selecting_an_empty_set_refuses() {
+        let p = plan(
+            "p",
+            vec![proposal("a", "/tmp/roms/a.bin", Some("/tmp/roms/A.bin"))],
+        );
+        assert!(select_repair_plan_subset(&p, &[]).is_err());
+    }
+
+    #[test]
+    fn selecting_an_unknown_id_refuses() {
+        let p = plan(
+            "p",
+            vec![proposal("a", "/tmp/roms/a.bin", Some("/tmp/roms/A.bin"))],
+        );
+        let error =
+            select_repair_plan_subset(&p, &[RepairProposalId::new("nope").unwrap()]).unwrap_err();
+        assert!(error.contains("does not exist"), "{error}");
+    }
+
+    #[test]
+    fn selecting_a_duplicate_id_refuses() {
+        let p = plan(
+            "p",
+            vec![proposal("a", "/tmp/roms/a.bin", Some("/tmp/roms/A.bin"))],
+        );
+        let id = RepairProposalId::new("a").unwrap();
+        let error = select_repair_plan_subset(&p, &[id.clone(), id]).unwrap_err();
+        assert!(error.contains("more than once"), "{error}");
+    }
+
+    #[test]
+    fn selecting_from_a_plan_with_an_unrelated_conflict_refuses() {
+        // "a" and "b" collide with each other on destination; "c" is unrelated
+        // but the whole plan is not conflict-free, so no subset may be taken.
+        let p = plan(
+            "p",
+            vec![
+                proposal("a", "/tmp/roms/a.bin", Some("/tmp/roms/X.bin")),
+                proposal("b", "/tmp/roms/b.bin", Some("/tmp/roms/X.bin")),
+                proposal("c", "/tmp/roms/c.bin", Some("/tmp/roms/C.bin")),
+            ],
+        );
+        let error =
+            select_repair_plan_subset(&p, &[RepairProposalId::new("c").unwrap()]).unwrap_err();
+        assert!(error.contains("unresolved conflicts"), "{error}");
     }
 }
