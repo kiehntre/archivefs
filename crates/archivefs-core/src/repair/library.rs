@@ -29,7 +29,7 @@
 //! rename rules prove the canonical name. [`RepairProfile::Romm`] is typed but
 //! deliberately produces no executable proposals yet.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
 use serde::{Deserialize, Serialize};
@@ -229,7 +229,8 @@ pub fn run_library_scan(
     cancel: &AtomicBool,
     on_progress: &dyn Fn(DatAuditProgress),
 ) -> Result<LibraryScanOutcome, LibraryScanError> {
-    let generation = now_unix();
+    let generation = dat_generation(&request.dat_path);
+    let created_at = now_unix();
 
     let audit_request = DatAuditRequest {
         source_id: request.source_id.clone(),
@@ -253,7 +254,7 @@ pub fn run_library_scan(
     // the hardened rename plan records identity only for whole outer archives.
     // Romm is typed but produces nothing executable yet.
     let repair_plan = if request.profile.is_implemented() {
-        repair_plan_from_scan_rename_plan(&rename_plan, generation)
+        repair_plan_from_scan_rename_plan(&rename_plan, created_at)
     } else {
         build_repair_plan(
             RepairPlanId::new(format!(
@@ -262,7 +263,7 @@ pub fn run_library_scan(
             ))
             .unwrap_or_else(|| RepairPlanId::new("library-scan").expect("static id")),
             generation,
-            generation,
+            created_at,
             Some(request.scan_root.to_string_lossy().into_owned()),
             Vec::new(),
         )
@@ -272,13 +273,44 @@ pub fn run_library_scan(
 
     Ok(LibraryScanOutcome {
         generation,
-        created_at_unix: generation,
+        created_at_unix: created_at,
         profile: request.profile,
         audit,
         rename_plan,
         repair_plan,
         report,
     })
+}
+
+/// A deterministic, DAT-derived generation stamp.
+///
+/// The same DAT file (or folder) yields the same generation, so a plan built
+/// from it can be independently re-proven at apply time, and a changed DAT
+/// yields a different (stale) generation. This is a non-cryptographic identity
+/// of the DAT's path + size + modification time, never a wall clock.
+fn dat_generation(dat_path: &Path) -> u64 {
+    let mut data: Vec<u8> = dat_path.to_string_lossy().as_bytes().to_vec();
+    if let Ok(meta) = std::fs::metadata(dat_path) {
+        data.extend_from_slice(&meta.len().to_le_bytes());
+        if let Ok(modified) = meta.modified()
+            && let Ok(elapsed) = modified.duration_since(std::time::UNIX_EPOCH)
+        {
+            data.extend_from_slice(&elapsed.as_secs().to_le_bytes());
+            data.extend_from_slice(&elapsed.subsec_nanos().to_le_bytes());
+        }
+    }
+    fnv1a64(&data)
+}
+
+/// FNV-1a 64-bit. Deterministic and non-cryptographic; used only to stamp a
+/// DAT's identity into a generation number.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 /// Converts a hardened DAT rename plan into an executable [`RepairPlan`],
@@ -289,10 +321,11 @@ pub fn run_library_scan(
 /// for whole outer archives. A loose-file rename is just as identity-bound at
 /// execution time, so this captures each loose source's identity here — while
 /// the file is still the exact object the audit verified — never later.
-fn repair_plan_from_scan_rename_plan(plan: &RenamePlan, generation: u64) -> RepairPlan {
+fn repair_plan_from_scan_rename_plan(plan: &RenamePlan, created_at_unix: u64) -> RepairPlan {
     let mut proposals = Vec::new();
     for proposal in &plan.proposals {
-        let Some(mut repair) = repair_proposal_from_suggested_rename(proposal, generation) else {
+        let Some(mut repair) = repair_proposal_from_suggested_rename(proposal, plan.generation)
+        else {
             continue;
         };
         if repair.expected_source_identity.is_none() {
@@ -326,7 +359,7 @@ fn repair_plan_from_scan_rename_plan(plan: &RenamePlan, generation: u64) -> Repa
     build_repair_plan(
         id,
         plan.generation,
-        generation,
+        created_at_unix,
         Some(plan.scan_root.clone()),
         proposals,
     )
@@ -482,4 +515,125 @@ pub fn apply_library_repair_plan(
     cancel: &AtomicBool,
 ) -> Result<RepairTransactionResult, RepairExecutionError> {
     execute_repair_plan(&plan.repair_plan, current_generation, options, cancel)
+}
+
+/// Why a saved plan could not be independently re-proven and applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApplySavedPlanError {
+    /// The authoritative re-scan failed.
+    Scan(LibraryScanError),
+    /// The saved plan's executable proposals could not be independently
+    /// reproduced from the trusted scan inputs. Nothing was executed.
+    NotAuthorized(String),
+    /// The Repair Center executor refused the freshly re-proven plan.
+    Execute(RepairExecutionError),
+}
+
+impl std::fmt::Display for ApplySavedPlanError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Scan(error) => write!(f, "re-scan failed: {error}"),
+            Self::NotAuthorized(detail) => write!(f, "saved plan is not authorized: {detail}"),
+            Self::Execute(error) => write!(f, "repair apply failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ApplySavedPlanError {}
+
+/// Re-proves a saved plan against a freshly re-run authoritative scan.
+///
+/// A saved plan is evidence, never permission. Every executable proposal it
+/// names must be independently reproduced by a fresh scan over the trusted
+/// inputs before anything may be executed. Any mismatch — in scan root, DAT,
+/// generation, or any proposal's source, destination, action, or audited
+/// identity — refuses.
+pub fn re_prove_saved_plan(
+    saved: &LibraryRepairPlan,
+    fresh: &LibraryScanOutcome,
+) -> Result<(), String> {
+    if saved.scan_root != fresh.audit.scan_root {
+        return Err(format!(
+            "saved scan root '{}' does not match the trusted scan root '{}'",
+            saved.scan_root, fresh.audit.scan_root
+        ));
+    }
+    if saved.dat_path != fresh.audit.dat_path {
+        return Err(format!(
+            "saved DAT '{}' does not match the trusted DAT '{}'",
+            saved.dat_path, fresh.audit.dat_path
+        ));
+    }
+    if saved.generation != fresh.generation {
+        return Err(format!(
+            "saved generation {} does not match the fresh generation {}",
+            saved.generation, fresh.generation
+        ));
+    }
+    let saved_proposals = &saved.repair_plan.proposals;
+    let fresh_proposals = &fresh.repair_plan.proposals;
+    if saved_proposals.len() != fresh_proposals.len() {
+        return Err(format!(
+            "saved plan names {} repairs but the fresh scan authorizes {}",
+            saved_proposals.len(),
+            fresh_proposals.len()
+        ));
+    }
+    for (saved_proposal, fresh_proposal) in saved_proposals.iter().zip(fresh_proposals.iter()) {
+        if saved_proposal.source_path != fresh_proposal.source_path
+            || saved_proposal.action != fresh_proposal.action
+            || saved_proposal.expected_source_identity != fresh_proposal.expected_source_identity
+        {
+            return Err(format!(
+                "saved proposal for '{}' was not independently reproduced by the fresh scan",
+                saved_proposal.source_path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Applies a saved plan by re-running the authoritative scan over trusted
+/// inputs, re-proving the saved proposals against it, and executing the freshly
+/// authorized plan.
+///
+/// The saved plan is never executed directly: only the fresh plan produced by
+/// this re-scan is handed to the executor, so a tampered destination, action,
+/// source, identity, safety state, conflict, generation, or scan root in the
+/// saved plan can never authorize a mutation. Refusal happens before any
+/// transaction is built, any journal is written, or any file is touched.
+pub fn apply_saved_plan(
+    saved: &LibraryRepairPlan,
+    root: &Path,
+    dat: &Path,
+    current_generation: u64,
+    options: &RepairExecutionOptions,
+    cancel: &AtomicBool,
+) -> Result<RepairTransactionResult, ApplySavedPlanError> {
+    let dat_kind = if std::fs::metadata(dat).is_ok_and(|meta| meta.is_dir()) {
+        DatSourceKind::Folder
+    } else {
+        DatSourceKind::File
+    };
+    let request = LibraryScanRequest {
+        source_id: saved.source_id.clone(),
+        source_display_name: saved.source_display_name.clone(),
+        dat_path: dat.to_path_buf(),
+        dat_kind,
+        scan_root: root.to_path_buf(),
+        limits: DatLimits::default(),
+        profile: RepairProfile::CanonicalInPlace,
+    };
+
+    // Re-run the authoritative scan over the trusted inputs. The trusted roots
+    // come from `options`, never from the saved plan.
+    let fresh = run_library_scan(&request, &options.trusted, cancel, &|_| {})
+        .map_err(ApplySavedPlanError::Scan)?;
+
+    // Re-prove: the saved plan must be independently reproducible.
+    re_prove_saved_plan(saved, &fresh).map_err(ApplySavedPlanError::NotAuthorized)?;
+
+    // Execute the freshly authorized plan (not the saved plan's proposals).
+    execute_repair_plan(&fresh.repair_plan, current_generation, options, cancel)
+        .map_err(ApplySavedPlanError::Execute)
 }

@@ -53,10 +53,10 @@ pub use execute::{
     reverify_transaction, rollback_repair_transaction,
 };
 pub use library::{
-    LibraryRepairPlan, LibraryRepairReport, LibraryScanError, LibraryScanOutcome,
-    LibraryScanRequest, PlanItem, RepairProfile, ReportCounts, SetItem, apply_library_repair_plan,
-    build_library_repair_report, plan_file_from_scan, preview_library_repair_plan,
-    run_library_scan,
+    ApplySavedPlanError, LibraryRepairPlan, LibraryRepairReport, LibraryScanError,
+    LibraryScanOutcome, LibraryScanRequest, PlanItem, RepairProfile, ReportCounts, SetItem,
+    apply_library_repair_plan, apply_saved_plan, build_library_repair_report, plan_file_from_scan,
+    preview_library_repair_plan, re_prove_saved_plan, run_library_scan,
 };
 pub use plan::{
     PlanConflict, PlanConflictKind, RepairPlan, RepairPlanId, build_repair_plan,

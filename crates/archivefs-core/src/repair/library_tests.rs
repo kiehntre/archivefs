@@ -10,12 +10,15 @@ use std::sync::atomic::AtomicBool;
 use tempfile::TempDir;
 
 use crate::dat::limits::DatLimits;
+use crate::dat::rename_apply::identity::capture_identity;
 use crate::dat::sources::DatSourceKind;
 use crate::repair::execute::{RepairExecutionError, RepairExecutionOptions, RepairReverifyOutcome};
 use crate::repair::library::{
-    LibraryScanRequest, RepairProfile, apply_library_repair_plan, plan_file_from_scan,
-    run_library_scan,
+    ApplySavedPlanError, LibraryRepairPlan, LibraryScanRequest, RepairProfile,
+    apply_library_repair_plan, apply_saved_plan, plan_file_from_scan, run_library_scan,
 };
+use crate::repair::plan::{PlanConflict, PlanConflictKind};
+use crate::repair::proposal::{RepairAction, SafetyState};
 use crate::safe_read::TrustedRoots;
 
 /// The SHA-1 of `b"test"` (4 bytes), used across DAT fixtures.
@@ -66,6 +69,11 @@ fn options(dir: &Path) -> RepairExecutionOptions {
         trusted: TrustedRoots::from_paths([dir]),
         journal_dir,
     }
+}
+
+/// Scans and returns the serialisable plan document (the saved plan).
+fn saved_plan(dat: &Path, roms: &Path) -> LibraryRepairPlan {
+    plan_file_from_scan(&scan(dat, roms))
 }
 
 /// A single-game, single-ROM Logiqx DAT declaring `super.bin` (the bytes of
@@ -502,4 +510,285 @@ fn a_batch_conflict_refuses_the_whole_transaction() {
     );
     assert!(a.exists());
     assert!(b.exists());
+}
+
+// ---------------------------------------------------------------------------
+// Authorization regressions: a saved plan is evidence, never permission.
+// ---------------------------------------------------------------------------
+
+// B. a stale independent generation refuses before any mutation.
+#[test]
+fn a_stale_generation_refuses_apply() {
+    let dir = temp();
+    let dat = single_rom_dat(dir.path());
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    write(&roms, "wrongname.bin", b"test");
+
+    let plan = saved_plan(&dat, &roms);
+    let error = apply_saved_plan(
+        &plan,
+        &roms,
+        &dat,
+        plan.generation.wrapping_add(1),
+        &options(dir.path()),
+        &no_cancel(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            ApplySavedPlanError::Execute(RepairExecutionError::StalePlan { .. })
+        ),
+        "{error:?}"
+    );
+    assert!(roms.join("wrongname.bin").exists(), "nothing was renamed");
+}
+
+// C. a tampered destination refuses.
+#[test]
+fn a_tampered_destination_refuses_apply() {
+    let dir = temp();
+    let dat = single_rom_dat(dir.path());
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    write(&roms, "wrongname.bin", b"test");
+
+    let mut plan = saved_plan(&dat, &roms);
+    for proposal in &mut plan.repair_plan.proposals {
+        if let RepairAction::RenamePath { destination } = &mut proposal.action {
+            *destination = roms.join("attacker.bin");
+        }
+    }
+
+    let error = apply_saved_plan(
+        &plan,
+        &roms,
+        &dat,
+        plan.generation,
+        &options(dir.path()),
+        &no_cancel(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, ApplySavedPlanError::NotAuthorized(_)),
+        "{error:?}"
+    );
+    assert!(roms.join("wrongname.bin").exists(), "nothing was renamed");
+    assert!(!roms.join("attacker.bin").exists());
+}
+
+// D. a tampered source + matching tampered identity refuses.
+#[test]
+fn a_tampered_source_and_identity_refuses_apply() {
+    let dir = temp();
+    let dat = single_rom_dat(dir.path());
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    write(&roms, "wrongname.bin", b"test");
+    // A different file the DAT does not authorize (content differs).
+    write(&roms, "other.bin", b"abc");
+
+    let mut plan = saved_plan(&dat, &roms);
+    for proposal in &mut plan.repair_plan.proposals {
+        proposal.source_path = roms.join("other.bin");
+        proposal.expected_source_identity = capture_identity(&roms.join("other.bin")).ok();
+    }
+
+    let error = apply_saved_plan(
+        &plan,
+        &roms,
+        &dat,
+        plan.generation,
+        &options(dir.path()),
+        &no_cancel(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, ApplySavedPlanError::NotAuthorized(_)),
+        "{error:?}"
+    );
+    assert!(
+        roms.join("other.bin").exists(),
+        "the tampered source was never renamed"
+    );
+}
+
+// E. a RenamePath -> MovePath tamper refuses.
+#[test]
+fn a_rename_to_move_tamper_refuses_apply() {
+    let dir = temp();
+    let dat = single_rom_dat(dir.path());
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    write(&roms, "wrongname.bin", b"test");
+
+    let mut plan = saved_plan(&dat, &roms);
+    for proposal in &mut plan.repair_plan.proposals {
+        if let RepairAction::RenamePath { destination } = &proposal.action {
+            proposal.action = RepairAction::MovePath {
+                destination: destination.clone(),
+            };
+        }
+    }
+
+    let error = apply_saved_plan(
+        &plan,
+        &roms,
+        &dat,
+        plan.generation,
+        &options(dir.path()),
+        &no_cancel(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, ApplySavedPlanError::NotAuthorized(_)),
+        "{error:?}"
+    );
+    assert!(roms.join("wrongname.bin").exists(), "nothing was renamed");
+}
+
+// F. a tampered scan_root cannot expand the trusted mutation root.
+#[test]
+fn a_tampered_scan_root_refuses_apply() {
+    let dir = temp();
+    let dat = single_rom_dat(dir.path());
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    write(&roms, "wrongname.bin", b"test");
+
+    let mut plan = saved_plan(&dat, &roms);
+    plan.scan_root = "/".to_string();
+
+    let error = apply_saved_plan(
+        &plan,
+        &roms,
+        &dat,
+        plan.generation,
+        &options(dir.path()),
+        &no_cancel(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, ApplySavedPlanError::NotAuthorized(_)),
+        "{error:?}"
+    );
+    assert!(roms.join("wrongname.bin").exists(), "nothing was renamed");
+}
+
+// G. a tampered safety/conflicts field is ignored: the fresh scan is authority.
+#[test]
+fn tampered_safety_and_conflicts_are_not_authority() {
+    let dir = temp();
+    let dat = single_rom_dat(dir.path());
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    write(&roms, "wrongname.bin", b"test");
+
+    let mut plan = saved_plan(&dat, &roms);
+    let first_id = plan.repair_plan.proposals[0].id.clone();
+    for proposal in &mut plan.repair_plan.proposals {
+        proposal.safety = SafetyState::NeedsReview;
+    }
+    plan.repair_plan.conflicts.push(PlanConflict {
+        kind: PlanConflictKind::UnsupportedProposal,
+        detail: "tampered".to_string(),
+        proposal_ids: vec![first_id],
+    });
+
+    // The saved safety/conflicts are ignored; the fresh scan authorizes and the
+    // correct rename still executes.
+    let result = apply_saved_plan(
+        &plan,
+        &roms,
+        &dat,
+        plan.generation,
+        &options(dir.path()),
+        &no_cancel(),
+    )
+    .expect("the fresh scan is authoritative");
+    assert_eq!(result.summary.applied, 1);
+    assert!(
+        roms.join("super.bin").exists(),
+        "the canonical rename happened"
+    );
+}
+
+// H. an untouched saved plan still applies.
+#[test]
+fn an_untouched_saved_plan_applies() {
+    let dir = temp();
+    let dat = single_rom_dat(dir.path());
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    write(&roms, "wrongname.bin", b"test");
+
+    let plan = saved_plan(&dat, &roms);
+    let result = apply_saved_plan(
+        &plan,
+        &roms,
+        &dat,
+        plan.generation,
+        &options(dir.path()),
+        &no_cancel(),
+    )
+    .expect("the untouched plan applies");
+    assert_eq!(result.summary.applied, 1);
+    assert!(roms.join("super.bin").exists());
+    assert!(!roms.join("wrongname.bin").exists());
+}
+
+// I. scan and plan remain read-only.
+#[test]
+fn plan_and_preview_remain_read_only() {
+    let dir = temp();
+    let dat = single_rom_dat(dir.path());
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    let source = write(&roms, "wrongname.bin", b"test");
+    let before = std::fs::read(&source).unwrap();
+
+    let plan = saved_plan(&dat, &roms);
+    let _ = crate::repair::library::preview_library_repair_plan(&plan, plan.generation);
+
+    assert_eq!(std::fs::read(&source).unwrap(), before);
+    assert!(source.exists());
+    assert!(!roms.join("super.bin").exists());
+}
+
+// J. refusal happens before journal creation or filesystem mutation.
+#[test]
+fn refusal_happens_before_journal_or_mutation() {
+    let dir = temp();
+    let dat = single_rom_dat(dir.path());
+    let roms = dir.path().join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    write(&roms, "wrongname.bin", b"test");
+
+    let mut plan = saved_plan(&dat, &roms);
+    for proposal in &mut plan.repair_plan.proposals {
+        if let RepairAction::RenamePath { destination } = &mut proposal.action {
+            *destination = roms.join("attacker.bin");
+        }
+    }
+
+    let journal_dir = dir.path().join("journal");
+    let error = apply_saved_plan(
+        &plan,
+        &roms,
+        &dat,
+        plan.generation,
+        &options(dir.path()),
+        &no_cancel(),
+    )
+    .unwrap_err();
+    assert!(matches!(error, ApplySavedPlanError::NotAuthorized(_)));
+
+    // No journal entry was written and nothing was mutated.
+    let journal_entries = std::fs::read_dir(&journal_dir)
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+    assert_eq!(journal_entries, 0, "no journal file was written");
+    assert!(roms.join("wrongname.bin").exists());
+    assert!(!roms.join("attacker.bin").exists());
 }

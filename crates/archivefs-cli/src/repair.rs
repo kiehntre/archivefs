@@ -5,7 +5,7 @@
 //! ```text
 //! emuwiz-cli repair scan  --root <dir> --dat <file> [--plan-out <json>] [--json]
 //! emuwiz-cli repair plan  --plan <json> [--json]
-//! emuwiz-cli repair apply --plan <json> [--generation <n>] [--journal-dir <dir>]
+//! emuwiz-cli repair apply --plan <json> --root <dir> --dat <file> --generation <n> [--journal-dir <dir>]
 //! ```
 //!
 //! `scan` is read-only by default: it audits, plans, and previews, and only
@@ -19,7 +19,7 @@ use archivefs_core::dat::rename_apply::journal::default_rename_transaction_dir;
 use archivefs_core::dat::sources::{DatSourceKind, suggest_display_name};
 use archivefs_core::repair::execute::RepairExecutionOptions;
 use archivefs_core::repair::library::{
-    LibraryRepairPlan, RepairProfile, apply_library_repair_plan, plan_file_from_scan,
+    LibraryRepairPlan, RepairProfile, apply_saved_plan, plan_file_from_scan,
     preview_library_repair_plan, run_library_scan,
 };
 use archivefs_core::safe_read::TrustedRoots;
@@ -148,33 +148,35 @@ fn run_apply(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let json = take_flag(&mut args, "--json");
     let plan_path =
         take_path_value(&mut args, "--plan")?.ok_or("repair apply requires --plan <plan file>")?;
-    let generation = take_u64_value(&mut args, "--generation")?;
+    let root = take_path_value(&mut args, "--root")?
+        .ok_or("repair apply requires --root <library directory>")?;
+    let dat = take_path_value(&mut args, "--dat")?
+        .ok_or("repair apply requires --dat <catalogue file>")?;
+    let generation = take_u64_value(&mut args, "--generation")?
+        .ok_or("repair apply requires --generation <n> (the current audit generation)")?;
     let journal_dir = take_path_value(&mut args, "--journal-dir")?;
     if !args.is_empty() {
         return Err(format!("repair apply does not accept {args:?}").into());
     }
 
     let plan = read_plan(&plan_path)?;
-    let current_generation = generation.unwrap_or(plan.generation);
-    if current_generation != plan.generation {
-        return Err(format!(
-            "the plan is stale (plan generation {}, current generation {}); re-run `repair scan`",
-            plan.generation, current_generation
-        )
-        .into());
-    }
 
     let journal_dir = journal_dir.unwrap_or_else(|| {
         default_rename_transaction_dir().unwrap_or_else(|_| PathBuf::from("rename-transactions"))
     });
-    let trusted = TrustedRoots::from_paths([Path::new(&plan.scan_root)]);
+    // The trusted mutation root comes from the caller's `--root`, never from the
+    // saved plan, so an edited plan cannot expand or redefine what may be touched.
+    let trusted = TrustedRoots::from_paths([&root]);
     let options = RepairExecutionOptions {
         trusted,
         journal_dir,
     };
     let cancel = std::sync::atomic::AtomicBool::new(false);
 
-    let result = apply_library_repair_plan(&plan, current_generation, &options, &cancel)?;
+    // Re-scan with the trusted inputs, re-prove the saved plan against the fresh
+    // scan, and execute the freshly authorized plan. `--generation` is the
+    // caller's independent assertion of the current generation.
+    let result = apply_saved_plan(&plan, &root, &dat, generation, &options, &cancel)?;
 
     let rolled_back = matches!(
         result.summary.rollback,
@@ -446,11 +448,20 @@ mod tests {
         );
         assert!(plan_path.exists(), "the plan file is written");
 
-        // apply: explicit, through the Repair Center executor.
+        let plan: archivefs_core::repair::library::LibraryRepairPlan =
+            serde_json::from_str(&std::fs::read_to_string(&plan_path).unwrap()).unwrap();
+
+        // apply: explicit, with the trusted inputs and the current generation.
         run(vec![
             "apply".into(),
             "--plan".into(),
             plan_path.display().to_string(),
+            "--root".into(),
+            roms.display().to_string(),
+            "--dat".into(),
+            dat.display().to_string(),
+            "--generation".into(),
+            plan.generation.to_string(),
             "--journal-dir".into(),
             dir.path().join("journal").display().to_string(),
         ])
@@ -461,6 +472,72 @@ mod tests {
             "apply renames to the canonical name"
         );
         assert!(!roms.join("wrongname.bin").exists(), "the old name is gone");
+    }
+
+    #[test]
+    fn apply_without_generation_refuses() {
+        let (dir, dat, roms) = fixture();
+        let plan_path = dir.path().join("plan.json");
+        run(vec![
+            "scan".into(),
+            "--root".into(),
+            roms.display().to_string(),
+            "--dat".into(),
+            dat.display().to_string(),
+            "--plan-out".into(),
+            plan_path.display().to_string(),
+        ])
+        .unwrap();
+
+        // Missing --generation must refuse before any mutation (--root/--dat given).
+        let error = run(vec![
+            "apply".into(),
+            "--plan".into(),
+            plan_path.display().to_string(),
+            "--root".into(),
+            roms.display().to_string(),
+            "--dat".into(),
+            dat.display().to_string(),
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("--generation"), "{error}");
+        assert!(roms.join("wrongname.bin").exists(), "nothing was renamed");
+    }
+
+    #[test]
+    fn apply_with_stale_generation_refuses() {
+        let (dir, dat, roms) = fixture();
+        let plan_path = dir.path().join("plan.json");
+        run(vec![
+            "scan".into(),
+            "--root".into(),
+            roms.display().to_string(),
+            "--dat".into(),
+            dat.display().to_string(),
+            "--plan-out".into(),
+            plan_path.display().to_string(),
+        ])
+        .unwrap();
+        let plan: archivefs_core::repair::library::LibraryRepairPlan =
+            serde_json::from_str(&std::fs::read_to_string(&plan_path).unwrap()).unwrap();
+
+        // A generation that does not match the fresh re-scan's generation.
+        let error = run(vec![
+            "apply".into(),
+            "--plan".into(),
+            plan_path.display().to_string(),
+            "--root".into(),
+            roms.display().to_string(),
+            "--dat".into(),
+            dat.display().to_string(),
+            "--generation".into(),
+            plan.generation.wrapping_add(1).to_string(),
+            "--journal-dir".into(),
+            dir.path().join("journal").display().to_string(),
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("stale"), "{error}");
+        assert!(roms.join("wrongname.bin").exists(), "nothing was renamed");
     }
 
     #[test]
