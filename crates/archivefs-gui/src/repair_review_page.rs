@@ -1,19 +1,26 @@
 //! The Repair Review page.
 //!
-//! Preview-only: it loads a saved whole-library [`LibraryRepairPlan`] (the
-//! exact JSON the CLI's `repair scan --plan-out` / `repair plan --plan`
-//! contract produces), summarises its [`ReportCounts`], and renders its
-//! proposals as a filterable, selectable, virtualised list.
+//! Loads a saved whole-library [`LibraryRepairPlan`] (the exact JSON the
+//! CLI's `repair scan --plan-out` / `repair plan --plan` contract produces),
+//! summarises its [`ReportCounts`], renders its proposals as a filterable,
+//! selectable, virtualised list, and can apply a user-selected subset of the
+//! Safe proposals.
 //!
-//! # No mutation, by construction
+//! # No mutation except through the trusted backend
 //!
-//! This module never imports or calls the Repair Center executor, apply,
-//! rollback, or re-proof paths. The state type holds only plan data, a filter,
-//! a selection set, and a details id. `load_plan` is a read-only file read.
-//! The only "Apply" surface is a permanently disabled button whose tooltip
-//! states that apply is not available in this build. There is no code path
-//! here that can rename, move, delete, or otherwise mutate a filesystem
-//! object.
+//! This module never calls `std::fs::rename` or any other filesystem
+//! mutation directly, and never builds or executes its own [`RepairPlan`].
+//! The only mutation path is [`apply_saved_plan_selected`], invoked on a
+//! background thread with the exact `LibraryRepairPlan` this page loaded
+//! from disk: that function re-runs the authoritative scan, fully re-proves
+//! the *entire* saved plan against it, resolves the selected ids against the
+//! freshly proven plan only, and executes through the existing
+//! transaction/journal/reverify machinery. This page never weakens, skips,
+//! or duplicates any of that — it only supplies the saved plan, the selected
+//! ids, and the trusted scan inputs recorded on the plan itself, and renders
+//! whatever the backend returns.
+//!
+//! [`RepairPlan`]: archivefs_core::repair::plan::RepairPlan
 //!
 //! # Rows come from the backend, verbatim
 //!
@@ -33,9 +40,18 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::AtomicBool;
+use std::sync::mpsc::{Receiver, TryRecvError};
 
-use archivefs_core::repair::library::{LibraryRepairPlan, ReportCounts};
+use archivefs_core::dat::rename_apply::model::EntryState;
+use archivefs_core::repair::execute::{
+    RepairExecutionOptions, RepairReverifyOutcome, RepairTransactionResult,
+};
+use archivefs_core::repair::library::{
+    ApplySavedPlanSelectedError, LibraryRepairPlan, ReportCounts, apply_saved_plan_selected,
+};
 use archivefs_core::repair::proposal::{RepairProposal, RepairProposalId};
+use archivefs_core::safe_read::TrustedRoots;
 use eframe::egui;
 
 use crate::ui::{components as widgets, theme};
@@ -226,7 +242,71 @@ pub(crate) fn summary_line(counts: &ReportCounts, availability: CountsAvailabili
     )
 }
 
-/// The page's authoritative state. Deliberately holds no executor/apply state.
+/// A snapshot of what "Apply Selected" is about to do, frozen at the moment
+/// the confirmation dialog opens.
+///
+/// Frozen rather than recomputed live so that the dialog's own text and the
+/// ids actually sent to the backend can never drift apart, even if the user
+/// changes the selection or loads a different plan while the dialog is open
+/// (in which case [`RepairReviewPageState::confirm_apply`] simply refuses).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RepairApplyConfirmation {
+    /// The exact, deterministically ordered ids [`apply_saved_plan_selected`]
+    /// will be called with.
+    pub(crate) selected: Vec<RepairProposalId>,
+    pub(crate) scan_root: String,
+    pub(crate) dat_path: String,
+}
+
+/// Why the background apply worker could not complete, with a short label a
+/// caller does not need to match on the underlying error type to show.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RepairApplyFailure {
+    pub(crate) label: &'static str,
+    pub(crate) detail: String,
+}
+
+impl RepairApplyFailure {
+    fn from_error(error: ApplySavedPlanSelectedError) -> Self {
+        match error {
+            ApplySavedPlanSelectedError::Scan(inner) => Self {
+                label: "Re-scan failed",
+                detail: inner.to_string(),
+            },
+            ApplySavedPlanSelectedError::NotAuthorized(detail) => Self {
+                label: "The saved plan could not be re-proven",
+                detail,
+            },
+            ApplySavedPlanSelectedError::InvalidSelection(detail) => Self {
+                label: "The selection could not be safely applied",
+                detail,
+            },
+            ApplySavedPlanSelectedError::Execute(inner) => Self {
+                label: "Apply failed",
+                detail: inner.to_string(),
+            },
+        }
+    }
+}
+
+/// The terminal message the background apply worker sends back.
+enum RepairApplyMessage {
+    Applied(Box<RepairTransactionResult>),
+    Failed(RepairApplyFailure),
+}
+
+/// The running background apply job. Mirrors the `dat_sources_page` job
+/// pattern: an unbounded channel drained once per frame by
+/// [`RepairReviewPageState::poll_apply`]. This slice does not offer
+/// mid-apply cancellation (the batch is small and short-lived by
+/// construction — a caller-selected subset), so no cancel handle is kept
+/// here; the worker still takes a cancel flag (required by
+/// [`apply_saved_plan_selected`]'s signature) but it is never set.
+struct RepairApplyJob {
+    messages: Receiver<RepairApplyMessage>,
+}
+
+/// The page's authoritative state.
 #[derive(Default)]
 pub(crate) struct RepairReviewPageState {
     pub(crate) plan: Option<LibraryRepairPlan>,
@@ -249,6 +329,27 @@ pub(crate) struct RepairReviewPageState {
     /// The last-built row list, keyed by the plan version and filter it was
     /// built from. `rows()` rebuilds only when either changes.
     rows_cache: Option<(u64, Option<RepairFilter>, Rc<Vec<RepairReviewRow>>)>,
+    /// A pending "Apply Selected" confirmation, frozen when the dialog opens.
+    /// `None` means no confirmation is showing.
+    pub(crate) apply_confirm: Option<RepairApplyConfirmation>,
+    /// Set once, right after the confirmation dialog opens, so its Cancel
+    /// button can claim focus on the frame it first appears (favouring
+    /// Cancel as the safe default) without re-stealing focus every frame.
+    apply_confirm_focus_cancel: bool,
+    apply_job: Option<RepairApplyJob>,
+    pub(crate) apply_running: bool,
+    /// The last apply's result, when the backend actually ran and returned.
+    /// Never populated for a refused/pre-mutation error - see `apply_failure`.
+    pub(crate) apply_result: Option<RepairTransactionResult>,
+    /// The last apply's refusal or error, when the backend refused or a
+    /// worker error occurred. Cleared only by a new apply attempt, never
+    /// automatically, so the reason stays visible until the user acts again.
+    pub(crate) apply_failure: Option<RepairApplyFailure>,
+    /// Set once an apply actually left entries applied on disk. The loaded
+    /// plan was proven against the library *before* that mutation, so it no
+    /// longer reflects the library's current state and must not be trusted
+    /// as evidence for a second apply without reloading/rescanning.
+    pub(crate) plan_stale: bool,
 }
 
 impl RepairReviewPageState {
@@ -271,6 +372,16 @@ impl RepairReviewPageState {
                 self.error = None;
                 self.counts_availability = availability;
                 self.plan_version = self.plan_version.wrapping_add(1);
+                // A freshly loaded plan supersedes any previous apply result,
+                // failure, staleness warning, or pending confirmation - all of
+                // those describe the *previous* plan, not this one. A running
+                // job is left alone: it was started against the plan it holds
+                // its own clone of, and finishes independently of what the
+                // page loads next.
+                self.apply_confirm = None;
+                self.apply_result = None;
+                self.apply_failure = None;
+                self.plan_stale = false;
             }
             Err(message) => self.error = Some(message),
         }
@@ -331,6 +442,219 @@ impl RepairReviewPageState {
             .as_ref()
             .and_then(|plan| plan.repair_plan.proposals.iter().find(|p| &p.id == id))
     }
+
+    /// Finds a selected proposal's id back from an applied entry's source
+    /// path. Valid because [`apply_saved_plan_selected`]'s full-plan re-proof
+    /// guarantees a fresh proposal's `source_path` is byte-identical to the
+    /// saved one this page loaded - so a match against the loaded plan's own
+    /// proposals is exact, never a guess.
+    fn proposal_id_for_source(&self, source: &std::path::Path) -> Option<RepairProposalId> {
+        self.plan.as_ref().and_then(|plan| {
+            plan.repair_plan
+                .proposals
+                .iter()
+                .find(|proposal| proposal.source_path == source)
+                .map(|proposal| proposal.id.clone())
+        })
+    }
+
+    /// The selected ids that are still an executable Safe proposal in the
+    /// loaded plan, in deterministic (`BTreeSet`) order. This is a defensive
+    /// re-check, not the safety boundary: [`apply_saved_plan_selected`]
+    /// re-validates everything again against a fresh scan regardless. It
+    /// exists so the enable rule and the confirmation dialog can never offer
+    /// to "apply" an id the loaded plan itself no longer backs.
+    pub(crate) fn actionable_selected_ids(&self) -> Vec<RepairProposalId> {
+        let Some(plan) = self.plan.as_ref() else {
+            return Vec::new();
+        };
+        self.selected
+            .iter()
+            .filter(|id| {
+                plan.repair_plan
+                    .proposals
+                    .iter()
+                    .any(|proposal| &proposal.id == *id && proposal.actionable())
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Whether "Apply Selected" may be invoked right now: a plan is loaded,
+    /// at least one selected proposal is still actionable, and no apply is
+    /// already running.
+    pub(crate) fn can_apply(&self) -> bool {
+        self.plan.is_some() && !self.apply_running && !self.actionable_selected_ids().is_empty()
+    }
+
+    /// Whether a background apply job is in flight.
+    pub(crate) fn is_apply_running(&self) -> bool {
+        self.apply_job.is_some()
+    }
+
+    /// Opens the confirmation dialog, freezing exactly what will be sent to
+    /// the backend if the user confirms. A no-op when `can_apply()` does not
+    /// hold, so a stale click (e.g. after the last selected id was
+    /// deselected) can never open a confirmation for nothing.
+    pub(crate) fn open_apply_confirmation(&mut self) {
+        if !self.can_apply() {
+            return;
+        }
+        let Some(plan) = self.plan.as_ref() else {
+            return;
+        };
+        self.apply_confirm = Some(RepairApplyConfirmation {
+            selected: self.actionable_selected_ids(),
+            scan_root: plan.scan_root.clone(),
+            dat_path: plan.dat_path.clone(),
+        });
+        self.apply_confirm_focus_cancel = true;
+    }
+
+    /// Dismisses the confirmation dialog without applying anything.
+    pub(crate) fn cancel_apply_confirmation(&mut self) {
+        self.apply_confirm = None;
+    }
+
+    /// Confirms the pending apply: spawns the background worker with exactly
+    /// the frozen [`RepairApplyConfirmation`], then closes the dialog.
+    ///
+    /// Refuses (closing the dialog without doing anything) if an apply is
+    /// already running or the plan was unloaded while the dialog was open -
+    /// both defensive, since the button that opens this dialog and the one
+    /// that would start a second job are both meant to already be disabled.
+    pub(crate) fn confirm_apply(&mut self) {
+        let Some(confirmation) = self.apply_confirm.take() else {
+            return;
+        };
+        if self.apply_running {
+            return;
+        }
+        let Some(plan) = self.plan.clone() else {
+            return;
+        };
+        self.spawn_apply(plan, confirmation);
+    }
+
+    /// Spawns the background apply worker. The GUI never mutates the
+    /// filesystem itself: this calls [`apply_saved_plan_selected`] on a
+    /// dedicated thread with the *exact* saved plan this page loaded (never
+    /// a GUI-built [`archivefs_core::repair::plan::RepairPlan`]) and the
+    /// exact frozen selection, and relays only the result back.
+    fn spawn_apply(&mut self, plan: LibraryRepairPlan, confirmation: RepairApplyConfirmation) {
+        if self.apply_job.is_some() {
+            return;
+        }
+        let root = PathBuf::from(&confirmation.scan_root);
+        let dat = PathBuf::from(&confirmation.dat_path);
+        let current_generation = plan.generation;
+        let selected = confirmation.selected;
+        let trusted = TrustedRoots::from_paths([&root]);
+        let journal_dir =
+            archivefs_core::dat::rename_apply::journal::default_rename_transaction_dir()
+                .unwrap_or_else(|_| PathBuf::from("rename-transactions"));
+        let options = RepairExecutionOptions {
+            trusted,
+            journal_dir,
+        };
+        // Never exposed to cancellation in this slice (see `RepairApplyJob`);
+        // still required by `apply_saved_plan_selected`'s signature.
+        let cancel = AtomicBool::new(false);
+        let (sender, messages) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || {
+            let result = apply_saved_plan_selected(
+                &plan,
+                &root,
+                &dat,
+                current_generation,
+                &selected,
+                &options,
+                &cancel,
+            );
+            let message = match result {
+                Ok(outcome) => RepairApplyMessage::Applied(Box::new(outcome)),
+                Err(error) => RepairApplyMessage::Failed(RepairApplyFailure::from_error(error)),
+            };
+            let _ = sender.send(message);
+        });
+
+        self.apply_job = Some(RepairApplyJob { messages });
+        self.apply_running = true;
+        self.apply_result = None;
+        self.apply_failure = None;
+    }
+
+    /// Drains the background apply job's channel, if one is running. Returns
+    /// whether anything changed (so the caller can request a repaint).
+    ///
+    /// On a successful apply, only the ids whose entry actually reached
+    /// [`EntryState::Applied`] are cleared from the selection - an id whose
+    /// entry was skipped, failed, or was rolled back stays selected, since it
+    /// was not, in the end, applied. On any failure the selection is left
+    /// entirely untouched: the caller decides what to do next.
+    pub(crate) fn poll_apply(&mut self) -> bool {
+        let Some(job) = self.apply_job.as_mut() else {
+            return false;
+        };
+        // The job sends exactly one terminal message and then hangs up, so
+        // one `try_recv` per frame is enough: there is never a backlog to
+        // drain in a loop the way a progress-reporting job needs.
+        let received = job.messages.try_recv();
+        match received {
+            Ok(message) => {
+                self.handle_apply_message(message);
+                self.apply_job = None;
+                true
+            }
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                self.apply_running = false;
+                self.apply_job = None;
+                true
+            }
+        }
+    }
+
+    /// Applies one terminal message from the apply worker to page state.
+    ///
+    /// On a successful apply, only the ids whose entry actually reached
+    /// [`EntryState::Applied`] are cleared from the selection - an id whose
+    /// entry was skipped, failed, or was rolled back stays selected, since it
+    /// was not, in the end, applied. On any failure the selection is left
+    /// entirely untouched: the caller decides what to do next.
+    fn handle_apply_message(&mut self, message: RepairApplyMessage) {
+        match message {
+            RepairApplyMessage::Applied(outcome) => {
+                let applied_sources: Vec<PathBuf> = outcome
+                    .transaction
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.state == EntryState::Applied)
+                    .map(|entry| entry.source_path.clone())
+                    .collect();
+                for source in &applied_sources {
+                    if let Some(id) = self.proposal_id_for_source(source) {
+                        self.selected.remove(&id);
+                    }
+                }
+                // Entries that stayed applied (not rolled back) mean the
+                // library changed under the loaded plan; a rescan/reload is
+                // required before this plan can back another apply.
+                if outcome.summary.applied > 0 {
+                    self.plan_stale = true;
+                }
+                self.apply_result = Some(*outcome);
+                self.apply_failure = None;
+                self.apply_running = false;
+            }
+            RepairApplyMessage::Failed(failure) => {
+                self.apply_failure = Some(failure);
+                self.apply_result = None;
+                self.apply_running = false;
+            }
+        }
+    }
 }
 
 /// Draws the page.
@@ -339,8 +663,13 @@ pub(crate) fn show_repair_review_page(ui: &mut egui::Ui, state: &mut RepairRevie
         ui,
         crate::ui::icons::VERIFY,
         "Repair Review",
-        "Preview the repairs a saved whole-library plan proposes. Nothing is applied here.",
+        "Preview a saved whole-library plan, then apply exactly the repairs you select.",
     );
+
+    // The confirmation dialog floats above everything else on the page and
+    // is drawn unconditionally so it stays visible (and actionable) no
+    // matter what else changed underneath it this frame.
+    show_apply_confirmation_dialog(ui, state);
 
     // Load control.
     widgets::card(ui, |ui| {
@@ -516,14 +845,32 @@ pub(crate) fn show_repair_review_page(ui: &mut egui::Ui, state: &mut RepairRevie
                 state.select_none();
             }
             ui.separator();
-            let apply = widgets::action_button(
-                ui,
-                format!("Apply Selected ({})", state.selected.len()),
-                widgets::ActionStyle::Primary,
-                false,
-            );
-            apply.on_disabled_hover_text("Preview only — apply is not available in this build.");
+            let can_apply = state.can_apply();
+            let apply_label = if state.apply_running {
+                "Applying…".to_string()
+            } else {
+                format!("Apply Selected ({})", state.selected.len())
+            };
+            let apply =
+                widgets::action_button(ui, apply_label, widgets::ActionStyle::Primary, can_apply);
+            let apply_clicked = apply.clicked();
+            if !can_apply {
+                let hover = if state.apply_running {
+                    "An apply is already running."
+                } else if state.actionable_selected_ids().is_empty() {
+                    "Select at least one Safe repair to apply."
+                } else {
+                    "Apply Selected is not available."
+                };
+                apply.on_disabled_hover_text(hover);
+            }
+            if apply_clicked {
+                state.open_apply_confirmation();
+            }
         });
+
+        show_apply_result(ui, state);
+        show_apply_failure(ui, state);
     }
 
     // Details panel for the selected Safe proposal, outside the virtualised
@@ -535,6 +882,135 @@ pub(crate) fn show_repair_review_page(ui: &mut egui::Ui, state: &mut RepairRevie
             None => state.details_id = None,
         }
     }
+}
+
+/// The "Apply Selected" confirmation dialog. A no-op draw when nothing is
+/// pending. Cancel is favoured: its button claims focus the first frame the
+/// dialog appears, and closing the window (e.g. Esc) is wired to Cancel, not
+/// Apply.
+fn show_apply_confirmation_dialog(ui: &mut egui::Ui, state: &mut RepairReviewPageState) {
+    let Some(confirmation) = state.apply_confirm.clone() else {
+        return;
+    };
+    let mut focus_cancel = state.apply_confirm_focus_cancel;
+    let mut cancel_clicked = false;
+    let mut apply_clicked = false;
+    let mut open = true;
+
+    egui::Window::new("Apply selected repairs?")
+        .collapsible(false)
+        .resizable(false)
+        .open(&mut open)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ui.ctx(), |ui| {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} repair(s) selected",
+                    confirmation.selected.len()
+                ))
+                .strong(),
+            );
+            detail_label(ui, "Scan root", &confirmation.scan_root);
+            detail_label(ui, "DAT source", &confirmation.dat_path);
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(
+                    "The selected files will be renamed or moved on disk. The saved plan is \
+                     re-proven against a fresh scan first; if anything has changed, nothing is \
+                     touched.",
+                )
+                .color(theme::muted(ui)),
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                let cancel = ui.add(egui::Button::new("Cancel"));
+                if focus_cancel {
+                    cancel.request_focus();
+                    focus_cancel = false;
+                }
+                if cancel.clicked() {
+                    cancel_clicked = true;
+                }
+                if ui.add(egui::Button::new("Apply")).clicked() {
+                    apply_clicked = true;
+                }
+            });
+        });
+
+    state.apply_confirm_focus_cancel = focus_cancel;
+    if cancel_clicked || !open {
+        state.cancel_apply_confirmation();
+    } else if apply_clicked {
+        state.confirm_apply();
+    }
+}
+
+/// Post-apply feedback for the last completed run: transaction id, counts,
+/// rollback status, and reverify results. Shown until superseded by the next
+/// apply or a newly loaded plan.
+fn show_apply_result(ui: &mut egui::Ui, state: &RepairReviewPageState) {
+    let Some(result) = state.apply_result.as_ref() else {
+        return;
+    };
+    ui.add_space(8.0);
+    widgets::card(ui, |ui| {
+        ui.label(egui::RichText::new("Apply complete").size(16.0).strong());
+        detail_label(ui, "Transaction id", &result.summary.transaction_id);
+        detail_label(ui, "Requested", &result.summary.requested.to_string());
+        detail_label(ui, "Applied", &result.summary.applied.to_string());
+        detail_label(ui, "Failed", &result.summary.failed.to_string());
+        detail_label(ui, "Skipped", &result.summary.skipped.to_string());
+        detail_label(ui, "Rollback", result.summary.rollback.label());
+        if !result.reverify.is_empty() {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new("Reverify").strong());
+            for entry in &result.reverify {
+                let tone = match entry.outcome {
+                    RepairReverifyOutcome::Verified => widgets::StatusTone::Success,
+                    RepairReverifyOutcome::Missing | RepairReverifyOutcome::Changed => {
+                        widgets::StatusTone::Blocked
+                    }
+                };
+                ui.horizontal(|ui| {
+                    widgets::status_badge(ui, entry.outcome.label(), tone);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} → {}",
+                            entry.source_path.display(),
+                            entry.destination_path.display()
+                        ))
+                        .monospace()
+                        .small(),
+                    );
+                });
+            }
+        }
+    });
+    if state.plan_stale {
+        ui.add_space(6.0);
+        widgets::banner(
+            ui,
+            "This loaded plan is now stale",
+            "The library changed on disk. Rescan (or reload a fresh saved plan) before applying \
+             again — this plan no longer reflects the library's current state.",
+            widgets::StatusTone::Warning,
+        );
+    }
+}
+
+/// The last apply's refusal or error, when there is one. Shown until
+/// superseded by the next apply attempt or a newly loaded plan.
+fn show_apply_failure(ui: &mut egui::Ui, state: &RepairReviewPageState) {
+    let Some(failure) = state.apply_failure.as_ref() else {
+        return;
+    };
+    ui.add_space(8.0);
+    widgets::banner(
+        ui,
+        failure.label,
+        &failure.detail,
+        widgets::StatusTone::Blocked,
+    );
 }
 
 /// Opens the plan picker and loads the chosen file. Shared by the header
