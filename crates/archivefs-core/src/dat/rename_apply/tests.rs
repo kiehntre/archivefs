@@ -1448,15 +1448,44 @@ fn apply_three_and_cancel_after_first_reverse_rename(
     });
 
     // Rollback runs in reverse order: index 2 is reversed first, restoring
-    // c.bin. Spin (without yielding) for that reverse rename, then cancel: the
-    // durable journal write after the reversal gives this thread the window.
+    // c.bin. Wait for that reverse rename's durable, observable side effect,
+    // then cancel: the durable journal write after the reversal gives this
+    // thread the window.
+    //
+    // This used to be a fixed 200_000-iteration `spin_loop()` budget with no
+    // wall-clock bound. `spin_loop()` is a CPU hint only - it never yields
+    // the OS timeslice - so under CI's parallel-test-thread contention (many
+    // `cargo test` worker threads sharing few vCPUs), the busy-spinning main
+    // thread could exhaust its whole iteration budget without the scheduler
+    // ever giving the rollback worker thread a slice to run the rename, all
+    // without spending enough *wall-clock* time for that to be unreasonable.
+    // A fixed iteration count is a proxy for time that only holds when the
+    // machine is otherwise idle, which is exactly what a local run is and a
+    // loaded CI runner is not.
+    //
+    // The fix keeps the same observable condition (the same fact the test is
+    // actually proving: the first reverse rename ran) but waits on wall-clock
+    // time instead of a CPU-hint budget, and actively yields the thread once
+    // a short initial spin hasn't resolved it - so the OS scheduler has a
+    // real, repeated opportunity to run the worker thread regardless of core
+    // count or contention. The 30s ceiling is generous enough that only a
+    // genuine hang (not scheduling variance) would ever hit it, at which
+    // point this still fails loudly with the same diagnostic as before,
+    // never silently.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let mut seen = false;
-    for _ in 0..200_000 {
+    let mut spins: u32 = 0;
+    while std::time::Instant::now() < deadline {
         if roms.join("c.bin").exists() {
             seen = true;
             break;
         }
-        std::hint::spin_loop();
+        spins += 1;
+        if spins < 10_000 {
+            std::hint::spin_loop();
+        } else {
+            std::thread::yield_now();
+        }
     }
     assert!(
         seen,

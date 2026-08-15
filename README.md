@@ -31,6 +31,9 @@ rewritten, and 7z DAT verification is not yet a production audit path. See
 [`docs/releases/v0.7.2-alpha.md`](docs/releases/v0.7.2-alpha.md) for the full
 release notes.
 
+Development is currently underway toward `v0.8.0-alpha`, which has not been
+published yet.
+
 ## Principles
 
 - **Local-first.** No telemetry, no required cloud account, and it keeps
