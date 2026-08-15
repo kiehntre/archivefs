@@ -8,14 +8,20 @@
 
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
+use archivefs_core::dat::limits::DatLimits;
+use archivefs_core::dat::sources::DatSourceKind;
+use archivefs_core::repair::execute::RepairReverifyOutcome;
 use archivefs_core::repair::library::{
-    LibraryRepairPlan, LibraryRepairReport, PlanItem, ReportCounts,
+    LibraryRepairPlan, LibraryRepairReport, LibraryScanRequest, PlanItem, RepairProfile,
+    ReportCounts, run_library_scan,
 };
 use archivefs_core::repair::plan::{RepairPlan, RepairPlanId};
 use archivefs_core::repair::proposal::{
     RepairAction, RepairEvidence, RepairEvidenceKind, RepairProposal, RepairProposalId, SafetyState,
 };
+use archivefs_core::safe_read::TrustedRoots;
 
 use super::*;
 
@@ -67,7 +73,18 @@ fn make_proposal(index: usize) -> RepairProposal {
             RepairEvidenceKind::CanonicalDatName,
             "canonical DAT name",
         )],
-        expected_source_identity: None,
+        // A real identity, not `None`: `RepairProposal::actionable()` (and so
+        // `RepairReviewPageState::actionable_selected_ids`) requires one, and
+        // several apply-enable-rule tests select fixture proposals.
+        expected_source_identity: Some(archivefs_core::dat::rename_apply::ObjectIdentity {
+            size_bytes: 1,
+            modified_unix: 1,
+            kind: archivefs_core::dat::rename_apply::ObjectKind::RegularFile,
+            #[cfg(unix)]
+            ino: 1,
+            #[cfg(unix)]
+            dev: 1,
+        }),
         originating_audit: None,
         safety: SafetyState::Safe,
         blockers: Vec::new(),
@@ -620,4 +637,393 @@ fn the_page_renders_summary_rows_and_a_disabled_apply() {
     assert!(rendered_text_contains(&output, "151 ancillary ignored"));
     assert!(rendered_text_contains(&output, "Apply Selected (0)"));
     assert!(rendered_text_contains(&output, "Load repair plan"));
+}
+
+// ---------------------------------------------------------------------------
+// Apply Selected: real scans, a real (disposable, temp-dir) library, and the
+// real trusted backend. Every fixture below is a fresh `TestDir`; nothing
+// here ever touches a real ROM library.
+// ---------------------------------------------------------------------------
+
+/// SHA-1 of `b"test"` (4 bytes).
+const SHA1_TEST: &str = "a94a8fe5ccb19ba61c4c0873d391e987982fbbd3";
+/// SHA-1 of `b"abc"` (3 bytes).
+const SHA1_ABC: &str = "a9993e364706816aba3e25717850c26c9cd0d89d";
+
+/// A two-game DAT and two wrongly-named loose ROMs under `dir`, so a real
+/// scan produces exactly two independent, non-conflicting Safe proposals.
+fn write_apply_fixture(dir: &std::path::Path) -> (PathBuf, PathBuf) {
+    let dat = dir.join("two.dat");
+    std::fs::write(
+        &dat,
+        format!(
+            r#"<datafile><header><name>Two</name></header>
+<game name="Alpha"><rom name="alpha.bin" size="4" sha1="{SHA1_TEST}"/></game>
+<game name="Beta"><rom name="beta.bin" size="3" sha1="{SHA1_ABC}"/></game>
+</datafile>"#
+        ),
+    )
+    .unwrap();
+    let roms = dir.join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    std::fs::write(roms.join("a.bin"), b"test").unwrap();
+    std::fs::write(roms.join("b.bin"), b"abc").unwrap();
+    (dat, roms)
+}
+
+/// Runs a real, read-only scan over `write_apply_fixture`'s layout and
+/// returns the saved-plan document exactly as `repair scan --plan-out`
+/// would, so apply tests exercise the real trust boundary
+/// (`apply_saved_plan_selected` re-scans and re-proves this) rather than a
+/// hand-built plan.
+fn scan_apply_fixture(dat: &std::path::Path, roms: &std::path::Path) -> LibraryRepairPlan {
+    let request = LibraryScanRequest {
+        source_id: "test".to_string(),
+        source_display_name: "Test catalogue".to_string(),
+        dat_path: dat.to_path_buf(),
+        dat_kind: DatSourceKind::File,
+        scan_root: roms.to_path_buf(),
+        limits: DatLimits::default(),
+        profile: RepairProfile::CanonicalInPlace,
+    };
+    let outcome = run_library_scan(
+        &request,
+        &TrustedRoots::none(),
+        &std::sync::atomic::AtomicBool::new(false),
+        &|_| {},
+    )
+    .expect("the fixture scan runs");
+    archivefs_core::repair::library::plan_file_from_scan(&outcome)
+}
+
+/// Blocks the calling test thread (never the egui/render thread - there is
+/// none in these tests) until the page's background apply job settles or a
+/// generous deadline passes, polling exactly the way the real render loop
+/// does (`poll_apply` once per tick).
+fn wait_for_apply(state: &mut RepairReviewPageState) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while state.is_apply_running() {
+        state.poll_apply();
+        if Instant::now() > deadline {
+            panic!("the background apply job did not finish in time");
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+fn proposal_id_for(plan: &LibraryRepairPlan, source_basename: &str) -> RepairProposalId {
+    plan.repair_plan
+        .proposals
+        .iter()
+        .find(|p| p.source_path.file_name().unwrap() == source_basename)
+        .expect("a proposal for the given source exists")
+        .id
+        .clone()
+}
+
+// --- enable/disable rules ---------------------------------------------------
+
+#[test]
+fn apply_is_disabled_with_no_plan_loaded() {
+    let state = RepairReviewPageState::default();
+    assert!(!state.can_apply());
+}
+
+#[test]
+fn apply_is_disabled_with_a_plan_but_no_selection() {
+    let state = RepairReviewPageState {
+        plan: Some(fixture_plan()),
+        ..RepairReviewPageState::default()
+    };
+    assert!(!state.can_apply());
+}
+
+#[test]
+fn apply_is_enabled_with_a_plan_and_a_safe_selection() {
+    let mut state = RepairReviewPageState {
+        plan: Some(fixture_plan()),
+        ..RepairReviewPageState::default()
+    };
+    let id = state.plan.as_ref().unwrap().repair_plan.proposals[0]
+        .id
+        .clone();
+    state.toggle_selected(&id);
+    assert!(state.can_apply());
+}
+
+#[test]
+fn apply_is_disabled_while_an_apply_is_already_running() {
+    let mut state = RepairReviewPageState {
+        plan: Some(fixture_plan()),
+        ..RepairReviewPageState::default()
+    };
+    let id = state.plan.as_ref().unwrap().repair_plan.proposals[0]
+        .id
+        .clone();
+    state.toggle_selected(&id);
+    assert!(state.can_apply());
+    state.apply_running = true;
+    assert!(!state.can_apply(), "a second apply must not be offered");
+}
+
+// --- confirmation is required, and cancelling it never applies -------------
+
+#[test]
+fn clicking_apply_opens_a_confirmation_and_never_starts_a_job() {
+    let mut state = RepairReviewPageState {
+        plan: Some(fixture_plan()),
+        ..RepairReviewPageState::default()
+    };
+    let id = state.plan.as_ref().unwrap().repair_plan.proposals[0]
+        .id
+        .clone();
+    state.toggle_selected(&id);
+
+    state.open_apply_confirmation();
+
+    assert!(state.apply_confirm.is_some(), "the dialog is pending");
+    assert!(
+        !state.is_apply_running(),
+        "opening the dialog must never itself start work"
+    );
+    assert_eq!(state.apply_confirm.as_ref().unwrap().selected, vec![id]);
+}
+
+#[test]
+fn cancelling_the_confirmation_never_touches_the_filesystem() {
+    let dir = TestDir::new("apply-cancel");
+    let (dat, roms) = write_apply_fixture(dir.path());
+    let plan = scan_apply_fixture(&dat, &roms);
+    let alpha_id = proposal_id_for(&plan, "a.bin");
+
+    let mut state = RepairReviewPageState {
+        plan: Some(plan),
+        ..RepairReviewPageState::default()
+    };
+    state.toggle_selected(&alpha_id);
+    state.open_apply_confirmation();
+    assert!(state.apply_confirm.is_some());
+
+    state.cancel_apply_confirmation();
+
+    assert!(state.apply_confirm.is_none());
+    assert!(!state.is_apply_running());
+    assert!(state.selected.contains(&alpha_id), "selection is kept");
+    assert!(roms.join("a.bin").exists(), "nothing was renamed");
+    assert!(roms.join("b.bin").exists(), "nothing was renamed");
+    assert!(!roms.join("alpha.bin").exists());
+}
+
+// --- selected ids are passed exactly once -----------------------------------
+
+#[test]
+fn only_the_confirmed_selection_is_sent_and_applied() {
+    let dir = TestDir::new("apply-selected-once");
+    let (dat, roms) = write_apply_fixture(dir.path());
+    let plan = scan_apply_fixture(&dat, &roms);
+    let alpha_id = proposal_id_for(&plan, "a.bin");
+    let beta_id = proposal_id_for(&plan, "b.bin");
+
+    let mut state = RepairReviewPageState {
+        plan: Some(plan),
+        ..RepairReviewPageState::default()
+    };
+    // Select only Alpha; Beta is a known-good proposal that must be left
+    // completely alone.
+    state.toggle_selected(&alpha_id);
+    state.open_apply_confirmation();
+    assert_eq!(
+        state.apply_confirm.as_ref().unwrap().selected,
+        vec![alpha_id.clone()],
+        "exactly the confirmed id, exactly once"
+    );
+    state.confirm_apply();
+    wait_for_apply(&mut state);
+
+    let result = state.apply_result.as_ref().expect("the apply succeeded");
+    assert_eq!(result.summary.requested, 1, "exactly one proposal ran");
+    assert_eq!(result.summary.applied, 1);
+    assert!(roms.join("alpha.bin").exists(), "Alpha was renamed");
+    assert!(roms.join("b.bin").exists(), "Beta was never touched");
+    assert!(!roms.join("beta.bin").exists());
+    assert!(!state.selected.contains(&alpha_id), "applied id is cleared");
+    let _ = beta_id;
+}
+
+// --- double-click / re-entry is blocked while running -----------------------
+
+#[test]
+fn a_second_apply_attempt_while_running_is_a_no_op() {
+    let dir = TestDir::new("apply-double-click");
+    let (dat, roms) = write_apply_fixture(dir.path());
+    let plan = scan_apply_fixture(&dat, &roms);
+    let alpha_id = proposal_id_for(&plan, "a.bin");
+
+    let mut state = RepairReviewPageState {
+        plan: Some(plan),
+        ..RepairReviewPageState::default()
+    };
+    state.toggle_selected(&alpha_id);
+    state.open_apply_confirmation();
+    state.confirm_apply();
+    assert!(state.is_apply_running());
+
+    // Simulate a second click landing while the first job is in flight: the
+    // button is supposed to be disabled by then, but the state methods
+    // themselves must also refuse, never spawning a second worker.
+    assert!(!state.can_apply());
+    state.open_apply_confirmation();
+    assert!(
+        state.apply_confirm.is_none(),
+        "a confirmation cannot open while an apply is already running"
+    );
+    state.confirm_apply(); // no-op: no pending confirmation to consume
+    assert!(state.is_apply_running(), "the original job is untouched");
+
+    wait_for_apply(&mut state);
+    let result = state.apply_result.as_ref().expect("the single apply ran");
+    assert_eq!(
+        result.summary.requested, 1,
+        "only the one originally confirmed proposal ever ran"
+    );
+    assert!(roms.join("alpha.bin").exists());
+}
+
+// --- successful result state -------------------------------------------------
+
+#[test]
+fn a_successful_apply_reports_counts_reverify_and_clears_the_selection() {
+    let dir = TestDir::new("apply-success");
+    let (dat, roms) = write_apply_fixture(dir.path());
+    let plan = scan_apply_fixture(&dat, &roms);
+    let alpha_id = proposal_id_for(&plan, "a.bin");
+    let beta_id = proposal_id_for(&plan, "b.bin");
+
+    let mut state = RepairReviewPageState {
+        plan: Some(plan),
+        ..RepairReviewPageState::default()
+    };
+    state.toggle_selected(&alpha_id);
+    state.toggle_selected(&beta_id);
+    state.open_apply_confirmation();
+    state.confirm_apply();
+    wait_for_apply(&mut state);
+
+    let result = state.apply_result.as_ref().expect("apply succeeded");
+    assert_eq!(result.summary.requested, 2);
+    assert_eq!(result.summary.applied, 2);
+    assert_eq!(result.summary.failed, 0);
+    assert!(!result.transaction.transaction_id.is_empty());
+    assert_eq!(result.reverify.len(), 2);
+    assert!(
+        result
+            .reverify
+            .iter()
+            .all(|entry| entry.outcome == RepairReverifyOutcome::Verified)
+    );
+    assert!(state.apply_failure.is_none());
+    assert!(!state.apply_running);
+    assert!(state.selected.is_empty(), "both applied ids are cleared");
+    assert!(state.plan_stale, "the loaded plan no longer reflects disk");
+    let transaction_id = result.summary.transaction_id.clone();
+
+    // Rendered feedback: counts, reverify, and the stale-plan warning.
+    let ctx = egui::Context::default();
+    let output = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            show_repair_review_page(ui, &mut state);
+        });
+    });
+    assert!(rendered_text_contains(&output, "Apply complete"));
+    assert!(rendered_text_contains(&output, &transaction_id));
+    assert!(rendered_text_contains(&output, "now stale"));
+}
+
+// --- failed/refused result state --------------------------------------------
+
+#[test]
+fn a_refused_apply_reports_the_reason_and_mutates_nothing() {
+    let dir = TestDir::new("apply-refused");
+    let (dat, roms) = write_apply_fixture(dir.path());
+    let mut plan = scan_apply_fixture(&dat, &roms);
+    let alpha_id = proposal_id_for(&plan, "a.bin");
+    // Point the plan's own recorded DAT at a path that does not exist: the
+    // background worker re-scans from exactly this path (never the real
+    // fixture DAT), so the re-scan itself refuses before anything is
+    // proven or touched.
+    plan.dat_path = dir.path().join("does-not-exist.dat").display().to_string();
+
+    let mut state = RepairReviewPageState {
+        plan: Some(plan),
+        ..RepairReviewPageState::default()
+    };
+    state.toggle_selected(&alpha_id);
+    state.open_apply_confirmation();
+    state.confirm_apply();
+    wait_for_apply(&mut state);
+
+    let failure = state.apply_failure.as_ref().expect("the apply refused");
+    assert_eq!(failure.label, "Re-scan failed");
+    assert!(state.apply_result.is_none());
+    assert!(!state.apply_running);
+    assert!(
+        state.selected.contains(&alpha_id),
+        "a refusal never clears the selection"
+    );
+    assert!(!state.plan_stale, "a refusal never mutates the library");
+    assert!(roms.join("a.bin").exists(), "nothing was renamed");
+    assert!(roms.join("b.bin").exists(), "nothing was renamed");
+
+    let ctx = egui::Context::default();
+    let output = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            show_repair_review_page(ui, &mut state);
+        });
+    });
+    assert!(rendered_text_contains(&output, "Re-scan failed"));
+}
+
+// --- the previous plan is retained on failure -------------------------------
+
+#[test]
+fn the_loaded_plan_is_retained_after_a_refused_apply() {
+    let dir = TestDir::new("apply-refused-keeps-plan");
+    let (dat, roms) = write_apply_fixture(dir.path());
+    let mut plan = scan_apply_fixture(&dat, &roms);
+    let alpha_id = proposal_id_for(&plan, "a.bin");
+    let original_source_id = plan.source_id.clone();
+    plan.dat_path = dir.path().join("does-not-exist.dat").display().to_string();
+
+    let mut state = RepairReviewPageState {
+        plan: Some(plan),
+        ..RepairReviewPageState::default()
+    };
+    state.toggle_selected(&alpha_id);
+    state.open_apply_confirmation();
+    state.confirm_apply();
+    wait_for_apply(&mut state);
+
+    assert!(state.apply_failure.is_some());
+    let plan_after = state.plan.as_ref().expect("the plan was never discarded");
+    assert_eq!(plan_after.source_id, original_source_id);
+}
+
+// --- no direct filesystem mutation path in this page ------------------------
+
+/// The page's own doc comment claims every mutation goes through
+/// `apply_saved_plan_selected`, never a direct `fs::rename`. This pins that
+/// claim structurally, not just behaviourally: the source of this page
+/// module must never spell a direct rename/move call.
+#[test]
+fn the_page_module_never_calls_fs_rename_directly() {
+    let source = include_str!("../repair_review_page.rs");
+    assert!(
+        !source.contains("fs::rename("),
+        "the Repair Review page must route every mutation through \
+         apply_saved_plan_selected, never a direct fs::rename"
+    );
+    assert!(
+        source.contains("apply_saved_plan_selected"),
+        "the page must call the trusted selected-apply backend"
+    );
 }
