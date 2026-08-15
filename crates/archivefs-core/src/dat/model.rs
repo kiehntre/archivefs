@@ -280,6 +280,16 @@ pub struct DatPartEntry {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DatGameEntry {
     pub name: String,
+    /// Raw `<game id="...">` declaration, when the DAT publishes one.
+    ///
+    /// No-Intro DATs assign a stable numeric-or-alphanumeric `id` to every
+    /// entry and reference it from a clone via `cloneofid` instead of (or
+    /// alongside) a name-based `cloneof`. This field preserves that literal
+    /// value so a `cloneofid` can be resolved as a second, ID-keyed identity,
+    /// never as a name lookup against an ID string (which is what silently
+    /// broke that resolution before this field existed).
+    #[serde(default)]
+    pub id: Option<String>,
     pub description: Option<String>,
     pub roms: Vec<DatRomEntry>,
     pub clone_of: Option<String>,

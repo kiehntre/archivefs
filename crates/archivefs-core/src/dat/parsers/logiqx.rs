@@ -68,6 +68,7 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
     let mut games: Vec<DatGameEntry> = Vec::new();
     let mut current_game_name: Option<String> = None;
     let mut current_game_desc: Option<String> = None;
+    let mut current_game_id: Option<String> = None;
     let mut current_game_clone_of: Option<String> = None;
     let mut current_game_rom_of: Option<String> = None;
     let mut current_game_sample_of: Option<String> = None;
@@ -169,6 +170,7 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                         );
                         drop_current_game(
                             &mut current_game_name,
+                            &mut current_game_id,
                             &mut current_game_desc,
                             &mut current_game_clone_of,
                             &mut current_game_rom_of,
@@ -201,12 +203,22 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                             &mut warnings,
                             limits.max_warnings,
                         )?;
+                        // The DAT's own `id` for this entry, when it publishes
+                        // one (No-Intro DATs always do). Preserved verbatim,
+                        // never length-checked or required - this is a
+                        // secondary identity a `cloneofid` reference resolves
+                        // against, not the entry's primary key.
+                        current_game_id =
+                            attr_str_opt(start_bytes, b"id", &mut warnings, limits.max_warnings);
                         // A `cloneof` attribute names the parent entry; when a
-                        // catalogue uses the MAME-style `cloneofid` (a ROM name)
-                        // instead, that is captured as the parent reference.
-                        // Deliberately not length-checked beyond the identifier
-                        // ceiling: a parent name is a label, and overlong values
-                        // are carried as-is so nothing is dropped.
+                        // catalogue uses `cloneofid` instead (No-Intro: another
+                        // entry's `id`, not a name), that raw value is captured
+                        // as the parent reference just the same. Resolving it
+                        // against the right index (name vs `id`) happens later,
+                        // in `DependencyGraph::resolve_set`. Deliberately not
+                        // length-checked beyond the identifier ceiling: a
+                        // parent reference is a label, and overlong values are
+                        // carried as-is so nothing is dropped.
                         current_game_clone_of = attr_str_opt(
                             start_bytes,
                             b"cloneof",
@@ -987,6 +999,7 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
     );
     drop_current_game(
         &mut current_game_name,
+        &mut current_game_id,
         &mut current_game_desc,
         &mut current_game_clone_of,
         &mut current_game_rom_of,
@@ -1198,6 +1211,7 @@ fn finish_current_structure(
 #[allow(clippy::too_many_arguments)]
 fn drop_current_game(
     name: &mut Option<String>,
+    id: &mut Option<String>,
     desc: &mut Option<String>,
     clone_of: &mut Option<String>,
     rom_of: &mut Option<String>,
@@ -1227,6 +1241,7 @@ fn drop_current_game(
     if let Some(game_name) = name.take() {
         games.push(DatGameEntry {
             name: game_name,
+            id: id.take(),
             description: desc.take(),
             roms: std::mem::take(roms),
             clone_of: clone_of.take(),
@@ -1599,10 +1614,59 @@ mod tests {
         assert_eq!(outcome.dat.games[0].name, "Parent Game");
         assert_eq!(outcome.dat.games[1].name, "Clone Game");
         // The parent declaration is captured so the clone policy can act on
-        // it; `cloneofid` (MAME-style, a ROM name) is used when `cloneof` is
-        // absent.
+        // it; `cloneofid` (No-Intro-style, another entry's `id`) is used when
+        // `cloneof` is absent. Resolving that value against the right index
+        // (name vs `id`) is `DependencyGraph::resolve_set`'s job, not this
+        // parser's - see logiqx.rs's `id`-preservation tests below and
+        // `dependency/graph.rs`.
         assert_eq!(outcome.dat.games[0].clone_of, None);
         assert_eq!(outcome.dat.games[1].clone_of.as_deref(), Some("parent.bin"));
+    }
+
+    #[test]
+    fn a_game_id_attribute_is_preserved_exactly() {
+        // No-Intro DATs assign every entry a stable id, independent of its
+        // name, and reference it from a clone via `cloneofid`.
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+    <game name="Phantasy Star (World) (En) (Sega Ages)" id="0658">
+        <rom name="ps.bin" size="100" crc="AAAAAAAA"/>
+    </game>
+</datafile>"#;
+        let outcome = parse_xml(xml).unwrap();
+        assert_eq!(outcome.dat.games[0].id.as_deref(), Some("0658"));
+    }
+
+    #[test]
+    fn a_game_with_no_id_attribute_leaves_id_absent() {
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+    <game name="No Id Here">
+        <rom name="x.bin" size="1" crc="AAAAAAAA"/>
+    </game>
+</datafile>"#;
+        let outcome = parse_xml(xml).unwrap();
+        assert_eq!(outcome.dat.games[0].id, None);
+    }
+
+    #[test]
+    fn a_cloneofid_reference_is_preserved_as_the_clone_reference_string() {
+        // The parser's job is only to capture the literal reference; turning
+        // it into a resolved entry (by id, not by name) is
+        // `DependencyGraph::resolve_set`'s job.
+        let xml = r#"<?xml version="1.0"?>
+<datafile>
+    <game name="Phantasy Star (World) (En) (Sega Ages)" id="0658" cloneofid="0272">
+        <rom name="ps.bin" size="100" crc="AAAAAAAA"/>
+    </game>
+    <game name="Phantasy Star (USA, Europe)" id="0272">
+        <rom name="ps-parent.bin" size="100" crc="BBBBBBBB"/>
+    </game>
+</datafile>"#;
+        let outcome = parse_xml(xml).unwrap();
+        assert_eq!(outcome.dat.games[0].id.as_deref(), Some("0658"));
+        assert_eq!(outcome.dat.games[0].clone_of.as_deref(), Some("0272"));
+        assert_eq!(outcome.dat.games[1].id.as_deref(), Some("0272"));
     }
 
     #[test]
