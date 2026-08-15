@@ -1,0 +1,485 @@
+//! Whole-library repair planning on top of the Repair Center.
+//!
+//! This is the first manually-testable layer above [`crate::repair`]: it turns
+//! a whole ROM directory into a read-only scan, a batch of trusted
+//! [`super::proposal::RepairProposal`]s, and a human/machine-readable report —
+//! without ever re-implementing DAT verification, archive decoding, or rename
+//! safety.
+//!
+//! # The pipeline
+//!
+//! ```text
+//! ROM root
+//!   -> run_dat_audit            (existing DAT audit / archive verification)
+//!   -> build_rename_plan        (existing hardened DAT rename rules)
+//!   -> repair_plan_from_scan_rename_plan (existing adapter + identity capture)
+//!   -> LibraryRepairPlan        (serialisable plan file + report)
+//!   -> execute_repair_plan      (existing Repair Center transaction layer)
+//!   -> reverify_transaction     (existing post-apply re-verification)
+//! ```
+//!
+//! Every mutation goes through the Repair Center executor; this module never
+//! calls `std::fs::rename` and never invents a second transaction system.
+//!
+//! # Profiles
+//!
+//! A [`RepairProfile`] decides which *executable* repairs a scan may produce.
+//! Only [`RepairProfile::CanonicalInPlace`] is implemented for this batch: keep
+//! files in their current directory and rename only when the hardened DAT
+//! rename rules prove the canonical name. [`RepairProfile::Romm`] is typed but
+//! deliberately produces no executable proposals yet.
+
+use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+
+use serde::{Deserialize, Serialize};
+
+use crate::dat::limits::DatLimits;
+use crate::dat::rename_apply::identity::capture_identity;
+use crate::dat::rename_plan::{
+    ProposalState, RenamePlan, RenamePlanContext, RenamePlanError, build_rename_plan,
+};
+use crate::dat::set::SetState;
+use crate::dat::sources::DatSourceKind;
+use crate::dat::sources::audit_run::{
+    DatAuditError, DatAuditOutcome, DatAuditProgress, DatAuditRequest, run_dat_audit,
+};
+use crate::dat::sources::now_unix;
+use crate::safe_read::TrustedRoots;
+
+use super::adapter::repair_proposal_from_suggested_rename;
+use super::execute::{
+    RepairExecutionError, RepairExecutionOptions, RepairTransactionResult, execute_repair_plan,
+};
+use super::plan::{RepairPlan, RepairPlanId, build_repair_plan};
+use super::preflight::{RepairPreflightReport, run_repair_preflight};
+
+/// The organisation profile a whole-library scan plans for.
+///
+/// Only [`RepairProfile::CanonicalInPlace`] is executable today;
+/// [`RepairProfile::Romm`] is a typed placeholder for a later batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairProfile {
+    /// Keep files in their current directory; rename only when the hardened
+    /// DAT rename rules prove the canonical name. Same-filesystem, in place.
+    CanonicalInPlace,
+    /// RomM platform organisation (moves into a platform tree). Not implemented
+    /// yet: this variant produces no executable proposals.
+    Romm,
+}
+
+impl RepairProfile {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::CanonicalInPlace => "canonical-in-place",
+            Self::Romm => "romm",
+        }
+    }
+
+    /// Whether this profile can produce executable repairs in this batch.
+    pub fn is_implemented(self) -> bool {
+        matches!(self, Self::CanonicalInPlace)
+    }
+
+    /// Parses a profile from a CLI flag value.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "canonical-in-place" | "canonical" => Some(Self::CanonicalInPlace),
+            "romm" => Some(Self::Romm),
+            _ => None,
+        }
+    }
+}
+
+/// What a whole-library scan needs: the library root and a DAT catalogue.
+#[derive(Debug, Clone)]
+pub struct LibraryScanRequest {
+    pub source_id: String,
+    pub source_display_name: String,
+    pub dat_path: PathBuf,
+    pub dat_kind: DatSourceKind,
+    pub scan_root: PathBuf,
+    pub limits: DatLimits,
+    pub profile: RepairProfile,
+}
+
+/// Why a whole-library scan could not complete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LibraryScanError {
+    /// The underlying DAT audit failed.
+    Audit(DatAuditError),
+    /// The rename plan could not be built from the audit.
+    Plan(RenamePlanError),
+}
+
+impl std::fmt::Display for LibraryScanError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Audit(error) => write!(f, "audit failed: {error}"),
+            Self::Plan(error) => write!(f, "rename plan failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for LibraryScanError {}
+
+/// The full result of one whole-library scan.
+#[derive(Debug, Clone)]
+pub struct LibraryScanOutcome {
+    pub generation: u64,
+    pub created_at_unix: u64,
+    pub profile: RepairProfile,
+    pub audit: DatAuditOutcome,
+    pub rename_plan: RenamePlan,
+    pub repair_plan: RepairPlan,
+    pub report: LibraryRepairReport,
+}
+
+/// One non-executable report row. Never a mutation candidate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanItem {
+    pub path: String,
+    pub reason: String,
+}
+
+/// One set-resolution report row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetItem {
+    pub game_name: String,
+    pub reason: String,
+}
+
+/// Categorised counts for a whole-library scan.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReportCounts {
+    pub complete_sets: usize,
+    pub incomplete_sets: usize,
+    pub bad_metadata_sets: usize,
+    pub needs_review_sets: usize,
+    pub safe_repairs: usize,
+    pub already_canonical: usize,
+    pub needs_review: usize,
+    pub blocked_repair: usize,
+    pub unsupported: usize,
+    pub scan_errors: usize,
+}
+
+/// The categorised, non-executable half of a scan report.
+///
+/// The executable half is [`LibraryRepairPlan::repair_plan`]. This report never
+/// hides skipped or unsupported objects.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LibraryRepairReport {
+    pub counts: ReportCounts,
+    pub complete_sets: Vec<SetItem>,
+    pub incomplete_sets: Vec<SetItem>,
+    pub bad_metadata_sets: Vec<SetItem>,
+    pub needs_review_sets: Vec<SetItem>,
+    pub needs_review: Vec<PlanItem>,
+    pub blocked: Vec<PlanItem>,
+    pub unsupported: Vec<PlanItem>,
+    /// Unhashed files, unreadable catalogues, and truncation — surfaced, never
+    /// hidden, so a partial scan can never be mistaken for a clean one.
+    pub scan_errors: Vec<String>,
+}
+
+/// The serialisable plan document written to `--plan-out` and read back by
+/// `repair plan` / `repair apply`.
+///
+/// A saved plan is **evidence and proposal data, never permission**: the
+/// executor recomputes every global conflict, re-validates every source
+/// identity, and refuses a stale generation immediately before any mutation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LibraryRepairPlan {
+    pub profile: String,
+    pub generation: u64,
+    pub created_at_unix: u64,
+    pub source_id: String,
+    pub source_display_name: String,
+    pub dat_path: String,
+    pub scan_root: String,
+    pub truncated: bool,
+    pub files_scanned: usize,
+    /// The executable Safe repairs, as a validated [`RepairPlan`].
+    pub repair_plan: RepairPlan,
+    /// The categorised non-executable report.
+    pub report: LibraryRepairReport,
+}
+
+impl LibraryRepairPlan {
+    /// The number of executable proposals in the plan.
+    pub fn safe_repair_count(&self) -> usize {
+        self.repair_plan.proposals.len()
+    }
+
+    /// Whether the plan has any executable proposal.
+    pub fn has_safe_repairs(&self) -> bool {
+        !self.repair_plan.proposals.is_empty()
+    }
+}
+
+/// Runs a whole-library scan: audit, rename plan, repair plan, report.
+///
+/// Read-only. `on_progress` is forwarded to the audit exactly as the GUI
+/// forwards it, so a caller can show progress without coupling to the audit.
+pub fn run_library_scan(
+    request: &LibraryScanRequest,
+    trusted: &TrustedRoots,
+    cancel: &AtomicBool,
+    on_progress: &dyn Fn(DatAuditProgress),
+) -> Result<LibraryScanOutcome, LibraryScanError> {
+    let generation = now_unix();
+
+    let audit_request = DatAuditRequest {
+        source_id: request.source_id.clone(),
+        source_display_name: request.source_display_name.clone(),
+        dat_path: request.dat_path.clone(),
+        dat_kind: request.dat_kind,
+        scan_root: request.scan_root.clone(),
+        limits: request.limits,
+        policy: None,
+        platform: None,
+    };
+    let audit = run_dat_audit(&audit_request, trusted, cancel, on_progress)
+        .map_err(LibraryScanError::Audit)?;
+
+    let rename_plan = build_rename_plan(&audit, &RenamePlanContext { generation }, cancel)
+        .map_err(LibraryScanError::Plan)?;
+
+    // CanonicalInPlace maps 1:1 onto the existing adapter: only a Suggested,
+    // collision-free, regular-file rename becomes an executable Repair proposal.
+    // A loose file's audited identity is captured here, at scan time, because
+    // the hardened rename plan records identity only for whole outer archives.
+    // Romm is typed but produces nothing executable yet.
+    let repair_plan = if request.profile.is_implemented() {
+        repair_plan_from_scan_rename_plan(&rename_plan, generation)
+    } else {
+        build_repair_plan(
+            RepairPlanId::new(format!(
+                "library-{}-{generation}",
+                request.source_id.replace(['/', '\\'], "_")
+            ))
+            .unwrap_or_else(|| RepairPlanId::new("library-scan").expect("static id")),
+            generation,
+            generation,
+            Some(request.scan_root.to_string_lossy().into_owned()),
+            Vec::new(),
+        )
+    };
+
+    let report = build_library_repair_report(&audit, &rename_plan, &repair_plan);
+
+    Ok(LibraryScanOutcome {
+        generation,
+        created_at_unix: generation,
+        profile: request.profile,
+        audit,
+        rename_plan,
+        repair_plan,
+        report,
+    })
+}
+
+/// Converts a hardened DAT rename plan into an executable [`RepairPlan`],
+/// reusing the existing adapter while capturing a loose file's audited
+/// identity at scan time.
+///
+/// The hardened rename plan records [`RenameProposal::audited_identity`] only
+/// for whole outer archives. A loose-file rename is just as identity-bound at
+/// execution time, so this captures each loose source's identity here — while
+/// the file is still the exact object the audit verified — never later.
+fn repair_plan_from_scan_rename_plan(plan: &RenamePlan, generation: u64) -> RepairPlan {
+    let mut proposals = Vec::new();
+    for proposal in &plan.proposals {
+        let Some(mut repair) = repair_proposal_from_suggested_rename(proposal, generation) else {
+            continue;
+        };
+        if repair.expected_source_identity.is_none() {
+            repair.expected_source_identity = capture_identity(&proposal.source_path).ok();
+        }
+        // The adapter carries the rename plan's policy explanations verbatim; a
+        // single exact match has none, so fill in a readable reason here.
+        if repair.reason.trim().is_empty() {
+            if proposal.is_outer_archive {
+                repair.reason = format!(
+                    "verified whole archive against DAT set '{}'",
+                    proposal.game_name.as_deref().unwrap_or("unknown")
+                );
+            } else {
+                repair.reason = format!(
+                    "verified {} match: {} / {}",
+                    proposal.verdict_label,
+                    proposal.game_name.as_deref().unwrap_or("unknown"),
+                    proposal.rom_name.as_deref().unwrap_or("unknown")
+                );
+            }
+        }
+        proposals.push(repair);
+    }
+    let id = RepairPlanId::new(format!(
+        "dat-{}-{}",
+        plan.source_id.replace(['/', '\\'], "_"),
+        plan.generation
+    ))
+    .unwrap_or_else(|| RepairPlanId::new("dat-rename").expect("static id"));
+    build_repair_plan(
+        id,
+        plan.generation,
+        generation,
+        Some(plan.scan_root.clone()),
+        proposals,
+    )
+}
+
+/// Builds the categorised report from the audit, the rename plan, and the
+/// executable repair plan. Pure: no filesystem access.
+pub fn build_library_repair_report(
+    audit: &DatAuditOutcome,
+    rename_plan: &RenamePlan,
+    repair_plan: &RepairPlan,
+) -> LibraryRepairReport {
+    let mut report = LibraryRepairReport::default();
+
+    // Per-file classification from the hardened rename plan. Only `Suggested`
+    // proposals become executable; every other state is surfaced verbatim.
+    for proposal in &rename_plan.proposals {
+        match proposal.state {
+            ProposalState::Suggested => {}
+            ProposalState::AlreadyCanonical => report.counts.already_canonical += 1,
+            ProposalState::Ambiguous | ProposalState::UnclassifiedContent => {
+                report.counts.needs_review += 1;
+                report.needs_review.push(PlanItem {
+                    path: proposal.source_path.to_string_lossy().into_owned(),
+                    reason: proposal
+                        .ambiguity_reason
+                        .clone()
+                        .unwrap_or_else(|| "ambiguous DAT attribution".to_string()),
+                });
+            }
+            ProposalState::Conflict | ProposalState::Blocked => {
+                report.counts.blocked_repair += 1;
+                let reason = proposal
+                    .blockers
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "blocked by a rename-plan conflict".to_string());
+                report.blocked.push(PlanItem {
+                    path: proposal.source_path.to_string_lossy().into_owned(),
+                    reason,
+                });
+            }
+            ProposalState::Unsupported | ProposalState::ExcludedByContentPolicy => {
+                report.counts.unsupported += 1;
+                report.unsupported.push(PlanItem {
+                    path: proposal.source_path.to_string_lossy().into_owned(),
+                    reason: proposal
+                        .blockers
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| "unsupported or excluded by content policy".to_string()),
+                });
+            }
+        }
+    }
+
+    // Set completeness from the audit's own resolutions.
+    for resolution in &audit.sets {
+        match &resolution.state {
+            SetState::Complete => {
+                report.counts.complete_sets += 1;
+                report.complete_sets.push(SetItem {
+                    game_name: resolution.identity.game_name.clone(),
+                    reason: "storage-complete set".to_string(),
+                });
+            }
+            SetState::Incomplete => {
+                report.counts.incomplete_sets += 1;
+                report.incomplete_sets.push(SetItem {
+                    game_name: resolution.identity.game_name.clone(),
+                    reason: "one or more required members are absent or unverified".to_string(),
+                });
+            }
+            SetState::BadMetadata(reason) => {
+                report.counts.bad_metadata_sets += 1;
+                report.bad_metadata_sets.push(SetItem {
+                    game_name: resolution.identity.game_name.clone(),
+                    reason: format!("bad metadata: {reason:?}"),
+                });
+            }
+            SetState::NeedsReview(reason) => {
+                report.counts.needs_review_sets += 1;
+                report.needs_review_sets.push(SetItem {
+                    game_name: resolution.identity.game_name.clone(),
+                    reason: format!("needs review: {reason:?}"),
+                });
+            }
+        }
+    }
+
+    // Scan errors: unhashed files, unreadable catalogues, truncation.
+    for unhashed in &audit.unhashed {
+        report.scan_errors.push(format!(
+            "unhashed {} ({}): {}",
+            unhashed.path, unhashed.code, unhashed.detail
+        ));
+    }
+    for catalogue in &audit.unreadable_catalogues {
+        report
+            .scan_errors
+            .push(format!("unreadable catalogue: {catalogue}"));
+    }
+    if audit.truncated {
+        report
+            .scan_errors
+            .push("the scan hit a ceiling and covers only part of the folder".to_string());
+    }
+    report.counts.scan_errors = report.scan_errors.len();
+
+    // The executable proposals are the repair plan's; it is authoritative (the
+    // adapter drops any Suggested proposal it refused, e.g. a missing identity).
+    report.counts.safe_repairs = repair_plan.proposals.len();
+
+    report
+}
+
+/// Builds the serialisable plan document from a completed scan.
+pub fn plan_file_from_scan(scan: &LibraryScanOutcome) -> LibraryRepairPlan {
+    LibraryRepairPlan {
+        profile: scan.profile.label().to_string(),
+        generation: scan.generation,
+        created_at_unix: scan.created_at_unix,
+        source_id: scan.audit.source_id.clone(),
+        source_display_name: scan.audit.source_display_name.clone(),
+        dat_path: scan.audit.dat_path.clone(),
+        scan_root: scan.audit.scan_root.clone(),
+        truncated: scan.audit.truncated,
+        files_scanned: scan.audit.files_scanned,
+        repair_plan: scan.repair_plan.clone(),
+        report: scan.report.clone(),
+    }
+}
+
+/// The pure dry-run for a saved plan. Re-validates every proposal against the
+/// live filesystem without mutating anything.
+pub fn preview_library_repair_plan(
+    plan: &LibraryRepairPlan,
+    current_generation: u64,
+) -> RepairPreflightReport {
+    run_repair_preflight(&plan.repair_plan, current_generation)
+}
+
+/// Applies a saved plan through the existing Repair Center executor.
+///
+/// The executor recomputes every global conflict, re-validates every source
+/// identity, refuses a stale generation, and performs no-clobber journaled
+/// renames. The caller supplies the *actual* current generation; a plan whose
+/// generation does not match is refused before anything is touched.
+pub fn apply_library_repair_plan(
+    plan: &LibraryRepairPlan,
+    current_generation: u64,
+    options: &RepairExecutionOptions,
+    cancel: &AtomicBool,
+) -> Result<RepairTransactionResult, RepairExecutionError> {
+    execute_repair_plan(&plan.repair_plan, current_generation, options, cancel)
+}
