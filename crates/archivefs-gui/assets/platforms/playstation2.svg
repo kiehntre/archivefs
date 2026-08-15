@@ -1,9 +1,1 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-  <!-- Original EmuWiz artwork: abstract tower-shaped console silhouette
-       (not a reproduction of any manufacturer logo or product design). -->
-  <rect x="22" y="6" width="20" height="52" rx="4" fill="none" stroke="#4a4a4a" stroke-width="3"/>
-  <circle cx="32" cy="16" r="2" fill="#4a4a4a"/>
-  <rect x="26" y="24" width="12" height="3" fill="#4a4a4a"/>
-  <rect x="26" y="30" width="12" height="3" fill="#4a4a4a"/>
-  <rect x="26" y="36" width="12" height="3" fill="#4a4a4a"/>
-</svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="20" height="52" x="22" y="6" fill="none" stroke="#4a4a4a" stroke-width="3" rx="4"/><circle cx="32" cy="16" r="2" fill="#4a4a4a"/><rect width="12" height="3" x="26" y="24" fill="#4a4a4a"/><rect width="12" height="3" x="26" y="30" fill="#4a4a4a"/><rect width="12" height="3" x="26" y="36" fill="#4a4a4a"/></svg>
