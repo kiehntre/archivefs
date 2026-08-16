@@ -141,6 +141,7 @@ pub(crate) mod dat_sources_page;
 pub mod game_presentation;
 pub(crate) mod gamer_artwork;
 pub(crate) mod home_page;
+pub(crate) mod repair_history_page;
 pub(crate) mod repair_review_page;
 pub(crate) mod rom_organisation_page;
 pub(crate) mod romm_browse;
@@ -2954,6 +2955,11 @@ enum MainView {
     /// `repair scan --plan-out` contract and shows its proposals. Nothing is
     /// applied from this page.
     RepairReview,
+    /// Repair History: recent rename transactions journaled through the
+    /// Repair Center (and any other flow sharing the same journal
+    /// directory), with reverify status and safe undo when the core proves
+    /// a transaction is reversible.
+    RepairHistory,
     /// The registered DAT catalogues: which local DAT files and folders
     /// EmuWiz can check a library against. Its own destination for the
     /// same reason Cheat Sources is: it is configuration that outlives any
@@ -3192,13 +3198,14 @@ impl ArchiveInspectorState {
 }
 
 const DEFAULT_INSPECTOR_PATH_COLUMN_WIDTH: f32 = 520.0;
-const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 15] = [
+const PRIMARY_NAVIGATION_DESTINATIONS: [(MainView, &str); 16] = [
     (MainView::Home, "Home"),
     (MainView::Mount, "Mount"),
     (MainView::Selected, "Selected"),
     (MainView::CheatsMods, "Cheats & Mods"),
     (MainView::CheatSources, "Cheat Sources"),
     (MainView::RepairReview, "Repair Review"),
+    (MainView::RepairHistory, "Repair History"),
     (MainView::DatSources, "DAT Sources"),
     (MainView::ActiveMounts, "Active Mounts"),
     (MainView::Library, "Library"),
@@ -3270,6 +3277,7 @@ fn main_view_title(view: MainView) -> &'static str {
         MainView::CheatSources => "Cheat Sources",
         MainView::CanonicalOrganisation => "Canonical organisation",
         MainView::RepairReview => "Repair Review",
+        MainView::RepairHistory => "Repair History",
         MainView::DatSources => "DAT Sources",
         MainView::ActiveMounts => "Active Mounts",
         MainView::Doctor => "Doctor",
@@ -3292,7 +3300,8 @@ fn main_view_content_width(view: MainView) -> ui_layout::ContentWidth {
         | MainView::Duplicates
         | MainView::Sources
         | MainView::LibraryViews
-        | MainView::HistoryLogs => ui_layout::ContentWidth::Wide,
+        | MainView::HistoryLogs
+        | MainView::RepairHistory => ui_layout::ContentWidth::Wide,
         MainView::CheatSources
         | MainView::CanonicalOrganisation
         | MainView::RepairReview
@@ -3340,6 +3349,13 @@ fn main_view_uses_page_scroll(view: MainView) -> bool {
             | MainView::HistoryLogs
             | MainView::Settings
             | MainView::About
+            // Repair History renders a plain top-down list of transaction
+            // cards with no internal `ScrollArea` of its own (unlike
+            // Library/Health/Duplicates/LibraryViews, which each manage
+            // their own bounded scroll region) - it needs the shared outer
+            // page scroll or content past the viewport is simply clipped
+            // with no way to reach it.
+            | MainView::RepairHistory
     )
 }
 
@@ -3631,6 +3647,10 @@ struct ArchiveFsApp {
     /// The Repair Review page, loaded lazily on first visit. Preview-only;
     /// it never applies anything.
     repair_review_page: Option<repair_review_page::RepairReviewPageState>,
+    /// The Repair History page, loaded lazily on first visit: recent rename
+    /// transactions journaled through the Repair Center, re-read from disk
+    /// on every refresh.
+    repair_history_page: Option<repair_history_page::RepairHistoryPageState>,
     /// Unsubmitted Cheat Sources text and disclosure state. Held here rather
     /// than in the page state because none of it is policy - see
     /// `CheatSourcesPageUi`.
@@ -3985,6 +4005,7 @@ impl ArchiveFsApp {
             cheat_sources_page: None,
             rom_organisation_page: None,
             repair_review_page: None,
+            repair_history_page: None,
             cheat_sources_ui: cheat_sources_page::CheatSourcesPageUi::default(),
             dat_sources_page: None,
             dat_sources_ui: dat_sources_page::DatSourcesPageUi::default(),
@@ -4921,6 +4942,18 @@ impl ArchiveFsApp {
             ui.ctx().request_repaint();
         }
         repair_review_page::show_repair_review_page(ui, page);
+    }
+
+    fn show_repair_history_page(&mut self, ui: &mut egui::Ui) {
+        let page = self
+            .repair_history_page
+            .get_or_insert_with(repair_history_page::RepairHistoryPageState::load);
+        // Drained before the view is built, so a running undo keeps
+        // repainting until it settles.
+        if page.poll_undo() || page.is_undo_running() {
+            ui.ctx().request_repaint();
+        }
+        repair_history_page::show_repair_history_page(ui, page, &mut self.clipboard);
     }
 
     fn show_cheat_sources_page(&mut self, ui: &mut egui::Ui) {
@@ -14401,6 +14434,11 @@ impl ArchiveFsApp {
 
                 if self.view == MainView::RepairReview {
                     self.show_repair_review_page(ui);
+                    return;
+                }
+
+                if self.view == MainView::RepairHistory {
+                    self.show_repair_history_page(ui);
                     return;
                 }
 
@@ -53765,6 +53803,7 @@ $Instant Growth [Nayr]\n";
             cheat_sources_page: None,
             rom_organisation_page: None,
             repair_review_page: None,
+            repair_history_page: None,
             cheat_sources_ui: cheat_sources_page::CheatSourcesPageUi::default(),
             dat_sources_page: None,
             dat_sources_ui: dat_sources_page::DatSourcesPageUi::default(),
@@ -54152,6 +54191,7 @@ $Instant Growth [Nayr]\n";
             MainView::About,
             MainView::Sources,
             MainView::HistoryLogs,
+            MainView::RepairHistory,
         ] {
             assert!(main_view_uses_page_scroll(view));
         }
