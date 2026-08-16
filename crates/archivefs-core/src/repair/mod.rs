@@ -40,6 +40,7 @@ pub mod library;
 pub mod plan;
 pub mod preflight;
 pub mod proposal;
+pub mod quarantine;
 
 #[cfg(test)]
 mod tests;
@@ -74,4 +75,10 @@ pub use preflight::{
 pub use proposal::{
     DeferredActionKind, RepairAction, RepairAuditRef, RepairEvidence, RepairEvidenceKind,
     RepairProposal, RepairProposalId, SafetyState,
+};
+pub use quarantine::{
+    KeeperEvidence, QUARANTINE_DIRECTORY_NAME, QuarantineGroupPlan, QuarantinePlanRefusal,
+    QuarantineRollbackOutcome, SurvivorSelection, apply_quarantine_transaction,
+    build_quarantine_transaction, keeper_evidence_from_rename_proposal, plan_duplicate_quarantine,
+    quarantine_destination, rollback_quarantine_transaction, select_survivor,
 };
