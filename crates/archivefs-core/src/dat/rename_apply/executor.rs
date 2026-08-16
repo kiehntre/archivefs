@@ -399,7 +399,13 @@ pub(crate) fn validate_classifier_version(plan_version: Option<&str>) -> Result<
 /// Called only after the entry's `Applying` state has been durably persisted.
 /// On success returns `Ok`; on any failure returns the entry state to record
 /// (`ApplyFailed`) and the exact reason.
-fn apply_mutation(entry: &TransactionEntry) -> Result<(), (EntryState, String)> {
+///
+/// `pub(crate)` (rather than private): reused, unchanged, by
+/// [`crate::repair::quarantine`]'s own per-entry apply loop, which needs to
+/// interleave a domain-specific re-proof between entries and so cannot
+/// delegate the whole batch to [`apply_transaction`]. Semantics here are not
+/// altered by that reuse.
+pub(crate) fn apply_mutation(entry: &TransactionEntry) -> Result<(), (EntryState, String)> {
     match rename_noreplace(&entry.source_path, &entry.destination_path) {
         Ok(()) => {
             // The filesystem must confirm the rename before Applied.
