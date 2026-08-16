@@ -122,7 +122,9 @@ fn scan_and_apply(dir: &Path) -> (PathBuf, PathBuf, RepairTransactionResult) {
         &options,
         &no_cancel(),
     )
-    .expect("the fixture apply succeeds");
+    .expect("the fixture apply succeeds")
+    .rename
+    .expect("the fixture's two proposals are ordinary renames");
     assert_eq!(result.summary.applied, 2);
     (roms, journal_dir, result)
 }

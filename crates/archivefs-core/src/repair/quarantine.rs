@@ -375,6 +375,11 @@ fn build_quarantine_proposal(
         match_confident: survivor.verified_confident,
         is_outer_archive: false,
         is_outer_archive_verified: false,
+        // The one authoritative signal that this `MovePath` is a
+        // duplicate-quarantine move: see `RepairProposal::survivor_path`'s
+        // doc. Every caller (selected apply, the generic executor's guard)
+        // uses this, never the action kind alone, to route execution.
+        survivor_path: Some(survivor.path.clone()),
     })
 }
 

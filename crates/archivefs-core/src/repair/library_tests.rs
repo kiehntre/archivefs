@@ -1085,7 +1085,10 @@ fn selecting_one_proposal_executes_only_that_one() {
         &no_cancel(),
     )
     .expect("the selected proposal applies");
-    assert_eq!(result.summary.applied, 1);
+    assert_eq!(
+        result.rename.expect("a rename batch ran").summary.applied,
+        1
+    );
     assert!(roms.join("beta.bin").exists());
     // Unselected files are untouched.
     assert!(roms.join("a.bin").exists(), "unselected source untouched");
@@ -1114,7 +1117,10 @@ fn selecting_multiple_proposals_executes_exactly_those() {
         &no_cancel(),
     )
     .expect("both selected proposals apply");
-    assert_eq!(result.summary.applied, 2);
+    assert_eq!(
+        result.rename.expect("a rename batch ran").summary.applied,
+        2
+    );
     assert!(roms.join("alpha.bin").exists());
     assert!(roms.join("gamma.bin").exists());
     // Beta was never selected.
@@ -1382,6 +1388,7 @@ fn subset_execution_uses_the_normal_transaction_and_reverify_path() {
         &no_cancel(),
     )
     .expect("the selected proposal applies");
+    let result = result.rename.expect("a rename batch ran");
 
     // A real journaled transaction was written.
     let journal_entries = std::fs::read_dir(&journal_dir)
@@ -1393,4 +1400,689 @@ fn subset_execution_uses_the_normal_transaction_and_reverify_path() {
     assert_eq!(result.reverify.len(), 1);
     assert_eq!(result.reverify[0].outcome, RepairReverifyOutcome::Verified);
     assert_eq!(result.reverify[0].destination_path, roms.join("beta.bin"));
+}
+
+// ---------------------------------------------------------------------
+// Duplicate-quarantine scan wiring (real library scan -> real quarantine
+// planner). See `crate::repair::duplicate_scan` for the bridge itself;
+// these tests exercise it only through the real, public `run_library_scan`
+// entry point, exactly as a caller would.
+// ---------------------------------------------------------------------
+
+/// A DAT declaring one game/rom `canon.bin`, plus a loose file at the
+/// canonical name and root (the survivor) and a second, identically-sized
+/// wrongly-named loose file in a *different* directory with the same bytes
+/// (a redundant duplicate that also needs an in-place DAT rename).
+fn overlapping_duplicate_and_rename_fixture(dir: &Path) -> (PathBuf, PathBuf) {
+    let dat = write(
+        dir,
+        "overlap.dat",
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<datafile>
+    <header><name>Overlap</name></header>
+    <game name="Game">
+        <rom name="canon.bin" size="4" sha1="{SHA1_TEST}"/>
+    </game>
+</datafile>"#
+        )
+        .as_bytes(),
+    );
+    let roms = dir.join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    write(&roms, "canon.bin", b"test");
+    let subdir = roms.join("subdir");
+    std::fs::create_dir(&subdir).unwrap();
+    write(&subdir, "wrong.bin", b"test");
+    (dat, roms)
+}
+
+// H. overlapping/duplicate source conflict -> fail closed.
+//
+// `subdir/wrong.bin` is simultaneously: (a) a Suggested DAT rename source
+// (it must become `subdir/canon.bin` in place) and (b) the redundant member
+// of a duplicate group whose survivor is `roms/canon.bin` (so it also gets a
+// quarantine MovePath proposal). One source, two proposed actions: the
+// existing global conflict detector must fail this closed, exactly as it
+// already does for any other duplicate-source case.
+#[test]
+fn a_source_that_is_both_a_rename_and_a_quarantine_target_fails_closed() {
+    let dir = temp();
+    let (dat, roms) = overlapping_duplicate_and_rename_fixture(dir.path());
+
+    let outcome = scan(&dat, &roms);
+
+    // Both proposals for `subdir/wrong.bin` are present in the plan...
+    let wrong = roms.join("subdir").join("wrong.bin");
+    let touching_wrong: Vec<_> = outcome
+        .repair_plan
+        .proposals
+        .iter()
+        .filter(|p| p.source_path == wrong)
+        .collect();
+    assert_eq!(
+        touching_wrong.len(),
+        2,
+        "both the rename and the quarantine proposal must be present: {touching_wrong:?}"
+    );
+
+    // ...and the plan fails closed with a DuplicateSource conflict.
+    assert!(outcome.repair_plan.has_conflicts());
+    assert!(
+        outcome
+            .repair_plan
+            .conflicts
+            .iter()
+            .any(|c| c.kind == PlanConflictKind::DuplicateSource),
+        "{:?}",
+        outcome.repair_plan.conflicts
+    );
+    assert!(!outcome.repair_plan.all_executable());
+}
+
+// I. ordinary DAT rename planning remains unchanged by this wiring.
+#[test]
+fn ordinary_dat_rename_planning_is_unaffected_by_duplicate_wiring() {
+    let dir = temp();
+    let (dat, roms) = three_proposal_fixture(dir.path());
+
+    let outcome = scan(&dat, &roms);
+
+    // Same three independent renames as before this slice existed - no
+    // duplicate group exists in this fixture (three distinct games), so no
+    // quarantine proposal is added and the plan is unchanged.
+    assert_eq!(outcome.repair_plan.proposals.len(), 3);
+    assert!(
+        outcome
+            .repair_plan
+            .proposals
+            .iter()
+            .all(|p| matches!(p.action, RepairAction::RenamePath { .. }))
+    );
+    assert!(!outcome.repair_plan.has_conflicts());
+    assert!(outcome.repair_plan.all_executable());
+    assert_eq!(outcome.report.counts.safe_repairs, 3);
+    assert_eq!(outcome.report.counts.duplicate_groups_examined, 0);
+    assert_eq!(outcome.report.counts.duplicate_quarantine_safe, 0);
+}
+
+/// A DAT declaring one game/rom `canon.bin`; a library containing the
+/// canonical keeper, a byte-identical redundant copy under a different
+/// name, and one unrelated file that shares nothing with the DAT.
+fn realistic_duplicate_fixture(dir: &Path) -> (PathBuf, PathBuf) {
+    let dat = write(
+        dir,
+        "realistic.dat",
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<datafile>
+    <header><name>Realistic</name></header>
+    <game name="Game">
+        <rom name="canon.bin" size="4" sha1="{SHA1_TEST}"/>
+    </game>
+</datafile>"#
+        )
+        .as_bytes(),
+    );
+    let roms = dir.join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    write(&roms, "canon.bin", b"test");
+    write(&roms, "redundant-copy.bin", b"test");
+    write(&roms, "unrelated.txt", b"not part of the dat at all");
+    (dat, roms)
+}
+
+// 12. Realistic, deterministic, end-to-end integration fixture: the actual
+// library planner discovers the duplicate group through the real scan path,
+// produces exactly one Safe quarantine proposal, leaves the unrelated file
+// untouched, and mutates nothing.
+#[test]
+fn the_real_library_planner_discovers_and_plans_one_duplicate_group() {
+    let dir = temp();
+    let (dat, roms) = realistic_duplicate_fixture(dir.path());
+    let keeper = roms.join("canon.bin");
+    let duplicate = roms.join("redundant-copy.bin");
+    let unrelated = roms.join("unrelated.txt");
+    let unrelated_before = std::fs::read(&unrelated).unwrap();
+    let keeper_before = std::fs::read(&keeper).unwrap();
+    let duplicate_before = std::fs::read(&duplicate).unwrap();
+
+    let outcome = scan(&dat, &roms);
+
+    // Exactly one quarantine proposal, sourced from the redundant copy, never
+    // the keeper.
+    let quarantine_proposals: Vec<_> = outcome
+        .repair_plan
+        .proposals
+        .iter()
+        .filter(|p| matches!(p.action, RepairAction::MovePath { .. }))
+        .collect();
+    assert_eq!(quarantine_proposals.len(), 1, "{quarantine_proposals:?}");
+    assert_eq!(quarantine_proposals[0].source_path, duplicate);
+    assert_ne!(quarantine_proposals[0].source_path, keeper);
+    assert!(quarantine_proposals[0].actionable());
+    assert_eq!(quarantine_proposals[0].safety, SafetyState::Safe);
+
+    assert_eq!(outcome.report.counts.duplicate_groups_examined, 1);
+    assert_eq!(outcome.report.counts.duplicate_groups_content_proven, 1);
+    assert_eq!(outcome.report.counts.duplicate_quarantine_safe, 1);
+    assert_eq!(outcome.report.counts.duplicate_quarantine_needs_review, 0);
+
+    assert!(!outcome.repair_plan.has_conflicts());
+    assert!(outcome.repair_plan.all_executable());
+
+    // No proposal at all touches the unrelated file.
+    assert!(
+        outcome
+            .repair_plan
+            .proposals
+            .iter()
+            .all(|p| p.source_path != unrelated)
+    );
+
+    // J. Planning performs no filesystem mutation and creates no
+    // `.emuwiz-quarantine` directory.
+    assert_eq!(std::fs::read(&keeper).unwrap(), keeper_before);
+    assert_eq!(std::fs::read(&duplicate).unwrap(), duplicate_before);
+    assert_eq!(std::fs::read(&unrelated).unwrap(), unrelated_before);
+    assert!(keeper.exists());
+    assert!(duplicate.exists());
+    assert!(unrelated.exists());
+    assert!(!roms.join(".emuwiz-quarantine").exists());
+}
+
+// ---------------------------------------------------------------------
+// Duplicate-quarantine selected apply: quarantine-specific backend, live
+// re-proof, and mixed rename+quarantine selections.
+// ---------------------------------------------------------------------
+
+/// Finds the (unique, in these fixtures) quarantine `MovePath` proposal's id
+/// in a saved plan.
+fn quarantine_proposal_id(plan: &LibraryRepairPlan) -> RepairProposalId {
+    plan.repair_plan
+        .proposals
+        .iter()
+        .find(|p| p.survivor_path.is_some())
+        .expect("a quarantine proposal exists")
+        .id
+        .clone()
+}
+
+// C. a selected Safe quarantine proposal applies through the
+// quarantine-specific backend (`build_quarantine_transaction` /
+// `apply_quarantine_transaction`), never the generic repair executor.
+#[test]
+fn a_selected_quarantine_proposal_applies_through_the_quarantine_backend() {
+    let dir = temp();
+    let (dat, roms) = realistic_duplicate_fixture(dir.path());
+    let plan = saved_plan(&dat, &roms);
+    let quarantine_id = quarantine_proposal_id(&plan);
+
+    let result = apply_saved_plan_selected(
+        &plan,
+        &roms,
+        &dat,
+        plan.generation,
+        std::slice::from_ref(&quarantine_id),
+        &options(dir.path()),
+        &no_cancel(),
+    )
+    .expect("the selected quarantine proposal applies");
+
+    assert!(result.rename.is_none(), "no rename proposal was selected");
+    assert_eq!(result.quarantine.len(), 1);
+    let quarantine = &result.quarantine[0];
+    assert_eq!(quarantine.survivor_path, roms.join("canon.bin"));
+    assert_eq!(quarantine.result.summary.applied, 1);
+    assert_eq!(quarantine.result.summary.failed, 0);
+
+    // The generic executor requires a `MovePath` destination directory to
+    // already exist (see `execute::validate_action`); `.emuwiz-quarantine`
+    // did not exist before this call, so its existence now is direct
+    // evidence the quarantine-specific backend (which creates it) ran, not
+    // the generic one (which would have refused outright).
+    assert!(roms.join(".emuwiz-quarantine").exists());
+    assert!(
+        !roms.join("redundant-copy.bin").exists(),
+        "the duplicate moved out of its original location"
+    );
+    assert!(roms.join("canon.bin").exists(), "the survivor is untouched");
+    assert_eq!(std::fs::read(roms.join("canon.bin")).unwrap(), b"test");
+}
+
+// D/E. a survivor that changed between scan and apply is caught by the fresh
+// re-scan/re-proof before any mutation - mirrors
+// `a_stale_selected_source_identity_refuses` for the quarantine survivor
+// instead of an ordinary rename source.
+#[test]
+fn a_changed_survivor_refuses_the_selected_quarantine_apply() {
+    let dir = temp();
+    let (dat, roms) = realistic_duplicate_fixture(dir.path());
+    let plan = saved_plan(&dat, &roms);
+    let quarantine_id = quarantine_proposal_id(&plan);
+
+    // Mutate the survivor's content after the plan was saved but before
+    // apply: its DAT match (and therefore the whole duplicate group) is no
+    // longer reproducible by a fresh scan.
+    std::fs::write(roms.join("canon.bin"), b"different-content-same-slot").unwrap();
+
+    let error = apply_saved_plan_selected(
+        &plan,
+        &roms,
+        &dat,
+        plan.generation,
+        std::slice::from_ref(&quarantine_id),
+        &options(dir.path()),
+        &no_cancel(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, ApplySavedPlanSelectedError::NotAuthorized(_)),
+        "{error:?}"
+    );
+    assert!(
+        roms.join("redundant-copy.bin").exists(),
+        "nothing was moved"
+    );
+    assert!(!roms.join(".emuwiz-quarantine").exists());
+}
+
+/// A three-game DAT plus: one ordinary wrongly-named loose ROM (ties to
+/// nothing duplicated), and one already-canonical ROM with a byte-identical
+/// redundant copy under a different name (a duplicate-quarantine
+/// candidate). The two proposals this produces - one `RenamePath`, one
+/// `MovePath` - share no source or destination, so they never conflict.
+fn mixed_rename_and_duplicate_fixture(dir: &Path) -> (PathBuf, PathBuf) {
+    let dat = write(
+        dir,
+        "mixed.dat",
+        format!(
+            r#"<datafile><header><name>Mixed</name></header>
+<game name="Alpha"><rom name="alpha.bin" size="4" sha1="{SHA1_TEST}"/></game>
+<game name="Beta"><rom name="beta.bin" size="3" sha1="{SHA1_ABC}"/></game>
+</datafile>"#
+        )
+        .as_bytes(),
+    );
+    let roms = dir.join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    // Ordinary rename: wrongly-named, no duplicate.
+    write(&roms, "a.bin", b"test");
+    // Already-canonical survivor plus a redundant duplicate.
+    write(&roms, "beta.bin", b"abc");
+    write(&roms, "beta-dup.bin", b"abc");
+    (dat, roms)
+}
+
+// G. a mixed selection (one ordinary rename id, one quarantine id) with no
+// overlap between them applies both, each through its own backend, in one
+// call.
+#[test]
+fn a_mixed_non_conflicting_selection_applies_both_backends() {
+    let dir = temp();
+    let (dat, roms) = mixed_rename_and_duplicate_fixture(dir.path());
+    let plan = saved_plan(&dat, &roms);
+
+    let rename_id = plan
+        .repair_plan
+        .proposals
+        .iter()
+        .find(|p| matches!(p.action, RepairAction::RenamePath { .. }))
+        .expect("the ordinary rename proposal exists")
+        .id
+        .clone();
+    let quarantine_id = quarantine_proposal_id(&plan);
+
+    let result = apply_saved_plan_selected(
+        &plan,
+        &roms,
+        &dat,
+        plan.generation,
+        &[rename_id, quarantine_id],
+        &options(dir.path()),
+        &no_cancel(),
+    )
+    .expect("both non-conflicting proposals apply");
+
+    let rename = result.rename.expect("the rename batch ran");
+    assert_eq!(rename.summary.applied, 1);
+    assert!(roms.join("alpha.bin").exists(), "the ordinary rename ran");
+
+    assert_eq!(result.quarantine.len(), 1);
+    assert_eq!(result.quarantine[0].survivor_path, roms.join("beta.bin"));
+    assert_eq!(result.quarantine[0].result.summary.applied, 1);
+    assert!(
+        !roms.join("beta-dup.bin").exists(),
+        "the duplicate moved out of its original location"
+    );
+    assert!(roms.join("beta.bin").exists(), "the survivor is untouched");
+    assert_eq!(std::fs::read(roms.join("beta.bin")).unwrap(), b"abc");
+}
+
+// H. a selection drawn from a plan with an unresolved duplicate-source
+// conflict (a rename target and a quarantine source sharing one file) fails
+// closed - `select_repair_plan_subset` already requires the *whole* fresh
+// plan to be conflict-free before any selection is honoured.
+#[test]
+fn a_selection_from_a_duplicate_source_conflicted_plan_fails_closed() {
+    let dir = temp();
+    let (dat, roms) = overlapping_duplicate_and_rename_fixture(dir.path());
+    let plan = saved_plan(&dat, &roms);
+    assert!(
+        plan.repair_plan.has_conflicts(),
+        "the fixture must contain the DuplicateSource conflict this test exercises"
+    );
+
+    // Any proposal id at all - even one otherwise unrelated to the conflict -
+    // must refuse, because the whole plan is not conflict-free.
+    let any_id = plan.repair_plan.proposals[0].id.clone();
+
+    let error = apply_saved_plan_selected(
+        &plan,
+        &roms,
+        &dat,
+        plan.generation,
+        std::slice::from_ref(&any_id),
+        &options(dir.path()),
+        &no_cancel(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, ApplySavedPlanSelectedError::InvalidSelection(_)),
+        "{error:?}"
+    );
+    assert!(roms.join("canon.bin").exists());
+    assert!(roms.join("subdir").join("wrong.bin").exists());
+    assert!(!roms.join(".emuwiz-quarantine").exists());
+}
+
+// A whole-plan (unselected) apply fails closed rather than mixing backends
+// automatically, when the fresh plan contains any duplicate-quarantine
+// proposal.
+#[test]
+fn a_whole_plan_apply_refuses_when_quarantine_proposals_are_present() {
+    let dir = temp();
+    let (dat, roms) = realistic_duplicate_fixture(dir.path());
+    let plan = saved_plan(&dat, &roms);
+
+    let error = apply_saved_plan(
+        &plan,
+        &roms,
+        &dat,
+        plan.generation,
+        &options(dir.path()),
+        &no_cancel(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            ApplySavedPlanError::QuarantineRequiresSelectedApply { count: 1 }
+        ),
+        "{error:?}"
+    );
+    assert!(roms.join("redundant-copy.bin").exists(), "nothing moved");
+    assert!(!roms.join(".emuwiz-quarantine").exists());
+}
+
+// A saved proposal whose action is an ordinary `RenamePath` but whose
+// `survivor_path` was tampered to `Some` (as if hand-edited in the saved
+// JSON, or corrupted) is rejected by the saved-plan re-proof before
+// anything executes: the fresh scan's equivalent proposal has
+// `survivor_path == None`, so `re_prove_saved_plan`'s field-by-field
+// comparison refuses the mismatch. `is_duplicate_quarantine()` reporting
+// `true` for the tampered value is never itself permission to run it.
+#[test]
+fn a_tampered_rename_with_a_forced_survivor_path_is_rejected_by_reproof() {
+    let dir = temp();
+    let (dat, roms) = three_proposal_fixture(dir.path());
+    let mut plan = saved_plan(&dat, &roms);
+
+    let target = plan
+        .repair_plan
+        .proposals
+        .iter_mut()
+        .find(|p| matches!(p.action, RepairAction::RenamePath { .. }))
+        .expect("an ordinary rename proposal exists");
+    assert!(!target.is_duplicate_quarantine());
+    target.survivor_path = Some(roms.join("does-not-matter.bin"));
+    assert!(target.is_duplicate_quarantine());
+    let tampered_id = target.id.clone();
+
+    let error = apply_saved_plan_selected(
+        &plan,
+        &roms,
+        &dat,
+        plan.generation,
+        std::slice::from_ref(&tampered_id),
+        &options(dir.path()),
+        &no_cancel(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, ApplySavedPlanSelectedError::NotAuthorized(_)),
+        "{error:?}"
+    );
+    assert!(roms.join("a.bin").exists(), "nothing was renamed or moved");
+    assert!(!roms.join(".emuwiz-quarantine").exists());
+}
+
+/// Two independent duplicate-content groups in two subdirectories, each with
+/// an already-canonical survivor and one byte-identical redundant copy, so a
+/// selection spanning both produces two quarantine transactions (one per
+/// survivor), processed in `BTreeMap<PathBuf, _>` (survivor path) order:
+/// `groupa` before `groupb`.
+fn two_independent_duplicate_groups_fixture(dir: &Path) -> (PathBuf, PathBuf) {
+    let dat = write(
+        dir,
+        "two-groups.dat",
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<datafile>
+    <header><name>TwoGroups</name></header>
+    <game name="GameA">
+        <rom name="canon-a.bin" size="4" sha1="{SHA1_TEST}"/>
+    </game>
+    <game name="GameB">
+        <rom name="canon-b.bin" size="3" sha1="{SHA1_ABC}"/>
+    </game>
+</datafile>"#
+        )
+        .as_bytes(),
+    );
+    let roms = dir.join("roms");
+    let group_a = roms.join("groupa");
+    let group_b = roms.join("groupb");
+    std::fs::create_dir_all(&group_a).unwrap();
+    std::fs::create_dir_all(&group_b).unwrap();
+    write(&group_a, "canon-a.bin", b"test");
+    write(&group_a, "redundant-a.bin", b"test");
+    write(&group_b, "canon-b.bin", b"abc");
+    write(&group_b, "redundant-b.bin", b"abc");
+    (dat, roms)
+}
+
+// Multi-survivor partial failure: group A (survivor `groupa/canon-a.bin`)
+// applies successfully and is durably journaled; group B (survivor
+// `groupb/canon-b.bin`) deterministically fails its own apply (a foreign
+// file is planted at its exact, precomputed quarantine destination before
+// the call, so the shared rename engine's no-clobber preflight refuses it -
+// never a race, never a content mutation that would also change what the
+// fresh re-scan inside `apply_saved_plan_selected` sees, so the whole-plan
+// re-proof still passes and both groups are genuinely selected and
+// attempted).
+//
+// This proves the actual behaviour the hostile review disputed: earlier
+// completed group results are NOT silently discarded from the returned
+// error - they are carried in `ApplySavedPlanSelectedError::QuarantineApply`'s
+// `completed` field (see its doc and the fix in `apply_saved_plan_selected`).
+#[test]
+fn a_later_quarantine_group_failure_does_not_lose_an_earlier_groups_success() {
+    let dir = temp();
+    let (dat, roms) = two_independent_duplicate_groups_fixture(dir.path());
+    let plan = saved_plan(&dat, &roms);
+
+    let quarantine_ids: Vec<RepairProposalId> = plan
+        .repair_plan
+        .proposals
+        .iter()
+        .filter(|p| p.is_duplicate_quarantine())
+        .map(|p| p.id.clone())
+        .collect();
+    assert_eq!(quarantine_ids.len(), 2, "{quarantine_ids:?}");
+
+    let group_b_proposal = plan
+        .repair_plan
+        .proposals
+        .iter()
+        .find(|p| p.is_duplicate_quarantine() && p.source_path.ends_with("redundant-b.bin"))
+        .expect("group B's quarantine proposal exists");
+    let group_b_destination = group_b_proposal
+        .destination()
+        .expect("a MovePath destination")
+        .clone();
+    let group_b_bucket = group_b_destination
+        .parent()
+        .expect("the destination has a content-hash bucket parent")
+        .to_path_buf();
+    let outside = tempfile::tempdir().unwrap();
+
+    // Make group B's own content-hash bucket directory a symlink out of the
+    // trust boundary, before any apply runs. This is deterministic (no
+    // race, no content mutation that would also change what the fresh
+    // re-scan inside `apply_saved_plan_selected` sees - the destination
+    // *file* path still resolves through the symlink to a location that
+    // does not exist, so the whole-plan "destination already exists"
+    // conflict check does not trip either) and it can only ever affect
+    // group B: `apply_quarantine_transaction` refuses outright the instant
+    // it finds a symlink where a quarantine directory it needs must be a
+    // real directory (see its own `a_symlinked_content_bucket_directory_\
+    // refuses_before_any_mutation` unit test in `quarantine::tests`).
+    std::fs::create_dir_all(group_b_bucket.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(outside.path(), &group_b_bucket).unwrap();
+
+    let opts = options(dir.path());
+    let error = apply_saved_plan_selected(
+        &plan,
+        &roms,
+        &dat,
+        plan.generation,
+        &quarantine_ids,
+        &opts,
+        &no_cancel(),
+    )
+    .unwrap_err();
+
+    let completed = match &error {
+        ApplySavedPlanSelectedError::QuarantineApply { completed, detail } => {
+            assert!(detail.contains("symlink"), "{detail}");
+            completed
+        }
+        other => panic!("expected QuarantineApply carrying the completed groups, got {other:?}"),
+    };
+
+    // Group A's result is not lost: it is visible in the error's
+    // `completed` field, its transaction is genuinely Applied, and its file
+    // actually moved on disk.
+    assert_eq!(completed.quarantine.len(), 1, "{completed:?}");
+    let group_a_result = &completed.quarantine[0];
+    assert_eq!(
+        group_a_result.survivor_path,
+        roms.join("groupa").join("canon-a.bin")
+    );
+    assert_eq!(group_a_result.result.summary.applied, 1);
+    assert_eq!(group_a_result.result.summary.failed, 0);
+    assert_eq!(
+        group_a_result.result.transaction.state,
+        crate::dat::rename_apply::TransactionState::Applied
+    );
+    assert!(!roms.join("groupa").join("redundant-a.bin").exists());
+    assert!(roms.join("groupa").join("canon-a.bin").exists());
+
+    // Group B never moved anything: its source is untouched, and the
+    // symlink that blocked it is untouched too - no unrelated file
+    // corruption, and nothing outside the trust boundary was written to.
+    assert!(roms.join("groupb").join("redundant-b.bin").exists());
+    assert!(roms.join("groupb").join("canon-b.bin").exists());
+    assert!(
+        !group_b_destination.exists(),
+        "nothing was moved into group B's bucket"
+    );
+    assert_eq!(
+        std::fs::read_dir(outside.path()).unwrap().count(),
+        0,
+        "nothing was ever written through the symlink outside the trust boundary"
+    );
+
+    // Group A's already-journaled transaction remains independently
+    // rollbackable, even though the call as a whole returned `Err`.
+    let mut group_a_transaction = group_a_result.result.transaction.clone();
+    let rollback = crate::dat::rename_apply::rollback_transaction(
+        &mut group_a_transaction,
+        &opts.journal_dir,
+        &no_cancel(),
+    )
+    .expect("group A's transaction rolls back");
+    assert!(
+        matches!(
+            rollback.result,
+            crate::dat::rename_apply::RollbackResult::FullyRolledBack
+        ),
+        "{:?}",
+        rollback.result
+    );
+    assert!(roms.join("groupa").join("redundant-a.bin").exists());
+}
+
+// Full-apply of a mixed plan (at least one Safe ordinary `RenamePath` plus
+// at least one Safe duplicate-quarantine proposal) refuses outright, before
+// touching anything: no backend ever runs, no journal is written, and no
+// `.emuwiz-quarantine` directory is created.
+#[test]
+fn a_full_apply_of_a_mixed_plan_refuses_before_any_mutation() {
+    let dir = temp();
+    let (dat, roms) = mixed_rename_and_duplicate_fixture(dir.path());
+    let plan = saved_plan(&dat, &roms);
+    assert!(
+        plan.repair_plan
+            .proposals
+            .iter()
+            .any(|p| matches!(p.action, RepairAction::RenamePath { .. })),
+        "the fixture must include an ordinary Safe rename"
+    );
+    assert!(
+        plan.repair_plan
+            .proposals
+            .iter()
+            .any(|p| p.is_duplicate_quarantine()),
+        "the fixture must include a Safe duplicate-quarantine proposal"
+    );
+
+    let opts = options(dir.path());
+    let error =
+        apply_saved_plan(&plan, &roms, &dat, plan.generation, &opts, &no_cancel()).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            ApplySavedPlanError::QuarantineRequiresSelectedApply { count: 1 }
+        ),
+        "{error:?}"
+    );
+
+    // The rename source is untouched...
+    assert!(roms.join("a.bin").exists());
+    assert!(!roms.join("alpha.bin").exists());
+    // ...and the quarantine source is untouched.
+    assert!(roms.join("beta-dup.bin").exists());
+    assert!(roms.join("beta.bin").exists());
+    assert_eq!(std::fs::read(roms.join("beta.bin")).unwrap(), b"abc");
+
+    // No journal was written for any mutation, and no quarantine directory
+    // was created.
+    assert_eq!(
+        std::fs::read_dir(&opts.journal_dir).unwrap().count(),
+        0,
+        "refusal happens before any transaction is journaled"
+    );
+    assert!(!roms.join(".emuwiz-quarantine").exists());
 }

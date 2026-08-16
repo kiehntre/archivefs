@@ -51,6 +51,7 @@ fn proposal(id: &str, source: &Path, destination: &Path, identity: bool) -> Repa
         match_confident: false,
         is_outer_archive: false,
         is_outer_archive_verified: false,
+        survivor_path: None,
     }
 }
 
@@ -420,6 +421,44 @@ fn a_successful_same_filesystem_move_executes() {
     assert!(!source.exists());
     assert_eq!(std::fs::read(&destination).unwrap(), b"payload");
     assert_eq!(result.transaction.applied_count(), 1);
+}
+
+// F. a duplicate-quarantine `MovePath` (survivor_path set) must never reach
+// the generic executor: it re-validates only the source's own identity,
+// never that the source is still a distinct-object duplicate of its
+// survivor, so it refuses outright rather than silently accepting a move
+// whose safety this code path cannot actually prove. Contrast with
+// `a_successful_same_filesystem_move_executes` immediately above: an
+// ordinary `MovePath` with no `survivor_path` is unaffected.
+#[test]
+fn a_move_proposal_with_a_survivor_path_is_refused_by_the_generic_executor() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("platform");
+    std::fs::create_dir(&sub).unwrap();
+    let source = dir.path().join("a.bin");
+    std::fs::write(&source, b"payload").unwrap();
+    let destination = sub.join("a.bin");
+    let mut quarantine_like = move_proposal("a", &source, &destination, true);
+    quarantine_like.survivor_path = Some(dir.path().join("survivor.bin"));
+    let p = plan(1, vec![quarantine_like]);
+
+    let error = build_repair_transaction(&p).unwrap_err();
+    assert!(
+        matches!(error, RepairExecutionError::NotExecutable { .. }),
+        "{error:?}"
+    );
+    let RepairExecutionError::NotExecutable { detail } = error else {
+        unreachable!()
+    };
+    assert!(detail.contains("quarantine"), "{detail}");
+    assert!(source.exists(), "nothing was moved");
+
+    // The same refusal reaches every caller that goes through
+    // `execute_repair_plan`, not just a direct `build_repair_transaction`
+    // call.
+    let error = execute_repair_plan(&p, 1, &options(dir.path()), &cancel()).unwrap_err();
+    assert!(matches!(error, RepairExecutionError::NotExecutable { .. }));
+    assert!(source.exists(), "nothing was moved");
 }
 
 #[test]

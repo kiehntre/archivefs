@@ -251,9 +251,48 @@ pub struct RepairProposal {
     /// Whether the outer archive's set was storage-`Complete` when proposed.
     #[serde(default)]
     pub is_outer_archive_verified: bool,
+    /// The kept file's path, for a duplicate-quarantine `MovePath` proposal
+    /// only ([`crate::repair::quarantine::build_quarantine_transaction`] and
+    /// [`crate::repair::quarantine::apply_quarantine_transaction`] both
+    /// require it explicitly). `None` for every other proposal - including
+    /// an ordinary DAT `RenamePath` and any other `MovePath` this foundation
+    /// might ever grow - so `Some(_)` is the one authoritative signal that a
+    /// proposal is a duplicate-quarantine move and must be executed through
+    /// the quarantine-specific apply path, never the generic repair
+    /// executor (see [`RepairAction::MovePath`]'s doc and
+    /// `execute::build_repair_transaction`, which refuses outright rather
+    /// than silently accepting one).
+    #[serde(default)]
+    pub survivor_path: Option<PathBuf>,
 }
 
 impl RepairProposal {
+    /// Whether this proposal is a duplicate-quarantine `MovePath`: the one
+    /// authoritative signal every caller that must route execution (never a
+    /// mere presence check) uses instead of re-deriving the invariant inline.
+    ///
+    /// `survivor_path` is `Some` **only** for a duplicate-quarantine move -
+    /// never for an ordinary DAT `RenamePath` and never for any other
+    /// `MovePath` this foundation might grow (see [`Self::survivor_path`]'s
+    /// doc). This predicate is that invariant's single named expression, so
+    /// every routing decision (selected-apply backend split, the generic
+    /// executor's refusal, the whole-plan quarantine refusal, CLI/GUI
+    /// display and selection) reads the same claim instead of re-checking
+    /// `survivor_path.is_some()` independently and risking drift.
+    ///
+    /// This is a *routing* predicate, not a safety boundary: a proposal that
+    /// claims `true` here still is not permitted to execute unless it is
+    /// also independently re-proven `MovePath` and re-proven a duplicate at
+    /// build/apply time by [`crate::repair::quarantine::build_quarantine_transaction`]
+    /// / [`crate::repair::quarantine::apply_quarantine_transaction`] - a
+    /// tampered `RenamePath` with `survivor_path` set would report `true`
+    /// here yet can never actually run, because the quarantine executor
+    /// refuses anything that is not a `MovePath` and the generic executor
+    /// refuses anything this predicate calls `true`.
+    pub fn is_duplicate_quarantine(&self) -> bool {
+        self.survivor_path.is_some()
+    }
+
     /// The destination, for rename and move actions.
     pub fn destination(&self) -> Option<&PathBuf> {
         self.action.destination()
@@ -366,6 +405,7 @@ mod tests {
             match_confident: false,
             is_outer_archive: false,
             is_outer_archive_verified: false,
+            survivor_path: None,
         };
         assert!(base.actionable());
         assert!(
@@ -405,5 +445,115 @@ mod tests {
             }
             .actionable()
         );
+    }
+
+    fn identity_fixture() -> crate::dat::rename_apply::ObjectIdentity {
+        crate::dat::rename_apply::ObjectIdentity {
+            size_bytes: 4,
+            modified_unix: 1,
+            kind: crate::dat::rename_apply::ObjectKind::RegularFile,
+            #[cfg(unix)]
+            ino: 1,
+            #[cfg(unix)]
+            dev: 1,
+        }
+    }
+
+    fn base_proposal() -> RepairProposal {
+        RepairProposal {
+            id: RepairProposalId::new("p1").unwrap(),
+            action: RepairAction::RenamePath {
+                destination: PathBuf::from("/tmp/x/new.bin"),
+            },
+            source_path: PathBuf::from("/tmp/x/old.bin"),
+            reason: "r".to_string(),
+            evidence: Vec::new(),
+            expected_source_identity: Some(identity_fixture()),
+            originating_audit: None,
+            safety: SafetyState::Safe,
+            blockers: Vec::new(),
+            warnings: Vec::new(),
+            dat_source_id: None,
+            dat_source_display: None,
+            game_name: None,
+            rom_name: None,
+            verdict_label: None,
+            match_confident: false,
+            is_outer_archive: false,
+            is_outer_archive_verified: false,
+            survivor_path: None,
+        }
+    }
+
+    #[test]
+    fn is_duplicate_quarantine_is_true_only_when_survivor_path_is_set() {
+        let quarantine = RepairProposal {
+            action: RepairAction::MovePath {
+                destination: PathBuf::from("/tmp/x/.emuwiz-quarantine/bucket/1-old.bin"),
+            },
+            survivor_path: Some(PathBuf::from("/tmp/x/canon.bin")),
+            ..base_proposal()
+        };
+        assert!(quarantine.is_duplicate_quarantine());
+    }
+
+    #[test]
+    fn an_ordinary_rename_is_never_a_duplicate_quarantine() {
+        let rename = base_proposal();
+        assert!(!rename.is_duplicate_quarantine());
+    }
+
+    #[test]
+    fn a_non_quarantine_move_with_no_survivor_is_never_a_duplicate_quarantine() {
+        let plain_move = RepairProposal {
+            action: RepairAction::MovePath {
+                destination: PathBuf::from("/tmp/y/old.bin"),
+            },
+            survivor_path: None,
+            ..base_proposal()
+        };
+        assert!(!plain_move.is_duplicate_quarantine());
+    }
+
+    #[test]
+    fn a_tampered_rename_with_survivor_path_reports_quarantine_but_cannot_execute() {
+        // A `RenamePath` proposal with `survivor_path` forced `Some` (as if
+        // tampered after being saved) reports `true` from the predicate -
+        // but this alone must never be permission to execute: the quarantine
+        // build path requires a `MovePath` action and refuses anything else,
+        // and `re_prove_saved_plan` refuses a saved proposal whose action or
+        // survivor_path was not independently reproduced by a fresh scan
+        // (see `crate::repair::library::re_prove_saved_plan`), so this
+        // proposal can never reach either executor under its tampered shape.
+        let tampered = RepairProposal {
+            survivor_path: Some(PathBuf::from("/tmp/x/canon.bin")),
+            ..base_proposal()
+        };
+        assert!(tampered.is_duplicate_quarantine());
+        assert!(!matches!(tampered.action, RepairAction::MovePath { .. }));
+    }
+
+    /// An old saved `RepairProposal` JSON document, from before
+    /// `survivor_path` existed, still deserialises: the field is
+    /// `#[serde(default)]`, so it comes back `None`, the proposal behaves as
+    /// an ordinary rename-only proposal, and `is_duplicate_quarantine()` is
+    /// `false` for it - never inferred `true` just because the field is
+    /// absent from older data.
+    #[test]
+    fn an_old_proposal_json_without_survivor_path_deserialises_as_an_ordinary_rename() {
+        let current = base_proposal();
+        let mut value = serde_json::to_value(&current).expect("the current shape serialises");
+        let object = value.as_object_mut().expect("a JSON object");
+        assert!(
+            object.remove("survivor_path").is_some(),
+            "the current shape must include survivor_path so this test proves something"
+        );
+
+        let restored: RepairProposal =
+            serde_json::from_value(value).expect("an old document without survivor_path parses");
+        assert_eq!(restored.survivor_path, None);
+        assert!(!restored.is_duplicate_quarantine());
+        assert!(matches!(restored.action, RepairAction::RenamePath { .. }));
+        assert!(restored.actionable());
     }
 }
