@@ -34,6 +34,7 @@
 //!    post-apply re-verification pass.
 
 pub mod adapter;
+pub mod duplicate;
 pub mod execute;
 pub mod library;
 pub mod plan;
@@ -46,6 +47,10 @@ mod tests;
 #[cfg(test)]
 mod library_tests;
 
+pub use duplicate::{
+    DuplicateContentProof, DuplicateHashCache, DuplicatePairClassification, DuplicateProofRefusal,
+    candidate_pairs, prove_duplicate_content, prove_duplicate_group,
+};
 pub use execute::{
     RepairApplyExecution, RepairExecutionError, RepairExecutionOptions, RepairRecoveryReport,
     RepairReverifyEntry, RepairReverifyOutcome, RepairTransactionResult, apply_repair_transaction,
