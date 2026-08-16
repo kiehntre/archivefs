@@ -365,6 +365,7 @@ mod tests {
             match_confident: false,
             is_outer_archive: false,
             is_outer_archive_verified: false,
+            survivor_path: None,
         }
     }
 

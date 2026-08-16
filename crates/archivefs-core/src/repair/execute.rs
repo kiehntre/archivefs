@@ -184,6 +184,23 @@ pub fn build_repair_transaction(
 
     let mut entries = Vec::with_capacity(plan.proposals.len());
     for proposal in &plan.proposals {
+        // 1b. A duplicate-quarantine proposal (`survivor_path.is_some()`)
+        //     must never reach this generic engine: it re-validates only the
+        //     source's own identity, never that the source is still a
+        //     distinct-object duplicate of its survivor. That live re-proof
+        //     exists only in `quarantine::build_quarantine_transaction` /
+        //     `apply_quarantine_transaction`, so this refuses outright
+        //     rather than silently accepting a mutation whose safety
+        //     depends on a check this code path never runs.
+        if proposal.is_duplicate_quarantine() {
+            return Err(RepairExecutionError::NotExecutable {
+                detail: format!(
+                    "proposal '{}' is a duplicate-quarantine move; it must be applied through \
+                     the quarantine-specific apply path, never the generic repair executor",
+                    proposal.id
+                ),
+            });
+        }
         // 2. Require the proposal to still be executable (Safe, no blockers,
         //    audited identity present).
         if !proposal.actionable() {

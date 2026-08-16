@@ -102,6 +102,7 @@ pub fn repair_proposal_from_suggested_rename(
         match_confident: proposal.match_confident,
         is_outer_archive: proposal.is_outer_archive,
         is_outer_archive_verified: proposal.is_outer_archive,
+        survivor_path: None,
     })
 }
 

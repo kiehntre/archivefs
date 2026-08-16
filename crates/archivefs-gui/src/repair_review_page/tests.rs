@@ -97,6 +97,7 @@ fn make_proposal(index: usize) -> RepairProposal {
         match_confident: true,
         is_outer_archive: false,
         is_outer_archive_verified: false,
+        survivor_path: None,
     }
 }
 

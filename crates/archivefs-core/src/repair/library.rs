@@ -48,12 +48,15 @@ use crate::dat::sources::now_unix;
 use crate::safe_read::TrustedRoots;
 
 use super::adapter::repair_proposal_from_suggested_rename;
+use super::duplicate_scan::{
+    DuplicateNeedsReviewMember, DuplicateScanAccounting, plan_duplicate_quarantine_from_rename_plan,
+};
 use super::execute::{
     RepairExecutionError, RepairExecutionOptions, RepairTransactionResult, execute_repair_plan,
 };
 use super::plan::{RepairPlan, RepairPlanId, build_repair_plan, select_repair_plan_subset};
 use super::preflight::{RepairPreflightReport, run_repair_preflight};
-use super::proposal::RepairProposalId;
+use super::proposal::{RepairAction, RepairProposalId};
 
 /// The organisation profile a whole-library scan plans for.
 ///
@@ -196,6 +199,37 @@ pub struct ReportCounts {
     /// Additive field, defaults to `0` for an old saved plan.
     #[serde(default)]
     pub unmatched_candidates: usize,
+    /// Duplicate-quarantine candidate groups found by verified DAT (game,
+    /// rom) identity, before any content proof
+    /// ([`crate::repair::DuplicateScanAccounting::groups_examined`]).
+    ///
+    /// Additive field, defaults to `0` for an old saved plan. Never distorts
+    /// [`Self::dat_candidates`], [`Self::safe_repairs`], or any other
+    /// existing bucket above - this is a second, orthogonal accounting of
+    /// the same scan from the duplicate-quarantine angle.
+    #[serde(default)]
+    pub duplicate_groups_examined: usize,
+    /// Of those, the groups where a unique objective survivor existed and
+    /// the other members were content-proven against it (whether or not that
+    /// produced a Safe proposal).
+    #[serde(default)]
+    pub duplicate_groups_content_proven: usize,
+    /// Safe `MovePath` quarantine proposals produced (one per redundant
+    /// member independently proven a distinct-object duplicate of its
+    /// group's survivor). Counted in files, not groups.
+    #[serde(default)]
+    pub duplicate_quarantine_safe: usize,
+    /// Groups with no unique objective survivor; never an executable Safe
+    /// proposal for that group. Counted in groups, not files.
+    #[serde(default)]
+    pub duplicate_quarantine_needs_review: usize,
+    /// Members skipped because they are the same filesystem object
+    /// (hard-linked) as their group's survivor.
+    #[serde(default)]
+    pub duplicate_same_object_ignored: usize,
+    /// Members skipped because content proof refused for any other reason.
+    #[serde(default)]
+    pub duplicate_content_mismatch_refused: usize,
 }
 
 /// The categorised, non-executable half of a scan report.
@@ -224,6 +258,16 @@ pub struct LibraryRepairReport {
     /// Additive field, defaults to empty for an old saved plan.
     #[serde(default)]
     pub ignored_ancillary_by_extension: std::collections::BTreeMap<String, usize>,
+    /// One row per member of a duplicate-quarantine candidate group that had
+    /// no unique objective survivor
+    /// ([`ReportCounts::duplicate_quarantine_needs_review`]) - never an
+    /// executable proposal, but never silently dropped either. `reason` is
+    /// [`super::quarantine::QuarantinePlanRefusal::NeedsReview`]'s own
+    /// explanation, verbatim.
+    ///
+    /// Additive field, defaults to empty for an old saved plan.
+    #[serde(default)]
+    pub duplicate_needs_review: Vec<PlanItem>,
 }
 
 /// The serialisable plan document written to `--plan-out` and read back by
@@ -294,24 +338,37 @@ pub fn run_library_scan(
     // collision-free, regular-file rename becomes an executable Repair proposal.
     // A loose file's audited identity is captured here, at scan time, because
     // the hardened rename plan records identity only for whole outer archives.
-    // Romm is typed but produces nothing executable yet.
-    let repair_plan = if request.profile.is_implemented() {
-        repair_plan_from_scan_rename_plan(&rename_plan, created_at)
-    } else {
-        build_repair_plan(
-            RepairPlanId::new(format!(
-                "library-{}-{generation}",
-                request.source_id.replace(['/', '\\'], "_")
-            ))
-            .unwrap_or_else(|| RepairPlanId::new("library-scan").expect("static id")),
-            generation,
-            created_at,
-            Some(request.scan_root.to_string_lossy().into_owned()),
-            Vec::new(),
-        )
-    };
+    // Duplicate-quarantine proposals are additive on top of that, bridged from
+    // the same rename plan (see `duplicate_scan`). Romm is typed but produces
+    // nothing executable yet, so it also gets no quarantine proposals.
+    let (repair_plan, duplicate_accounting, duplicate_needs_review) =
+        if request.profile.is_implemented() {
+            repair_plan_from_scan_rename_plan(&rename_plan, created_at, trusted, cancel)
+        } else {
+            (
+                build_repair_plan(
+                    RepairPlanId::new(format!(
+                        "library-{}-{generation}",
+                        request.source_id.replace(['/', '\\'], "_")
+                    ))
+                    .unwrap_or_else(|| RepairPlanId::new("library-scan").expect("static id")),
+                    generation,
+                    created_at,
+                    Some(request.scan_root.to_string_lossy().into_owned()),
+                    Vec::new(),
+                ),
+                DuplicateScanAccounting::default(),
+                Vec::new(),
+            )
+        };
 
-    let report = build_library_repair_report(&audit, &rename_plan, &repair_plan);
+    let report = build_library_repair_report(
+        &audit,
+        &rename_plan,
+        &repair_plan,
+        &duplicate_accounting,
+        &duplicate_needs_review,
+    );
 
     Ok(LibraryScanOutcome {
         generation,
@@ -363,7 +420,16 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 /// for whole outer archives. A loose-file rename is just as identity-bound at
 /// execution time, so this captures each loose source's identity here — while
 /// the file is still the exact object the audit verified — never later.
-fn repair_plan_from_scan_rename_plan(plan: &RenamePlan, created_at_unix: u64) -> RepairPlan {
+fn repair_plan_from_scan_rename_plan(
+    plan: &RenamePlan,
+    created_at_unix: u64,
+    trusted: &TrustedRoots,
+    cancel: &AtomicBool,
+) -> (
+    RepairPlan,
+    DuplicateScanAccounting,
+    Vec<DuplicateNeedsReviewMember>,
+) {
     let mut proposals = Vec::new();
     for proposal in &plan.proposals {
         let Some(mut repair) = repair_proposal_from_suggested_rename(proposal, plan.generation)
@@ -392,19 +458,33 @@ fn repair_plan_from_scan_rename_plan(plan: &RenamePlan, created_at_unix: u64) ->
         }
         proposals.push(repair);
     }
+
+    // Additive: duplicate-quarantine proposals bridged from this same rename
+    // plan, using the real scan root as the trusted root - never a second
+    // scan, never EmuWiz state. This never removes or changes a DAT rename
+    // proposal above; `detect_plan_conflicts` (run inside `build_repair_plan`
+    // below) sees both sets together, so a source that is both a DAT rename
+    // target and a quarantine-move source fails closed as an ordinary
+    // `DuplicateSource` conflict rather than being silently allowed.
+    let scan_root = Path::new(&plan.scan_root);
+    let (quarantine_proposals, duplicate_accounting, duplicate_needs_review) =
+        plan_duplicate_quarantine_from_rename_plan(plan, scan_root, trusted, Some(cancel));
+    proposals.extend(quarantine_proposals);
+
     let id = RepairPlanId::new(format!(
         "dat-{}-{}",
         plan.source_id.replace(['/', '\\'], "_"),
         plan.generation
     ))
     .unwrap_or_else(|| RepairPlanId::new("dat-rename").expect("static id"));
-    build_repair_plan(
+    let repair_plan = build_repair_plan(
         id,
         plan.generation,
         created_at_unix,
         Some(plan.scan_root.clone()),
         proposals,
-    )
+    );
+    (repair_plan, duplicate_accounting, duplicate_needs_review)
 }
 
 /// Builds the categorised report from the audit, the rename plan, and the
@@ -413,6 +493,8 @@ pub fn build_library_repair_report(
     audit: &DatAuditOutcome,
     rename_plan: &RenamePlan,
     repair_plan: &RepairPlan,
+    duplicate_accounting: &DuplicateScanAccounting,
+    duplicate_needs_review: &[DuplicateNeedsReviewMember],
 ) -> LibraryRepairReport {
     let mut report = LibraryRepairReport::default();
 
@@ -552,9 +634,38 @@ pub fn build_library_repair_report(
     }
     report.counts.scan_errors = report.scan_errors.len();
 
-    // The executable proposals are the repair plan's; it is authoritative (the
-    // adapter drops any Suggested proposal it refused, e.g. a missing identity).
-    report.counts.safe_repairs = repair_plan.proposals.len();
+    // The executable DAT rename proposals are the repair plan's `RenamePath`
+    // proposals; it is authoritative (the adapter drops any Suggested
+    // proposal it refused, e.g. a missing identity). `MovePath` proposals in
+    // the same plan are duplicate-quarantine moves, accounted for separately
+    // below so this count keeps its original, DAT-rename-only meaning.
+    report.counts.safe_repairs = repair_plan
+        .proposals
+        .iter()
+        .filter(|proposal| matches!(proposal.action, RepairAction::RenamePath { .. }))
+        .count();
+
+    // Duplicate-quarantine accounting: purely additive, never folded into any
+    // DAT candidate/ancillary/unmatched bucket above.
+    report.counts.duplicate_groups_examined = duplicate_accounting.groups_examined;
+    report.counts.duplicate_groups_content_proven = duplicate_accounting.groups_content_proven;
+    report.counts.duplicate_quarantine_safe = duplicate_accounting.quarantine_safe;
+    report.counts.duplicate_quarantine_needs_review = duplicate_accounting.quarantine_needs_review;
+    report.counts.duplicate_same_object_ignored = duplicate_accounting.same_object_ignored;
+    report.counts.duplicate_content_mismatch_refused =
+        duplicate_accounting.content_mismatch_refused;
+    report.duplicate_needs_review = duplicate_needs_review
+        .iter()
+        .map(|member| PlanItem {
+            path: member.path.to_string_lossy().into_owned(),
+            reason: format!(
+                "duplicate group '{} / {}': {}",
+                member.game_name.as_deref().unwrap_or("unknown game"),
+                member.rom_name.as_deref().unwrap_or("unknown rom"),
+                member.reason
+            ),
+        })
+        .collect();
 
     // Purely arithmetic, over counts this function already finished
     // computing above: any DAT candidate not already accounted for by one of
@@ -634,6 +745,16 @@ pub enum ApplySavedPlanError {
     /// The saved plan's executable proposals could not be independently
     /// reproduced from the trusted scan inputs. Nothing was executed.
     NotAuthorized(String),
+    /// The freshly re-proven plan contains one or more duplicate-quarantine
+    /// proposals. A whole-plan apply never mixes backends automatically: the
+    /// generic executor refuses a `MovePath` with `survivor_path` set
+    /// outright (see `execute::build_repair_transaction`), and this
+    /// foundation deliberately has no orchestration layer that would decide
+    /// how to split an *unselected* batch across the rename and
+    /// quarantine-specific executors and still fail closed on every
+    /// overlap. Use [`apply_saved_plan_selected`] instead, which does that
+    /// splitting explicitly. Nothing was executed.
+    QuarantineRequiresSelectedApply { count: usize },
     /// The Repair Center executor refused the freshly re-proven plan.
     Execute(RepairExecutionError),
 }
@@ -643,6 +764,11 @@ impl std::fmt::Display for ApplySavedPlanError {
         match self {
             Self::Scan(error) => write!(f, "re-scan failed: {error}"),
             Self::NotAuthorized(detail) => write!(f, "saved plan is not authorized: {detail}"),
+            Self::QuarantineRequiresSelectedApply { count } => write!(
+                f,
+                "the plan contains {count} duplicate-quarantine proposal(s); apply them \
+                 explicitly with selected apply (`--proposal-id`), not a whole-plan apply"
+            ),
             Self::Execute(error) => write!(f, "repair apply failed: {error}"),
         }
     }
@@ -692,6 +818,7 @@ pub fn re_prove_saved_plan(
         if saved_proposal.source_path != fresh_proposal.source_path
             || saved_proposal.action != fresh_proposal.action
             || saved_proposal.expected_source_identity != fresh_proposal.expected_source_identity
+            || saved_proposal.survivor_path != fresh_proposal.survivor_path
         {
             return Err(format!(
                 "saved proposal for '{}' was not independently reproduced by the fresh scan",
@@ -727,6 +854,20 @@ pub fn apply_saved_plan(
     // Re-prove: the saved plan must be independently reproducible.
     re_prove_saved_plan(saved, &fresh).map_err(ApplySavedPlanError::NotAuthorized)?;
 
+    // Fail closed rather than mix backends automatically: see
+    // `ApplySavedPlanError::QuarantineRequiresSelectedApply`'s doc.
+    let quarantine_count = fresh
+        .repair_plan
+        .proposals
+        .iter()
+        .filter(|proposal| proposal.is_duplicate_quarantine())
+        .count();
+    if quarantine_count > 0 {
+        return Err(ApplySavedPlanError::QuarantineRequiresSelectedApply {
+            count: quarantine_count,
+        });
+    }
+
     // Execute the freshly authorized plan (not the saved plan's proposals).
     execute_repair_plan(&fresh.repair_plan, current_generation, options, cancel)
         .map_err(ApplySavedPlanError::Execute)
@@ -748,8 +889,33 @@ pub enum ApplySavedPlanSelectedError {
     /// duplicate id, a not-Safe proposal, or any conflict anywhere in the
     /// fresh plan (even one that does not touch a selected proposal).
     InvalidSelection(String),
-    /// The Repair Center executor refused the freshly re-proven subset.
+    /// The Repair Center executor refused the freshly re-proven rename subset.
     Execute(RepairExecutionError),
+    /// A selected duplicate-quarantine subset could not be rebuilt against
+    /// the live filesystem
+    /// ([`super::quarantine::build_quarantine_transaction`] refused), after
+    /// zero or more earlier groups in this same call already applied.
+    /// `completed` carries every rename batch and quarantine group that
+    /// already succeeded before this failure — see this type's module doc:
+    /// a selection spanning several duplicate-quarantine survivor groups
+    /// applies one transaction per survivor, and an earlier group's success
+    /// is real and already durably journaled even though this call as a
+    /// whole returns `Err`. A caller that only inspects the error would
+    /// otherwise have no way to learn what actually happened on disk.
+    QuarantineBuild {
+        completed: Box<CombinedApplyResult>,
+        detail: String,
+    },
+    /// The quarantine-specific executor refused the freshly re-proven
+    /// quarantine subset
+    /// ([`super::quarantine::apply_quarantine_transaction`] refused), after
+    /// zero or more earlier groups already applied. `completed` carries the
+    /// same already-succeeded results as
+    /// [`Self::QuarantineBuild`]'s `completed` field — see its doc.
+    QuarantineApply {
+        completed: Box<CombinedApplyResult>,
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for ApplySavedPlanSelectedError {
@@ -764,11 +930,46 @@ impl std::fmt::Display for ApplySavedPlanSelectedError {
                 )
             }
             Self::Execute(error) => write!(f, "repair apply failed: {error}"),
+            Self::QuarantineBuild { detail, .. } => {
+                write!(f, "quarantine apply could not be built: {detail}")
+            }
+            Self::QuarantineApply { detail, .. } => write!(f, "quarantine apply failed: {detail}"),
         }
     }
 }
 
 impl std::error::Error for ApplySavedPlanSelectedError {}
+
+/// One duplicate-quarantine group's apply outcome, applied through the
+/// quarantine-specific backend
+/// ([`super::quarantine::build_quarantine_transaction`] /
+/// [`super::quarantine::apply_quarantine_transaction`]) — never the generic
+/// repair executor. Shaped exactly like [`RepairTransactionResult`]
+/// (transaction, summary, reverify) so a caller reports it the same way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuarantineApplyResult {
+    pub survivor_path: PathBuf,
+    pub result: RepairTransactionResult,
+}
+
+/// The outcome of a selected-proposal apply that may mix ordinary DAT
+/// `RenamePath` proposals with duplicate-quarantine `MovePath` proposals.
+///
+/// Each kind is executed through its own backend — [`execute_repair_plan`]
+/// for renames, [`super::quarantine::build_quarantine_transaction`] /
+/// [`super::quarantine::apply_quarantine_transaction`] for quarantine,
+/// grouped by survivor — so a `MovePath` never reaches the generic executor
+/// (which independently refuses one anyway; see
+/// `execute::build_repair_transaction`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CombinedApplyResult {
+    /// The ordinary DAT rename batch's result, when the selection included
+    /// at least one `RenamePath` proposal.
+    pub rename: Option<RepairTransactionResult>,
+    /// One entry per distinct survivor among the selected quarantine
+    /// proposals, in deterministic (survivor path) order.
+    pub quarantine: Vec<QuarantineApplyResult>,
+}
 
 /// Applies only a caller-selected subset of a saved plan's proposals, through
 /// the same full-plan trust boundary [`apply_saved_plan`] uses.
@@ -783,10 +984,17 @@ impl std::error::Error for ApplySavedPlanSelectedError {}
 ///    proposal refuses here even if it was never selected.
 /// 3. Only once the full plan is proven equivalent are `selected_ids`
 ///    resolved — against the **fresh** plan's proposals only
-///    ([`select_repair_plan_subset`]), never against the saved JSON.
-/// 4. The resulting subset [`RepairPlan`] is executed through the ordinary
-///    Repair Center executor, with every identity, conflict, journal,
-///    rollback, and reverify guarantee intact.
+///    ([`select_repair_plan_subset`]), never against the saved JSON. This is
+///    also where a mixed selection fails closed on overlap: the fresh *whole*
+///    plan must already be conflict-free (including any `DuplicateSource`
+///    conflict between a rename and a quarantine move sharing one source),
+///    or selection refuses outright — before it ever reaches the split below.
+/// 4. The resulting subset is split by [`super::proposal::RepairProposal::survivor_path`]
+///    — `Some` only for a duplicate-quarantine `MovePath`, never for an
+///    ordinary rename — and each half is executed through its own backend.
+///    Every identity, conflict, journal, rollback, and reverify guarantee
+///    from both backends stays intact; nothing here re-implements or
+///    weakens either.
 pub fn apply_saved_plan_selected(
     saved: &LibraryRepairPlan,
     root: &Path,
@@ -795,7 +1003,7 @@ pub fn apply_saved_plan_selected(
     selected_ids: &[RepairProposalId],
     options: &RepairExecutionOptions,
     cancel: &AtomicBool,
-) -> Result<RepairTransactionResult, ApplySavedPlanSelectedError> {
+) -> Result<CombinedApplyResult, ApplySavedPlanSelectedError> {
     let fresh = rescan_for_saved_plan(saved, root, dat, &options.trusted, cancel)
         .map_err(ApplySavedPlanSelectedError::Scan)?;
 
@@ -804,8 +1012,109 @@ pub fn apply_saved_plan_selected(
     let subset_plan = select_repair_plan_subset(&fresh.repair_plan, selected_ids)
         .map_err(ApplySavedPlanSelectedError::InvalidSelection)?;
 
-    execute_repair_plan(&subset_plan, current_generation, options, cancel)
-        .map_err(ApplySavedPlanSelectedError::Execute)
+    // Split by backend. `survivor_path` is the one authoritative signal a
+    // `MovePath` is a duplicate-quarantine move (see its doc); this split is
+    // what keeps a quarantine proposal from ever being hardened into the
+    // generic executor's transaction alongside an ordinary rename.
+    let (quarantine_proposals, rename_proposals): (Vec<_>, Vec<_>) = subset_plan
+        .proposals
+        .into_iter()
+        .partition(|proposal| proposal.is_duplicate_quarantine());
+
+    let mut result = CombinedApplyResult::default();
+
+    if !rename_proposals.is_empty() {
+        let rename_plan = build_repair_plan(
+            subset_plan.id.clone(),
+            subset_plan.generation,
+            subset_plan.created_at_unix,
+            subset_plan.source_scan_id.clone(),
+            rename_proposals,
+        );
+        result.rename = Some(
+            execute_repair_plan(&rename_plan, current_generation, options, cancel)
+                .map_err(ApplySavedPlanSelectedError::Execute)?,
+        );
+    }
+
+    if !quarantine_proposals.is_empty() {
+        // Group by survivor: `build_quarantine_transaction`/
+        // `apply_quarantine_transaction` each take one survivor path for the
+        // whole batch they apply, so a selection spanning several duplicate
+        // groups runs one transaction per survivor. One cache is shared
+        // across every group in this call, exactly as a whole scan shares one.
+        let mut by_survivor: std::collections::BTreeMap<
+            PathBuf,
+            Vec<super::proposal::RepairProposal>,
+        > = std::collections::BTreeMap::new();
+        for proposal in quarantine_proposals {
+            let survivor_path = proposal
+                .survivor_path
+                .clone()
+                .expect("partitioned by survivor_path.is_some() above");
+            by_survivor.entry(survivor_path).or_default().push(proposal);
+        }
+
+        let mut cache = super::duplicate::DuplicateHashCache::new();
+        for (survivor_path, proposals) in by_survivor {
+            // Each group is applied independently through its own journaled
+            // quarantine transaction. A later group's build/apply failure
+            // must never discard an earlier group's already-applied,
+            // already-journaled result: `result` (everything completed so
+            // far, including any rename batch above) is carried into the
+            // error rather than dropped by an early `?` return. See
+            // `ApplySavedPlanSelectedError::QuarantineBuild`/`QuarantineApply`'s
+            // doc.
+            let mut transaction = match super::quarantine::build_quarantine_transaction(
+                &proposals,
+                &survivor_path,
+                root,
+                current_generation,
+                &mut cache,
+                &options.trusted,
+                Some(cancel),
+            ) {
+                Ok(transaction) => transaction,
+                Err(detail) => {
+                    return Err(ApplySavedPlanSelectedError::QuarantineBuild {
+                        completed: Box::new(result),
+                        detail,
+                    });
+                }
+            };
+
+            let outcome = match super::quarantine::apply_quarantine_transaction(
+                &mut transaction,
+                &survivor_path,
+                root,
+                current_generation,
+                options.trusted.clone(),
+                &options.journal_dir,
+                cancel,
+                &mut cache,
+            ) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    return Err(ApplySavedPlanSelectedError::QuarantineApply {
+                        completed: Box::new(result),
+                        detail: error.to_string(),
+                    });
+                }
+            };
+
+            let reverify = super::execute::reverify_transaction(&outcome.transaction);
+            result.quarantine.push(QuarantineApplyResult {
+                survivor_path,
+                result: RepairTransactionResult {
+                    transaction: outcome.transaction,
+                    summary: outcome.summary,
+                    reverify,
+                },
+            });
+        }
+    }
+
+    Ok(result)
 }
 
 /// Builds the [`LibraryScanRequest`] a saved plan's re-scan needs and runs it.

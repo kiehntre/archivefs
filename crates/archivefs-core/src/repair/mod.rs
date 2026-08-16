@@ -35,6 +35,7 @@
 
 pub mod adapter;
 pub mod duplicate;
+pub mod duplicate_scan;
 pub mod execute;
 pub mod library;
 pub mod plan;
@@ -52,6 +53,9 @@ pub use duplicate::{
     DuplicateContentProof, DuplicateHashCache, DuplicatePairClassification, DuplicateProofRefusal,
     candidate_pairs, prove_duplicate_content, prove_duplicate_group,
 };
+pub use duplicate_scan::{
+    DuplicateNeedsReviewMember, DuplicateScanAccounting, plan_duplicate_quarantine_from_rename_plan,
+};
 pub use execute::{
     RepairApplyExecution, RepairExecutionError, RepairExecutionOptions, RepairRecoveryReport,
     RepairReverifyEntry, RepairReverifyOutcome, RepairTransactionResult, apply_repair_transaction,
@@ -59,11 +63,11 @@ pub use execute::{
     reverify_transaction, rollback_repair_transaction,
 };
 pub use library::{
-    ApplySavedPlanError, ApplySavedPlanSelectedError, LibraryRepairPlan, LibraryRepairReport,
-    LibraryScanError, LibraryScanOutcome, LibraryScanRequest, PlanItem, RepairProfile,
-    ReportCounts, SetItem, apply_library_repair_plan, apply_saved_plan, apply_saved_plan_selected,
-    build_library_repair_report, plan_file_from_scan, preview_library_repair_plan,
-    re_prove_saved_plan, run_library_scan,
+    ApplySavedPlanError, ApplySavedPlanSelectedError, CombinedApplyResult, LibraryRepairPlan,
+    LibraryRepairReport, LibraryScanError, LibraryScanOutcome, LibraryScanRequest, PlanItem,
+    QuarantineApplyResult, RepairProfile, ReportCounts, SetItem, apply_library_repair_plan,
+    apply_saved_plan, apply_saved_plan_selected, build_library_repair_report, plan_file_from_scan,
+    preview_library_repair_plan, re_prove_saved_plan, run_library_scan,
 };
 pub use plan::{
     PlanConflict, PlanConflictKind, RepairPlan, RepairPlanId, build_repair_plan,

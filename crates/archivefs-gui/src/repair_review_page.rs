@@ -285,6 +285,20 @@ impl RepairApplyFailure {
                 label: "Apply failed",
                 detail: inner.to_string(),
             },
+            // Unreachable in practice: `actionable_selected_ids` never sends
+            // a duplicate-quarantine proposal id to `apply_saved_plan_selected`
+            // (see its doc), so the quarantine backend never runs from this
+            // page. Handled explicitly rather than silently, so a future
+            // change that lifts that restriction fails loudly here instead
+            // of panicking on an unmatched pattern.
+            ApplySavedPlanSelectedError::QuarantineBuild { detail, .. } => Self {
+                label: "Apply failed",
+                detail,
+            },
+            ApplySavedPlanSelectedError::QuarantineApply { detail, .. } => Self {
+                label: "Apply failed",
+                detail,
+            },
         }
     }
 }
@@ -458,12 +472,20 @@ impl RepairReviewPageState {
         })
     }
 
-    /// The selected ids that are still an executable Safe proposal in the
-    /// loaded plan, in deterministic (`BTreeSet`) order. This is a defensive
-    /// re-check, not the safety boundary: [`apply_saved_plan_selected`]
-    /// re-validates everything again against a fresh scan regardless. It
-    /// exists so the enable rule and the confirmation dialog can never offer
-    /// to "apply" an id the loaded plan itself no longer backs.
+    /// The selected ids that are still an executable Safe **rename**
+    /// proposal in the loaded plan, in deterministic (`BTreeSet`) order.
+    /// This is a defensive re-check, not the safety boundary:
+    /// [`apply_saved_plan_selected`] re-validates everything again against a
+    /// fresh scan regardless. It exists so the enable rule and the
+    /// confirmation dialog can never offer to "apply" an id the loaded plan
+    /// itself no longer backs.
+    ///
+    /// A duplicate-quarantine `MovePath` proposal (`survivor_path.is_some()`)
+    /// is deliberately excluded here: this page's apply worker and its result
+    /// display are still built around one ordinary rename batch
+    /// ([`RepairTransactionResult`]) only. Quarantine review/apply through
+    /// this page is a follow-up slice, not silently mixed in - see this
+    /// page's module doc.
     pub(crate) fn actionable_selected_ids(&self) -> Vec<RepairProposalId> {
         let Some(plan) = self.plan.as_ref() else {
             return Vec::new();
@@ -471,10 +493,11 @@ impl RepairReviewPageState {
         self.selected
             .iter()
             .filter(|id| {
-                plan.repair_plan
-                    .proposals
-                    .iter()
-                    .any(|proposal| &proposal.id == *id && proposal.actionable())
+                plan.repair_plan.proposals.iter().any(|proposal| {
+                    &proposal.id == *id
+                        && proposal.actionable()
+                        && !proposal.is_duplicate_quarantine()
+                })
             })
             .cloned()
             .collect()
@@ -573,7 +596,18 @@ impl RepairReviewPageState {
                 &cancel,
             );
             let message = match result {
-                Ok(outcome) => RepairApplyMessage::Applied(Box::new(outcome)),
+                // `actionable_selected_ids` only ever sends ordinary rename
+                // ids (see its doc), so `rename` is always populated and
+                // `quarantine` always empty here; the `None` arm exists only
+                // so a future change to that invariant fails as a reported
+                // apply failure, never a panic.
+                Ok(outcome) => match outcome.rename {
+                    Some(rename) => RepairApplyMessage::Applied(Box::new(rename)),
+                    None => RepairApplyMessage::Failed(RepairApplyFailure {
+                        label: "Apply failed",
+                        detail: "the apply produced no rename batch to report".to_string(),
+                    }),
+                },
                 Err(error) => RepairApplyMessage::Failed(RepairApplyFailure::from_error(error)),
             };
             let _ = sender.send(message);
