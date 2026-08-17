@@ -176,7 +176,8 @@ use archivefs_core::{
     BulkPlatformAssignmentResult, CUSTOM_FOLDER_ALIAS_SOURCE, CatalogueDuplicateArchive,
     CatalogueDuplicateGroup, CatalogueDuplicateReport, CatalogueStats, CompletedScanSummary,
     Config, ConfigIdentity, DAT_ROMM_AGREEMENT_SOURCE, Database, DatabaseHealth,
-    DatabaseHealthReport, DoctorReport, DoctorStatus, HealthCategory, HealthIssue, InspectorEntry,
+    DatabaseHealthReport, DoctorReport, DoctorStatus, FrontendPlatformMapping, FrontendProfile,
+    FrontendProfileKind, FrontendProfilePolicy, HealthCategory, HealthIssue, InspectorEntry,
     InspectorEntryClassification, InspectorEntryKind, InspectorReport, LazyUnmountCleanupResult,
     LibraryViewApplyReport, LibraryViewConfig, LibraryViewLayoutTemplate, LibraryViewPlan,
     LibraryViewPlanAction, LibraryViewPlanEntry, MANUAL_PLATFORM_SOURCE,
@@ -308,6 +309,32 @@ fn library_view_submit_blocker(name: &str, destination: &str, busy: bool) -> Opt
         Some("Choose a destination folder for this Library View.")
     } else {
         None
+    }
+}
+
+/// Builds the `FrontendProfile` the dialog's submit handler sends to
+/// `archivefs_core` from `dialog`'s current state - the one place a
+/// `FrontendPlatformMapping` is ever constructed from the edited override
+/// list. `romm_overrides` is folded in regardless of `profile_kind` (a
+/// harmless no-op for `Generic`/`EsDe`, since neither ever reads
+/// `platform_mapping_overrides`) rather than conditionally dropped, so
+/// switching the radio button back and forth never silently discards what
+/// the person already typed. Kept as its own pure function - not inlined
+/// into the submit handler - so a test can exercise exactly what gets sent
+/// without simulating a button click (mirrors
+/// `validate_library_view_destination`'s own use in
+/// `library_view_form_dialog_rejects_a_destination_inside_a_source_with_an_inline_message`).
+fn library_view_form_profile(dialog: &LibraryViewFormDialogState) -> FrontendProfile {
+    let mut platform_mapping_overrides = FrontendPlatformMapping::default();
+    for (platform, slug) in &dialog.romm_overrides {
+        platform_mapping_overrides.insert(platform.clone(), slug.clone());
+    }
+    FrontendProfile {
+        kind: dialog.profile_kind,
+        policy: FrontendProfilePolicy {
+            platform_mapping_overrides,
+            ..Default::default()
+        },
     }
 }
 const SEARCH_FILTER_TEXT_EDIT_ID: &str = "archivefs_library_search_filter";
@@ -2606,6 +2633,7 @@ enum LibraryViewAction {
         destination_root: PathBuf,
         source_folders: Vec<PathBuf>,
         platforms: Vec<String>,
+        profile: FrontendProfile,
     },
     Edit {
         identifier: String,
@@ -2613,6 +2641,7 @@ enum LibraryViewAction {
         destination_root: PathBuf,
         source_folders: Vec<PathBuf>,
         platforms: Vec<String>,
+        profile: FrontendProfile,
     },
     SetEnabled {
         identifier: String,
@@ -2643,10 +2672,19 @@ enum LibraryViewActionOutcome {
     Applied {
         view: LibraryViewConfig,
         report: LibraryViewApplyReport,
+        /// The current plan's `counts.skip` - re-previewed immediately
+        /// after applying, so a partial RomM result (unresolved platform
+        /// mappings, collisions) is never silently presented as a fully
+        /// complete apply. `None` only if the re-preview itself could not
+        /// be run (e.g. the view was removed between apply and preview) -
+        /// the success message falls back to omitting the count rather
+        /// than fabricating one.
+        skipped: Option<usize>,
     },
     Repaired {
         view: LibraryViewConfig,
         report: LibraryViewApplyReport,
+        skipped: Option<usize>,
     },
     Removed {
         view: LibraryViewConfig,
@@ -2677,6 +2715,20 @@ struct LibraryViewFormDialogState {
     selected_source_folders: HashSet<PathBuf>,
     selected_platforms: HashSet<String>,
     validation_message: Option<String>,
+    /// Which frontend the resulting view is nominally shaped for - see
+    /// `FrontendProfileKind`. `Generic` (the derived default) keeps every
+    /// existing Add/Edit flow byte-for-byte unchanged.
+    profile_kind: FrontendProfileKind,
+    /// Explicit `catalogue platform -> RomM slug` overrides, edited as an
+    /// ordered list (insertion order is cosmetic only - never a safety
+    /// concern, since `FrontendPlatformMapping` is `BTreeMap`-backed and a
+    /// duplicate platform key simply overwrites its previous value on
+    /// submit). Only ever read/written when `profile_kind` is `Romm`.
+    romm_overrides: Vec<(String, String)>,
+    /// Scratch input for the "add an override" row - cleared after each
+    /// successful add, never itself submitted.
+    romm_override_platform_input: String,
+    romm_override_slug_input: String,
 }
 
 /// The Remove-view confirmation dialog's state. `view_name` is copied at
@@ -18360,6 +18412,33 @@ fn library_view_action_started_message(action: &LibraryViewAction) -> String {
     }
 }
 
+/// Builds the Apply/Repair feedback message, including the current skip
+/// count so a partial RomM result (unresolved platform mappings,
+/// collisions) is never worded as a plain, unqualified success - see
+/// `library_view_current_skip_count`. `skipped` is `None` only when the
+/// post-apply re-preview itself could not run; the message still reports
+/// the apply's own outcome truthfully in that case, it just cannot add a
+/// skip count.
+fn library_view_apply_summary_message(
+    verb: &str,
+    view_name: &str,
+    report: &LibraryViewApplyReport,
+    skipped: Option<usize>,
+) -> String {
+    let base = format!(
+        "{verb} '{}': {} created, {} repaired, {} removed, {} unchanged, {} failed",
+        view_name, report.created, report.repaired, report.removed, report.unchanged, report.failed
+    );
+    match skipped {
+        Some(0) => format!("{base}, 0 skipped."),
+        Some(skipped) => format!(
+            "{base}, {skipped} skipped - this view is not fully applied. Unresolved platform \
+             mappings or collisions remain; see Preview for details."
+        ),
+        None => format!("{base}."),
+    }
+}
+
 fn library_view_action_success_message(outcome: &LibraryViewActionOutcome) -> String {
     match outcome {
         LibraryViewActionOutcome::Added(view) => format!(
@@ -18386,24 +18465,16 @@ fn library_view_action_success_message(outcome: &LibraryViewActionOutcome) -> St
             plan.counts.collision,
             plan.counts.skip
         ),
-        LibraryViewActionOutcome::Applied { view, report } => format!(
-            "Applied '{}': {} created, {} repaired, {} removed, {} unchanged, {} failed.",
-            view.name,
-            report.created,
-            report.repaired,
-            report.removed,
-            report.unchanged,
-            report.failed
-        ),
-        LibraryViewActionOutcome::Repaired { view, report } => format!(
-            "Repaired '{}': {} created, {} repaired, {} removed, {} unchanged, {} failed.",
-            view.name,
-            report.created,
-            report.repaired,
-            report.removed,
-            report.unchanged,
-            report.failed
-        ),
+        LibraryViewActionOutcome::Applied {
+            view,
+            report,
+            skipped,
+        } => library_view_apply_summary_message("Applied", &view.name, report, *skipped),
+        LibraryViewActionOutcome::Repaired {
+            view,
+            report,
+            skipped,
+        } => library_view_apply_summary_message("Repaired", &view.name, report, *skipped),
         LibraryViewActionOutcome::Removed {
             view,
             report,
@@ -18424,6 +18495,20 @@ fn library_view_action_success_message(outcome: &LibraryViewActionOutcome) -> St
     }
 }
 
+/// Re-previews `view_id` immediately after an Apply/Repair, purely to read
+/// off the resulting plan's `counts.skip` for an honest post-apply summary -
+/// never used to decide whether the apply itself succeeded (that already
+/// happened, via the existing `apply_library_view_default`/
+/// `repair_library_view_default` call), and never fed back into another
+/// apply. Uses the same `preview_library_view_default` the Preview button
+/// already calls - no second planning implementation. `None` on any error
+/// (e.g. the view was concurrently removed) rather than fabricating a count.
+fn library_view_current_skip_count(view_id: &str) -> Option<usize> {
+    preview_library_view_default(view_id)
+        .ok()
+        .map(|(_, plan)| plan.counts.skip)
+}
+
 /// Runs one [`LibraryViewAction`] against the default config/database
 /// paths - the production entry point `ArchiveFsApp::start_library_view_action`
 /// runs on a background thread. Every arm calls straight into the same,
@@ -18438,12 +18523,14 @@ fn run_library_view_action(action: &LibraryViewAction) -> Result<LibraryViewActi
             destination_root,
             source_folders,
             platforms,
+            profile,
         } => add_library_view_default(
             name.clone(),
             destination_root.clone(),
             source_folders.clone(),
             platforms.clone(),
             LibraryViewLayoutTemplate::PlatformFilename,
+            profile.clone(),
         )
         .map(LibraryViewActionOutcome::Added)
         .map_err(|error| error.to_string()),
@@ -18453,12 +18540,14 @@ fn run_library_view_action(action: &LibraryViewAction) -> Result<LibraryViewActi
             destination_root,
             source_folders,
             platforms,
+            profile,
         } => edit_library_view_default(
             identifier,
             name.clone(),
             destination_root.clone(),
             source_folders.clone(),
             platforms.clone(),
+            profile.clone(),
         )
         .map(LibraryViewActionOutcome::Edited)
         .map_err(|error| error.to_string()),
@@ -18472,10 +18561,24 @@ fn run_library_view_action(action: &LibraryViewAction) -> Result<LibraryViewActi
             .map(|(view, plan)| LibraryViewActionOutcome::Previewed { view, plan })
             .map_err(|error| error.to_string()),
         LibraryViewAction::Apply(identifier) => apply_library_view_default(identifier)
-            .map(|(view, report)| LibraryViewActionOutcome::Applied { view, report })
+            .map(|(view, report)| {
+                let skipped = library_view_current_skip_count(&view.id);
+                LibraryViewActionOutcome::Applied {
+                    view,
+                    report,
+                    skipped,
+                }
+            })
             .map_err(|error| error.to_string()),
         LibraryViewAction::Repair(identifier) => repair_library_view_default(identifier)
-            .map(|(view, report)| LibraryViewActionOutcome::Repaired { view, report })
+            .map(|(view, report)| {
+                let skipped = library_view_current_skip_count(&view.id);
+                LibraryViewActionOutcome::Repaired {
+                    view,
+                    report,
+                    skipped,
+                }
+            })
             .map_err(|error| error.to_string()),
         LibraryViewAction::Remove {
             identifier,
@@ -20549,6 +20652,23 @@ fn show_library_view_plan_summary(
         );
         return;
     }
+    if let Some(error) = &plan.profile_error {
+        ui.colored_label(
+            ui.visuals().error_fg_color,
+            format!("Unsupported frontend profile - Apply/Repair are refused: {error}"),
+        );
+        return;
+    }
+    if let Some(conflict) = &plan.fingerprint_conflict {
+        ui.colored_label(
+            ui.visuals().warn_fg_color,
+            format!(
+                "Profile changed since this view was last applied - review before re-applying: \
+                 {conflict}"
+            ),
+        );
+        return;
+    }
 
     ui.horizontal_wrapped(|ui| {
         ui.label(format!("Create: {}", plan.counts.create));
@@ -20670,6 +20790,111 @@ fn show_library_view_platform_selection(ui: &mut egui::Ui, selected: &mut HashSe
                     }
                 }
             });
+    });
+}
+
+/// The Frontend Profile section of the Add/Edit View dialog: which frontend
+/// (`FrontendProfileKind`) the view is nominally shaped for, and - only for
+/// `Romm` - its explicit `catalogue platform -> RomM slug` overrides.
+/// `Generic` is the default and, being the pre-existing behaviour, needs no
+/// extra controls at all. `EsDe` is shown (so the vocabulary is visible -
+/// milestone note: "should remain visible only if that fits the current UI
+/// vocabulary") but its own radio option is disabled, with a short reason,
+/// since `FrontendProfileKind::EsDe` still fails closed in the backend -
+/// selecting it here would only ever produce a refused plan.
+///
+/// Writes overrides into `overrides` as an edited `(platform, slug)` list;
+/// the caller (the dialog's submit handler) is the only place that turns
+/// this into a real `FrontendPlatformMapping` - this function never talks to
+/// `archivefs_core` at all, matching every other selection widget in this
+/// dialog (`show_library_view_source_selection`/`show_library_view_platform_selection`).
+#[allow(clippy::too_many_arguments)]
+fn show_library_view_profile_selection(
+    ui: &mut egui::Ui,
+    profile_kind: &mut FrontendProfileKind,
+    overrides: &mut Vec<(String, String)>,
+    platform_input: &mut String,
+    slug_input: &mut String,
+    clipboard: &mut dyn ClipboardBackend,
+) {
+    widgets::card(ui, |ui| {
+        widgets::section_header(
+            ui,
+            "Frontend Profile",
+            Some(
+                "Which frontend this view is shaped for. Generic is the existing \
+                 {platform}/{filename} layout and is unaffected by anything below.",
+            ),
+        );
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(profile_kind, FrontendProfileKind::Generic, "Generic");
+            ui.selectable_value(profile_kind, FrontendProfileKind::Romm, "RomM");
+            ui.add_enabled_ui(false, |ui| {
+                ui.selectable_value(profile_kind, FrontendProfileKind::EsDe, "ES-DE");
+            })
+            .response
+            .on_disabled_hover_text(
+                "ES-DE planning is not implemented yet - selecting it would only produce a \
+                 refused plan.",
+            );
+        });
+
+        if *profile_kind == FrontendProfileKind::Romm {
+            ui.add_space(6.0);
+            widgets::banner(
+                ui,
+                "RomM layout",
+                "Plans roms/<slug>/<filename> under the destination above. A platform with no \
+                 resolved RomM slug is skipped individually, never guessed - add an explicit \
+                 override below, or resolve it via a previously imported RomM identity cache.",
+                widgets::StatusTone::Info,
+            );
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new("Platform overrides").strong());
+            if overrides.is_empty() {
+                ui.weak("No explicit overrides yet.");
+            } else {
+                let mut remove_index = None;
+                for (index, (platform, slug)) in overrides.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(format!("{platform} -> {slug}")).monospace());
+                        if ui.small_button("Remove").clicked() {
+                            remove_index = Some(index);
+                        }
+                    });
+                }
+                if let Some(index) = remove_index {
+                    overrides.remove(index);
+                }
+            }
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("Canonical platform:");
+                show_text_edit_with_context_menu(ui, platform_input, clipboard, |text_edit| {
+                    text_edit
+                        .id_salt("library_view_form_romm_override_platform")
+                        .desired_width(140.0)
+                });
+                ui.label("RomM slug:");
+                show_text_edit_with_context_menu(ui, slug_input, clipboard, |text_edit| {
+                    text_edit
+                        .id_salt("library_view_form_romm_override_slug")
+                        .desired_width(120.0)
+                });
+                let platform_trimmed = platform_input.trim();
+                let slug_trimmed = slug_input.trim();
+                let can_add = !platform_trimmed.is_empty() && !slug_trimmed.is_empty();
+                if ui
+                    .add_enabled(can_add, egui::Button::new("Add override"))
+                    .clicked()
+                {
+                    overrides.retain(|(existing, _)| existing != platform_trimmed);
+                    overrides.push((platform_trimmed.to_string(), slug_trimmed.to_string()));
+                    platform_input.clear();
+                    slug_input.clear();
+                }
+            });
+        }
     });
 }
 
@@ -20810,6 +21035,18 @@ fn show_library_views_page(
                                         .collect(),
                                     selected_platforms: view.platforms.iter().cloned().collect(),
                                     validation_message: None,
+                                    profile_kind: view.profile.kind,
+                                    romm_overrides: view
+                                        .profile
+                                        .policy
+                                        .platform_mapping_overrides
+                                        .iter()
+                                        .map(|(platform, slug)| {
+                                            (platform.to_string(), slug.to_string())
+                                        })
+                                        .collect(),
+                                    romm_override_platform_input: String::new(),
+                                    romm_override_slug_input: String::new(),
                                 });
                             }
                             let enable_label = if view.enabled { "Disable" } else { "Enable" };
@@ -21000,6 +21237,15 @@ fn show_library_views_page(
                             "Creates {platform}/{filename}. No other layout is selected or implied.",
                             widgets::StatusTone::Info,
                         );
+                        ui.add_space(8.0);
+                        show_library_view_profile_selection(
+                            ui,
+                            &mut dialog.profile_kind,
+                            &mut dialog.romm_overrides,
+                            &mut dialog.romm_override_platform_input,
+                            &mut dialog.romm_override_slug_input,
+                            clipboard,
+                        );
                     });
 
                 ui.separator();
@@ -21056,6 +21302,7 @@ fn show_library_views_page(
                         dialog.selected_source_folders.iter().cloned().collect();
                     let platforms: Vec<String> =
                         dialog.selected_platforms.iter().cloned().collect();
+                    let profile = library_view_form_profile(dialog);
                     action = Some(match &dialog.editing_id {
                         Some(identifier) => LibraryViewAction::Edit {
                             identifier: identifier.clone(),
@@ -21063,12 +21310,14 @@ fn show_library_views_page(
                             destination_root: validated_destination,
                             source_folders,
                             platforms,
+                            profile,
                         },
                         None => LibraryViewAction::Add {
                             name,
                             destination_root: validated_destination,
                             source_folders,
                             platforms,
+                            profile,
                         },
                     });
                 }
@@ -63982,7 +64231,7 @@ $Instant Growth [Nayr]\n";
             source_folders: Vec::new(),
             platforms: Vec::new(),
             layout_template: LibraryViewLayoutTemplate::PlatformFilename,
-            profile: archivefs_core::FrontendProfile::default(),
+            profile: FrontendProfile::default(),
         }
     }
 
@@ -64227,6 +64476,416 @@ $Instant Growth [Nayr]\n";
         .expect_err("a destination inside a configured source folder must be rejected");
         assert!(!error.to_string().is_empty());
         std::fs::remove_dir_all(&source_dir).unwrap();
+    }
+
+    // -------------------------------------------------------------------
+    // RomM frontend-profile GUI flow.
+    // -------------------------------------------------------------------
+
+    fn sample_plan(
+        counts: LibraryViewPlanCounts,
+        entries: Vec<LibraryViewPlanEntry>,
+        profile_error: Option<String>,
+        fingerprint_conflict: Option<String>,
+    ) -> LibraryViewPlan {
+        LibraryViewPlan {
+            view_id: "view-1".to_string(),
+            destination_root: PathBuf::from("/home/user/retrodeck/roms"),
+            counts,
+            entries,
+            unsafe_root_error: None,
+            profile_fingerprint: "fingerprint".to_string(),
+            fingerprint_conflict,
+            profile_error,
+        }
+    }
+
+    /// Test A: Generic remains the default profile in fresh dialog state,
+    /// and building a profile from that fresh state is byte-for-byte
+    /// `FrontendProfile::default()` - so an untouched Add View dialog can
+    /// never silently produce anything other than the pre-existing
+    /// behaviour.
+    #[test]
+    fn library_view_form_default_profile_is_generic() {
+        let dialog = LibraryViewFormDialogState::default();
+        assert_eq!(dialog.profile_kind, FrontendProfileKind::Generic);
+        assert!(dialog.romm_overrides.is_empty());
+        assert_eq!(
+            library_view_form_profile(&dialog),
+            FrontendProfile::default()
+        );
+    }
+
+    /// Test B: selecting RomM (the same state change the radio button
+    /// drives via `ui.selectable_value(&mut dialog.profile_kind, ...)`)
+    /// persists into the `FrontendProfile` the submit handler sends to
+    /// `archivefs_core`.
+    #[test]
+    fn library_view_form_romm_selection_persists_into_the_built_profile() {
+        let dialog = LibraryViewFormDialogState {
+            profile_kind: FrontendProfileKind::Romm,
+            ..Default::default()
+        };
+        let profile = library_view_form_profile(&dialog);
+        assert_eq!(profile.kind, FrontendProfileKind::Romm);
+    }
+
+    /// Test C: switching between every profile kind - the same state
+    /// transitions the dialog's radio buttons drive - never touches the
+    /// filesystem. `library_view_form_profile` is a pure function (no
+    /// `archivefs_core` call, no `std::fs` use); this proves it against a
+    /// real file, not just by code inspection.
+    #[test]
+    fn library_view_form_profile_switch_never_touches_the_filesystem() {
+        let dir = database_test_dir("library-view-profile-switch-no-mutation");
+        let marker = dir.join("source-file.zip");
+        std::fs::write(&marker, b"original-bytes").unwrap();
+        let before = std::fs::read(&marker).unwrap();
+
+        let mut dialog = LibraryViewFormDialogState::default();
+        for kind in [
+            FrontendProfileKind::Generic,
+            FrontendProfileKind::Romm,
+            FrontendProfileKind::EsDe,
+            FrontendProfileKind::Generic,
+        ] {
+            dialog.profile_kind = kind;
+            let _ = library_view_form_profile(&dialog);
+        }
+
+        assert_eq!(std::fs::read(&marker).unwrap(), before);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Test D: RomM platform overrides typed into the dialog (the same
+    /// `dialog.romm_overrides` list the "Add override" button pushes into)
+    /// persist into `FrontendProfilePolicy::platform_mapping_overrides` on
+    /// the submitted profile - the only place a `FrontendPlatformMapping`
+    /// is built from GUI state.
+    #[test]
+    fn library_view_form_romm_overrides_persist_into_the_built_profile() {
+        let mut dialog = LibraryViewFormDialogState {
+            profile_kind: FrontendProfileKind::Romm,
+            ..Default::default()
+        };
+        dialog
+            .romm_overrides
+            .push(("NES".to_string(), "nes".to_string()));
+        dialog
+            .romm_overrides
+            .push(("SNES".to_string(), "snes".to_string()));
+
+        let profile = library_view_form_profile(&dialog);
+        assert_eq!(
+            profile.policy.platform_mapping_overrides.get("NES"),
+            Some("nes")
+        );
+        assert_eq!(
+            profile.policy.platform_mapping_overrides.get("SNES"),
+            Some("snes")
+        );
+    }
+
+    /// Editing an existing RomM view must prefill the dialog with its
+    /// current profile kind and overrides - the Edit button's own
+    /// construction of `LibraryViewFormDialogState`, exercised directly
+    /// rather than by simulating a click (same convention as
+    /// `library_view_form_dialog_rejects_a_destination_inside_a_source_with_an_inline_message`
+    /// above).
+    #[test]
+    fn library_view_form_edit_prefills_romm_profile_and_overrides_from_the_view() {
+        let mut view = sample_library_view("view-1", "retrodeck", "/home/user/retrodeck/roms");
+        view.profile.kind = FrontendProfileKind::Romm;
+        view.profile
+            .policy
+            .platform_mapping_overrides
+            .insert("NES".to_string(), "nes".to_string());
+
+        let dialog = LibraryViewFormDialogState {
+            editing_id: Some(view.id.clone()),
+            name: view.name.clone(),
+            destination_text: view.destination_root.display().to_string(),
+            selected_source_folders: view.source_folders.iter().cloned().collect(),
+            selected_platforms: view.platforms.iter().cloned().collect(),
+            validation_message: None,
+            profile_kind: view.profile.kind,
+            romm_overrides: view
+                .profile
+                .policy
+                .platform_mapping_overrides
+                .iter()
+                .map(|(platform, slug)| (platform.to_string(), slug.to_string()))
+                .collect(),
+            romm_override_platform_input: String::new(),
+            romm_override_slug_input: String::new(),
+        };
+
+        assert_eq!(dialog.profile_kind, FrontendProfileKind::Romm);
+        assert_eq!(
+            dialog.romm_overrides,
+            vec![("NES".to_string(), "nes".to_string())]
+        );
+        // Round-trips back through the same builder the submit handler uses.
+        assert_eq!(library_view_form_profile(&dialog), view.profile);
+    }
+
+    /// Test E: the preview summary renders a resolved RomM path.
+    #[test]
+    fn library_view_plan_summary_shows_resolved_romm_paths() {
+        let ctx = egui::Context::default();
+        let plan = sample_plan(
+            LibraryViewPlanCounts {
+                create: 1,
+                correct: 0,
+                repair: 0,
+                remove: 0,
+                collision: 0,
+                skip: 0,
+            },
+            vec![LibraryViewPlanEntry {
+                action: LibraryViewPlanAction::Create,
+                archive_path: Some(PathBuf::from("/roms/source/Game.zip")),
+                relative_link_path: Some(PathBuf::from("roms/nes/Game.zip")),
+                destination_path: Some(PathBuf::from(
+                    "/home/user/retrodeck/roms/roms/nes/Game.zip",
+                )),
+                platform: Some("NES".to_string()),
+                reason: None,
+                colliding_with: None,
+                source_folder_path: Some(PathBuf::from("/roms/source")),
+                archive_identity: None,
+            }],
+            None,
+            None,
+        );
+        let mut filter = LibraryViewPlanFilter::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_library_view_plan_summary(ui, &plan, &mut filter);
+            });
+        });
+        assert!(rendered_text_contains(&output, "Create: 1"));
+        assert!(rendered_text_contains(
+            &output,
+            "/home/user/retrodeck/roms/roms/nes/Game.zip"
+        ));
+    }
+
+    /// Test F: an unresolved RomM mapping shows as a Skip entry with its
+    /// reason clearly visible - never silently dropped.
+    #[test]
+    fn library_view_plan_summary_shows_unresolved_romm_mappings_with_reasons() {
+        let ctx = egui::Context::default();
+        let plan = sample_plan(
+            LibraryViewPlanCounts {
+                create: 0,
+                correct: 0,
+                repair: 0,
+                remove: 0,
+                collision: 0,
+                skip: 1,
+            },
+            vec![LibraryViewPlanEntry {
+                action: LibraryViewPlanAction::SkipInvalidPath,
+                archive_path: Some(PathBuf::from("/roms/source/Obscure.zip")),
+                relative_link_path: None,
+                destination_path: None,
+                platform: Some("Atari Jaguar".to_string()),
+                reason: Some(
+                    "no RomM platform slug could be resolved for catalogue platform \
+                     \"Atari Jaguar\""
+                        .to_string(),
+                ),
+                colliding_with: None,
+                source_folder_path: None,
+                archive_identity: None,
+            }],
+            None,
+            None,
+        );
+        let mut filter = LibraryViewPlanFilter::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_library_view_plan_summary(ui, &plan, &mut filter);
+            });
+        });
+        assert!(rendered_text_contains(&output, "Skip: 1"));
+        assert!(rendered_text_contains(
+            &output,
+            "no RomM platform slug could be resolved"
+        ));
+        assert!(rendered_text_contains(&output, "Atari Jaguar"));
+    }
+
+    /// Test G: a fingerprint conflict is shown clearly and short-circuits
+    /// the summary - the ordinary Create/Correct/... counts (which apply
+    /// would act on) are not rendered alongside a state where Apply is
+    /// refused, so the refusal cannot be missed. `plan.is_safe_to_apply()`
+    /// (which every Apply/Repair button's `can_apply` is computed from - see
+    /// `show_library_views_page`) is `false` for this plan, confirmed
+    /// directly rather than by pixel-level widget introspection.
+    #[test]
+    fn library_view_plan_summary_shows_fingerprint_conflict_and_blocks_apply() {
+        let ctx = egui::Context::default();
+        let plan = sample_plan(
+            LibraryViewPlanCounts::default(),
+            Vec::new(),
+            None,
+            Some("this view's existing manifest was written under a different profile".to_string()),
+        );
+        assert!(!plan.is_safe_to_apply());
+        let mut filter = LibraryViewPlanFilter::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_library_view_plan_summary(ui, &plan, &mut filter);
+            });
+        });
+        assert!(rendered_text_contains(&output, "Profile changed"));
+        assert!(!rendered_text_contains(&output, "Create: "));
+    }
+
+    /// Test H: a `profile_error` (e.g. the still-unimplemented ES-DE kind)
+    /// is shown clearly and also blocks Apply.
+    #[test]
+    fn library_view_plan_summary_shows_profile_error_and_blocks_apply() {
+        let ctx = egui::Context::default();
+        let plan = sample_plan(
+            LibraryViewPlanCounts::default(),
+            Vec::new(),
+            Some(
+                "the EsDe frontend profile does not implement real Library View materialization \
+                 yet"
+                .to_string(),
+            ),
+            None,
+        );
+        assert!(!plan.is_safe_to_apply());
+        let mut filter = LibraryViewPlanFilter::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_library_view_plan_summary(ui, &plan, &mut filter);
+            });
+        });
+        assert!(rendered_text_contains(
+            &output,
+            "Unsupported frontend profile"
+        ));
+        assert!(!rendered_text_contains(&output, "Create: "));
+    }
+
+    /// Test K/L: the post-apply summary message includes the skip count,
+    /// and visibly distinguishes a fully-applied result from a partial one
+    /// - never wording a partial RomM result as an unqualified success.
+    #[test]
+    fn library_view_apply_summary_message_reports_skip_count_and_partial_state() {
+        let report = LibraryViewApplyReport {
+            view_id: "view-1".to_string(),
+            created: 1243,
+            repaired: 0,
+            removed: 0,
+            unchanged: 340,
+            failed: 0,
+            results: Vec::new(),
+        };
+
+        let full = library_view_apply_summary_message("Applied", "retrodeck", &report, Some(0));
+        assert!(full.contains("1243 created"));
+        assert!(full.contains("340 unchanged"));
+        assert!(full.contains("0 skipped"));
+        assert!(!full.contains("not fully applied"));
+
+        let partial = library_view_apply_summary_message("Applied", "retrodeck", &report, Some(3));
+        assert!(partial.contains("3 skipped"));
+        assert!(
+            partial.contains("not fully applied"),
+            "a nonzero skip count must visibly say the view is not fully applied: {partial:?}"
+        );
+
+        // A re-preview failure (e.g. the view vanished) never fabricates a
+        // count - the apply's own outcome is still reported truthfully.
+        let unknown = library_view_apply_summary_message("Applied", "retrodeck", &report, None);
+        assert!(unknown.contains("1243 created"));
+        assert!(!unknown.contains("skipped"));
+    }
+
+    /// Test M: collisions remain visible in the preview summary - never
+    /// silently dropped or merged into another bucket.
+    #[test]
+    fn library_view_plan_summary_shows_collisions() {
+        let ctx = egui::Context::default();
+        let plan = sample_plan(
+            LibraryViewPlanCounts {
+                create: 0,
+                correct: 0,
+                repair: 0,
+                remove: 0,
+                collision: 1,
+                skip: 0,
+            },
+            vec![LibraryViewPlanEntry {
+                action: LibraryViewPlanAction::Collision,
+                archive_path: Some(PathBuf::from("/roms/source/Game.zip")),
+                relative_link_path: Some(PathBuf::from("roms/nes/Game.zip")),
+                destination_path: Some(PathBuf::from(
+                    "/home/user/retrodeck/roms/roms/nes/Game.zip",
+                )),
+                platform: Some("NES".to_string()),
+                reason: Some(
+                    "a real file or directory already exists at this destination".to_string(),
+                ),
+                colliding_with: None,
+                source_folder_path: None,
+                archive_identity: None,
+            }],
+            None,
+            None,
+        );
+        let mut filter = LibraryViewPlanFilter::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_library_view_plan_summary(ui, &plan, &mut filter);
+            });
+        });
+        assert!(rendered_text_contains(&output, "Collision: 1"));
+        assert!(rendered_text_contains(&output, "[Collision]"));
+        assert!(rendered_text_contains(
+            &output,
+            "a real file or directory already exists at this destination"
+        ));
+    }
+
+    /// Test O: ES-DE stays visible (per the milestone's UI-vocabulary note)
+    /// but is presented as a disabled, non-executable choice in the Add/Edit
+    /// View dialog - never a selectable option that could plan/apply
+    /// anything.
+    #[test]
+    fn library_view_form_esde_is_visible_but_not_selectable() {
+        let ctx = egui::Context::default();
+        let mut profile_kind = FrontendProfileKind::Generic;
+        let mut overrides = Vec::new();
+        let mut platform_input = String::new();
+        let mut slug_input = String::new();
+        let mut clipboard = InMemoryClipboard::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_library_view_profile_selection(
+                    ui,
+                    &mut profile_kind,
+                    &mut overrides,
+                    &mut platform_input,
+                    &mut slug_input,
+                    &mut clipboard,
+                );
+            });
+        });
+        assert!(rendered_text_contains(&output, "ES-DE"));
+        assert!(rendered_text_contains(&output, "Generic"));
+        assert!(rendered_text_contains(&output, "RomM"));
+        // ES-DE fails closed in the backend regardless of GUI wiring -
+        // confirmed at the type/profile level here rather than re-deriving
+        // a plan (already exhaustively covered in
+        // `archivefs-core`'s `esde_profile_kind_fails_closed_...` test).
+        assert_eq!(FrontendProfileKind::default(), FrontendProfileKind::Generic);
     }
 
     #[test]

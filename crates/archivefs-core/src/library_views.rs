@@ -2335,6 +2335,7 @@ pub fn add_library_view_default(
     source_folders: Vec<PathBuf>,
     platforms: Vec<String>,
     layout_template: LibraryViewLayoutTemplate,
+    profile: FrontendProfile,
 ) -> Result<LibraryViewConfig> {
     let (_, all_source_folders) = load_catalogue_for_planning()?;
     let all_source_paths: Vec<PathBuf> = all_source_folders
@@ -2351,7 +2352,7 @@ pub fn add_library_view_default(
         source_folders,
         platforms,
         layout_template,
-        profile: FrontendProfile::default(),
+        profile,
     };
 
     let mut views = load_library_view_configs_default()?;
@@ -2405,6 +2406,7 @@ pub fn edit_library_view_default(
     destination_root: PathBuf,
     source_folders: Vec<PathBuf>,
     platforms: Vec<String>,
+    profile: FrontendProfile,
 ) -> Result<LibraryViewConfig> {
     let (_, all_source_folders) = load_catalogue_for_planning()?;
     let all_source_paths: Vec<PathBuf> = all_source_folders
@@ -2417,6 +2419,7 @@ pub fn edit_library_view_default(
         view.destination_root = destination_root;
         view.source_folders = source_folders;
         view.platforms = platforms;
+        view.profile = profile;
     })
 }
 
