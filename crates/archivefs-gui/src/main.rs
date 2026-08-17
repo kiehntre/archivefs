@@ -3731,6 +3731,15 @@ struct ArchiveFsApp {
     snapshot_generation: Option<RefreshGeneration>,
     database_state: DatabaseState,
     database_generation: DatabaseGeneration,
+    /// A `ScanPersistSummary` from a just-completed Sources-page scan
+    /// (`SourceActionOutcome::Scanned`), waiting to be carried into the
+    /// `DatabaseState::Ready.last_scan_summary` produced by the plain
+    /// snapshot reload that `poll_source_action` always triggers afterward
+    /// (`DatabaseOutcome::Loaded`, which otherwise has no scan summary of
+    /// its own). Consumed (taken) by the very next `poll_database_load`
+    /// completion regardless of its outcome, so a summary can never attach
+    /// to an unrelated, later reload.
+    pending_source_scan_summary: Option<ScanPersistSummary>,
     library_filters: LibraryRowFilters,
     platform_action: Option<RunningPlatformAction>,
     platform_choice: Option<String>,
@@ -4063,6 +4072,7 @@ impl ArchiveFsApp {
             state: start_load(context.clone(), generation, None),
             database_state: start_database_load(context.clone(), database_generation, None, false),
             database_generation,
+            pending_source_scan_summary: None,
             cheat_sources_page: None,
             rom_organisation_page: None,
             repair_review_page: None,
@@ -4526,10 +4536,17 @@ impl ArchiveFsApp {
             let _ = worker.join();
         }
 
+        // Consumed unconditionally, whatever `result` turns out to be below:
+        // a pending Sources-page scan summary is only ever valid for the
+        // very next reload completion, never a later one (requirement:
+        // never invent a state transition - if this reload doesn't land in
+        // `Ready`, there is no `last_scan_summary` to attach it to, so it
+        // is simply dropped rather than held over).
+        let pending_source_scan_summary = self.pending_source_scan_summary.take();
         self.database_state = match result {
             Ok(DatabaseOutcome::Loaded(snapshot)) => DatabaseState::Ready {
                 snapshot: Box::new(snapshot),
-                last_scan_summary: None,
+                last_scan_summary: pending_source_scan_summary,
             },
             Ok(DatabaseOutcome::Scanned {
                 snapshot,
@@ -5766,6 +5783,16 @@ impl ArchiveFsApp {
                 if matches!(action, SourceAction::Remove { .. }) {
                     self.sources_remove_dialog = None;
                 }
+                // Carry this scan's skip detail into the plain snapshot
+                // reload triggered below, so Database Status -> Skipped
+                // files -> Inspect... becomes reachable without a separate
+                // Database Status -> Scan library run. Any other source
+                // action clears it, so a stale summary can never attach to
+                // an unrelated later reload.
+                self.pending_source_scan_summary = match &outcome {
+                    SourceActionOutcome::Scanned(summary) => Some(summary.clone()),
+                    _ => None,
+                };
                 self.start_database_action(context.clone(), false);
             }
             Err(message) => {
@@ -54209,6 +54236,7 @@ $Instant Growth [Nayr]\n";
                 database_path: PathBuf::from("/config/library.sqlite3"),
             },
             database_generation: DatabaseGeneration::INITIAL,
+            pending_source_scan_summary: None,
             // Left unloaded: these tests never open the Cheat Sources page,
             // and loading it here would read the real per-user preferences.
             cheat_sources_page: None,
@@ -59066,6 +59094,228 @@ $Instant Growth [Nayr]\n";
         // database state correctly Ready.
         assert!(matches!(app.database_state, DatabaseState::Ready { .. }));
         assert!(matches!(app.state, LoadState::Loading { .. }));
+    }
+
+    // -------------------------------------------------------------------
+    // Sources-page scan results feeding `last_scan_summary`
+    // (bug: SourceActionOutcome::Scanned's summary was discarded, so the
+    // Database Status "Skipped files -> Inspect..." control was only ever
+    // reachable via a separate Database Status -> Scan library run).
+    // -------------------------------------------------------------------
+
+    /// Drives `poll_source_action` with a `SourceActionOutcome::Scanned`
+    /// result, then drives the plain reload it triggers to completion via a
+    /// manually-controlled channel - never the real
+    /// `start_database_action`/`start_database_load` worker (which would
+    /// touch the process's real default database/config paths; the same
+    /// concern `start_source_action_does_not_start_a_second_concurrent_action`
+    /// documents). `database_state` is pre-seeded already `Loading` at the
+    /// current generation so `start_database_action` (called internally by
+    /// `poll_source_action`) sees `is_loading() == true` and returns
+    /// immediately without spawning a thread or touching `database_state`,
+    /// leaving our channel in full control of what "reload" observes.
+    fn drive_sources_scan_through_to_ready(
+        summary: ScanPersistSummary,
+    ) -> (ArchiveFsApp, ScanPersistSummary) {
+        let mut app = app_for_operation_tests();
+        let generation = DatabaseGeneration::INITIAL.next();
+        app.database_generation = generation;
+        let (db_sender, db_receiver) = mpsc::channel::<DatabaseMessage>();
+        app.database_state = DatabaseState::Loading {
+            generation,
+            receiver: db_receiver,
+            worker: None,
+            previous: None,
+            scanning: false,
+        };
+
+        let (source_sender, source_receiver) = mpsc::channel();
+        app.source_action = Some(RunningSourceAction {
+            action: SourceAction::ScanAll,
+            receiver: source_receiver,
+            worker: None,
+        });
+        source_sender
+            .send(Ok(SourceActionOutcome::Scanned(summary.clone())))
+            .unwrap();
+
+        app.poll_source_action(&egui::Context::default());
+
+        // The reload `poll_source_action` asked for was a no-op (already
+        // loading), so `database_state` is still exactly the `Loading` we
+        // seeded - now complete it as a plain (non-scan) reload, exactly
+        // as the real worker would.
+        let snapshot = cached_snapshot(Vec::new());
+        db_sender
+            .send((generation, Ok(DatabaseOutcome::Loaded(snapshot))))
+            .unwrap();
+        app.poll_database_load(&egui::Context::default());
+
+        (app, summary)
+    }
+
+    #[test]
+    fn sources_page_scan_with_skipped_files_populates_last_scan_summary() {
+        let summary = skipped_files_summary(
+            vec![archivefs_core::SkippedFile {
+                path: PathBuf::from("/roms/c128/boxart.png"),
+                reason: archivefs_core::SkipReason::UnsupportedExtension,
+            }],
+            2,
+            1,
+        );
+        let (app, _) = drive_sources_scan_through_to_ready(summary);
+
+        match &app.database_state {
+            DatabaseState::Ready {
+                last_scan_summary, ..
+            } => {
+                assert!(
+                    last_scan_summary.is_some(),
+                    "a Sources-page scan with skipped files must populate last_scan_summary"
+                );
+            }
+            _ => panic!("expected DatabaseState::Ready"),
+        }
+        // Consumed exactly once: it must never leak into a later, unrelated
+        // reload.
+        assert!(app.pending_source_scan_summary.is_none());
+    }
+
+    #[test]
+    fn sources_page_scan_preserves_the_exact_skipped_files_total() {
+        let summary = skipped_files_summary(Vec::new(), 5, 2);
+        let expected_total = summary.skipped_files_total();
+        assert_eq!(expected_total, 7);
+        let (app, _) = drive_sources_scan_through_to_ready(summary);
+
+        let DatabaseState::Ready {
+            last_scan_summary: Some(stored),
+            ..
+        } = &app.database_state
+        else {
+            panic!("expected Ready with a stored last_scan_summary");
+        };
+        assert_eq!(stored.skipped_files_total(), expected_total);
+    }
+
+    #[test]
+    fn sources_page_scan_status_text_is_unchanged_by_the_last_scan_summary_fix() {
+        // Same wording assertion as
+        // `source_action_success_messages_are_specific_per_variant`'s own
+        // Scanned coverage - this fix only changes what happens to the
+        // summary afterward, never the feedback text shown for the action
+        // itself.
+        let summary = skipped_files_summary(Vec::new(), 2, 1);
+        let (app, _) = drive_sources_scan_through_to_ready(summary);
+
+        let feedback = app.feedback.as_ref().expect("expected feedback to be set");
+        assert!(feedback.succeeded);
+        assert_eq!(
+            feedback.message,
+            "Scan complete: 0 source(s) scanned, 0 archive(s) found, 0 missing."
+        );
+    }
+
+    #[test]
+    fn database_status_inspector_condition_becomes_true_after_a_sources_page_scan() {
+        let summary = skipped_files_summary(
+            vec![archivefs_core::SkippedFile {
+                path: PathBuf::from("/roms/megadrive/RESOURCE.GEN"),
+                reason: archivefs_core::SkipReason::AmbiguousPlatform,
+            }],
+            0,
+            1,
+        );
+        let (app, _) = drive_sources_scan_through_to_ready(summary);
+
+        // The exact guard `show_database_panel` uses to decide whether to
+        // render the "Skipped files" row and its "Inspect..." button.
+        let inspector_reachable = matches!(
+            &app.database_state,
+            DatabaseState::Ready {
+                last_scan_summary: Some(summary),
+                ..
+            } if summary.skipped_files_total() > 0
+        );
+        assert!(
+            inspector_reachable,
+            "Database Status -> Skipped files -> Inspect... must become reachable \
+             immediately after a Sources-page scan with skipped files"
+        );
+    }
+
+    #[test]
+    fn plain_reloads_unrelated_to_a_sources_scan_still_leave_last_scan_summary_none() {
+        // No regression: a reload not preceded by a Sources-page scan
+        // (pending_source_scan_summary left at its default None) must
+        // behave exactly as before this fix.
+        let mut app = app_for_operation_tests();
+        let generation = DatabaseGeneration::INITIAL.next();
+        app.database_generation = generation;
+        let (sender, receiver) = mpsc::channel::<DatabaseMessage>();
+        app.database_state = DatabaseState::Loading {
+            generation,
+            receiver,
+            worker: None,
+            previous: None,
+            scanning: false,
+        };
+        assert!(app.pending_source_scan_summary.is_none());
+        let snapshot = cached_snapshot(Vec::new());
+        sender
+            .send((generation, Ok(DatabaseOutcome::Loaded(snapshot))))
+            .unwrap();
+
+        app.poll_database_load(&egui::Context::default());
+
+        match &app.database_state {
+            DatabaseState::Ready {
+                last_scan_summary, ..
+            } => assert!(last_scan_summary.is_none()),
+            _ => panic!("expected DatabaseState::Ready"),
+        }
+    }
+
+    #[test]
+    fn the_database_status_scan_library_path_still_populates_last_scan_summary_directly() {
+        // No regression to `DatabaseOutcome::Scanned` (the separate
+        // Database Status -> "Scan library" flow): it must keep populating
+        // `last_scan_summary` itself, exactly as before this fix, and must
+        // never consult `pending_source_scan_summary`.
+        let mut app = app_for_operation_tests();
+        let generation = DatabaseGeneration::INITIAL.next();
+        app.database_generation = generation;
+        app.pending_source_scan_summary = None;
+        let (sender, receiver) = mpsc::channel::<DatabaseMessage>();
+        app.database_state = DatabaseState::Loading {
+            generation,
+            receiver,
+            worker: None,
+            previous: None,
+            scanning: true,
+        };
+        let snapshot = cached_snapshot(Vec::new());
+        let scan_summary = skipped_files_summary(Vec::new(), 1, 0);
+        sender
+            .send((
+                generation,
+                Ok(DatabaseOutcome::Scanned {
+                    snapshot,
+                    scan_summary: scan_summary.clone(),
+                }),
+            ))
+            .unwrap();
+
+        app.poll_database_load(&egui::Context::default());
+
+        match &app.database_state {
+            DatabaseState::Ready {
+                last_scan_summary: Some(stored),
+                ..
+            } => assert_eq!(stored.skipped_files_total(), 1),
+            _ => panic!("expected Ready with a scan summary"),
+        }
     }
 
     fn row_with_origin(origin: RowOrigin, unknown_platform: bool) -> ArchiveRow {
