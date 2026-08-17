@@ -8,6 +8,24 @@
 # Exits 0 if every test passes, 1 if any test fails.
 set -eu
 
+# Never inherit the caller's TTY on stdin. install.sh's fresh-install first-
+# source prompt is deliberately offered only when `[ -t 0 ]` (stdin is a
+# terminal) - see its own comment above that check. Every install.sh
+# invocation below is automated and expects no interactive input; run from
+# a real terminal without this, `[ -t 0 ]` would be true for those
+# invocations (this script's own stdin, inherited by every command and
+# command substitution it runs), and a fresh-config install would open
+# /dev/tty and block waiting for input that never arrives. Redirecting once,
+# here, covers every current and future install.sh call in this file - the
+# same effect `assert_success`/`assert_failure` already get for stdout/
+# stderr via their own `>/dev/null 2>&1`, just for stdin, and just once
+# instead of at each call site. This never affects install.sh's own
+# production behavior (`[ -t 0 ]` is still checked honestly - it now
+# genuinely reads "no" for these automated runs) and never affects a real
+# interactive install run outside this test suite. CI already runs with no
+# TTY on stdin, which is exactly why this bug never reproduced there.
+exec </dev/null
+
 script_dir=$(dirname -- "$0")
 script_dir=$(CDPATH= cd -- "$script_dir" && pwd)
 repo_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
@@ -218,6 +236,42 @@ assert_files_equal "config.toml matches config.toml.example" \
 cli_out=$("$bin_dir/emuwiz-cli")
 assert_contains "installed emuwiz-cli runs (bundle stub)" "$cli_out" "fake-cli"
 rm -rf -- "$work"
+
+echo "=== test: this suite does not block on stdin when launched from a real controlling terminal ==="
+# Regression coverage for the bug this fix addresses. Without the top-level
+# `exec </dev/null` above, running this suite from a real terminal (not "no
+# TTY at all" - CI already covered that, and it would pass even with the
+# bug present, since an absent TTY was never the distinguishing case) would
+# inherit that terminal on fd 0, and the first fresh install above would
+# hit install.sh's `[ -t 0 ]` prompt check, open /dev/tty, and block
+# forever waiting for input nothing supplies.
+#
+# This manufactures a real controlling terminal (a pty, via `script`) and
+# re-invokes this very script under it, completely unmodified - exactly
+# what a developer running `sh tests/test_install.sh` from their own shell
+# does - so the fix is proven at its actual entry point, not inferred from
+# a synthetic stand-in for it. Bounded by `timeout` so a regression here
+# fails loudly rather than hanging this run too.
+#
+# Guarded against recursing more than one level deep: the re-invoked copy
+# below is this same script, which reaches this same block again. Without
+# a guard, that copy would spawn its own pty and re-invoke a third copy,
+# and so on - each level adding real `script`/process-spawn overhead on
+# top of the ~249 already-run tests above it, until an outer `timeout`
+# eventually fires and fails the whole chain even though the fix itself
+# is fine. One level of real-TTY re-invocation is already a faithful,
+# sufficient proof of the fix; it does not need to recurse further.
+if [ "${TEST_INSTALL_TTY_REGRESSION_GUARD:-}" = 1 ]; then
+    printf 'SKIP - already running under the controlling-terminal regression re-invocation; not recursing further\n'
+elif command -v script >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then
+    if TEST_INSTALL_TTY_REGRESSION_GUARD=1 timeout 180 script -qec "sh '$repo_root/tests/test_install.sh'" /dev/null >/dev/null 2>&1; then
+        ok "the full suite completes under a real controlling terminal (does not block on /dev/tty)"
+    else
+        bad "the full suite completes under a real controlling terminal (blocked, or failed - see timeout/exit status)"
+    fi
+else
+    printf 'SKIP - script and/or timeout unavailable; cannot prove the controlling-terminal case directly\n'
+fi
 
 echo "=== test: custom XDG data home and a prefix containing spaces ==="
 work=$(mktemp -d)
