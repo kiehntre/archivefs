@@ -49,10 +49,23 @@ struct Fixture {
     config_path: PathBuf,
 }
 
+/// Disambiguates fixture roots within one test binary process, alongside the
+/// process id and a wall-clock timestamp. A monotonic counter is required
+/// (not just a timestamp) because `cargo test`'s parallel test threads can
+/// call `Fixture::new()` at effectively the same instant: on a coarser or
+/// contended clock this can produce colliding nanosecond readings across
+/// threads, which would otherwise let two tests' `remove_dir_all`/
+/// `create_dir_all` calls race over the same directory. Matches this
+/// codebase's own established pattern for the same problem elsewhere (e.g.
+/// `generate_library_view_id`, `create_or_repair_symlink`'s temp-file
+/// sequence).
+static FIXTURE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl Fixture {
     fn new() -> Self {
+        let sequence = FIXTURE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
-            "archivefs-gui-dat-sources-page-{}-{}",
+            "archivefs-gui-dat-sources-page-{}-{}-{sequence:x}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
