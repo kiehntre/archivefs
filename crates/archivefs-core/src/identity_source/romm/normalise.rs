@@ -331,6 +331,23 @@ pub fn normalise_platform(value: &Value) -> Option<NormalisedPlatform> {
 /// A short explicit table handles the few slugs whose RomM spelling has no alias
 /// in the registry. It is deliberately tiny and each entry is a slug observed on
 /// a real instance; anything not here stays unknown rather than being guessed.
+///
+/// # Deliberately not inverted for the opposite (canonical -> slug) direction
+///
+/// The Library Views frontend-profile planner (`library_views::resolve_romm_platform_slug`)
+/// needs the *opposite* direction - given a canonical platform, which RomM slug
+/// to plan a path under - and does not derive it from this table. Several
+/// entries below are intentionally approximate, many-to-one associations for
+/// *importing* provider data (e.g. `fds` -> `NES`, because FDS games are
+/// commonly catalogued alongside NES; `pc-fx` -> `PC Engine`, a related but
+/// distinct NEC console; `xboxone` -> `Xbox`, a different console generation),
+/// which is safe for recognising an incoming slug but would be actively wrong
+/// if inverted to output a default slug for the canonical platform (`NES`'s
+/// real, correct RomM slug is `nes` - resolved through `platform_for_alias`
+/// above - never `fds`). The output-direction planner therefore only ever
+/// resolves a slug from an explicit user override or a locally cached, live
+/// instance's own reported slug, and fails closed otherwise; see that
+/// function's doc comment.
 pub fn canonical_platform_for_romm_slug(slug: &str) -> Option<&'static str> {
     if let Some(platform) = crate::platform::platform_for_alias(slug) {
         return Some(platform.id);

@@ -67,7 +67,7 @@ pub use library_views::{
     load_library_view_manifest_at, load_library_view_manifest_default, plan_generated_file,
     plan_library_view, preview_library_view_default, remove_library_view_default,
     remove_library_view_symlinks, repair_library_view, repair_library_view_default,
-    resolve_library_view_identifier, save_library_view_configs_default,
+    resolve_library_view_identifier, resolve_romm_platform_slug, save_library_view_configs_default,
     save_library_view_configs_to, set_library_view_enabled_default,
     validate_library_view_destination,
 };
