@@ -722,6 +722,28 @@ fn proposal_id_for(plan: &LibraryRepairPlan, source_basename: &str) -> RepairPro
         .clone()
 }
 
+/// An isolated journal directory inside a test's own [`TestDir`], created
+/// eagerly (journal writing requires the directory to already exist).
+/// Every test that drives a real `confirm_apply` -> `spawn_apply` run must
+/// use this - never the production default - so it can never write a fake
+/// transaction into the developer's real Repair History. See
+/// `RepairReviewPageState::journal_dir_override`'s doc.
+fn isolated_journal_dir(dir: &std::path::Path) -> PathBuf {
+    let journal_dir = dir.join("journal");
+    std::fs::create_dir_all(&journal_dir).unwrap();
+    journal_dir
+}
+
+/// A page state with `plan` loaded and its journal directory overridden to
+/// `journal_dir` - see [`isolated_journal_dir`].
+fn isolated_state(plan: LibraryRepairPlan, journal_dir: PathBuf) -> RepairReviewPageState {
+    RepairReviewPageState {
+        plan: Some(plan),
+        journal_dir_override: Some(journal_dir),
+        ..RepairReviewPageState::default()
+    }
+}
+
 // --- enable/disable rules ---------------------------------------------------
 
 #[test]
@@ -797,10 +819,7 @@ fn cancelling_the_confirmation_never_touches_the_filesystem() {
     let plan = scan_apply_fixture(&dat, &roms);
     let alpha_id = proposal_id_for(&plan, "a.bin");
 
-    let mut state = RepairReviewPageState {
-        plan: Some(plan),
-        ..RepairReviewPageState::default()
-    };
+    let mut state = isolated_state(plan, isolated_journal_dir(dir.path()));
     state.toggle_selected(&alpha_id);
     state.open_apply_confirmation();
     assert!(state.apply_confirm.is_some());
@@ -825,10 +844,7 @@ fn only_the_confirmed_selection_is_sent_and_applied() {
     let alpha_id = proposal_id_for(&plan, "a.bin");
     let beta_id = proposal_id_for(&plan, "b.bin");
 
-    let mut state = RepairReviewPageState {
-        plan: Some(plan),
-        ..RepairReviewPageState::default()
-    };
+    let mut state = isolated_state(plan, isolated_journal_dir(dir.path()));
     // Select only Alpha; Beta is a known-good proposal that must be left
     // completely alone.
     state.toggle_selected(&alpha_id);
@@ -842,8 +858,10 @@ fn only_the_confirmed_selection_is_sent_and_applied() {
     wait_for_apply(&mut state);
 
     let result = state.apply_result.as_ref().expect("the apply succeeded");
-    assert_eq!(result.summary.requested, 1, "exactly one proposal ran");
-    assert_eq!(result.summary.applied, 1);
+    let rename = result.rename.as_ref().expect("a rename batch ran");
+    assert_eq!(rename.summary.requested, 1, "exactly one proposal ran");
+    assert_eq!(rename.summary.applied, 1);
+    assert!(result.quarantine.is_empty(), "no quarantine proposal ran");
     assert!(roms.join("alpha.bin").exists(), "Alpha was renamed");
     assert!(roms.join("b.bin").exists(), "Beta was never touched");
     assert!(!roms.join("beta.bin").exists());
@@ -860,10 +878,7 @@ fn a_second_apply_attempt_while_running_is_a_no_op() {
     let plan = scan_apply_fixture(&dat, &roms);
     let alpha_id = proposal_id_for(&plan, "a.bin");
 
-    let mut state = RepairReviewPageState {
-        plan: Some(plan),
-        ..RepairReviewPageState::default()
-    };
+    let mut state = isolated_state(plan, isolated_journal_dir(dir.path()));
     state.toggle_selected(&alpha_id);
     state.open_apply_confirmation();
     state.confirm_apply();
@@ -883,8 +898,9 @@ fn a_second_apply_attempt_while_running_is_a_no_op() {
 
     wait_for_apply(&mut state);
     let result = state.apply_result.as_ref().expect("the single apply ran");
+    let rename = result.rename.as_ref().expect("a rename batch ran");
     assert_eq!(
-        result.summary.requested, 1,
+        rename.summary.requested, 1,
         "only the one originally confirmed proposal ever ran"
     );
     assert!(roms.join("alpha.bin").exists());
@@ -900,10 +916,7 @@ fn a_successful_apply_reports_counts_reverify_and_clears_the_selection() {
     let alpha_id = proposal_id_for(&plan, "a.bin");
     let beta_id = proposal_id_for(&plan, "b.bin");
 
-    let mut state = RepairReviewPageState {
-        plan: Some(plan),
-        ..RepairReviewPageState::default()
-    };
+    let mut state = isolated_state(plan, isolated_journal_dir(dir.path()));
     state.toggle_selected(&alpha_id);
     state.toggle_selected(&beta_id);
     state.open_apply_confirmation();
@@ -911,22 +924,24 @@ fn a_successful_apply_reports_counts_reverify_and_clears_the_selection() {
     wait_for_apply(&mut state);
 
     let result = state.apply_result.as_ref().expect("apply succeeded");
-    assert_eq!(result.summary.requested, 2);
-    assert_eq!(result.summary.applied, 2);
-    assert_eq!(result.summary.failed, 0);
-    assert!(!result.transaction.transaction_id.is_empty());
-    assert_eq!(result.reverify.len(), 2);
+    let rename = result.rename.as_ref().expect("a rename batch ran");
+    assert_eq!(rename.summary.requested, 2);
+    assert_eq!(rename.summary.applied, 2);
+    assert_eq!(rename.summary.failed, 0);
+    assert!(!rename.transaction.transaction_id.is_empty());
+    assert_eq!(rename.reverify.len(), 2);
     assert!(
-        result
+        rename
             .reverify
             .iter()
             .all(|entry| entry.outcome == RepairReverifyOutcome::Verified)
     );
+    assert!(result.quarantine.is_empty(), "no quarantine proposal ran");
     assert!(state.apply_failure.is_none());
     assert!(!state.apply_running);
     assert!(state.selected.is_empty(), "both applied ids are cleared");
     assert!(state.plan_stale, "the loaded plan no longer reflects disk");
-    let transaction_id = result.summary.transaction_id.clone();
+    let transaction_id = rename.summary.transaction_id.clone();
 
     // Rendered feedback: counts, reverify, and the stale-plan warning.
     let ctx = egui::Context::default();
@@ -935,7 +950,7 @@ fn a_successful_apply_reports_counts_reverify_and_clears_the_selection() {
             show_repair_review_page(ui, &mut state);
         });
     });
-    assert!(rendered_text_contains(&output, "Apply complete"));
+    assert!(rendered_text_contains(&output, "Rename batch complete"));
     assert!(rendered_text_contains(&output, &transaction_id));
     assert!(rendered_text_contains(&output, "now stale"));
 }
@@ -954,10 +969,7 @@ fn a_refused_apply_reports_the_reason_and_mutates_nothing() {
     // proven or touched.
     plan.dat_path = dir.path().join("does-not-exist.dat").display().to_string();
 
-    let mut state = RepairReviewPageState {
-        plan: Some(plan),
-        ..RepairReviewPageState::default()
-    };
+    let mut state = isolated_state(plan, isolated_journal_dir(dir.path()));
     state.toggle_selected(&alpha_id);
     state.open_apply_confirmation();
     state.confirm_apply();
@@ -995,10 +1007,7 @@ fn the_loaded_plan_is_retained_after_a_refused_apply() {
     let original_source_id = plan.source_id.clone();
     plan.dat_path = dir.path().join("does-not-exist.dat").display().to_string();
 
-    let mut state = RepairReviewPageState {
-        plan: Some(plan),
-        ..RepairReviewPageState::default()
-    };
+    let mut state = isolated_state(plan, isolated_journal_dir(dir.path()));
     state.toggle_selected(&alpha_id);
     state.open_apply_confirmation();
     state.confirm_apply();
@@ -1027,4 +1036,717 @@ fn the_page_module_never_calls_fs_rename_directly() {
         source.contains("apply_saved_plan_selected"),
         "the page must call the trusted selected-apply backend"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Duplicate quarantine: display, selection, confirmation, apply, partial
+// failure, and its downstream visibility in Repair History / rollback.
+//
+// Every fixture below is a fresh, disposable `TestDir`; the quarantine
+// proposals come from the real duplicate-scan/planning path
+// (`run_library_scan` -> `plan_file_from_scan`), never hand-built, so these
+// tests exercise the exact shape `RepairProposal::survivor_path` /
+// `is_duplicate_quarantine()` actually produces.
+// ---------------------------------------------------------------------------
+
+use crate::repair_history_page::RepairHistoryPageState;
+
+/// A DAT with one game/rom, and a library with the canonical keeper plus one
+/// byte-identical redundant copy under an unrelated name - the real scan
+/// produces exactly one Safe duplicate-quarantine `MovePath` proposal.
+fn write_duplicate_fixture(dir: &std::path::Path) -> (PathBuf, PathBuf) {
+    let dat = dir.join("dup.dat");
+    std::fs::write(
+        &dat,
+        format!(
+            r#"<datafile><header><name>Dup</name></header>
+<game name="Game"><rom name="canon.bin" size="4" sha1="{SHA1_TEST}"/></game>
+</datafile>"#
+        ),
+    )
+    .unwrap();
+    let roms = dir.join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    std::fs::write(roms.join("canon.bin"), b"test").unwrap();
+    std::fs::write(roms.join("dup-copy.bin"), b"test").unwrap();
+    (dat, roms)
+}
+
+/// One ordinary wrongly-named rename target plus one already-canonical
+/// survivor with a redundant duplicate: a real scan produces exactly one
+/// `RenamePath` proposal and one duplicate-quarantine `MovePath` proposal,
+/// sharing no source or destination.
+fn write_mixed_fixture(dir: &std::path::Path) -> (PathBuf, PathBuf) {
+    let dat = dir.join("mixed.dat");
+    std::fs::write(
+        &dat,
+        format!(
+            r#"<datafile><header><name>Mixed</name></header>
+<game name="Alpha"><rom name="alpha.bin" size="4" sha1="{SHA1_TEST}"/></game>
+<game name="Beta"><rom name="beta.bin" size="3" sha1="{SHA1_ABC}"/></game>
+</datafile>"#
+        ),
+    )
+    .unwrap();
+    let roms = dir.join("roms");
+    std::fs::create_dir(&roms).unwrap();
+    std::fs::write(roms.join("a.bin"), b"test").unwrap();
+    std::fs::write(roms.join("beta.bin"), b"abc").unwrap();
+    std::fs::write(roms.join("beta-dup.bin"), b"abc").unwrap();
+    (dat, roms)
+}
+
+/// Two independent duplicate-content groups in two subdirectories, each with
+/// an already-canonical survivor and one redundant copy - a selection
+/// spanning both produces two independent quarantine transactions.
+fn write_two_group_duplicate_fixture(dir: &std::path::Path) -> (PathBuf, PathBuf) {
+    let dat = dir.join("two-groups.dat");
+    std::fs::write(
+        &dat,
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<datafile>
+    <header><name>TwoGroups</name></header>
+    <game name="GameA"><rom name="canon-a.bin" size="4" sha1="{SHA1_TEST}"/></game>
+    <game name="GameB"><rom name="canon-b.bin" size="3" sha1="{SHA1_ABC}"/></game>
+</datafile>"#
+        ),
+    )
+    .unwrap();
+    let roms = dir.join("roms");
+    let group_a = roms.join("groupa");
+    let group_b = roms.join("groupb");
+    std::fs::create_dir_all(&group_a).unwrap();
+    std::fs::create_dir_all(&group_b).unwrap();
+    std::fs::write(group_a.join("canon-a.bin"), b"test").unwrap();
+    std::fs::write(group_a.join("redundant-a.bin"), b"test").unwrap();
+    std::fs::write(group_b.join("canon-b.bin"), b"abc").unwrap();
+    std::fs::write(group_b.join("redundant-b.bin"), b"abc").unwrap();
+    (dat, roms)
+}
+
+/// The (unique, in these fixtures) quarantine `MovePath` proposal's id.
+fn quarantine_proposal_id(plan: &LibraryRepairPlan) -> RepairProposalId {
+    plan.repair_plan
+        .proposals
+        .iter()
+        .find(|p| p.survivor_path.is_some())
+        .expect("a quarantine proposal exists")
+        .id
+        .clone()
+}
+
+// --- A. distinct action label -----------------------------------------------
+
+#[test]
+fn a_quarantine_proposal_row_renders_a_distinct_action_label() {
+    let dir = TestDir::new("quarantine-row-label");
+    let (dat, roms) = write_duplicate_fixture(dir.path());
+    let plan = scan_apply_fixture(&dat, &roms);
+    let quarantine_id = quarantine_proposal_id(&plan);
+
+    let rows = build_rows(&plan, Some(RepairFilter::Safe));
+    let row = rows
+        .iter()
+        .find(|row| row.proposal_id.as_ref() == Some(&quarantine_id))
+        .expect("the quarantine row exists");
+    assert!(row.is_duplicate_quarantine);
+    assert!(row.survivor.is_some());
+    assert!(row.has_duplicate_content_evidence);
+
+    let mut state = RepairReviewPageState {
+        plan: Some(plan),
+        plan_path: Some(PathBuf::from("/roms/plan.json")),
+        ..RepairReviewPageState::default()
+    };
+    let ctx = egui::Context::default();
+    let output = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            show_repair_review_page(ui, &mut state);
+        });
+    });
+    assert!(rendered_text_contains(&output, "Quarantine duplicate"));
+    assert!(rendered_text_contains(&output, "survivor:"));
+}
+
+// --- B. a Safe quarantine proposal is selectable ----------------------------
+
+#[test]
+fn a_safe_quarantine_proposal_is_selectable_and_actionable() {
+    let dir = TestDir::new("quarantine-selectable");
+    let (dat, roms) = write_duplicate_fixture(dir.path());
+    let plan = scan_apply_fixture(&dat, &roms);
+    let quarantine_id = quarantine_proposal_id(&plan);
+
+    let mut state = RepairReviewPageState {
+        plan: Some(plan),
+        ..RepairReviewPageState::default()
+    };
+    state.toggle_selected(&quarantine_id);
+    assert_eq!(state.actionable_selected_ids(), vec![quarantine_id.clone()]);
+    assert!(state.can_apply());
+
+    // Select all also picks it up: it is a Safe row like any other.
+    let mut state2 = RepairReviewPageState {
+        plan: Some(state.plan.clone().unwrap()),
+        ..RepairReviewPageState::default()
+    };
+    let rows = build_rows(state2.plan.as_ref().unwrap(), None);
+    state2.select_all(&rows);
+    assert!(state2.selected.contains(&quarantine_id));
+}
+
+// --- C. a NeedsReview row is never selectable, quarantine or not -----------
+
+#[test]
+fn a_needs_review_row_mentioning_a_duplicate_is_never_selectable() {
+    let mut plan = fixture_plan_mixed();
+    plan.report.needs_review[0].reason =
+        "no unique survivor among a duplicate-content group".to_string();
+    let rows = build_rows(&plan, None);
+    let needs_review_row = rows
+        .iter()
+        .find(|row| row.kind == RepairRowKind::NeedsReview)
+        .expect("the NeedsReview row exists");
+    // The report's `PlanItem` carries no proposal id at all - a NeedsReview
+    // row can never be selected regardless of what its reason says, and it
+    // is never presented as a duplicate-quarantine row (`build_rows` never
+    // fabricates a `survivor_path` it was not handed).
+    assert!(needs_review_row.proposal_id.is_none());
+    assert!(!needs_review_row.is_duplicate_quarantine);
+
+    // Select All (via `state.select_all`) only ever picks up a row's
+    // `proposal_id`; the NeedsReview row has none, so it is structurally
+    // impossible for it to end up selected, however many ordinary Safe rows
+    // are also selected alongside it.
+    let mut state = RepairReviewPageState::default();
+    state.select_all(&rows);
+    assert_eq!(
+        state.selected.len(),
+        26,
+        "only the fixture's 26 Safe rows are selected"
+    );
+    for id in &state.selected {
+        assert_ne!(
+            Some(id),
+            needs_review_row.proposal_id.as_ref(),
+            "the NeedsReview row has no id to begin with, so it cannot appear here"
+        );
+    }
+}
+
+// --- D. confirmation counts rename vs quarantine ----------------------------
+
+#[test]
+fn the_confirmation_dialog_counts_rename_and_quarantine_actions_separately() {
+    let dir = TestDir::new("quarantine-confirm-counts");
+    let (dat, roms) = write_mixed_fixture(dir.path());
+    let plan = scan_apply_fixture(&dat, &roms);
+    let rename_id = plan
+        .repair_plan
+        .proposals
+        .iter()
+        .find(|p| !p.is_duplicate_quarantine())
+        .expect("the ordinary rename proposal exists")
+        .id
+        .clone();
+    let quarantine_id = quarantine_proposal_id(&plan);
+
+    let mut state = RepairReviewPageState {
+        plan: Some(plan),
+        ..RepairReviewPageState::default()
+    };
+    state.toggle_selected(&rename_id);
+    state.toggle_selected(&quarantine_id);
+    state.open_apply_confirmation();
+
+    let confirmation = state.apply_confirm.as_ref().expect("the dialog opened");
+    assert_eq!(confirmation.rename_count, 1);
+    assert_eq!(confirmation.quarantine_count, 1);
+    assert_eq!(confirmation.selected.len(), 2);
+
+    let ctx = egui::Context::default();
+    // The confirmation dialog is an `egui::Window`; like any floating area,
+    // its content is only guaranteed painted from the second frame onward
+    // (the first frame establishes its size/position). Run twice, exactly
+    // as a real event loop would across two frames.
+    let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            show_repair_review_page(ui, &mut state);
+        });
+    });
+    let output = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            show_repair_review_page(ui, &mut state);
+        });
+    });
+    assert!(rendered_text_contains(&output, "1 rename action(s)"));
+    assert!(rendered_text_contains(&output, "1 quarantine action(s)"));
+    assert!(rendered_text_contains(&output, ".emuwiz-quarantine"));
+    assert!(rendered_text_contains(&output, "not permanently deleted"));
+    assert!(rendered_text_contains(&output, "Repair History"));
+}
+
+// --- E (numbering per the review). "Apply Selected" button count and the
+// confirmation dialog both reflect only the currently actionable selection,
+// never the raw (possibly stale) `selected` set size.
+#[test]
+fn apply_selected_button_count_and_confirmation_match_only_the_actionable_ids() {
+    let mut state = RepairReviewPageState {
+        plan: Some(fixture_plan()),
+        ..RepairReviewPageState::default()
+    };
+    let actionable_id = state.plan.as_ref().unwrap().repair_plan.proposals[0]
+        .id
+        .clone();
+    let stale_id = state.plan.as_ref().unwrap().repair_plan.proposals[1]
+        .id
+        .clone();
+    state.toggle_selected(&actionable_id);
+    state.toggle_selected(&stale_id);
+    assert_eq!(state.selected.len(), 2, "both ids are selected");
+
+    // The second selected proposal is no longer actionable in the loaded
+    // plan (e.g. it became NeedsReview) - `selected` itself is left
+    // completely untouched, exactly like a real stale selection.
+    state.plan.as_mut().unwrap().repair_plan.proposals[1].safety = SafetyState::NeedsReview;
+    assert_eq!(
+        state.actionable_selected_ids(),
+        vec![actionable_id.clone()],
+        "only the still-Safe proposal is actionable"
+    );
+
+    // The button label uses the actionable count (1), never the raw
+    // selection size (2).
+    let ctx = egui::Context::default();
+    let output = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            show_repair_review_page(ui, &mut state);
+        });
+    });
+    assert!(rendered_text_contains(&output, "Apply Selected (1)"));
+    assert!(!rendered_text_contains(&output, "Apply Selected (2)"));
+
+    // The confirmation dialog, and the exact ids it would submit, agree.
+    state.open_apply_confirmation();
+    let confirmation = state.apply_confirm.as_ref().expect("confirmation opens");
+    assert_eq!(
+        confirmation.selected,
+        vec![actionable_id],
+        "only the actionable id is ever sent to the backend"
+    );
+    assert_eq!(
+        state.selected.len(),
+        2,
+        "the stale id remains selected in the UI state, it is just never submitted"
+    );
+}
+
+// --- zero-applied quarantine group wording ----------------------------------
+
+fn transaction_stub() -> archivefs_core::dat::rename_apply::RenameTransaction {
+    archivefs_core::dat::rename_apply::RenameTransaction {
+        transaction_id: "stub".to_string(),
+        plan_generation: 0,
+        classifier_version: None,
+        created_at_unix: 0,
+        source_scan_root: String::new(),
+        state: archivefs_core::dat::rename_apply::TransactionState::ApplyFailed,
+        entries: Vec::new(),
+        created_directories: Vec::new(),
+        unknown: Default::default(),
+    }
+}
+
+/// A `RepairTransactionResult` whose typed counts are exactly what the
+/// caller asks for - never derived from real entries, since
+/// [`quarantine_group_headline`] only ever reads `result.summary`.
+fn result_stub(applied: usize, failed: usize, skipped: usize) -> RepairTransactionResult {
+    RepairTransactionResult {
+        transaction: transaction_stub(),
+        summary: archivefs_core::dat::rename_apply::TransactionSummary {
+            transaction_id: "stub".to_string(),
+            requested: applied + failed + skipped,
+            applied,
+            failed,
+            skipped,
+            rollback: Default::default(),
+            started_at_unix: None,
+            ended_at_unix: None,
+        },
+        reverify: Vec::new(),
+    }
+}
+
+#[test]
+fn quarantine_group_headline_reflects_the_actual_applied_count() {
+    assert_eq!(
+        quarantine_group_headline(&result_stub(1, 0, 0)),
+        "Quarantine group complete"
+    );
+    assert_eq!(
+        quarantine_group_headline(&result_stub(0, 1, 0)),
+        "Quarantine group produced no applied changes",
+        "applied == 0 must never be reported as complete, even with a failure"
+    );
+    assert_eq!(
+        quarantine_group_headline(&result_stub(0, 0, 0)),
+        "Quarantine group produced no applied changes",
+        "applied == 0 must never be reported as complete, even with nothing else recorded either"
+    );
+    assert_eq!(
+        quarantine_group_headline(&result_stub(1, 1, 0)),
+        "Quarantine group partially applied",
+        "some applied and some failed within one group is neither a full success nor a total failure"
+    );
+    assert_eq!(
+        quarantine_group_headline(&result_stub(1, 0, 1)),
+        "Quarantine group partially applied"
+    );
+}
+
+#[test]
+fn a_zero_applied_quarantine_group_is_never_rendered_as_complete() {
+    let mut state = RepairReviewPageState {
+        plan: Some(fixture_plan()),
+        apply_result: Some(CombinedApplyResult {
+            rename: None,
+            quarantine: vec![archivefs_core::repair::library::QuarantineApplyResult {
+                survivor_path: PathBuf::from("/roms/canon.bin"),
+                result: result_stub(0, 1, 0),
+            }],
+        }),
+        ..RepairReviewPageState::default()
+    };
+    let ctx = egui::Context::default();
+    let output = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            show_repair_review_page(ui, &mut state);
+        });
+    });
+    assert!(rendered_text_contains(
+        &output,
+        "Quarantine group produced no applied changes"
+    ));
+    assert!(!rendered_text_contains(
+        &output,
+        "Quarantine group complete"
+    ));
+}
+
+// --- E. a successful GUI quarantine apply creates a transaction ------------
+
+#[test]
+fn a_successful_quarantine_apply_creates_a_journaled_transaction() {
+    let dir = TestDir::new("quarantine-apply-success");
+    let (dat, roms) = write_duplicate_fixture(dir.path());
+    let plan = scan_apply_fixture(&dat, &roms);
+    let quarantine_id = quarantine_proposal_id(&plan);
+    let journal_dir = isolated_journal_dir(dir.path());
+
+    let mut state = isolated_state(plan, journal_dir.clone());
+    state.toggle_selected(&quarantine_id);
+    state.open_apply_confirmation();
+    state.confirm_apply();
+    wait_for_apply(&mut state);
+
+    let result = state.apply_result.as_ref().expect("the apply succeeded");
+    assert!(result.rename.is_none(), "no ordinary rename was selected");
+    assert_eq!(result.quarantine.len(), 1);
+    let group = &result.quarantine[0];
+    assert_eq!(group.survivor_path, roms.join("canon.bin"));
+    assert_eq!(group.result.summary.applied, 1);
+    assert_eq!(group.result.summary.failed, 0);
+    assert!(!group.result.summary.transaction_id.is_empty());
+
+    assert!(roms.join(".emuwiz-quarantine").exists());
+    assert!(
+        !roms.join("dup-copy.bin").exists(),
+        "the duplicate moved out of its original location"
+    );
+    assert!(roms.join("canon.bin").exists(), "the survivor is untouched");
+    assert!(state.apply_failure.is_none());
+    assert!(state.plan_stale);
+    assert!(!state.selected.contains(&quarantine_id));
+    let group_transaction_id = group.result.summary.transaction_id.clone();
+
+    // Regression: the real `confirm_apply` -> `spawn_apply` path actually
+    // used the isolated `journal_dir_override`, not the production default -
+    // the journal exists exactly where this test pointed it.
+    assert!(
+        journal_dir
+            .join(format!("{group_transaction_id}.json"))
+            .exists(),
+        "the journal was written to the overridden test journal directory"
+    );
+
+    let ctx = egui::Context::default();
+    let output = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            show_repair_review_page(ui, &mut state);
+        });
+    });
+    assert!(rendered_text_contains(&output, "Quarantine group complete"));
+    assert!(rendered_text_contains(&output, &group_transaction_id));
+}
+
+// --- F. partial multi-group apply surfaces completed + failed state --------
+
+#[test]
+fn a_partial_multi_group_apply_surfaces_completed_and_failed_state() {
+    let dir = TestDir::new("quarantine-partial");
+    let (dat, roms) = write_two_group_duplicate_fixture(dir.path());
+    let plan = scan_apply_fixture(&dat, &roms);
+
+    let quarantine_ids: Vec<RepairProposalId> = plan
+        .repair_plan
+        .proposals
+        .iter()
+        .filter(|p| p.is_duplicate_quarantine())
+        .map(|p| p.id.clone())
+        .collect();
+    assert_eq!(quarantine_ids.len(), 2, "{quarantine_ids:?}");
+
+    // Deterministically break group B (never a race): its content-hash
+    // bucket directory is replaced with a symlink pointing outside the
+    // trust boundary before any apply runs, so `apply_quarantine_transaction`
+    // refuses it outright the instant it needs that directory - group A is
+    // completely unaffected. Mirrors
+    // `archivefs_core::repair::library_tests::a_later_quarantine_group_failure_does_not_lose_an_earlier_groups_success`.
+    let group_b_proposal = plan
+        .repair_plan
+        .proposals
+        .iter()
+        .find(|p| p.is_duplicate_quarantine() && p.source_path.ends_with("redundant-b.bin"))
+        .expect("group B's quarantine proposal exists");
+    let group_b_destination = group_b_proposal
+        .destination()
+        .expect("a MovePath destination")
+        .clone();
+    let group_b_bucket = group_b_destination
+        .parent()
+        .expect("the destination has a content-hash bucket parent")
+        .to_path_buf();
+    let outside = TestDir::new("quarantine-partial-outside");
+    std::fs::create_dir_all(group_b_bucket.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(outside.path(), &group_b_bucket).unwrap();
+
+    let journal_dir = isolated_journal_dir(dir.path());
+    let mut state = isolated_state(plan, journal_dir.clone());
+    for id in &quarantine_ids {
+        state.toggle_selected(id);
+    }
+    state.open_apply_confirmation();
+    state.confirm_apply();
+    wait_for_apply(&mut state);
+
+    let result = state
+        .apply_result
+        .as_ref()
+        .expect("group A's completed result is surfaced, not discarded");
+    assert_eq!(result.quarantine.len(), 1, "{result:?}");
+    assert_eq!(
+        result.quarantine[0].survivor_path,
+        roms.join("groupa").join("canon-a.bin")
+    );
+    assert_eq!(result.quarantine[0].result.summary.applied, 1);
+    let group_a_transaction_id = result.quarantine[0].result.summary.transaction_id.clone();
+
+    // Regression: the isolated `journal_dir_override` was actually used by
+    // the real `spawn_apply` worker for group A's successful transaction.
+    assert!(
+        journal_dir
+            .join(format!("{group_a_transaction_id}.json"))
+            .exists(),
+        "the journal was written to the overridden test journal directory"
+    );
+
+    // The failure state is asserted by its typed category (`label`, set by
+    // the page's own worker match arm - see `RepairApplyMessage::Partial`'s
+    // construction in `spawn_apply`) rather than by matching a substring of
+    // the underlying error's free-text `detail`, which is the core
+    // executor's implementation detail (the exact wording of a symlink
+    // refusal), not a GUI-level contract.
+    let failure = state
+        .apply_failure
+        .as_ref()
+        .expect("group B's failure is surfaced");
+    assert_eq!(failure.label, "Quarantine apply failed", "{failure:?}");
+    assert!(!failure.detail.is_empty(), "{failure:?}");
+
+    assert!(!roms.join("groupa").join("redundant-a.bin").exists());
+    assert!(roms.join("groupa").join("canon-a.bin").exists());
+    assert!(
+        roms.join("groupb").join("redundant-b.bin").exists(),
+        "group B never moved"
+    );
+    assert!(!group_b_destination.exists());
+
+    // Rendered feedback: the completed group is shown, and the failure
+    // banner explicitly says something already completed rather than
+    // reading as "nothing applied".
+    let ctx = egui::Context::default();
+    let output = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            show_repair_review_page(ui, &mut state);
+        });
+    });
+    assert!(rendered_text_contains(&output, "Quarantine group complete"));
+    assert!(rendered_text_contains(&output, "already completed"));
+}
+
+// --- G/H. history sees the resulting transaction, and rollback restores ----
+//
+// Both of these drive the *real* production state machine end to end -
+// `open_apply_confirmation` -> `confirm_apply` -> `spawn_apply` ->
+// `poll_apply` - never a direct call to `apply_saved_plan_selected`, so they
+// prove the actual `RepairReviewPageState` GUI path (not just the backend
+// it calls) leaves a journal `RepairHistoryPageState` can see and undo. The
+// journal directory is overridden to an isolated path (see
+// `isolated_journal_dir`) so this never touches the real user data
+// directory.
+
+/// Runs a real scan and a real GUI quarantine apply through
+/// [`RepairReviewPageState`]'s own confirmation/spawn/poll cycle, leaving a
+/// genuine `Applied` quarantine journal on disk in an isolated directory.
+fn scan_and_apply_quarantine_through_the_gui(
+    dir: &std::path::Path,
+) -> (
+    PathBuf,
+    PathBuf,
+    archivefs_core::repair::library::QuarantineApplyResult,
+) {
+    let (dat, roms) = write_duplicate_fixture(dir);
+    let plan = scan_apply_fixture(&dat, &roms);
+    let quarantine_id = quarantine_proposal_id(&plan);
+    let journal_dir = isolated_journal_dir(dir);
+
+    let mut state = isolated_state(plan, journal_dir.clone());
+    state.toggle_selected(&quarantine_id);
+    state.open_apply_confirmation();
+    state.confirm_apply();
+    wait_for_apply(&mut state);
+
+    let result = state
+        .apply_result
+        .expect("the real GUI apply path succeeds");
+    assert!(result.rename.is_none(), "no ordinary rename was selected");
+    let group = result
+        .quarantine
+        .into_iter()
+        .next()
+        .expect("exactly one quarantine group applied");
+    assert_eq!(group.result.summary.applied, 1);
+    (roms, journal_dir, group)
+}
+
+#[test]
+fn repair_history_sees_a_quarantine_transaction_produced_from_the_gui_apply_path() {
+    let dir = TestDir::new("quarantine-history-visibility");
+    let (_roms, journal_dir, group) = scan_and_apply_quarantine_through_the_gui(dir.path());
+
+    let history = RepairHistoryPageState::load_with_journal_dir(journal_dir);
+    assert!(
+        history
+            .transactions
+            .iter()
+            .any(|transaction| transaction.transaction_id == group.result.summary.transaction_id),
+        "the quarantine transaction appears in ordinary Repair History, with no special-casing"
+    );
+}
+
+#[test]
+fn a_quarantine_transaction_from_the_gui_rolls_back_through_repair_history_undo() {
+    let dir = TestDir::new("quarantine-history-rollback");
+    let (roms, journal_dir, group) = scan_and_apply_quarantine_through_the_gui(dir.path());
+    assert!(
+        !roms.join("dup-copy.bin").exists(),
+        "the duplicate was quarantined"
+    );
+    assert!(
+        roms.join("canon.bin").exists(),
+        "the survivor is untouched by the apply"
+    );
+    let quarantine_destination = group.result.transaction.entries[0].destination_path.clone();
+    assert!(
+        quarantine_destination.exists(),
+        "the quarantine destination exists right after apply"
+    );
+
+    let mut history = RepairHistoryPageState::load_with_journal_dir(journal_dir);
+    let transaction_id = group.result.summary.transaction_id.clone();
+    // The transaction id the real GUI apply reported is exactly the one
+    // Repair History resolves against - the same journal, no translation.
+    assert!(history.can_undo(&transaction_id));
+
+    history.open_undo_confirmation(&transaction_id);
+    assert!(history.undo_confirm.is_some());
+    history.confirm_undo();
+    wait_for_undo(&mut history);
+
+    let outcome = history.undo_outcome.as_ref().expect("the undo ran");
+    assert!(
+        matches!(
+            outcome.result,
+            archivefs_core::dat::rename_apply::RollbackResult::FullyRolledBack
+        ),
+        "{outcome:?}"
+    );
+    assert!(
+        roms.join("dup-copy.bin").exists(),
+        "the quarantined file was restored to its original location"
+    );
+    assert!(
+        !quarantine_destination.exists(),
+        "the quarantine destination is gone after undo"
+    );
+    assert!(history.undo_error.is_none());
+
+    // The default (live) journal directory was never touched by any of this.
+    if let Ok(default_dir) = archivefs_core::dat::rename_apply::default_rename_transaction_dir() {
+        assert!(
+            !default_dir.join(format!("{transaction_id}.json")).exists(),
+            "the real user journal directory must never see a test transaction"
+        );
+    }
+}
+
+/// Blocks the test thread until the history page's background undo job
+/// settles or a generous deadline passes, polling exactly the way the real
+/// render loop does. Mirrors `wait_for_apply` above and
+/// `repair_history_page::tests::wait_for_undo`.
+fn wait_for_undo(state: &mut RepairHistoryPageState) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while state.is_undo_running() {
+        state.poll_undo();
+        if Instant::now() > deadline {
+            panic!("the background undo job did not finish in time");
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+// --- I. ordinary rename-only Repair Review behaviour is unchanged ----------
+
+#[test]
+fn ordinary_rename_only_rows_carry_no_quarantine_signal_and_render_unchanged() {
+    let rows = build_rows(&fixture_plan(), Some(RepairFilter::Safe));
+    assert!(!rows.is_empty());
+    assert!(rows.iter().all(|row| !row.is_duplicate_quarantine));
+    assert!(rows.iter().all(|row| row.survivor.is_none()));
+    assert!(rows.iter().all(|row| !row.has_duplicate_content_evidence));
+
+    let mut state = RepairReviewPageState {
+        plan: Some(fixture_plan()),
+        plan_path: Some(PathBuf::from("/roms/sms/plan.json")),
+        ..RepairReviewPageState::default()
+    };
+    let ctx = egui::Context::default();
+    let output = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            show_repair_review_page(ui, &mut state);
+        });
+    });
+    assert!(!rendered_text_contains(&output, "Quarantine duplicate"));
+    assert!(rendered_text_contains(&output, "26 safe repairs"));
 }

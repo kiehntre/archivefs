@@ -1591,6 +1591,101 @@ fn the_real_library_planner_discovers_and_plans_one_duplicate_group() {
     assert!(!roms.join(".emuwiz-quarantine").exists());
 }
 
+// 12b. Regression: a rename-plan `Conflict` source that also has a Safe,
+// independently content-proven duplicate-quarantine resolution must never
+// be presented as a contradictory generic "Blocked repair" alongside its
+// Safe quarantine proposal - see `build_library_repair_report`'s
+// `quarantine_superseded_sources`. `realistic_duplicate_fixture` produces
+// exactly this: `canon.bin` and `redundant-copy.bin` share one directory and
+// one DAT identity, so `redundant-copy.bin`'s own rename target collides
+// with `canon.bin` (already occupying the canonical name) - a genuine
+// rename-plan `Conflict`, not fabricated for this test.
+#[test]
+fn a_conflict_source_with_a_safe_quarantine_resolution_is_never_also_reported_blocked() {
+    let dir = temp();
+    let (dat, roms) = realistic_duplicate_fixture(dir.path());
+    let keeper = roms.join("canon.bin");
+    let duplicate = roms.join("redundant-copy.bin");
+    let keeper_before = std::fs::read(&keeper).unwrap();
+    let duplicate_before = std::fs::read(&duplicate).unwrap();
+
+    let outcome = scan(&dat, &roms);
+
+    // The fixture's own premise: the redundant copy's rename-plan proposal
+    // really is `Conflict`-state (this is not a fabricated scenario).
+    let rename_plan_proposal = outcome
+        .rename_plan
+        .proposals
+        .iter()
+        .find(|p| p.source_path == duplicate)
+        .expect("the redundant copy has a rename-plan proposal");
+    assert_eq!(
+        rename_plan_proposal.state,
+        crate::dat::rename_plan::ProposalState::Conflict,
+        "the fixture must exercise a genuine rename-plan Conflict, not some other state"
+    );
+
+    // It also has a Safe, actionable, content-proven duplicate-quarantine
+    // proposal for the exact same source - content proof is unchanged by
+    // the reporting fix.
+    let quarantine_proposal = outcome
+        .repair_plan
+        .proposals
+        .iter()
+        .find(|p| p.source_path == duplicate)
+        .expect("the redundant copy has a repair proposal");
+    assert!(quarantine_proposal.is_duplicate_quarantine());
+    assert!(quarantine_proposal.actionable());
+    assert_eq!(quarantine_proposal.safety, SafetyState::Safe);
+    assert!(
+        quarantine_proposal
+            .evidence
+            .iter()
+            .any(|evidence| evidence.kind
+                == crate::repair::proposal::RepairEvidenceKind::DuplicateContent),
+        "content proof evidence is unchanged: {:?}",
+        quarantine_proposal.evidence
+    );
+
+    // The contradictory presentation is gone: this source never appears in
+    // the generic Blocked report, even though its rename-plan state really
+    // is Conflict.
+    assert!(
+        outcome
+            .report
+            .blocked
+            .iter()
+            .all(|item| item.path != duplicate.to_string_lossy()),
+        "{:?}",
+        outcome.report.blocked
+    );
+
+    // No mutation occurred during scan.
+    assert_eq!(std::fs::read(&keeper).unwrap(), keeper_before);
+    assert_eq!(std::fs::read(&duplicate).unwrap(), duplicate_before);
+    assert!(!roms.join(".emuwiz-quarantine").exists());
+}
+
+// 12c. A `Conflict` source with NO duplicate-quarantine resolution (no
+// second copy at all) must still be reported Blocked exactly as before -
+// this fix must never suppress a genuinely unresolved conflict.
+#[test]
+fn a_conflict_source_without_any_quarantine_resolution_is_still_reported_blocked() {
+    let dir = temp();
+    let (dat, roms) = overlapping_duplicate_and_rename_fixture(dir.path());
+
+    let outcome = scan(&dat, &roms);
+
+    // This fixture's `DuplicateSource` conflict means neither proposal for
+    // `subdir/wrong.bin` is Safe/actionable (see
+    // `a_source_that_is_both_a_rename_and_a_quarantine_target_fails_closed`),
+    // so nothing here could have superseded any Blocked reporting - this
+    // test only pins that the suppression added above requires an actual
+    // Safe quarantine resolution and is not blanket-applied to every
+    // Conflict-adjacent source.
+    assert!(!outcome.repair_plan.all_executable());
+}
+
 // ---------------------------------------------------------------------
 // Duplicate-quarantine selected apply: quarantine-specific backend, live
 // re-proof, and mixed rename+quarantine selections.
