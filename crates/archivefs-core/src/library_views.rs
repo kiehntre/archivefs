@@ -5216,4 +5216,328 @@ mod tests {
             compute_view_profile_fingerprint(&view)
         );
     }
+
+    // -------------------------------------------------------------------
+    // Source-folder filtering regression suite (2026-08-17 smoke-test
+    // incident: a view scoped to `/mnt/games/roms/sms` appeared to plan
+    // archives from `/mnt/local/downloads/jdownloader2/output`). Root cause
+    // was a stale cached GUI plan, not this planner - these tests pin down
+    // that `plan_library_view`'s own source-folder filtering is, and stays,
+    // correct in isolation, independent of the GUI fix.
+    // -------------------------------------------------------------------
+
+    /// Test A: a view whose `source_folders` names only source A must never
+    /// plan (as *any* action - Create, Skip, or Collision) an archive that
+    /// belongs to a different, unselected source B, even when B is present
+    /// in the same catalogue read and has archives with the exact same
+    /// platform/filename shape.
+    #[test]
+    fn selected_source_never_plans_an_archive_from_an_unselected_source() {
+        let root = temp_dir("source-filter-a-never-b");
+        let source_a_dir = root.join("games/roms/sms");
+        let source_b_dir = root.join("local/downloads/jdownloader2/output");
+        let archive_a = source_a_dir.join("Alex Kidd.zip");
+        let archive_b = source_b_dir.join("Agatha Christie.zip");
+        write_file(&archive_a, b"sms-bytes");
+        write_file(&archive_b, b"jdownloader-bytes");
+        let destination = root.join("dest");
+
+        let source_a = make_source(9, &source_a_dir);
+        let source_b = make_source(1, &source_b_dir);
+        // Archive B has no assigned platform - exactly the
+        // `SkipUnknownPlatform` shape the incident reported - so this test
+        // also proves an unselected source's unknown-platform archives are
+        // not merely re-bucketed as Skip, they are not planned *at all*.
+        let record_a = make_archive(1, 9, &archive_a, Some("MasterSystem"));
+        let record_b = make_archive(2, 1, &archive_b, None);
+
+        let view = make_view(
+            "view-1",
+            &destination,
+            vec![source_a_dir.clone()],
+            vec!["MasterSystem".to_string()],
+        );
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(
+            &view,
+            &[record_a, record_b],
+            &[source_a, source_b],
+            &manifest,
+            None,
+        );
+
+        assert_eq!(
+            plan.entries.len(),
+            1,
+            "an unselected source's archive must produce zero plan entries of any kind"
+        );
+        assert_eq!(plan.entries[0].action, LibraryViewPlanAction::Create);
+        assert_eq!(plan.entries[0].archive_path, Some(archive_a));
+        assert!(
+            plan.entries
+                .iter()
+                .all(|entry| entry.archive_path.as_deref() != Some(archive_b.as_path())),
+            "source B's archive must never appear in the plan, in any action bucket"
+        );
+        assert_eq!(plan.counts.skip, 0);
+        assert_eq!(plan.counts.create, 1);
+    }
+
+    /// Test B: a configured source folder is matched against the
+    /// catalogue's `SourceFolderRecord` by its registered identity (exact
+    /// `path` string, via the `source_folder_id` a record actually belongs
+    /// to) - never by textual path *containment*. A newly registered,
+    /// narrower source folder that happens to be a sub-path of an older,
+    /// already-scanned, broader source folder does not "inherit" that
+    /// broader source's archives - this is exactly the incident's
+    /// environment shape (a fresh, unscanned `/mnt/games/roms/sms`
+    /// registration sitting underneath an already-scanned
+    /// `/mnt/games/roms`): the view must see zero entries from the broader
+    /// source, not a leaked subset of it.
+    #[test]
+    fn selected_source_path_resolves_by_registered_identity_not_containment() {
+        let root = temp_dir("source-filter-containment");
+        let broad_dir = root.join("games/roms");
+        let narrow_dir = broad_dir.join("sms");
+        let archive_under_broad = narrow_dir.join("Alex Kidd.zip");
+        write_file(&archive_under_broad, b"sms-bytes");
+        let destination = root.join("dest");
+
+        // The archive is catalogued under the *broad* source's id (5, as in
+        // the real incident), even though it physically lives under what is
+        // now also a separately-registered narrower source (9). The
+        // catalogue ties every record to the source_folder_id it was
+        // scanned under - never re-derived from the path at plan time.
+        let broad_source = make_source(5, &broad_dir);
+        let narrow_source = make_source(9, &narrow_dir);
+        let record = make_archive(1, 5, &archive_under_broad, Some("MasterSystem"));
+
+        let view = make_view(
+            "view-1",
+            &destination,
+            vec![narrow_dir.clone()],
+            vec!["MasterSystem".to_string()],
+        );
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(
+            &view,
+            &[record],
+            &[broad_source, narrow_source],
+            &manifest,
+            None,
+        );
+
+        assert!(
+            plan.entries.is_empty(),
+            "a view scoped to the narrow (unscanned) source must not see the broad source's \
+             archives just because the narrow path is textually inside the broad one - \
+             got {:?}",
+            plan.entries
+        );
+        assert_eq!(plan.counts.create, 0);
+    }
+
+    /// Test C: editing a view's selected source (A -> B) replaces the
+    /// effective filter outright - the new plan reflects only B, never a
+    /// union of A and B, and never still-A.
+    #[test]
+    fn editing_selected_source_replaces_the_effective_filter() {
+        let root = temp_dir("source-filter-edit-replaces");
+        let source_a_dir = root.join("source-a");
+        let source_b_dir = root.join("source-b");
+        let archive_a = source_a_dir.join("Game.zip");
+        let archive_b = source_b_dir.join("Game.zip");
+        write_file(&archive_a, b"a");
+        write_file(&archive_b, b"b");
+        let destination = root.join("dest");
+
+        let source_a = make_source(1, &source_a_dir);
+        let source_b = make_source(2, &source_b_dir);
+        let record_a = make_archive(1, 1, &archive_a, Some("NES"));
+        let record_b = make_archive(2, 2, &archive_b, Some("NES"));
+        let records = [record_a, record_b];
+        let sources = [source_a, source_b];
+
+        let mut view = make_view("view-1", &destination, vec![source_a_dir.clone()], vec![]);
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan_before = plan_library_view(&view, &records, &sources, &manifest, None);
+        assert_eq!(plan_before.entries.len(), 1);
+        assert_eq!(plan_before.entries[0].archive_path, Some(archive_a.clone()));
+
+        // The edit: source_folders now names B instead of A.
+        view.source_folders = vec![source_b_dir.clone()];
+        let plan_after = plan_library_view(&view, &records, &sources, &manifest, None);
+        assert_eq!(plan_after.entries.len(), 1);
+        assert_eq!(plan_after.entries[0].archive_path, Some(archive_b));
+    }
+
+    /// Test D: a configured source folder that matches no registered
+    /// `SourceFolderRecord` at all (e.g. it was removed, or was never a
+    /// real source) must never be treated as "no filter" / "all sources" -
+    /// it must produce zero entries, the same as any other selection that
+    /// matches nothing.
+    #[test]
+    fn unresolvable_selected_source_never_degrades_to_all_sources() {
+        let root = temp_dir("source-filter-unresolvable");
+        let known_dir = root.join("known-source");
+        let archive = known_dir.join("Game.zip");
+        write_file(&archive, b"bytes");
+        let destination = root.join("dest");
+
+        let known_source = make_source(1, &known_dir);
+        let record = make_archive(1, 1, &archive, Some("NES"));
+
+        let unresolvable_path = root.join("this-path-was-never-registered-as-a-source");
+        let view = make_view("view-1", &destination, vec![unresolvable_path], vec![]);
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(&view, &[record], &[known_source], &manifest, None);
+
+        assert!(
+            plan.entries.is_empty(),
+            "an unresolvable source selection must plan nothing, never silently fall back to \
+             every configured source - got {:?}",
+            plan.entries
+        );
+    }
+
+    /// Test E: the documented "empty `source_folders` means every
+    /// configured source is included" semantics still hold exactly - not
+    /// affected by the source-identity matching used when the list is
+    /// non-empty.
+    #[test]
+    fn empty_source_folders_still_means_every_configured_source() {
+        let root = temp_dir("source-filter-empty-means-all");
+        let source_a_dir = root.join("source-a");
+        let source_b_dir = root.join("source-b");
+        let archive_a = source_a_dir.join("A.zip");
+        let archive_b = source_b_dir.join("B.zip");
+        write_file(&archive_a, b"a");
+        write_file(&archive_b, b"b");
+        let destination = root.join("dest");
+
+        let source_a = make_source(1, &source_a_dir);
+        let source_b = make_source(2, &source_b_dir);
+        let record_a = make_archive(1, 1, &archive_a, Some("NES"));
+        let record_b = make_archive(2, 2, &archive_b, Some("NES"));
+
+        // No source_folders selected at all.
+        let view = make_view("view-1", &destination, vec![], vec![]);
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(
+            &view,
+            &[record_a, record_b],
+            &[source_a, source_b],
+            &manifest,
+            None,
+        );
+
+        assert_eq!(plan.entries.len(), 2);
+        assert_eq!(plan.counts.create, 2);
+    }
+
+    /// Test G: `Generic` and `Romm` apply byte-identical source-folder
+    /// filtering - the profile kind only changes the *output path shape*
+    /// for an already-selected archive, never which archives are selected
+    /// in the first place.
+    #[test]
+    fn generic_and_romm_profiles_apply_identical_source_filtering() {
+        let root = temp_dir("source-filter-generic-vs-romm");
+        let source_a_dir = root.join("source-a");
+        let source_b_dir = root.join("source-b");
+        let archive_a = source_a_dir.join("Game.zip");
+        let archive_b = source_b_dir.join("Other.zip");
+        write_file(&archive_a, b"a");
+        write_file(&archive_b, b"b");
+        let destination = root.join("dest");
+
+        let source_a = make_source(1, &source_a_dir);
+        let source_b = make_source(2, &source_b_dir);
+        let record_a = make_archive(1, 1, &archive_a, Some("NES"));
+        let record_b = make_archive(2, 2, &archive_b, Some("NES"));
+        let records = [record_a, record_b];
+        let sources = [source_a, source_b];
+
+        let generic_view = make_view("view-1", &destination, vec![source_a_dir.clone()], vec![]);
+        let manifest = empty_manifest(&generic_view.id, &destination);
+        let generic_plan = plan_library_view(&generic_view, &records, &sources, &manifest, None);
+
+        let mut romm_view = romm_view_with_override("view-1", &destination, "NES", "nes");
+        romm_view.source_folders = vec![source_a_dir.clone()];
+        let romm_plan = plan_library_view(&romm_view, &records, &sources, &manifest, None);
+
+        // Same archives selected (only A's), same skip/collision shape -
+        // only the destination shape differs (Generic's `{platform}/{filename}`
+        // vs RomM's `roms/{slug}/{filename}`).
+        assert_eq!(generic_plan.entries.len(), 1);
+        assert_eq!(romm_plan.entries.len(), 1);
+        assert_eq!(
+            generic_plan.entries[0].archive_path,
+            Some(archive_a.clone())
+        );
+        assert_eq!(romm_plan.entries[0].archive_path, Some(archive_a));
+        assert_eq!(
+            generic_plan.entries[0].action,
+            LibraryViewPlanAction::Create
+        );
+        assert_eq!(romm_plan.entries[0].action, LibraryViewPlanAction::Create);
+        assert_eq!(generic_plan.counts.create, romm_plan.counts.create);
+    }
+
+    /// Test H: source filtering and platform filtering compose correctly -
+    /// an archive is only planned when it matches *both*; matching only one
+    /// of the two must silently exclude it (never a reportable Skip, per
+    /// the existing "ordinary filter" semantics), and an unselected
+    /// source's archive is excluded regardless of platform, even an
+    /// otherwise-matching one.
+    #[test]
+    fn source_and_platform_filters_compose_correctly() {
+        let root = temp_dir("source-and-platform-compose");
+        let selected_dir = root.join("selected-source");
+        let other_dir = root.join("other-source");
+        let matching = selected_dir.join("Matches.zip");
+        let wrong_platform = selected_dir.join("WrongPlatform.zip");
+        let wrong_source = other_dir.join("WrongSource.zip");
+        write_file(&matching, b"a");
+        write_file(&wrong_platform, b"b");
+        write_file(&wrong_source, b"c");
+        let destination = root.join("dest");
+
+        let selected_source = make_source(1, &selected_dir);
+        let other_source = make_source(2, &other_dir);
+        let record_matching = make_archive(1, 1, &matching, Some("MasterSystem"));
+        let record_wrong_platform = make_archive(2, 1, &wrong_platform, Some("SNES"));
+        // Same platform as the target, but from the unselected source.
+        let record_wrong_source = make_archive(3, 2, &wrong_source, Some("MasterSystem"));
+
+        let view = make_view(
+            "view-1",
+            &destination,
+            vec![selected_dir.clone()],
+            vec!["MasterSystem".to_string()],
+        );
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(
+            &view,
+            &[record_matching, record_wrong_platform, record_wrong_source],
+            &[selected_source, other_source],
+            &manifest,
+            None,
+        );
+
+        assert_eq!(
+            plan.entries.len(),
+            1,
+            "only the archive matching both filters is planned"
+        );
+        assert_eq!(plan.entries[0].archive_path, Some(matching));
+        assert_eq!(plan.entries[0].action, LibraryViewPlanAction::Create);
+        assert_eq!(plan.counts.create, 1);
+        assert_eq!(plan.counts.skip, 0);
+    }
 }

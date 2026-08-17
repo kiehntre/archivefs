@@ -20968,11 +20968,25 @@ fn show_library_views_page(
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for view in views {
+                    // Compares the *whole* cached `LibraryViewConfig`, not
+                    // just `id` - a stale plan computed for an earlier
+                    // version of this same view (different source_folders,
+                    // platforms, profile, ...) must never be shown or
+                    // offered for Apply as if it still described `view`.
+                    // `library_view_last_plan` is proactively cleared on
+                    // every Add/Edit/Apply/Repair/Remove outcome already
+                    // (see `poll_library_view_action`), but that is a
+                    // single, easily-bypassed invalidation point (e.g. the
+                    // config file changing on disk between two frames for
+                    // any other reason); comparing full equality here is a
+                    // second, always-correct guard that never depends on
+                    // every mutation path remembering to invalidate the
+                    // cache by hand.
                     let has_current_plan = last_plan
                         .as_ref()
-                        .is_some_and(|(previewed, _)| previewed.id == view.id);
+                        .is_some_and(|(previewed, _)| previewed == view);
                     let can_apply = last_plan.as_ref().is_some_and(|(previewed, plan)| {
-                        previewed.id == view.id && plan.is_safe_to_apply()
+                        previewed == view && plan.is_safe_to_apply()
                     });
                     let group_response = ui.group(|ui| {
                         ui.horizontal(|ui| {
@@ -64886,6 +64900,155 @@ $Instant Growth [Nayr]\n";
         // a plan (already exhaustively covered in
         // `archivefs-core`'s `esde_profile_kind_fails_closed_...` test).
         assert_eq!(FrontendProfileKind::default(), FrontendProfileKind::Generic);
+    }
+
+    /// Test F (2026-08-17 smoke-test incident regression): a cached
+    /// `library_view_last_plan` for a view whose `source_folders` (or any
+    /// other field) no longer matches the *current* `LibraryViewConfig` of
+    /// the same id must never be rendered as if it still described that
+    /// view - it must disappear (prompting a fresh Preview) rather than
+    /// silently show entries planned against the old configuration. This
+    /// is the actual production fix: `show_library_views_page`'s
+    /// `has_current_plan`/`can_apply` now compare the *whole* cached
+    /// `LibraryViewConfig` (`previewed == view`), not just `previewed.id ==
+    /// view.id` - id equality alone is exactly what let a plan computed
+    /// while `source_folders` pointed at
+    /// `/mnt/local/downloads/jdownloader2/output` keep rendering after the
+    /// view was corrected to `/mnt/games/roms/sms`, because the two
+    /// `LibraryViewConfig`s share an id but disagree on every field that
+    /// actually drives planning.
+    #[test]
+    fn stale_cached_plan_for_a_changed_view_is_never_rendered_as_current() {
+        let ctx = egui::Context::default();
+        let mut current_view =
+            sample_library_view("view-1", "master system smoke", "/mnt/romm-view-smoke");
+        current_view.source_folders = vec![PathBuf::from("/mnt/games/roms/sms")];
+        current_view.platforms = vec!["MasterSystem".to_string()];
+
+        // The cached plan was computed for the *same id*, but a different
+        // (stale) configuration - exactly the incident's shape: an earlier
+        // source selection.
+        let mut stale_view = current_view.clone();
+        stale_view.source_folders = vec![PathBuf::from("/mnt/local/downloads/jdownloader2/output")];
+        let stale_plan = sample_plan(
+            LibraryViewPlanCounts {
+                create: 0,
+                correct: 0,
+                repair: 0,
+                remove: 0,
+                collision: 0,
+                skip: 8,
+            },
+            vec![LibraryViewPlanEntry {
+                action: LibraryViewPlanAction::SkipUnknownPlatform,
+                archive_path: Some(PathBuf::from(
+                    "/mnt/local/downloads/jdownloader2/output/Agatha Christie.zip",
+                )),
+                relative_link_path: None,
+                destination_path: None,
+                platform: None,
+                reason: Some("archive has no assigned platform".to_string()),
+                colliding_with: None,
+                source_folder_path: None,
+                archive_identity: None,
+            }],
+            None,
+            None,
+        );
+        let last_plan = Some((stale_view, stale_plan));
+
+        let views = vec![current_view];
+        let all_source_folders: Vec<SourceFolderView> = Vec::new();
+        let mut plan_filter = LibraryViewPlanFilter::default();
+        let mut form_dialog = None;
+        let mut remove_dialog = None;
+        let mut clipboard = InMemoryClipboard::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_library_views_page(
+                    ui,
+                    &views,
+                    &all_source_folders,
+                    false,
+                    last_plan.as_ref(),
+                    None,
+                    &mut plan_filter,
+                    &mut form_dialog,
+                    &mut remove_dialog,
+                    &mut clipboard,
+                );
+            });
+        });
+
+        assert!(
+            !rendered_text_contains(&output, "jdownloader2"),
+            "a plan computed for a different source selection must never be shown for the \
+             current (edited) view"
+        );
+        assert!(
+            !rendered_text_contains(&output, "Skip: 8"),
+            "stale counts from an outdated plan must not be rendered as the current view's plan"
+        );
+    }
+
+    /// The matching-and-current case must still render normally - the fix
+    /// above must not make every plan look stale.
+    #[test]
+    fn current_cached_plan_for_an_unchanged_view_still_renders() {
+        let ctx = egui::Context::default();
+        let view = sample_library_view("view-1", "master system smoke", "/mnt/romm-view-smoke");
+        let plan = sample_plan(
+            LibraryViewPlanCounts {
+                create: 1,
+                correct: 0,
+                repair: 0,
+                remove: 0,
+                collision: 0,
+                skip: 0,
+            },
+            vec![LibraryViewPlanEntry {
+                action: LibraryViewPlanAction::Create,
+                archive_path: Some(PathBuf::from("/mnt/games/roms/sms/Alex Kidd.zip")),
+                relative_link_path: Some(PathBuf::from("MasterSystem/Alex Kidd.zip")),
+                destination_path: Some(PathBuf::from(
+                    "/mnt/romm-view-smoke/MasterSystem/Alex Kidd.zip",
+                )),
+                platform: Some("MasterSystem".to_string()),
+                reason: None,
+                colliding_with: None,
+                source_folder_path: Some(PathBuf::from("/mnt/games/roms/sms")),
+                archive_identity: None,
+            }],
+            None,
+            None,
+        );
+        let last_plan = Some((view.clone(), plan));
+
+        let views = vec![view];
+        let all_source_folders: Vec<SourceFolderView> = Vec::new();
+        let mut plan_filter = LibraryViewPlanFilter::default();
+        let mut form_dialog = None;
+        let mut remove_dialog = None;
+        let mut clipboard = InMemoryClipboard::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_library_views_page(
+                    ui,
+                    &views,
+                    &all_source_folders,
+                    false,
+                    last_plan.as_ref(),
+                    None,
+                    &mut plan_filter,
+                    &mut form_dialog,
+                    &mut remove_dialog,
+                    &mut clipboard,
+                );
+            });
+        });
+
+        assert!(rendered_text_contains(&output, "Create: 1"));
+        assert!(rendered_text_contains(&output, "Alex Kidd.zip"));
     }
 
     #[test]
