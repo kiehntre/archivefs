@@ -13,8 +13,85 @@ guessing at intent, dates, or scope.
 
 ## v0.8.0-alpha (unreleased)
 
-Development for the next alpha is underway; entries will be recorded here as
-they land.
+Frontend Profiles / RomM Library Views and repair-workflow release
+("Alpha 2.0"). **Not yet tagged or published.** The currently published
+release remains
+[`v0.7.2-alpha`](docs/releases/v0.7.2-alpha.md); this entry describes what
+has merged to `main` toward the next alpha so far. Feature freeze is active.
+See [`docs/releases/v0.8.0-alpha.md`](docs/releases/v0.8.0-alpha.md) for
+full release notes.
+
+### Added
+
+- **Library Views** (Frontend Profiles / RomM): named, symlink-based
+  organized folder trees generated from the existing catalogue, in a
+  `Generic` (`{platform}/{filename}`) or `Romm` (`roms/{slug}/{filename}`)
+  layout, planned (preview) and applied (create/repair/remove) as two
+  separate, explicit steps. Always derived - never copies, moves, renames,
+  or modifies an original archive.
+- A centralized media registry as the single source of truth for which
+  file extensions EmuWiz recognises and how each persists, shared by
+  scanning, rescanning, and the filesystem watcher (closing a real drift
+  where `.gcz`/`.rvz`/`.wbfs`/`.ciso` were scan-recognised but
+  watch-blind).
+- Loose Commodore `.d64`/`.g64` (C128) and MAME `.chd` (Neo Geo CD, Sega
+  CD, arcade, redump CD/DVD sets) recognised as catalogued media, plus a
+  `neocdz` folder alias for Neo Geo CD.
+- Trusted local DTD diagnostics: a Logiqx DAT's `DOCTYPE` external
+  identifier is resolved against a short, explicit, local-only allowlist
+  with real provenance diagnostics, replacing the previous blanket
+  "accepted as inert text" note. Read-only, local-only, no network
+  request, no DTD schema validation claimed.
+- A whole-library Repair Center: a transaction-based, journal-checkpointed,
+  no-clobber rename executor with crash-safe recovery/reconciliation and
+  rollback, a whole-library repair planner (CLI `repair scan`/`plan`/
+  `apply`), a Repair Review GUI (preview, select, apply, always re-scanning
+  and re-proving the plan before mutating anything), Repair History with
+  safe undo, and duplicate-content quarantine/review (byte-identical
+  duplicates safely moved to a reversible `.emuwiz-quarantine` folder,
+  never permanently deleted; groups with no unique objective survivor are
+  left needs-review, never guessed at).
+- GUI "Scan library for repairs": runs the same whole-library repair-scan
+  engine the CLI already had, on a background thread, and loads a
+  successful result directly into Repair Review.
+- A drillable, bounded (1000-entry-capped, honestly-reported-when-truncated)
+  skipped-file list in the GUI, alongside the existing exact aggregate
+  skip counts.
+
+### Changed
+
+- Library View Apply hardened: every Create/Repair/RemoveStale/
+  managed-directory-cleanup path now verifies destination containment via
+  canonicalization (closing a symlink-escape class of bug), and
+  Create/Repair re-verify the source target's existence, type, source-root
+  containment, and recorded size/mtime fingerprint immediately before
+  mutating anything.
+- Rename-transaction restart recovery now reconciles a transaction-level
+  status left stuck at `Applying` (a final journal write that failed to
+  land after every entry had already durably settled) using the same
+  completion rule the executor's own happy path already applies, and fails
+  closed whenever that outcome cannot be proven. The GUI's fresh-restart
+  load path and its already-open-page recovery refresh now share this
+  reconciliation.
+- Bounded 7z member DAT verification, CHD v5 header identity and disk
+  identity evidence, dependency-aware (Stage 2d) and conservative Stage 1/2
+  set-completeness semantics, nested software-list DAT member indexing,
+  safe outer-archive renaming, optional fd-pinned RAR5 verification, and a
+  No-Intro/SMS DAT semantics fix (verified status and `cloneofid`
+  handling) all merged in this range.
+
+### Known limitations
+
+- ES-DE frontend output is not implemented (typed placeholder, fails
+  closed rather than falling back to `Generic`).
+- RomM Library View identity-cache server-ID validation is deferred (a
+  deliberate, documented choice - not an oversight).
+- CUE/BIN, GDI, and M3U grouping are not implemented; the media registry
+  recognises single files only.
+- A `.chd` extension alone is never sufficient platform identity by
+  itself.
+- No claim of broad Libretro-extension support - the media registry
+  covers only the specific formats added in this range.
 
 ## v0.7.2-alpha (2026-08-13)
 

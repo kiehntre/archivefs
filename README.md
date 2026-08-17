@@ -31,8 +31,13 @@ rewritten, and 7z DAT verification is not yet a production audit path. See
 [`docs/releases/v0.7.2-alpha.md`](docs/releases/v0.7.2-alpha.md) for the full
 release notes.
 
-Development is currently underway toward `v0.8.0-alpha`, which has not been
-published yet.
+`main` is currently the `v0.8.0-alpha` release candidate: feature-frozen and
+in release preparation, with its own draft
+[`docs/releases/v0.8.0-alpha.md`](docs/releases/v0.8.0-alpha.md) and
+[`CHANGELOG.md`](CHANGELOG.md#v080-alpha-unreleased) entries kept up to date
+as it stabilizes. `v0.8.0-alpha` has **not** been tagged, released, or
+published yet - the current published release remains `v0.7.2-alpha` above
+until it is.
 
 ## Principles
 
