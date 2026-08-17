@@ -48,9 +48,10 @@ use archivefs_core::repair::execute::{
     RepairExecutionOptions, RepairReverifyOutcome, RepairTransactionResult,
 };
 use archivefs_core::repair::library::{
-    ApplySavedPlanSelectedError, LibraryRepairPlan, ReportCounts, apply_saved_plan_selected,
+    ApplySavedPlanSelectedError, CombinedApplyResult, LibraryRepairPlan, ReportCounts,
+    apply_saved_plan_selected,
 };
-use archivefs_core::repair::proposal::{RepairProposal, RepairProposalId};
+use archivefs_core::repair::proposal::{RepairEvidenceKind, RepairProposal, RepairProposalId};
 use archivefs_core::safe_read::TrustedRoots;
 use eframe::egui;
 
@@ -113,9 +114,23 @@ pub(crate) struct RepairReviewRow {
     pub(crate) proposal_id: Option<RepairProposalId>,
     pub(crate) source: String,
     /// `None` when the backend's row carries no destination (NeedsReview /
-    /// Blocked buckets, which have no canonical name).
+    /// Blocked buckets, which have no canonical name). For a duplicate
+    /// quarantine `MovePath` row this is the quarantine destination, exactly
+    /// as recorded on the proposal - never a second-guessed path.
     pub(crate) destination: Option<String>,
     pub(crate) reason: String,
+    /// Mirrors `RepairProposal::is_duplicate_quarantine()` for a Safe row;
+    /// always `false` for a NeedsReview/Blocked row, which carries no
+    /// `RepairProposal` (and so no `survivor_path`) to check at all - see
+    /// `build_rows`.
+    pub(crate) is_duplicate_quarantine: bool,
+    /// The kept survivor's path, for a duplicate quarantine row only.
+    pub(crate) survivor: Option<String>,
+    /// Whether the proposal's evidence includes `DuplicateContent` - shown as
+    /// its own visual signal, distinct from the quarantine action label
+    /// itself (a future proposal kind could in principle carry this evidence
+    /// without being a quarantine move).
+    pub(crate) has_duplicate_content_evidence: bool,
 }
 
 /// Builds the deterministic row list for the current filter, purely from the
@@ -140,6 +155,15 @@ pub(crate) fn build_rows(
                 } else {
                     proposal.reason.clone()
                 },
+                is_duplicate_quarantine: proposal.is_duplicate_quarantine(),
+                survivor: proposal
+                    .survivor_path
+                    .as_ref()
+                    .map(|survivor| survivor.display().to_string()),
+                has_duplicate_content_evidence: proposal
+                    .evidence
+                    .iter()
+                    .any(|evidence| evidence.kind == RepairEvidenceKind::DuplicateContent),
             });
         }
     }
@@ -151,6 +175,9 @@ pub(crate) fn build_rows(
                 source: item.path.clone(),
                 destination: None,
                 reason: item.reason.clone(),
+                is_duplicate_quarantine: false,
+                survivor: None,
+                has_duplicate_content_evidence: false,
             });
         }
     }
@@ -162,6 +189,9 @@ pub(crate) fn build_rows(
                 source: item.path.clone(),
                 destination: None,
                 reason: item.reason.clone(),
+                is_duplicate_quarantine: false,
+                survivor: None,
+                has_duplicate_content_evidence: false,
             });
         }
     }
@@ -256,6 +286,13 @@ pub(crate) struct RepairApplyConfirmation {
     pub(crate) selected: Vec<RepairProposalId>,
     pub(crate) scan_root: String,
     pub(crate) dat_path: String,
+    /// How many of `selected` are ordinary rename proposals, computed from
+    /// the loaded plan at the moment the dialog opened (`is_duplicate_quarantine()`
+    /// is `false`).
+    pub(crate) rename_count: usize,
+    /// How many of `selected` are duplicate-quarantine `MovePath` proposals
+    /// (`is_duplicate_quarantine()` is `true`).
+    pub(crate) quarantine_count: usize,
 }
 
 /// Why the background apply worker could not complete, with a short label a
@@ -285,18 +322,19 @@ impl RepairApplyFailure {
                 label: "Apply failed",
                 detail: inner.to_string(),
             },
-            // Unreachable in practice: `actionable_selected_ids` never sends
-            // a duplicate-quarantine proposal id to `apply_saved_plan_selected`
-            // (see its doc), so the quarantine backend never runs from this
-            // page. Handled explicitly rather than silently, so a future
-            // change that lifts that restriction fails loudly here instead
-            // of panicking on an unmatched pattern.
+            // Unreachable via `spawn_apply`'s worker: it matches these two
+            // variants explicitly and turns them into `RepairApplyMessage::Partial`
+            // so the completed groups they carry are never dropped (see
+            // `spawn_apply` and `apply_combined_result`). Handled here too,
+            // rather than left an unmatched pattern, purely so this function
+            // stays total if a future caller ever routes one of these
+            // variants through it directly.
             ApplySavedPlanSelectedError::QuarantineBuild { detail, .. } => Self {
-                label: "Apply failed",
+                label: "Quarantine apply could not be built",
                 detail,
             },
             ApplySavedPlanSelectedError::QuarantineApply { detail, .. } => Self {
-                label: "Apply failed",
+                label: "Quarantine apply failed",
                 detail,
             },
         }
@@ -305,7 +343,22 @@ impl RepairApplyFailure {
 
 /// The terminal message the background apply worker sends back.
 enum RepairApplyMessage {
-    Applied(Box<RepairTransactionResult>),
+    /// The whole selection applied without error: `CombinedApplyResult` may
+    /// still carry a rename batch, zero or more quarantine groups, or both -
+    /// see [`CombinedApplyResult`]'s doc.
+    Applied(Box<CombinedApplyResult>),
+    /// A later duplicate-quarantine group could not be built or applied,
+    /// after zero or more earlier groups (and any rename batch, which always
+    /// runs first) already succeeded and were durably journaled.
+    /// `completed` is never dropped - see
+    /// [`ApplySavedPlanSelectedError::QuarantineBuild`]/[`ApplySavedPlanSelectedError::QuarantineApply`]'s
+    /// doc.
+    Partial {
+        completed: Box<CombinedApplyResult>,
+        failure: RepairApplyFailure,
+    },
+    /// Nothing at all was applied: the re-scan, re-proof, selection, or the
+    /// rename batch itself refused before any quarantine group ran.
     Failed(RepairApplyFailure),
 }
 
@@ -352,9 +405,12 @@ pub(crate) struct RepairReviewPageState {
     apply_confirm_focus_cancel: bool,
     apply_job: Option<RepairApplyJob>,
     pub(crate) apply_running: bool,
-    /// The last apply's result, when the backend actually ran and returned.
-    /// Never populated for a refused/pre-mutation error - see `apply_failure`.
-    pub(crate) apply_result: Option<RepairTransactionResult>,
+    /// The last apply's result, when the backend actually ran and produced at
+    /// least one rename batch or quarantine group. Carries a *partial* result
+    /// (some groups applied, a later one failed) as well as a full success -
+    /// see [`RepairApplyMessage::Partial`]. Never populated when nothing at
+    /// all ran - see `apply_failure`.
+    pub(crate) apply_result: Option<CombinedApplyResult>,
     /// The last apply's refusal or error, when the backend refused or a
     /// worker error occurred. Cleared only by a new apply attempt, never
     /// automatically, so the reason stays visible until the user acts again.
@@ -364,6 +420,19 @@ pub(crate) struct RepairReviewPageState {
     /// longer reflects the library's current state and must not be trusted
     /// as evidence for a second apply without reloading/rescanning.
     pub(crate) plan_stale: bool,
+    /// Overrides the journal directory [`Self::spawn_apply`] passes to
+    /// [`apply_saved_plan_selected`]. `None` (the `Default`, and always the
+    /// case in production) means production behaviour is completely
+    /// unchanged: [`spawn_apply`](Self::spawn_apply) resolves
+    /// [`archivefs_core::dat::rename_apply::journal::default_rename_transaction_dir`]
+    /// exactly as before. `Some(dir)` exists only so a test can point a real
+    /// `confirm_apply` -> `spawn_apply` run at an isolated temporary
+    /// directory instead of the developer's real Repair History - never a
+    /// second journal system, never a different transaction format, and
+    /// never a different default location; it is the exact same
+    /// `RepairExecutionOptions::journal_dir` the production path already
+    /// threads through unchanged.
+    pub(crate) journal_dir_override: Option<PathBuf>,
 }
 
 impl RepairReviewPageState {
@@ -472,20 +541,23 @@ impl RepairReviewPageState {
         })
     }
 
-    /// The selected ids that are still an executable Safe **rename**
-    /// proposal in the loaded plan, in deterministic (`BTreeSet`) order.
-    /// This is a defensive re-check, not the safety boundary:
-    /// [`apply_saved_plan_selected`] re-validates everything again against a
-    /// fresh scan regardless. It exists so the enable rule and the
-    /// confirmation dialog can never offer to "apply" an id the loaded plan
-    /// itself no longer backs.
+    /// The selected ids that are still an executable Safe proposal in the
+    /// loaded plan - an ordinary rename *or* a duplicate-quarantine move
+    /// alike - in deterministic (`BTreeSet`) order. This is a defensive
+    /// re-check, not the safety boundary: [`apply_saved_plan_selected`]
+    /// re-validates everything again against a fresh scan regardless (full
+    /// re-proof, then [`archivefs_core::repair::plan::select_repair_plan_subset`]'s
+    /// own conflict-free-whole-plan requirement, then per-backend re-proof
+    /// immediately before mutation). It exists only so the enable rule and
+    /// the confirmation dialog can never offer to "apply" an id the loaded
+    /// plan itself no longer backs (already NeedsReview/Blocked, or absent).
     ///
-    /// A duplicate-quarantine `MovePath` proposal (`survivor_path.is_some()`)
-    /// is deliberately excluded here: this page's apply worker and its result
-    /// display are still built around one ordinary rename batch
-    /// ([`RepairTransactionResult`]) only. Quarantine review/apply through
-    /// this page is a follow-up slice, not silently mixed in - see this
-    /// page's module doc.
+    /// A NeedsReview or Blocked proposal is never actionable
+    /// (`RepairProposal::actionable()` requires `SafetyState::Safe`), so it
+    /// can never appear here regardless of whether it is a quarantine move -
+    /// this page never has a `RepairProposalId` for one anyway, since
+    /// NeedsReview/Blocked rows come from the report's id-less `PlanItem`s
+    /// (see [`build_rows`]), never from `plan.repair_plan.proposals`.
     pub(crate) fn actionable_selected_ids(&self) -> Vec<RepairProposalId> {
         let Some(plan) = self.plan.as_ref() else {
             return Vec::new();
@@ -493,11 +565,10 @@ impl RepairReviewPageState {
         self.selected
             .iter()
             .filter(|id| {
-                plan.repair_plan.proposals.iter().any(|proposal| {
-                    &proposal.id == *id
-                        && proposal.actionable()
-                        && !proposal.is_duplicate_quarantine()
-                })
+                plan.repair_plan
+                    .proposals
+                    .iter()
+                    .any(|proposal| &proposal.id == *id && proposal.actionable())
             })
             .cloned()
             .collect()
@@ -526,10 +597,23 @@ impl RepairReviewPageState {
         let Some(plan) = self.plan.as_ref() else {
             return;
         };
+        let selected = self.actionable_selected_ids();
+        let quarantine_count = selected
+            .iter()
+            .filter(|id| {
+                plan.repair_plan
+                    .proposals
+                    .iter()
+                    .any(|proposal| &proposal.id == *id && proposal.is_duplicate_quarantine())
+            })
+            .count();
+        let rename_count = selected.len() - quarantine_count;
         self.apply_confirm = Some(RepairApplyConfirmation {
-            selected: self.actionable_selected_ids(),
+            selected,
             scan_root: plan.scan_root.clone(),
             dat_path: plan.dat_path.clone(),
+            rename_count,
+            quarantine_count,
         });
         self.apply_confirm_focus_cancel = true;
     }
@@ -573,9 +657,13 @@ impl RepairReviewPageState {
         let current_generation = plan.generation;
         let selected = confirmation.selected;
         let trusted = TrustedRoots::from_paths([&root]);
-        let journal_dir =
+        // `None` in production: resolves the exact same default journal
+        // directory as before. `Some(dir)` only in tests - see
+        // `journal_dir_override`'s doc.
+        let journal_dir = self.journal_dir_override.clone().unwrap_or_else(|| {
             archivefs_core::dat::rename_apply::journal::default_rename_transaction_dir()
-                .unwrap_or_else(|_| PathBuf::from("rename-transactions"));
+                .unwrap_or_else(|_| PathBuf::from("rename-transactions"))
+        });
         let options = RepairExecutionOptions {
             trusted,
             journal_dir,
@@ -596,18 +684,30 @@ impl RepairReviewPageState {
                 &cancel,
             );
             let message = match result {
-                // `actionable_selected_ids` only ever sends ordinary rename
-                // ids (see its doc), so `rename` is always populated and
-                // `quarantine` always empty here; the `None` arm exists only
-                // so a future change to that invariant fails as a reported
-                // apply failure, never a panic.
-                Ok(outcome) => match outcome.rename {
-                    Some(rename) => RepairApplyMessage::Applied(Box::new(rename)),
-                    None => RepairApplyMessage::Failed(RepairApplyFailure {
-                        label: "Apply failed",
-                        detail: "the apply produced no rename batch to report".to_string(),
-                    }),
-                },
+                Ok(outcome) => RepairApplyMessage::Applied(Box::new(outcome)),
+                // A later duplicate-quarantine group failed to build/apply:
+                // never discard whatever already succeeded (any rename batch,
+                // plus zero or more earlier quarantine groups) - see
+                // `ApplySavedPlanSelectedError::QuarantineBuild`/`QuarantineApply`'s
+                // doc and `RepairApplyMessage::Partial`.
+                Err(ApplySavedPlanSelectedError::QuarantineBuild { completed, detail }) => {
+                    RepairApplyMessage::Partial {
+                        completed,
+                        failure: RepairApplyFailure {
+                            label: "Quarantine apply could not be built",
+                            detail,
+                        },
+                    }
+                }
+                Err(ApplySavedPlanSelectedError::QuarantineApply { completed, detail }) => {
+                    RepairApplyMessage::Partial {
+                        completed,
+                        failure: RepairApplyFailure {
+                            label: "Quarantine apply failed",
+                            detail,
+                        },
+                    }
+                }
                 Err(error) => RepairApplyMessage::Failed(RepairApplyFailure::from_error(error)),
             };
             let _ = sender.send(message);
@@ -652,35 +752,21 @@ impl RepairReviewPageState {
 
     /// Applies one terminal message from the apply worker to page state.
     ///
-    /// On a successful apply, only the ids whose entry actually reached
-    /// [`EntryState::Applied`] are cleared from the selection - an id whose
-    /// entry was skipped, failed, or was rolled back stays selected, since it
-    /// was not, in the end, applied. On any failure the selection is left
-    /// entirely untouched: the caller decides what to do next.
+    /// On a successful (or partially successful) apply, only the ids whose
+    /// entry actually reached [`EntryState::Applied`] - across the rename
+    /// batch and every quarantine group that ran - are cleared from the
+    /// selection; an id whose entry was skipped, failed, rolled back, or
+    /// never reached (a later group that never ran after an earlier one
+    /// failed) stays selected. On a total failure (nothing ran at all) the
+    /// selection is left entirely untouched: the caller decides what to do
+    /// next.
     fn handle_apply_message(&mut self, message: RepairApplyMessage) {
         match message {
             RepairApplyMessage::Applied(outcome) => {
-                let applied_sources: Vec<PathBuf> = outcome
-                    .transaction
-                    .entries
-                    .iter()
-                    .filter(|entry| entry.state == EntryState::Applied)
-                    .map(|entry| entry.source_path.clone())
-                    .collect();
-                for source in &applied_sources {
-                    if let Some(id) = self.proposal_id_for_source(source) {
-                        self.selected.remove(&id);
-                    }
-                }
-                // Entries that stayed applied (not rolled back) mean the
-                // library changed under the loaded plan; a rescan/reload is
-                // required before this plan can back another apply.
-                if outcome.summary.applied > 0 {
-                    self.plan_stale = true;
-                }
-                self.apply_result = Some(*outcome);
-                self.apply_failure = None;
-                self.apply_running = false;
+                self.apply_combined_result(*outcome, None);
+            }
+            RepairApplyMessage::Partial { completed, failure } => {
+                self.apply_combined_result(*completed, Some(failure));
             }
             RepairApplyMessage::Failed(failure) => {
                 self.apply_failure = Some(failure);
@@ -688,6 +774,59 @@ impl RepairReviewPageState {
                 self.apply_running = false;
             }
         }
+    }
+
+    /// Shared by both the fully-successful and partial-failure arms of
+    /// [`Self::handle_apply_message`]: records every applied source's id as
+    /// no longer selected, marks the plan stale if anything actually landed
+    /// on disk, and stores the result (and, for a partial failure, the
+    /// reason the run stopped) - never silently dropping a completed
+    /// rename batch or quarantine group just because a later one failed.
+    fn apply_combined_result(
+        &mut self,
+        outcome: CombinedApplyResult,
+        failure: Option<RepairApplyFailure>,
+    ) {
+        let mut applied_sources: Vec<PathBuf> = Vec::new();
+        let mut any_applied = false;
+        if let Some(rename) = &outcome.rename {
+            any_applied |= rename.summary.applied > 0;
+            applied_sources.extend(
+                rename
+                    .transaction
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.state == EntryState::Applied)
+                    .map(|entry| entry.source_path.clone()),
+            );
+        }
+        for group in &outcome.quarantine {
+            any_applied |= group.result.summary.applied > 0;
+            applied_sources.extend(
+                group
+                    .result
+                    .transaction
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.state == EntryState::Applied)
+                    .map(|entry| entry.source_path.clone()),
+            );
+        }
+        for source in &applied_sources {
+            if let Some(id) = self.proposal_id_for_source(source) {
+                self.selected.remove(&id);
+            }
+        }
+        // Entries that stayed applied (not rolled back) mean the library
+        // changed under the loaded plan; a rescan/reload is required before
+        // this plan can back another apply.
+        if any_applied {
+            self.plan_stale = true;
+        }
+        let has_any_result = outcome.rename.is_some() || !outcome.quarantine.is_empty();
+        self.apply_result = has_any_result.then_some(outcome);
+        self.apply_failure = failure;
+        self.apply_running = false;
     }
 }
 
@@ -880,10 +1019,16 @@ pub(crate) fn show_repair_review_page(ui: &mut egui::Ui, state: &mut RepairRevie
             }
             ui.separator();
             let can_apply = state.can_apply();
+            // The exact count `open_apply_confirmation` would freeze into
+            // the confirmation dialog and send to the backend - never
+            // `state.selected.len()`, which also counts stale/no-longer-
+            // actionable ids (already applied, or no longer Safe in the
+            // loaded plan) that will never actually be submitted.
+            let actionable_count = state.actionable_selected_ids().len();
             let apply_label = if state.apply_running {
                 "Applying…".to_string()
             } else {
-                format!("Apply Selected ({})", state.selected.len())
+                format!("Apply Selected ({actionable_count})")
             };
             let apply =
                 widgets::action_button(ui, apply_label, widgets::ActionStyle::Primary, can_apply);
@@ -891,7 +1036,7 @@ pub(crate) fn show_repair_review_page(ui: &mut egui::Ui, state: &mut RepairRevie
             if !can_apply {
                 let hover = if state.apply_running {
                     "An apply is already running."
-                } else if state.actionable_selected_ids().is_empty() {
+                } else if actionable_count == 0 {
                     "Select at least one Safe repair to apply."
                 } else {
                     "Apply Selected is not available."
@@ -944,6 +1089,13 @@ fn show_apply_confirmation_dialog(ui: &mut egui::Ui, state: &mut RepairReviewPag
                 ))
                 .strong(),
             );
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} rename action(s) · {} quarantine action(s)",
+                    confirmation.rename_count, confirmation.quarantine_count
+                ))
+                .color(theme::muted(ui)),
+            );
             detail_label(ui, "Scan root", &confirmation.scan_root);
             detail_label(ui, "DAT source", &confirmation.dat_path);
             ui.add_space(6.0);
@@ -955,6 +1107,19 @@ fn show_apply_confirmation_dialog(ui: &mut egui::Ui, state: &mut RepairReviewPag
                 )
                 .color(theme::muted(ui)),
             );
+            if confirmation.quarantine_count > 0 {
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} of these are duplicate quarantine action(s): the redundant file is \
+                         moved into a '.emuwiz-quarantine' folder inside its own trusted root, \
+                         not permanently deleted. The move is fully reversible from Repair \
+                         History's Undo, the same as any other repair.",
+                        confirmation.quarantine_count
+                    ))
+                    .color(theme::muted(ui)),
+                );
+            }
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 let cancel = ui.add(egui::Button::new("Cancel"));
@@ -979,47 +1144,111 @@ fn show_apply_confirmation_dialog(ui: &mut egui::Ui, state: &mut RepairReviewPag
     }
 }
 
-/// Post-apply feedback for the last completed run: transaction id, counts,
-/// rollback status, and reverify results. Shown until superseded by the next
-/// apply or a newly loaded plan.
+/// Renders one [`RepairTransactionResult`]'s counts and reverify entries -
+/// shared by the rename batch and every quarantine group in
+/// [`show_apply_result`], since both are the same result shape.
+fn show_transaction_result_body(ui: &mut egui::Ui, result: &RepairTransactionResult) {
+    detail_label(ui, "Transaction id", &result.summary.transaction_id);
+    detail_label(ui, "Requested", &result.summary.requested.to_string());
+    detail_label(ui, "Applied", &result.summary.applied.to_string());
+    detail_label(ui, "Failed", &result.summary.failed.to_string());
+    detail_label(ui, "Skipped", &result.summary.skipped.to_string());
+    detail_label(ui, "Rollback", result.summary.rollback.label());
+    if !result.reverify.is_empty() {
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new("Reverify").strong());
+        for entry in &result.reverify {
+            let tone = match entry.outcome {
+                RepairReverifyOutcome::Verified => widgets::StatusTone::Success,
+                RepairReverifyOutcome::Missing | RepairReverifyOutcome::Changed => {
+                    widgets::StatusTone::Blocked
+                }
+            };
+            ui.horizontal(|ui| {
+                widgets::status_badge(ui, entry.outcome.label(), tone);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} → {}",
+                        entry.source_path.display(),
+                        entry.destination_path.display()
+                    ))
+                    .monospace()
+                    .small(),
+                );
+            });
+        }
+    }
+}
+
+/// The headline for one duplicate-quarantine group's result card, chosen
+/// from the group's own typed [`TransactionSummary`] counts
+/// (`RepairTransactionResult::summary`) - never "complete" merely because a
+/// [`QuarantineApplyResult`](archivefs_core::repair::library::QuarantineApplyResult)
+/// exists to render.
+///
+/// A `QuarantineApplyResult` is present in [`CombinedApplyResult::quarantine`]
+/// whenever [`apply_quarantine_transaction`](archivefs_core::repair::quarantine::apply_quarantine_transaction)
+/// returned `Ok(_)`, but `Ok` only means the call completed cleanly, not that
+/// every (or any) entry was actually applied: the per-entry Layer 2 re-proof
+/// immediately before each move (or a mid-batch cancellation) can leave
+/// `summary.applied == 0` even though the whole-batch Layer 1 pre-proof
+/// already passed. `AbortAll` semantics also mean a single group's own
+/// transaction can itself be partial - an earlier entry applied, a later one
+/// failed within the same content-hash group - so "some but not all applied"
+/// is reported distinctly from a genuine full completion.
+fn quarantine_group_headline(result: &RepairTransactionResult) -> &'static str {
+    let summary = &result.summary;
+    if summary.applied == 0 {
+        "Quarantine group produced no applied changes"
+    } else if summary.failed > 0 || summary.skipped > 0 {
+        "Quarantine group partially applied"
+    } else {
+        "Quarantine group complete"
+    }
+}
+
+/// Post-apply feedback for the last completed (or partially completed) run:
+/// the rename batch's result, if any proposal in the selection was an
+/// ordinary rename, and each duplicate-quarantine group's own result, if any
+/// were selected. A group applied through
+/// [`archivefs_core::repair::quarantine::apply_quarantine_transaction`] is
+/// rendered with its own transaction id and counts, distinct from the rename
+/// batch - never merged into one summary, since they are independent
+/// journaled transactions. Shown until superseded by the next apply or a
+/// newly loaded plan; a partial result (some groups applied, a later one
+/// failed - see [`RepairApplyMessage::Partial`]) is rendered exactly the same
+/// way, so completed work is never hidden just because the run as a whole did
+/// not fully succeed. [`show_apply_failure`] renders the reason it stopped.
 fn show_apply_result(ui: &mut egui::Ui, state: &RepairReviewPageState) {
     let Some(result) = state.apply_result.as_ref() else {
         return;
     };
-    ui.add_space(8.0);
-    widgets::card(ui, |ui| {
-        ui.label(egui::RichText::new("Apply complete").size(16.0).strong());
-        detail_label(ui, "Transaction id", &result.summary.transaction_id);
-        detail_label(ui, "Requested", &result.summary.requested.to_string());
-        detail_label(ui, "Applied", &result.summary.applied.to_string());
-        detail_label(ui, "Failed", &result.summary.failed.to_string());
-        detail_label(ui, "Skipped", &result.summary.skipped.to_string());
-        detail_label(ui, "Rollback", result.summary.rollback.label());
-        if !result.reverify.is_empty() {
-            ui.add_space(4.0);
-            ui.label(egui::RichText::new("Reverify").strong());
-            for entry in &result.reverify {
-                let tone = match entry.outcome {
-                    RepairReverifyOutcome::Verified => widgets::StatusTone::Success,
-                    RepairReverifyOutcome::Missing | RepairReverifyOutcome::Changed => {
-                        widgets::StatusTone::Blocked
-                    }
-                };
-                ui.horizontal(|ui| {
-                    widgets::status_badge(ui, entry.outcome.label(), tone);
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{} → {}",
-                            entry.source_path.display(),
-                            entry.destination_path.display()
-                        ))
-                        .monospace()
-                        .small(),
-                    );
-                });
-            }
-        }
-    });
+    if let Some(rename) = &result.rename {
+        ui.add_space(8.0);
+        widgets::card(ui, |ui| {
+            ui.label(
+                egui::RichText::new("Rename batch complete")
+                    .size(16.0)
+                    .strong(),
+            );
+            show_transaction_result_body(ui, rename);
+        });
+    }
+    for group in &result.quarantine {
+        ui.add_space(8.0);
+        widgets::card(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(quarantine_group_headline(&group.result))
+                        .size(16.0)
+                        .strong(),
+                );
+                widgets::status_badge(ui, "Quarantine duplicate", widgets::StatusTone::Info);
+            });
+            detail_label(ui, "Survivor", &group.survivor_path.display().to_string());
+            show_transaction_result_body(ui, &group.result);
+        });
+    }
     if state.plan_stale {
         ui.add_space(6.0);
         widgets::banner(
@@ -1034,17 +1263,26 @@ fn show_apply_result(ui: &mut egui::Ui, state: &RepairReviewPageState) {
 
 /// The last apply's refusal or error, when there is one. Shown until
 /// superseded by the next apply attempt or a newly loaded plan.
+///
+/// When `apply_result` is *also* set, this is a partial failure: one or more
+/// groups shown above by [`show_apply_result`] already succeeded before this
+/// one stopped the run. The banner says so explicitly, so this never reads
+/// as "nothing happened" when something in fact did.
 fn show_apply_failure(ui: &mut egui::Ui, state: &RepairReviewPageState) {
     let Some(failure) = state.apply_failure.as_ref() else {
         return;
     };
     ui.add_space(8.0);
-    widgets::banner(
-        ui,
-        failure.label,
-        &failure.detail,
-        widgets::StatusTone::Blocked,
-    );
+    let message = if state.apply_result.is_some() {
+        format!(
+            "{} The result(s) shown above already completed and were journaled before this \
+             happened; nothing already applied was undone.",
+            failure.detail
+        )
+    } else {
+        failure.detail.clone()
+    };
+    widgets::banner(ui, failure.label, &message, widgets::StatusTone::Blocked);
 }
 
 /// Opens the plan picker and loads the chosen file. Shared by the header
@@ -1110,10 +1348,36 @@ fn show_row(ui: &mut egui::Ui, row: &RepairReviewRow, state: &mut RepairReviewPa
     }
 
     widgets::status_badge(&mut row_ui, row.kind.label(), row.kind.tone());
+    // A duplicate-quarantine proposal is visually distinct from an ordinary
+    // rename row: its own action-label badge, always immediately after the
+    // safety badge, and (when the evidence is present) a second badge naming
+    // the `DuplicateContent` evidence it rests on - never inferred, only
+    // shown when `build_rows` actually found it on the proposal.
+    if row.is_duplicate_quarantine {
+        widgets::status_badge(
+            &mut row_ui,
+            "Quarantine duplicate",
+            widgets::StatusTone::Info,
+        );
+    }
+    if row.has_duplicate_content_evidence {
+        widgets::status_badge(
+            &mut row_ui,
+            "Duplicate content evidence",
+            widgets::StatusTone::Active,
+        );
+    }
 
-    let path_text = match &row.destination {
-        Some(destination) => format!("{} → {}", row.source, destination),
-        None => row.source.clone(),
+    // Ordinary rename rows keep their exact prior "source → destination"
+    // text. A quarantine row additionally names the kept survivor, so the
+    // three paths this move involves (source, quarantine destination,
+    // survivor) are all visible without opening Details.
+    let path_text = match (&row.destination, &row.survivor) {
+        (Some(destination), Some(survivor)) => {
+            format!("{} → {} (survivor: {survivor})", row.source, destination)
+        }
+        (Some(destination), None) => format!("{} → {}", row.source, destination),
+        (None, _) => row.source.clone(),
     };
     let path_width = (row_ui.available_width() * 0.5).max(140.0);
     row_ui
@@ -1159,11 +1423,22 @@ fn show_details(ui: &mut egui::Ui, id: &RepairProposalId, proposal: &RepairPropo
             ui.label(egui::RichText::new("Proposal details").size(17.0).strong());
             ui.label(egui::RichText::new(id.to_string()).color(theme::muted(ui)));
             widgets::status_badge(ui, "Safe", widgets::StatusTone::Success);
+            if proposal.is_duplicate_quarantine() {
+                widgets::status_badge(ui, "Quarantine duplicate", widgets::StatusTone::Info);
+            }
         });
         ui.add_space(4.0);
         detail_label(ui, "Source", &proposal.source_path.display().to_string());
         if let Some(destination) = proposal.destination() {
-            detail_label(ui, "Destination", &destination.display().to_string());
+            let label = if proposal.is_duplicate_quarantine() {
+                "Quarantine destination"
+            } else {
+                "Destination"
+            };
+            detail_label(ui, label, &destination.display().to_string());
+        }
+        if let Some(survivor) = &proposal.survivor_path {
+            detail_label(ui, "Survivor (kept file)", &survivor.display().to_string());
         }
         if !proposal.reason.is_empty() {
             detail_label(ui, "Reason", &proposal.reason);

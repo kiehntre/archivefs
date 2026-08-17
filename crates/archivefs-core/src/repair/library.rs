@@ -539,6 +539,31 @@ pub fn build_library_repair_report(
         .files_scanned
         .saturating_sub(report.counts.ignored_ancillary);
 
+    // Sources whose rename-plan `Conflict` has an independent, Safe,
+    // executable duplicate-quarantine resolution in the *same* repair plan.
+    //
+    // `duplicate_scan::duplicate_candidate_groups` deliberately still treats
+    // a `ProposalState::Conflict` source as a duplicate-quarantine candidate
+    // (its doc: "the rename-plan collision ... is a *different* question ...
+    // from whether they are duplicate-quarantine candidates"), so the same
+    // source can legitimately be both "cannot be safely renamed in place"
+    // (the rename-plan conflict) and "safely quarantined" (an independent,
+    // content-proven `MovePath`). Reporting the source as an undifferentiated
+    // "Blocked repair" while it is *also* Safe/actionable elsewhere in this
+    // same report is a contradiction, not two independently true facts - so
+    // such a source is surfaced only through its Safe quarantine proposal
+    // (and the existing, purely additive `duplicate_quarantine_safe` count
+    // below), never duplicated into `blocked`/`blocked_repair` as well. This
+    // never suppresses a `Conflict` source that has no such resolution, and
+    // never touches `ProposalState::Blocked` (which
+    // `duplicate_candidate_groups` never even considers a candidate).
+    let quarantine_superseded_sources: std::collections::HashSet<&Path> = repair_plan
+        .proposals
+        .iter()
+        .filter(|proposal| proposal.is_duplicate_quarantine() && proposal.actionable())
+        .map(|proposal| proposal.source_path.as_path())
+        .collect();
+
     // Per-file classification from the hardened rename plan. Only `Suggested`
     // proposals become executable; every other state is surfaced verbatim.
     for proposal in &rename_plan.proposals {
@@ -554,6 +579,12 @@ pub fn build_library_repair_report(
                         .clone()
                         .unwrap_or_else(|| "ambiguous DAT attribution".to_string()),
                 });
+            }
+            ProposalState::Conflict
+                if quarantine_superseded_sources.contains(proposal.source_path.as_path()) =>
+            {
+                // Resolved by a Safe duplicate-quarantine proposal for this
+                // exact source; see `quarantine_superseded_sources` above.
             }
             ProposalState::Conflict | ProposalState::Blocked => {
                 report.counts.blocked_repair += 1;
