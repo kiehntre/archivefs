@@ -7610,6 +7610,42 @@ mod tests {
         let _ = fs::remove_dir_all(root.parent().unwrap());
     }
 
+    /// Real-world-surfaced regression: `neocdz` (the actual MAME driver
+    /// name, and what several real Neo Geo CD collections/frontends use as
+    /// a folder name) must resolve `.chd` to Neo Geo CD via folder-alias
+    /// evidence, exactly like `neogeocd`/`snkneogeocd`/`ngcd` already do.
+    /// The companion case in the same test proves this is still genuine
+    /// folder-alias corroboration, not a relaxation of CHD's ambiguity: a
+    /// `.chd` in an unrelated folder must remain unresolved.
+    #[test]
+    fn neocdz_folder_alias_resolves_chd_to_neo_geo_cd_while_an_unknown_folder_stays_unresolved() {
+        let root = test_root("chd-neocdz-folder-alias").join("neocdz");
+        fs::create_dir_all(&root).unwrap();
+        let chd = root.join("2020 Super Baseball (World).chd");
+        fs::write(&chd, vec![0_u8; 1024]).unwrap();
+
+        let archive = Archive::from_path_in_root(&chd, &root).unwrap();
+        assert_eq!(archive.kind, ArchiveKind::DirectGameImage);
+        assert_eq!(archive.identity.platform.as_deref(), Some("Neo Geo CD"));
+        assert_eq!(
+            archive.identity.platform_provenance,
+            Some(PlatformProvenance::FolderAlias)
+        );
+
+        let unknown_root = test_root("chd-neocdz-folder-alias").join("some-other-folder");
+        fs::create_dir_all(&unknown_root).unwrap();
+        let unknown_chd = unknown_root.join("Game.chd");
+        fs::write(&unknown_chd, vec![0_u8; 1024]).unwrap();
+        let unknown_archive = Archive::from_path_in_root(&unknown_chd, &unknown_root).unwrap();
+        assert_eq!(
+            unknown_archive.identity.platform, None,
+            "`.chd` must stay unresolved outside a recognised folder - the fix only adds a \
+             folder alias, it never makes `.chd` sufficient platform identity on its own"
+        );
+
+        let _ = fs::remove_dir_all(root.parent().unwrap());
+    }
+
     #[test]
     fn archive_kind_recognizes_loose_commodore_disk_images() {
         assert_eq!(

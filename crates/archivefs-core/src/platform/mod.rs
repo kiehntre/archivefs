@@ -840,7 +840,7 @@ pub const PLATFORMS: &[Platform] = &[
     Platform {
         id: "Neo Geo CD",
         display_name: "Neo Geo CD",
-        folder_aliases: &["neogeocd", "snkneogeocd", "ngcd"],
+        folder_aliases: &["neogeocd", "snkneogeocd", "ngcd", "neocdz"],
         filename_aliases: &[],
         strong_extensions: &[],
         weak_extensions: &["iso", "cue", "bin", "chd", "img"],
