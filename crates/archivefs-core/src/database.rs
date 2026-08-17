@@ -1233,6 +1233,28 @@ pub struct ScanPersistSummary {
     /// Direct images that stayed visible but did not receive the source's
     /// platform because that platform/format combination is incompatible.
     pub platform_assignment_warnings: Vec<(PathBuf, String)>,
+    /// A bounded sample of individual skipped files across every folder
+    /// this run scanned - see [`crate::MAX_RETAINED_SKIPPED_FILES`] and
+    /// [`crate::ArchiveScanDiscovery::skipped_files`], whose per-folder
+    /// samples this aggregates and re-bounds. Never persisted to the
+    /// database (unlike `counts`, which is the exact, durable record) -
+    /// this is in-memory detail for the caller of *this* scan only, exactly
+    /// like `folder_errors`/`platform_assignment_warnings` above.
+    pub skipped_files: Vec<crate::SkippedFile>,
+}
+
+impl ScanPersistSummary {
+    /// The exact total skipped count this run found, across every folder -
+    /// always accurate even when [`Self::skipped_files`] is truncated.
+    pub fn skipped_files_total(&self) -> i64 {
+        self.counts.skipped_unsupported_extension + self.counts.skipped_ambiguous_platform
+    }
+
+    /// Whether [`Self::skipped_files`] is a truncated sample of
+    /// [`Self::skipped_files_total`].
+    pub fn skipped_files_truncated(&self) -> bool {
+        self.skipped_files_total() > self.skipped_files.len() as i64
+    }
 }
 
 /// A persisted `archives` row joined with its current platform (if any),
@@ -3779,6 +3801,7 @@ fn scan_and_persist_folders_transaction(
     let mut counts = ScanRunCounts::default();
     let mut folder_errors = Vec::new();
     let mut platform_assignment_warnings = Vec::new();
+    let mut skipped_files: Vec<crate::SkippedFile> = Vec::new();
 
     for folder in folders {
         let folder_config = Config {
@@ -3805,6 +3828,15 @@ fn scan_and_persist_folders_transaction(
         };
         counts.skipped_unsupported_extension += discovery.skipped_unsupported_extension as i64;
         counts.skipped_ambiguous_platform += discovery.skipped_ambiguous_platform as i64;
+        // Re-bounded across the whole multi-folder run, not just within one
+        // folder's own `ArchiveScanDiscovery::skipped_files` (each of which
+        // is already independently capped at `MAX_RETAINED_SKIPPED_FILES` -
+        // see `ArchiveScanner::scan_source`) - otherwise N folders could
+        // retain up to N times the intended detail.
+        if skipped_files.len() < crate::MAX_RETAINED_SKIPPED_FILES {
+            let remaining = crate::MAX_RETAINED_SKIPPED_FILES - skipped_files.len();
+            skipped_files.extend(discovery.skipped_files.into_iter().take(remaining));
+        }
         let archives = discovery.archives;
         if let Some(platform) = folder.assigned_platform.as_deref() {
             for archive in &archives {
@@ -3876,6 +3908,7 @@ fn scan_and_persist_folders_transaction(
         counts,
         folder_errors,
         platform_assignment_warnings,
+        skipped_files,
     })
 }
 

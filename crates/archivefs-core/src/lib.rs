@@ -4443,11 +4443,81 @@ pub struct ArchiveScanner<'a> {
     config: &'a Config,
 }
 
+/// The maximum number of individual [`SkippedFile`] entries
+/// [`ArchiveScanDiscovery::skipped_files`] retains, regardless of how many
+/// files a scan actually skips. The aggregate counters
+/// (`skipped_unsupported_extension`/`skipped_ambiguous_platform`) always
+/// reflect the *entire* scan; `skipped_files` is a bounded, best-effort
+/// sample of that total for GUI drill-down, never a second source of truth
+/// for the count - see [`ArchiveScanDiscovery::skipped_files_truncated`].
+pub const MAX_RETAINED_SKIPPED_FILES: usize = 1000;
+
+/// Why one file was skipped during a scan - see
+/// [`ArchiveScanner::scan_source`]'s two skip branches, which are the only
+/// two ways a file is ever skipped today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SkipReason {
+    /// No extension the media registry recognises at all -
+    /// `media_registry::is_recognized_extension` returned `false` and the
+    /// extension is not one of the Mega Drive corroboration candidates
+    /// either.
+    UnsupportedExtension,
+    /// The extension is shared with `MegaDriveRom` (`.md`/`.bin`/`.gen`) but
+    /// no folder, source-root, or cartridge-header evidence corroborated it,
+    /// see `archive_kind_in_root`. A genuinely different, unrelated file
+    /// that merely shares one of these three extensions (for example a
+    /// ScummVM `RESOURCE.GEN`) is reported this way, not as unsupported.
+    AmbiguousPlatform,
+}
+
+impl SkipReason {
+    /// A short, human-readable label - what a GUI shows for this reason.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::UnsupportedExtension => "Unsupported extension",
+            Self::AmbiguousPlatform => "Ambiguous platform",
+        }
+    }
+}
+
+/// One skipped file's identity and reason - part of the bounded,
+/// best-effort sample [`ArchiveScanDiscovery::skipped_files`] retains for
+/// GUI drill-down. Never itself a classification decision: recording (or
+/// failing to record, once the bound is reached) a file here changes
+/// nothing about whether it was skipped or why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedFile {
+    pub path: PathBuf,
+    pub reason: SkipReason,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ArchiveScanDiscovery {
     pub archives: Vec<Archive>,
     pub skipped_unsupported_extension: usize,
     pub skipped_ambiguous_platform: usize,
+    /// A bounded (see [`MAX_RETAINED_SKIPPED_FILES`]) sample of individual
+    /// skipped files, for GUI drill-down. The exact totals always live in
+    /// `skipped_unsupported_extension`/`skipped_ambiguous_platform` - this
+    /// list is explanatory detail on top of those counts, never a
+    /// replacement for them; call [`Self::skipped_files_truncated`] before
+    /// presenting it as complete.
+    pub skipped_files: Vec<SkippedFile>,
+}
+
+impl ArchiveScanDiscovery {
+    /// The exact total skipped count across both reasons - always accurate,
+    /// regardless of how much detail `skipped_files` retains.
+    pub fn total_skipped(&self) -> usize {
+        self.skipped_unsupported_extension + self.skipped_ambiguous_platform
+    }
+
+    /// Whether `skipped_files` is a truncated sample of the full skip
+    /// count - true whenever more files were skipped in total than
+    /// [`MAX_RETAINED_SKIPPED_FILES`] retains detail for.
+    pub fn skipped_files_truncated(&self) -> bool {
+        self.total_skipped() > self.skipped_files.len()
+    }
 }
 
 impl<'a> ArchiveScanner<'a> {
@@ -4619,13 +4689,25 @@ impl<'a> ArchiveScanner<'a> {
                     // or a cartridge header corroborates them, so one that was
                     // skipped was skipped for an ambiguous platform - not
                     // because the extension is unsupported.
-                    if extension
+                    let reason = if extension
                         .as_deref()
                         .is_some_and(|value| matches!(value, "md" | "bin" | "gen"))
                     {
                         discovery.skipped_ambiguous_platform += 1;
+                        SkipReason::AmbiguousPlatform
                     } else {
                         discovery.skipped_unsupported_extension += 1;
+                        SkipReason::UnsupportedExtension
+                    };
+                    // Bounded: the counters above always stay exact for the
+                    // whole scan, but the retained detail list never grows
+                    // past `MAX_RETAINED_SKIPPED_FILES` - see
+                    // `ArchiveScanDiscovery::skipped_files_truncated`.
+                    if discovery.skipped_files.len() < MAX_RETAINED_SKIPPED_FILES {
+                        discovery.skipped_files.push(SkippedFile {
+                            path: path.clone(),
+                            reason,
+                        });
                     }
                 }
             }
@@ -7531,8 +7613,193 @@ mod tests {
              never silently dropped"
         );
         assert_eq!(discovery.skipped_ambiguous_platform, 0);
+        // The same three files must also appear as individual skipped-file
+        // detail, each with the unsupported-extension reason and its own
+        // path - see the "Skipped files / why-skipped UI" milestone.
+        assert_eq!(discovery.skipped_files.len(), 3);
+        assert!(
+            discovery
+                .skipped_files
+                .iter()
+                .all(|item| item.reason == SkipReason::UnsupportedExtension)
+        );
+        assert!(
+            discovery
+                .skipped_files
+                .iter()
+                .any(|item| item.path.ends_with("gamelist.xml"))
+        );
+        assert!(!discovery.skipped_files_truncated());
 
         let _ = fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    // -------------------------------------------------------------------
+    // Skipped-files detail (`SkippedFile`/`SkipReason`) - the "Skipped
+    // files / why-skipped UI" milestone.
+    // -------------------------------------------------------------------
+
+    /// Test: an unsupported-extension file produces a `SkippedFile` detail
+    /// entry with the exact right reason and path.
+    #[test]
+    fn unsupported_extension_produces_a_skipped_file_detail_entry() {
+        let root = test_root("skipped-detail-unsupported");
+        fs::create_dir_all(&root).unwrap();
+        let boxart = root.join("boxart.png");
+        fs::write(&boxart, b"not a rom").unwrap();
+
+        let config = Config {
+            source_folders: vec![root.clone()],
+            mount_root: root.join("mount"),
+            ratarmount_bin: "ratarmount".into(),
+            master_rom_root: None,
+        };
+        let discovery = ArchiveScanner::new(&config)
+            .scan_archives_with_summary()
+            .unwrap();
+
+        assert_eq!(discovery.skipped_unsupported_extension, 1);
+        assert_eq!(discovery.skipped_files.len(), 1);
+        assert_eq!(discovery.skipped_files[0].path, boxart);
+        assert_eq!(
+            discovery.skipped_files[0].reason,
+            SkipReason::UnsupportedExtension
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Test: an uncorroborated `.gen` (shared with Mega Drive, but with no
+    /// folder/source/header evidence here) produces a `SkippedFile` detail
+    /// entry with the ambiguous-platform reason, not unsupported-extension.
+    #[test]
+    fn ambiguous_platform_produces_a_skipped_file_detail_entry() {
+        let root = test_root("skipped-detail-ambiguous");
+        fs::create_dir_all(&root).unwrap();
+        let resource = root.join("RESOURCE.GEN");
+        fs::write(&resource, b"scummvm resource, not a rom").unwrap();
+
+        let config = Config {
+            source_folders: vec![root.clone()],
+            mount_root: root.join("mount"),
+            ratarmount_bin: "ratarmount".into(),
+            master_rom_root: None,
+        };
+        let discovery = ArchiveScanner::new(&config)
+            .scan_archives_with_summary()
+            .unwrap();
+
+        assert_eq!(discovery.skipped_ambiguous_platform, 1);
+        assert_eq!(discovery.skipped_unsupported_extension, 0);
+        assert_eq!(discovery.skipped_files.len(), 1);
+        assert_eq!(discovery.skipped_files[0].path, resource);
+        assert_eq!(
+            discovery.skipped_files[0].reason,
+            SkipReason::AmbiguousPlatform
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Test: a recognised archive produces no skipped-file detail at all -
+    /// explaining skips must never mention something that was not, in
+    /// fact, skipped.
+    #[test]
+    fn recognized_file_produces_no_skipped_detail() {
+        let root = test_root("skipped-detail-recognized");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("Sonic.zip"), b"zip bytes").unwrap();
+
+        let config = Config {
+            source_folders: vec![root.clone()],
+            mount_root: root.join("mount"),
+            ratarmount_bin: "ratarmount".into(),
+            master_rom_root: None,
+        };
+        let discovery = ArchiveScanner::new(&config)
+            .scan_archives_with_summary()
+            .unwrap();
+
+        assert_eq!(discovery.archives.len(), 1);
+        assert!(discovery.skipped_files.is_empty());
+        assert_eq!(discovery.total_skipped(), 0);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Test: the aggregate counters stay exact for the *entire* scan even
+    /// when the retained detail list is capped at
+    /// `MAX_RETAINED_SKIPPED_FILES` - the count is never derived from
+    /// `skipped_files.len()`, and truncation is reported honestly rather
+    /// than the list silently pretending to be complete.
+    #[test]
+    fn aggregate_counters_remain_exact_when_the_detail_list_is_capped() {
+        let root = test_root("skipped-detail-capped");
+        fs::create_dir_all(&root).unwrap();
+        let extra = 5;
+        let total_unsupported = MAX_RETAINED_SKIPPED_FILES + extra;
+        for index in 0..total_unsupported {
+            fs::write(root.join(format!("junk-{index:05}.xyz")), b"").unwrap();
+        }
+
+        let config = Config {
+            source_folders: vec![root.clone()],
+            mount_root: root.join("mount"),
+            ratarmount_bin: "ratarmount".into(),
+            master_rom_root: None,
+        };
+        let discovery = ArchiveScanner::new(&config)
+            .scan_archives_with_summary()
+            .unwrap();
+
+        assert_eq!(
+            discovery.skipped_unsupported_extension, total_unsupported,
+            "the exact aggregate count must reflect every skipped file, capped detail or not"
+        );
+        assert_eq!(discovery.total_skipped(), total_unsupported);
+        assert_eq!(
+            discovery.skipped_files.len(),
+            MAX_RETAINED_SKIPPED_FILES,
+            "the retained detail list must never grow past the bound"
+        );
+        assert!(discovery.skipped_files_truncated());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Test: no skipped file is ever recorded twice in `skipped_files`,
+    /// whether or not it shares its skip reason with others in the same
+    /// scan.
+    #[test]
+    fn no_duplicate_skipped_entries() {
+        let root = test_root("skipped-detail-no-duplicates");
+        fs::create_dir_all(&root).unwrap();
+        for name in ["a.png", "b.jpg", "c.xyz"] {
+            fs::write(root.join(name), b"").unwrap();
+        }
+        for name in ["d.gen", "e.bin"] {
+            fs::write(root.join(name), b"").unwrap();
+        }
+
+        let config = Config {
+            source_folders: vec![root.clone()],
+            mount_root: root.join("mount"),
+            ratarmount_bin: "ratarmount".into(),
+            master_rom_root: None,
+        };
+        let discovery = ArchiveScanner::new(&config)
+            .scan_archives_with_summary()
+            .unwrap();
+
+        assert_eq!(discovery.skipped_files.len(), 5);
+        let unique: std::collections::HashSet<&Path> = discovery
+            .skipped_files
+            .iter()
+            .map(|item| item.path.as_path())
+            .collect();
+        assert_eq!(unique.len(), discovery.skipped_files.len());
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// Media/platform-responsibility review: `.g64` is strong extension

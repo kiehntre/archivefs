@@ -3784,6 +3784,15 @@ struct ArchiveFsApp {
     show_activity: bool,
     /// Whether the Help "About EmuWiz" window is open.
     show_about: bool,
+    /// Whether the "Skipped files" drill-down window (opened from the
+    /// Database Status overlay's "Skipped N" detail) is open. Read-only:
+    /// opening it never re-scans, re-classifies, or mutates anything - it
+    /// only displays `ScanPersistSummary::skipped_files` from the most
+    /// recently completed scan this session already produced.
+    show_skipped_files: bool,
+    /// The active reason filter for the skipped-files window. `None` is
+    /// "All reasons".
+    skipped_files_filter: Option<archivefs_core::SkipReason>,
     /// A one-shot signal from the Library menu's "Select all visible" item.
     /// `show_loaded_data` consumes and clears it the same way it already
     /// consumes a Ctrl+A keypress or the inline button, calling the exact
@@ -4146,6 +4155,8 @@ impl ArchiveFsApp {
             tools_overlay: ToolsOverlay::default(),
             show_activity: ACTIVITY_EXPANDED_BY_DEFAULT,
             show_about: false,
+            show_skipped_files: false,
+            skipped_files_filter: None,
             select_all_visible_requested: false,
             source_action: None,
             bsfree_manager: BsFreeManagerState::NotLoaded,
@@ -14033,6 +14044,22 @@ impl ArchiveFsApp {
             );
         }
 
+        if self.show_skipped_files {
+            let summary = match &self.database_state {
+                DatabaseState::Ready {
+                    last_scan_summary: Some(summary),
+                    ..
+                } => Some(summary),
+                _ => None,
+            };
+            show_skipped_files_window(
+                context,
+                &mut self.show_skipped_files,
+                summary,
+                &mut self.skipped_files_filter,
+            );
+        }
+
         let mut retry = false;
         let mut requested_action = None;
         let mut diagnostics_action = None;
@@ -14099,6 +14126,10 @@ impl ArchiveFsApp {
                                     DatabasePanelAction::RefreshStatus
                                     | DatabasePanelAction::RetryLoad => {
                                         self.start_database_action(context.clone(), false);
+                                    }
+                                    DatabasePanelAction::ViewSkippedFiles => {
+                                        self.show_skipped_files = true;
+                                        self.skipped_files_filter = None;
                                     }
                                 }
                             }
@@ -16029,6 +16060,97 @@ fn platform_provenance_lines(details: &PlatformProvenanceDetails) -> Vec<(&'stat
     }
 
     lines
+}
+
+/// Renders the read-only "Skipped files" drill-down: a bounded sample of
+/// the files the most recently completed scan skipped, with a concise
+/// reason and a simple reason filter. Purely informational - this never
+/// re-scans, reclassifies, renames, or otherwise touches anything on disk;
+/// it only reads [`ScanPersistSummary::skipped_files`], the exact detail
+/// `scan_and_persist` already produced from the same scan whose aggregate
+/// counts are shown elsewhere in the Database Status panel.
+///
+/// `summary` is `None` when no scan has completed yet this session (or the
+/// database state changed underneath the window); the window still opens
+/// and says so, rather than silently doing nothing.
+///
+/// Not virtualised: `skipped_files` is hard-bounded at
+/// [`archivefs_core::MAX_RETAINED_SKIPPED_FILES`] (1000) entries, small
+/// enough that a plain scrolling list of simple labels stays practical
+/// without the fixed-row-height virtualisation `repair_review_page` needs
+/// for its potentially much larger proposal lists.
+fn show_skipped_files_window(
+    context: &egui::Context,
+    open: &mut bool,
+    summary: Option<&ScanPersistSummary>,
+    filter: &mut Option<archivefs_core::SkipReason>,
+) {
+    egui::Window::new("Skipped files")
+        .open(open)
+        .resizable(true)
+        .default_width(560.0)
+        .show(context, |ui| {
+            let Some(summary) = summary else {
+                ui.label("No scan has completed yet this session.");
+                return;
+            };
+            let total = summary.skipped_files_total();
+            if total == 0 {
+                ui.label("Nothing was skipped in the most recent scan.");
+                return;
+            }
+            let retained = summary.skipped_files.len();
+            if summary.skipped_files_truncated() {
+                ui.label(format!(
+                    "Showing {retained} of {total} skipped files - the rest were skipped for \
+                     the same reasons but are not individually listed."
+                ));
+            } else {
+                ui.label(format!("{retained} skipped file(s)."));
+            }
+            ui.label(
+                egui::RichText::new(
+                    "Explanatory only - nothing here changes how a file was classified or \
+                     mutates any file.",
+                )
+                .color(theme::muted(ui)),
+            );
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label("Filter:");
+                if ui.selectable_label(filter.is_none(), "All").clicked() {
+                    *filter = None;
+                }
+                for reason in [
+                    archivefs_core::SkipReason::UnsupportedExtension,
+                    archivefs_core::SkipReason::AmbiguousPlatform,
+                ] {
+                    if ui
+                        .selectable_label(*filter == Some(reason), reason.label())
+                        .clicked()
+                    {
+                        *filter = Some(reason);
+                    }
+                }
+            });
+
+            ui.add_space(6.0);
+            egui::ScrollArea::vertical()
+                .max_height(360.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for item in summary.skipped_files.iter().filter(|item| match filter {
+                        Some(reason) => item.reason == *reason,
+                        None => true,
+                    }) {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(item.reason.label()).small());
+                            ui.label(item.path.display().to_string());
+                        });
+                    }
+                });
+        });
 }
 
 fn format_scan_completion(summary: &ScanPersistSummary) -> String {
@@ -33337,6 +33459,10 @@ enum DatabasePanelAction {
     ViewRecentlyFound,
     RefreshStatus,
     RetryLoad,
+    /// Opens the read-only skipped-files drill-down for the most recently
+    /// completed scan this session. Never re-scans or reclassifies
+    /// anything - see [`show_skipped_files_window`].
+    ViewSkippedFiles,
 }
 
 /// The best-known database path regardless of current state - even a
@@ -33422,6 +33548,25 @@ fn show_database_panel(ui: &mut egui::Ui, state: &DatabaseState) -> Option<Datab
                         ui.strong("Last scan (this session)");
                         ui.label(format_scan_completion(summary));
                         ui.end_row();
+
+                        let skipped_total = summary.skipped_files_total();
+                        if skipped_total > 0 {
+                            ui.strong("Skipped files");
+                            ui.horizontal(|ui| {
+                                ui.label(format!("{skipped_total} skipped"));
+                                if widgets::action_button(
+                                    ui,
+                                    "Inspect…",
+                                    widgets::ActionStyle::Quiet,
+                                    true,
+                                )
+                                .clicked()
+                                {
+                                    action = Some(DatabasePanelAction::ViewSkippedFiles);
+                                }
+                            });
+                            ui.end_row();
+                        }
                     }
 
                     ui.strong("Action safety");
@@ -54160,6 +54305,8 @@ $Instant Growth [Nayr]\n";
             tools_overlay: ToolsOverlay::default(),
             show_activity: ACTIVITY_EXPANDED_BY_DEFAULT,
             show_about: false,
+            show_skipped_files: false,
+            skipped_files_filter: None,
             select_all_visible_requested: false,
             source_action: None,
             bsfree_manager: BsFreeManagerState::NotLoaded,
@@ -55340,6 +55487,7 @@ $Instant Growth [Nayr]\n";
             },
             folder_errors: vec![(PathBuf::from("/offline"), "unavailable".to_string())],
             platform_assignment_warnings: Vec::new(),
+            skipped_files: Vec::new(),
         };
 
         assert_eq!(
@@ -55356,6 +55504,148 @@ $Instant Growth [Nayr]\n";
             1,
             "activity must stay one concise entry"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Skipped-files drill-down (`show_skipped_files_window`).
+    // -------------------------------------------------------------------
+
+    fn skipped_files_summary(
+        skipped_files: Vec<archivefs_core::SkippedFile>,
+        skipped_unsupported_extension: i64,
+        skipped_ambiguous_platform: i64,
+    ) -> ScanPersistSummary {
+        ScanPersistSummary {
+            scan_run_id: 1,
+            counts: archivefs_core::ScanRunCounts {
+                skipped_unsupported_extension,
+                skipped_ambiguous_platform,
+                ..Default::default()
+            },
+            folder_errors: Vec::new(),
+            platform_assignment_warnings: Vec::new(),
+            skipped_files,
+        }
+    }
+
+    /// A never-before-seen `egui::Window` needs one settling frame before
+    /// its content actually paints (its `Area` has no remembered
+    /// position/size yet on the very first frame) - true of any floating
+    /// window in this codebase, not specific to this one. A real running
+    /// app repaints continuously, so this is purely a test-harness detail:
+    /// render once to let the window settle, then render again and return
+    /// that output for assertions.
+    fn run_skipped_files_window_twice(
+        summary: &ScanPersistSummary,
+        open: &mut bool,
+        filter: &mut Option<archivefs_core::SkipReason>,
+    ) -> egui::FullOutput {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            show_skipped_files_window(ctx, open, Some(summary), filter);
+        });
+        ctx.run(egui::RawInput::default(), |ctx| {
+            show_skipped_files_window(ctx, open, Some(summary), filter);
+        })
+    }
+
+    #[test]
+    fn skipped_files_window_displays_both_reasons_and_their_paths() {
+        let summary = skipped_files_summary(
+            vec![
+                archivefs_core::SkippedFile {
+                    path: PathBuf::from("/roms/c128/boxart.png"),
+                    reason: archivefs_core::SkipReason::UnsupportedExtension,
+                },
+                archivefs_core::SkippedFile {
+                    path: PathBuf::from("/roms/megadrive/RESOURCE.GEN"),
+                    reason: archivefs_core::SkipReason::AmbiguousPlatform,
+                },
+            ],
+            1,
+            1,
+        );
+        let mut open = true;
+        let mut filter = None;
+        let output = run_skipped_files_window_twice(&summary, &mut open, &mut filter);
+
+        assert!(rendered_text_contains(&output, "Unsupported extension"));
+        assert!(rendered_text_contains(&output, "Ambiguous platform"));
+        assert!(rendered_text_contains(&output, "/roms/c128/boxart.png"));
+        assert!(rendered_text_contains(
+            &output,
+            "/roms/megadrive/RESOURCE.GEN"
+        ));
+    }
+
+    #[test]
+    fn skipped_files_window_reports_truncation_honestly() {
+        let full: Vec<archivefs_core::SkippedFile> = (0..3)
+            .map(|index| archivefs_core::SkippedFile {
+                path: PathBuf::from(format!("/roms/junk{index}.xyz")),
+                reason: archivefs_core::SkipReason::UnsupportedExtension,
+            })
+            .collect();
+        // The real total (5) exceeds how many detail entries were retained
+        // (3) - exactly the shape a capped, real scan produces.
+        let summary = skipped_files_summary(full, 5, 0);
+        assert!(summary.skipped_files_truncated());
+
+        let mut open = true;
+        let mut filter = None;
+        let output = run_skipped_files_window_twice(&summary, &mut open, &mut filter);
+        assert!(
+            rendered_text_contains(&output, "Showing 3 of 5"),
+            "a capped list must say so, never present itself as complete"
+        );
+    }
+
+    #[test]
+    fn skipped_files_window_never_claims_truncation_when_the_list_is_complete() {
+        let full: Vec<archivefs_core::SkippedFile> = (0..3)
+            .map(|index| archivefs_core::SkippedFile {
+                path: PathBuf::from(format!("/roms/junk{index}.xyz")),
+                reason: archivefs_core::SkipReason::UnsupportedExtension,
+            })
+            .collect();
+        let summary = skipped_files_summary(full, 3, 0);
+        assert!(!summary.skipped_files_truncated());
+
+        let mut open = true;
+        let mut filter = None;
+        let output = run_skipped_files_window_twice(&summary, &mut open, &mut filter);
+        assert!(rendered_text_contains(&output, "3 skipped file(s)"));
+        assert!(!rendered_text_contains(&output, "Showing"));
+    }
+
+    /// Rendering the drill-down window is purely informational: it must
+    /// never mutate the summary it was given, and the underlying skipped
+    /// paths (which never actually exist on disk here, but the principle is
+    /// the same as a real file) are never touched by opening or scrolling
+    /// the window - the function's own signature (`&ScanPersistSummary`,
+    /// never `&mut`) already proves this at the type level; this test
+    /// proves it in practice by rendering twice and checking nothing about
+    /// the input changed.
+    #[test]
+    fn viewing_skipped_file_details_is_read_only() {
+        let summary = skipped_files_summary(
+            vec![archivefs_core::SkippedFile {
+                path: PathBuf::from("/roms/c128/boxart.png"),
+                reason: archivefs_core::SkipReason::UnsupportedExtension,
+            }],
+            1,
+            0,
+        );
+        let before = summary.clone();
+        let mut open = true;
+        let mut filter = None;
+        let output = run_skipped_files_window_twice(&summary, &mut open, &mut filter);
+        assert!(
+            rendered_text_contains(&output, "/roms/c128/boxart.png"),
+            "sanity check: the window must actually have rendered content for this test to \
+             prove anything"
+        );
+        assert_eq!(summary, before, "viewing details must never mutate them");
     }
 
     #[test]
