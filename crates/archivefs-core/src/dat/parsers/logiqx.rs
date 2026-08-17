@@ -34,6 +34,7 @@ use super::super::model::{
     ParsedDat,
 };
 use super::super::parser::{ParseError, ParseOutcome, ParseWarning};
+use super::super::trusted_dtd::{self, classify_doctype, describe_doctype_outcome};
 
 pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, ParseError> {
     let metadata = std::fs::metadata(path).map_err(|error| ParseError::Io {
@@ -121,23 +122,46 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
             Ok(Event::Decl(_decl)) => {
                 // XML declaration is harmless; skip it.
             }
-            Ok(Event::DocType(_)) => {
+            Ok(Event::DocType(ref doctype)) => {
                 // The Logiqx XML schema publishes a standard DOCTYPE. quick-xml
                 // with default-features=false does not fetch external DTDs and
-                // does not expand entities — the DOCTYPE is raw text only.
-                // Accepting it as inert text is both safe and required: every
-                // real-world No-Intro and Redump DAT file carries this DOCTYPE,
-                // and rejecting it would mean supporting no DAT files at all.
-                // This is expected parser behaviour, so it is a parser note, not
-                // a warning: the DAT is fine and nothing needs to be done.
-                record_note(
-                    &mut warnings,
-                    limits.max_warnings,
-                    "doctype_ignored",
-                    "DOCTYPE declaration accepted as inert text: external DTDs are \
-                     intentionally never fetched and no entity is expanded, for security"
-                        .to_string(),
-                );
+                // does not expand entities — the DOCTYPE arrives as raw text
+                // only, and still does here: `classify_doctype` never feeds
+                // this back into the XML parser and never opens a resolved
+                // DTD's *contents* - it only decides, from the declaration's
+                // own external identifier, whether a trusted local copy is
+                // available for provenance/diagnostics. Accepting the
+                // declaration itself is both safe and required: every
+                // real-world No-Intro and Redump DAT file carries one, and
+                // rejecting it would mean supporting no DAT files at all.
+                let outcome = classify_doctype(doctype.as_ref(), path);
+                let code = match &outcome {
+                    trusted_dtd::DoctypeOutcome::NoDoctype => "doctype_none",
+                    trusted_dtd::DoctypeOutcome::TrustedDtdResolved { .. } => {
+                        "trusted_dtd_resolved"
+                    }
+                    trusted_dtd::DoctypeOutcome::TrustedDtdUnavailable { .. } => {
+                        "trusted_dtd_unavailable"
+                    }
+                    trusted_dtd::DoctypeOutcome::UnsafeOrUnknownDoctypeIgnored { .. } => {
+                        "unsafe_or_unknown_doctype_ignored"
+                    }
+                };
+                let message = describe_doctype_outcome(&outcome);
+                // Expected, benign outcomes (the DTD is trusted by name,
+                // whether or not a local copy happens to be available) stay
+                // a parser note - nothing needs to be done. An unrecognised
+                // or unsafe reference is a step further from the expected
+                // shape every real-world DAT has, so it is a warning: still
+                // entirely non-fatal, but worth a person's attention.
+                if matches!(
+                    outcome,
+                    trusted_dtd::DoctypeOutcome::UnsafeOrUnknownDoctypeIgnored { .. }
+                ) {
+                    record_warning(&mut warnings, limits.max_warnings, code, message);
+                } else {
+                    record_note(&mut warnings, limits.max_warnings, code, message);
+                }
             }
             Ok(Event::Start(ref start_bytes)) => {
                 depth += 1;
@@ -1453,8 +1477,17 @@ mod tests {
                 .source
                 .parse_warnings
                 .iter()
-                .any(|w| w.contains("DOCTYPE")),
-            "DOCTYPE acceptance warning expected"
+                .any(|w| w.contains("Logiqx") && w.contains("DTD")),
+            "a Logiqx DTD provenance diagnostic is expected"
+        );
+        assert!(
+            !outcome
+                .dat
+                .source
+                .parse_warnings
+                .iter()
+                .any(|w| w.to_lowercase().contains("validation passed")),
+            "no diagnostic may claim DTD validation occurred"
         );
     }
 

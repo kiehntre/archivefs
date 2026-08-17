@@ -693,7 +693,7 @@ mod tests {
             "a parser note is not a warning:\n{text}"
         );
         assert!(text.contains("Parser notes:"), "{text}");
-        assert!(text.contains("DOCTYPE"), "{text}");
+        assert!(text.contains("Logiqx"), "{text}");
     }
 
     #[test]
@@ -707,7 +707,7 @@ mod tests {
             "inspect must not label a parser note as a warning:\n{text}"
         );
         assert!(text.contains("Parser notes:"), "{text}");
-        assert!(text.contains("DOCTYPE"), "{text}");
+        assert!(text.contains("Logiqx"), "{text}");
     }
 
     #[test]
@@ -748,8 +748,8 @@ mod tests {
         );
         assert_eq!(output.notes.len(), 1, "{:?}", output.notes);
         assert_eq!(output.notes[0].severity, DiagnosticSeverity::Note);
-        assert_eq!(output.notes[0].code, "doctype_ignored");
-        assert!(output.notes[0].message.contains("DOCTYPE"), "{output:?}");
+        assert_eq!(output.notes[0].code, "trusted_dtd_unavailable");
+        assert!(output.notes[0].message.contains("Logiqx"), "{output:?}");
     }
 
     #[test]
@@ -807,7 +807,7 @@ mod tests {
         );
         assert_eq!(output.notes.len(), 1, "{:?}", output.notes);
         assert_eq!(output.notes[0].severity, DiagnosticSeverity::Note);
-        assert_eq!(output.notes[0].code, "doctype_ignored");
+        assert_eq!(output.notes[0].code, "trusted_dtd_unavailable");
     }
 
     #[test]
@@ -873,8 +873,8 @@ mod tests {
         );
         assert_eq!(output.notes.len(), 1, "{:?}", output.notes);
         assert_eq!(output.notes[0].severity, DiagnosticSeverity::Note);
-        assert_eq!(output.notes[0].code, "doctype_ignored");
-        assert!(output.notes[0].message.contains("DOCTYPE"), "{output:?}");
+        assert_eq!(output.notes[0].code, "trusted_dtd_unavailable");
+        assert!(output.notes[0].message.contains("Logiqx"), "{output:?}");
         assert!(output.errors.is_empty(), "{:?}", output.errors);
     }
 
@@ -918,7 +918,7 @@ mod tests {
         assert_eq!(output.warnings[0].severity, DiagnosticSeverity::Warning);
         assert_eq!(output.notes.len(), 1, "{:?}", output.notes);
         assert_eq!(output.notes[0].severity, DiagnosticSeverity::Note);
-        assert_eq!(output.notes[0].code, "doctype_ignored");
+        assert_eq!(output.notes[0].code, "trusted_dtd_unavailable");
         assert!(output.errors.is_empty(), "{:?}", output.errors);
     }
 

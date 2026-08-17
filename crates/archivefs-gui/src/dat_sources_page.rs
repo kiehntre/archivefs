@@ -322,7 +322,7 @@ pub(crate) struct DiagnosticOccurrenceView {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DiagnosticGroupView {
     pub(crate) severity: DiagnosticSeverity,
-    /// The stable parser code, e.g. "doctype_ignored".
+    /// The stable parser code, e.g. "trusted_dtd_unavailable".
     pub(crate) code: &'static str,
     /// The diagnostic message, verbatim, deduplicated by the group key.
     pub(crate) message: String,

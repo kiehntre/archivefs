@@ -590,7 +590,7 @@ fn a_doctype_parser_note_keeps_the_source_valid() {
         "{diagnostics:?}"
     );
     assert!(
-        diagnostics[0].message.contains("DOCTYPE"),
+        diagnostics[0].message.contains("Logiqx") && diagnostics[0].message.contains("DTD"),
         "{diagnostics:?}"
     );
 }

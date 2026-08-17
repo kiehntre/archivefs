@@ -1497,7 +1497,7 @@ fn warnings_and_parser_notes_render_as_separate_sections() {
     // A parsed file carrying both a real warning and a parser note must show
     // them as two distinct, labelled sections - the note must never be counted
     // as a warning.
-    let note_text = "DOCTYPE declaration accepted as inert text";
+    let note_text = "Logiqx DTD referenced, but no trusted local copy was found. The DAT was parsed normally without DTD validation.";
     let warning_text =
         "crc attribute on a rom element is not a well-formed checksum and was dropped";
     let (_fixture, page) = page_with_report(
@@ -1607,7 +1607,7 @@ fn mixed_errors_warnings_and_notes_render_as_three_sections() {
     // badge stays driven by core health (Invalid because an error is present).
     let error_text = "one entry was refused";
     let warning_text = "a checksum was dropped";
-    let note_text = "DOCTYPE declaration accepted as inert text";
+    let note_text = "Logiqx DTD referenced, but no trusted local copy was found. The DAT was parsed normally without DTD validation.";
     let (_fixture, page) = page_with_report(
         vec![vec![error(error_text), warn(warning_text), note(note_text)]],
         DatHealthState::Invalid,
@@ -1695,7 +1695,7 @@ fn thousands_of_diagnostics_stay_bounded_and_deterministic() {
         .map(|_| (0..30).map(|_| warn("repeated checksum dropped")).collect())
         .collect();
     let mut with_second_type = per_file.clone();
-    with_second_type[0].push(note("DOCTYPE declaration accepted as inert text"));
+    with_second_type[0].push(note("Logiqx DTD referenced, but no trusted local copy was found. The DAT was parsed normally without DTD validation."));
 
     let (_fixture, page) = page_with_report(
         with_second_type,
@@ -1880,7 +1880,7 @@ fn expanding_a_group_on_one_source_does_not_open_the_same_group_on_another() {
     // Regression: the group id used to be "{code}:{message}", so expanding the
     // DOCTYPE note on source A left source B's identical note open on load. The
     // id is now scoped by source and severity.
-    let note_text = "DOCTYPE declaration accepted as inert text";
+    let note_text = "Logiqx DTD referenced, but no trusted local copy was found. The DAT was parsed normally without DTD validation.";
     let fixture = Fixture::new();
 
     // Build two independent sources that both carry the same note.
@@ -2250,7 +2250,7 @@ fn a_doctype_parser_note_shows_valid_with_no_warnings() {
     assert_eq!(row.diagnostic_occurrences(DiagnosticSeverity::Note), 1);
     let note_group = &row.groups_of(DiagnosticSeverity::Note)[0];
     assert!(
-        note_group.message.contains("DOCTYPE"),
+        note_group.message.contains("Logiqx") && note_group.message.contains("DTD"),
         "{}",
         note_group.message
     );

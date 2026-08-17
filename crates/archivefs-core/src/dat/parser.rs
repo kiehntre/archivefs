@@ -47,8 +47,9 @@ pub struct ParseWarning {
     pub message: String,
     pub severity: DiagnosticSeverity,
     /// A stable machine code naming the diagnostic kind (for example
-    /// "doctype_ignored" or "checksum_dropped"). Repeated diagnostics across
-    /// many DAT files share one code, which is what lets a report group them.
+    /// "trusted_dtd_unavailable" or "checksum_dropped"). Repeated diagnostics
+    /// across many DAT files share one code, which is what lets a report
+    /// group them.
     pub code: &'static str,
 }
 
@@ -176,16 +177,6 @@ pub enum ParseError {
         detail: String,
         byte_offset: Option<usize>,
     },
-    DoctypeRejected {
-        root_name: String,
-    },
-    EntityDeclarationRejected {
-        entity_name: String,
-    },
-    UnsupportedEntityReference {
-        name: String,
-        byte_offset: Option<usize>,
-    },
     UnknownFormat,
     UnsupportedFormat {
         detail: String,
@@ -247,19 +238,6 @@ impl std::fmt::Display for ParseError {
                     write!(f, "malformed XML at byte {offset}: {detail}")
                 } else {
                     write!(f, "malformed XML: {detail}")
-                }
-            }
-            Self::DoctypeRejected { root_name } => {
-                write!(f, "DOCTYPE declaration rejected (root={root_name})")
-            }
-            Self::EntityDeclarationRejected { entity_name } => {
-                write!(f, "entity declaration rejected ({entity_name})")
-            }
-            Self::UnsupportedEntityReference { name, byte_offset } => {
-                if let Some(offset) = byte_offset {
-                    write!(f, "unsupported entity reference &{name}; at byte {offset}")
-                } else {
-                    write!(f, "unsupported entity reference &{name};")
                 }
             }
             Self::UnknownFormat => write!(f, "unknown DAT format"),
