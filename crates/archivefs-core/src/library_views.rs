@@ -1918,7 +1918,19 @@ pub fn apply_library_view(
                     continue;
                 };
                 let is_repair = entry.action == LibraryViewPlanAction::Repair;
-                match create_or_repair_symlink(&destination_path, &archive_path) {
+                let outcome = reproof_symlink_target(
+                    &archive_path,
+                    entry.source_folder_path.as_deref(),
+                    entry.archive_identity.as_deref(),
+                )
+                .and_then(|()| {
+                    create_or_repair_symlink(
+                        &view.destination_root,
+                        &destination_path,
+                        &archive_path,
+                    )
+                });
+                match outcome {
                     Ok(()) => {
                         let created_at = if is_repair {
                             entries_by_path
@@ -1985,7 +1997,11 @@ pub fn apply_library_view(
                 else {
                     continue;
                 };
-                match remove_managed_symlink(&destination_path, &recorded.target_path) {
+                match remove_managed_symlink(
+                    &view.destination_root,
+                    &destination_path,
+                    &recorded.target_path,
+                ) {
                     Ok(true) => {
                         entries_by_path.remove(&relative_link_path);
                         report.removed += 1;
@@ -2101,7 +2117,7 @@ pub fn remove_library_view_symlinks(
 
     for entry in &manifest.entries {
         let destination = view.destination_root.join(&entry.relative_link_path);
-        match remove_managed_symlink(&destination, &entry.target_path) {
+        match remove_managed_symlink(&view.destination_root, &destination, &entry.target_path) {
             Ok(true) => {
                 report.removed += 1;
                 report.results.push(LibraryViewApplyEntryResult {
@@ -2434,10 +2450,127 @@ pub fn edit_library_view_default(
 /// Only ever called for `Create`/`Repair` entries, which `plan_library_view`
 /// has already proven safe to write: either nothing real is at
 /// `destination`, or what is there is a symlink this view already owns.
-fn create_or_repair_symlink(destination: &Path, target: &Path) -> Result<()> {
+/// Verifies that `path` (nominally somewhere under `destination_root`)
+/// cannot be reached by following a pre-existing symlinked ancestor
+/// component out of `destination_root` - the destination-side mirror of
+/// `validate_symlink_target_within_source`.
+///
+/// A Library View's destination tree is built incrementally
+/// (`fs::create_dir_all`, symlink creation, rename, directory cleanup), and
+/// every one of those filesystem calls transparently follows any symlink it
+/// encounters among a path's *existing* ancestor components - that is
+/// ordinary POSIX path resolution, not a bug in any single call. If
+/// something has replaced an intermediate directory (e.g.
+/// `destination_root/roms`) with a symlink pointing outside
+/// `destination_root` - possibly into a source or preservation
+/// directory - every one of those calls would silently operate on whatever
+/// the symlink points at instead. This function is the one check every
+/// mutating call site below must pass first: it resolves `path`'s nearest
+/// *existing* ancestor (`canonical_or_nearest_existing_ancestor`, the same
+/// helper `validate_library_view_destination` and
+/// `validate_symlink_target_within_source` already use) and fails closed -
+/// refusing rather than writing/removing anything - unless that resolved
+/// ancestor is still provably inside the destination root. A component that
+/// does not exist yet can never be a symlink, so nothing is lost by only
+/// checking the existing prefix.
+fn verify_destination_containment(destination_root: &Path, path: &Path) -> Result<()> {
+    let destination_root_canonical = canonical_or_nearest_existing_ancestor(destination_root)?;
+    let resolved = canonical_or_nearest_existing_ancestor(path)?;
+    if resolved.starts_with(&destination_root_canonical) {
+        Ok(())
+    } else {
+        Err(ArchiveFsError::Config(format!(
+            "{} would escape the Library View destination root {} through a pre-existing \
+             symlinked ancestor directory - refusing to write or remove anything outside the \
+             real destination",
+            path.display(),
+            destination_root.display()
+        )))
+    }
+}
+
+/// Re-verifies a planned symlink target immediately before Create/Repair
+/// mutates anything. A plan is computed from catalogue and filesystem state
+/// that may already be stale by the time Apply actually runs - scanning and
+/// applying are never one atomic operation - so this re-checks, right
+/// before the symlink is created, everything the plan already assumed:
+///
+/// - the target still exists,
+/// - the target has not itself become a symlink (a catalogued archive is
+///   never expected to be one; if it now is, whatever made it one is not
+///   something this function trusts),
+/// - the target still resolves inside its registered source root (the same
+///   check `plan_library_view` already performs at plan time, reused here
+///   because a symlink can be planted after planning just as easily as
+///   before it), and
+/// - if the catalogue recorded a `size:mtime` fingerprint for the target
+///   (`archive_identity`), a fresh read still matches it - proving the
+///   file at this path is still the same object, not a different file that
+///   was swapped in at the same path since scanning.
+///
+/// Fails closed on any mismatch: this never creates a dangling link, and
+/// never links to something other than what was actually planned. It is
+/// not a content hash and cannot catch every possible replacement (a
+/// same-size, same-second replacement is invisible to it) - it only ever
+/// refuses on a *provable* mismatch; an unchanged target with no recorded
+/// fingerprint at all is still allowed through, since absence of evidence
+/// is not evidence of tampering.
+fn reproof_symlink_target(
+    archive_path: &Path,
+    source_folder_path: Option<&Path>,
+    expected_identity: Option<&str>,
+) -> Result<()> {
+    let metadata = fs::symlink_metadata(archive_path).map_err(|source| {
+        ArchiveFsError::Config(format!(
+            "{} no longer exists - refusing to create a dangling Library View symlink ({source})",
+            archive_path.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(ArchiveFsError::Config(format!(
+            "{} has become a symlink since it was catalogued - refusing to link to it",
+            archive_path.display()
+        )));
+    }
+    if let Some(source_folder_path) = source_folder_path {
+        validate_symlink_target_within_source(archive_path, source_folder_path)?;
+    }
+    if let Some(expected) = expected_identity {
+        let fresh_modified = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or(0);
+        let fresh = format!("{}:{fresh_modified}", metadata.len());
+        if fresh != expected {
+            return Err(ArchiveFsError::Config(format!(
+                "{} no longer matches the size/modified-time fingerprint recorded when it was \
+                 catalogued - it was likely replaced since scanning; refusing to link to it",
+                archive_path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn create_or_repair_symlink(
+    destination_root: &Path,
+    destination: &Path,
+    target: &Path,
+) -> Result<()> {
     let parent = destination.parent().ok_or_else(|| {
         ArchiveFsError::Config(format!("{} has no parent directory", destination.display()))
     })?;
+    // Checked against `parent`, never `destination` itself: `destination`
+    // is expected to already exist as a symlink in the Repair case (that is
+    // exactly what is being replaced), and `canonical_or_nearest_existing_
+    // ancestor` follows an existing path's own symlink-ness when resolving
+    // it - checking `destination` directly would therefore validate
+    // wherever the *old, possibly-wrong* symlink already points, not
+    // whether the directory it lives in is safe. The directory this
+    // symlink will be created/replaced in is what must be proven contained.
+    verify_destination_containment(destination_root, parent)?;
     fs::create_dir_all(parent)
         .map_err(|source| ArchiveFsError::io(parent.to_path_buf(), source))?;
 
@@ -2466,7 +2599,27 @@ fn create_or_repair_symlink(destination: &Path, target: &Path) -> Result<()> {
 /// case nothing is touched at all, satisfying "never remove anything
 /// EmuWiz did not record as managed" even when the manifest is stale
 /// relative to the filesystem.
-fn remove_managed_symlink(destination: &Path, recorded_target: &Path) -> Result<bool> {
+///
+/// Checks destination containment (`verify_destination_containment`)
+/// first and returns `Err` - never `Ok(false)` - if `destination` cannot be
+/// proven to stay inside `destination_root`: a stale-manifest mismatch is
+/// an expected, quiet no-op, but a containment escape is a real, distinct
+/// failure that must be reported, not silently swallowed as "left
+/// unchanged".
+fn remove_managed_symlink(
+    destination_root: &Path,
+    destination: &Path,
+    recorded_target: &Path,
+) -> Result<bool> {
+    // Checked against `destination`'s parent, not `destination` itself, for
+    // the same reason `create_or_repair_symlink` does: `destination` is
+    // expected to already be a symlink, and resolving it directly would
+    // follow it to wherever it currently points rather than proving the
+    // directory it lives in is safe.
+    let parent = destination.parent().ok_or_else(|| {
+        ArchiveFsError::Config(format!("{} has no parent directory", destination.display()))
+    })?;
+    verify_destination_containment(destination_root, parent)?;
     let metadata = match fs::symlink_metadata(destination) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
@@ -2525,6 +2678,18 @@ fn maybe_remove_empty_managed_directories(destination_root: &Path, manifest: &Li
     ordered.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
     for dir in ordered {
         if dir == destination_root || !dir.starts_with(destination_root) {
+            continue;
+        }
+        // Canonicalization-based containment, not just the textual
+        // `starts_with` above: a candidate directory reached through a
+        // pre-existing symlinked ancestor (e.g. `destination_root/roms`
+        // replaced by a symlink pointing outside `destination_root`) would
+        // still textually start with `destination_root` while physically
+        // resolving `fs::remove_dir` to somewhere else entirely - deleting
+        // a real, possibly-outside-any-source-or-destination directory.
+        // `verify_destination_containment` is the same check every other
+        // mutating call site in this module now goes through first.
+        if verify_destination_containment(destination_root, &dir).is_err() {
             continue;
         }
         let _ = fs::remove_dir(&dir);
@@ -2610,6 +2775,23 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .to_string();
+        // Mirrors the real file's actual size/mtime when it exists, so the
+        // `archive_identity` fingerprint `plan_library_view` derives from
+        // this fixture matches what `reproof_symlink_target` reads fresh at
+        // Apply time - exactly like a real scan would. Falls back to fixed
+        // placeholder values only for a path that was never written (tests
+        // deliberately covering a missing/not-yet-created source).
+        let (size_bytes, modified_time_unix_seconds) = fs::metadata(absolute_path)
+            .ok()
+            .map(|metadata| {
+                let modified = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_secs() as i64);
+                (Some(metadata.len()), modified)
+            })
+            .unwrap_or((Some(1234), Some(1_700_000_000)));
         PersistedArchive {
             id,
             source_folder_id,
@@ -2618,8 +2800,8 @@ mod tests {
             archive_kind: "zip".to_string(),
             display_name: file_name.clone(),
             normalized_name: file_name.to_lowercase(),
-            size_bytes: Some(1234),
-            modified_time_unix_seconds: Some(1_700_000_000),
+            size_bytes,
+            modified_time_unix_seconds,
             platform: platform.map(|p| p.to_string()),
             platform_source: platform.map(|_| "heuristic-path-detector".to_string()),
             last_known_health: "ok".to_string(),
@@ -3071,7 +3253,7 @@ mod tests {
         // replaced by a real file - e.g. by the user, outside EmuWiz.
         write_file(&link_path, b"a real file now sits here");
 
-        let removed = remove_managed_symlink(&link_path, &archive_path).unwrap();
+        let removed = remove_managed_symlink(&destination, &link_path, &archive_path).unwrap();
         assert!(!removed);
         assert_eq!(fs::read(&link_path).unwrap(), b"a real file now sits here");
 
@@ -5791,5 +5973,545 @@ mod tests {
         );
         // The source file itself is untouched - no rename, no wrapper.
         assert_eq!(fs::read(&d64).unwrap(), b"d64-bytes");
+    }
+
+    // -------------------------------------------------------------------
+    // Hostile-review fix: Apply safety.
+    //
+    // BUG 1 (destination-side symlink escape) - a pre-existing symlinked
+    // ancestor directory under a view's destination root (e.g.
+    // `destination_root/roms` replaced with a symlink pointing outside
+    // `destination_root`, possibly into a source/preservation directory)
+    // must never be silently followed by Create/Repair/RemoveStale/managed-
+    // directory cleanup into a physical write outside the real destination.
+    //
+    // BUG 2 (stale source reproof) - a plan computed from catalogue/
+    // filesystem state that has since changed (target deleted, replaced by
+    // a symlink, or replaced by a different file at the same path) must
+    // never be applied as if it were still true; Create/Repair re-verify
+    // the target immediately before mutating anything.
+    // -------------------------------------------------------------------
+
+    /// Test: a pre-existing symlink at `destination_root/roms` pointing to
+    /// an arbitrary directory outside `destination_root` must refuse Apply
+    /// for every entry that would be created underneath it - nothing may be
+    /// written into the escape target.
+    #[test]
+    fn apply_refuses_to_create_through_a_symlinked_destination_parent() {
+        let root = temp_dir("destination-symlink-escape-create");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Game.zip");
+        write_file(&archive_path, b"zip-bytes");
+        let destination = root.join("dest");
+        fs::create_dir_all(&destination).unwrap();
+        let data_dir = root.join("data");
+
+        // The escape: `dest/roms` is a symlink to a directory entirely
+        // outside the destination root.
+        let outside_dir = root.join("outside");
+        fs::create_dir_all(&outside_dir).unwrap();
+        symlink(&outside_dir, destination.join("roms")).unwrap();
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("NES"));
+        let view = romm_view_with_override("view-escape", &destination, "NES", "nes");
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(
+            &view,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &manifest,
+            None,
+        );
+        assert_eq!(plan.entries[0].action, LibraryViewPlanAction::Create);
+
+        let report = apply_library_view(&view, &plan, &manifest, &data_dir).unwrap();
+        assert_eq!(
+            report.created, 0,
+            "nothing may be created through a symlinked destination parent"
+        );
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.results[0].outcome, LibraryViewApplyOutcome::Failed);
+
+        // Nothing physically appeared under the escape target.
+        assert!(
+            fs::read_dir(&outside_dir).unwrap().next().is_none(),
+            "the escape target must remain completely untouched"
+        );
+    }
+
+    /// Test: the same escape, but the symlink points at a real, separately
+    /// registered source folder - the worst case named by the review. Apply
+    /// must still refuse, and the other source folder must gain nothing.
+    #[test]
+    fn apply_refuses_to_write_into_a_source_folder_through_a_symlinked_destination_parent() {
+        let root = temp_dir("destination-symlink-escape-into-source");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Game.zip");
+        write_file(&archive_path, b"zip-bytes");
+        let other_source_dir = root.join("other-source");
+        fs::create_dir_all(&other_source_dir).unwrap();
+        let destination = root.join("dest");
+        fs::create_dir_all(&destination).unwrap();
+        let data_dir = root.join("data");
+
+        // `dest/roms` points directly into a different, real, registered
+        // source folder.
+        symlink(&other_source_dir, destination.join("roms")).unwrap();
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("NES"));
+        let view = romm_view_with_override("view-escape-source", &destination, "NES", "nes");
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(
+            &view,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &manifest,
+            None,
+        );
+        assert_eq!(plan.entries[0].action, LibraryViewPlanAction::Create);
+
+        let report = apply_library_view(&view, &plan, &manifest, &data_dir).unwrap();
+        assert_eq!(report.created, 0);
+        assert_eq!(report.failed, 1);
+        assert!(
+            fs::read_dir(&other_source_dir).unwrap().next().is_none(),
+            "a source/preservation directory reached only through a destination-side symlink \
+             must never receive a written symlink"
+        );
+    }
+
+    /// Test: RemoveStale must refuse the same escape - a managed directory
+    /// replaced by an outside-pointing symlink after a prior successful
+    /// apply must never have anything removed through it.
+    #[test]
+    fn apply_refuses_to_remove_stale_through_a_symlinked_destination_parent() {
+        let root = temp_dir("destination-symlink-escape-removestale");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Game.zip");
+        write_file(&archive_path, b"zip-bytes");
+        let destination = root.join("dest");
+        let data_dir = root.join("data");
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("NES"));
+        let view = make_view("view-1", &destination, vec![], vec![]);
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(
+            &view,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &manifest,
+            None,
+        );
+        let report = apply_library_view(&view, &plan, &manifest, &data_dir).unwrap();
+        assert_eq!(report.created, 1);
+        let manifest_after_create = load_library_view_manifest_at(&data_dir, &view.id).unwrap();
+
+        // The attack: the managed `NES` directory is replaced with a
+        // symlink pointing outside the destination root, after a real
+        // managed symlink was already recorded underneath the original
+        // (real) directory. The archive is then dropped from the
+        // catalogue, so the next plan wants the recorded entry removed.
+        fs::remove_dir_all(destination.join("NES")).unwrap();
+        let outside_dir = root.join("outside");
+        fs::create_dir_all(&outside_dir).unwrap();
+        fs::write(outside_dir.join("Game.zip"), b"unrelated-outside-file").unwrap();
+        symlink(&outside_dir, destination.join("NES")).unwrap();
+
+        let plan2 = plan_library_view(
+            &view,
+            &[],
+            std::slice::from_ref(&source),
+            &manifest_after_create,
+            None,
+        );
+        assert_eq!(plan2.counts.remove, 1);
+
+        let report2 = apply_library_view(&view, &plan2, &manifest_after_create, &data_dir).unwrap();
+        assert_eq!(
+            report2.removed, 0,
+            "nothing may be removed through a symlinked destination parent"
+        );
+        assert_eq!(report2.failed, 1);
+        assert_eq!(
+            fs::read(outside_dir.join("Game.zip")).unwrap(),
+            b"unrelated-outside-file",
+            "the file reached only through the escape symlink must survive untouched"
+        );
+    }
+
+    /// Test: with no symlinked ancestor anywhere, Create, RemoveStale, and
+    /// managed-directory cleanup all still work exactly as before - the new
+    /// containment check must never reject an ordinary, fully-real
+    /// destination tree.
+    #[test]
+    fn destination_containment_check_does_not_interfere_with_normal_real_directories() {
+        let root = temp_dir("destination-containment-normal");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Game.zip");
+        write_file(&archive_path, b"zip-bytes");
+        let destination = root.join("dest");
+        let data_dir = root.join("data");
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("NES"));
+        let view = make_view("view-normal", &destination, vec![], vec![]);
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(
+            &view,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &manifest,
+            None,
+        );
+        let report = apply_library_view(&view, &plan, &manifest, &data_dir).unwrap();
+        assert_eq!(report.created, 1);
+        assert_eq!(report.failed, 0);
+        let link_path = destination.join("NES").join("Game.zip");
+        assert_eq!(fs::read_link(&link_path).unwrap(), archive_path);
+
+        let manifest_after_create = load_library_view_manifest_at(&data_dir, &view.id).unwrap();
+        let plan2 = plan_library_view(
+            &view,
+            &[],
+            std::slice::from_ref(&source),
+            &manifest_after_create,
+            None,
+        );
+        let report2 = apply_library_view(&view, &plan2, &manifest_after_create, &data_dir).unwrap();
+        assert_eq!(report2.removed, 1);
+        assert_eq!(report2.failed, 0);
+        assert!(!link_path.exists());
+        assert!(!destination.join("NES").exists());
+    }
+
+    /// Test: the source target vanishes after planning, before Apply runs -
+    /// Apply must refuse rather than create a dangling symlink.
+    #[test]
+    fn apply_refuses_to_create_a_link_when_the_target_disappeared_since_planning() {
+        let root = temp_dir("reproof-target-deleted");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Game.zip");
+        write_file(&archive_path, b"zip-bytes");
+        let destination = root.join("dest");
+        let data_dir = root.join("data");
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("NES"));
+        let view = make_view("view-1", &destination, vec![], vec![]);
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(
+            &view,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &manifest,
+            None,
+        );
+        assert_eq!(plan.entries[0].action, LibraryViewPlanAction::Create);
+
+        // Deleted after planning, before Apply.
+        fs::remove_file(&archive_path).unwrap();
+
+        let report = apply_library_view(&view, &plan, &manifest, &data_dir).unwrap();
+        assert_eq!(report.created, 0);
+        assert_eq!(report.failed, 1);
+        assert!(!destination.join("NES").join("Game.zip").exists());
+    }
+
+    /// Test: the source target is replaced by a symlink after planning,
+    /// before Apply runs - Apply must refuse to link to it.
+    #[test]
+    fn apply_refuses_to_link_when_the_target_became_a_symlink_since_planning() {
+        let root = temp_dir("reproof-target-became-symlink");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Game.zip");
+        write_file(&archive_path, b"zip-bytes");
+        let elsewhere = root.join("elsewhere.zip");
+        write_file(&elsewhere, b"elsewhere-bytes");
+        let destination = root.join("dest");
+        let data_dir = root.join("data");
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("NES"));
+        let view = make_view("view-1", &destination, vec![], vec![]);
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(
+            &view,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &manifest,
+            None,
+        );
+        assert_eq!(plan.entries[0].action, LibraryViewPlanAction::Create);
+
+        // Replaced by a symlink after planning, before Apply.
+        fs::remove_file(&archive_path).unwrap();
+        symlink(&elsewhere, &archive_path).unwrap();
+
+        let report = apply_library_view(&view, &plan, &manifest, &data_dir).unwrap();
+        assert_eq!(report.created, 0);
+        assert_eq!(report.failed, 1);
+        assert!(!destination.join("NES").join("Game.zip").exists());
+    }
+
+    /// Test: a different file is written at the exact same path after
+    /// planning - the catalogue's own size:mtime fingerprint no longer
+    /// matches a fresh read, so Apply must fail closed rather than link to
+    /// whatever is there now.
+    #[test]
+    fn apply_refuses_to_link_when_the_target_was_replaced_by_a_different_file_at_the_same_path() {
+        let root = temp_dir("reproof-target-replaced");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Game.zip");
+        write_file(&archive_path, b"zip-bytes");
+        let destination = root.join("dest");
+        let data_dir = root.join("data");
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("NES"));
+        let view = make_view("view-1", &destination, vec![], vec![]);
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(
+            &view,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &manifest,
+            None,
+        );
+        assert_eq!(plan.entries[0].action, LibraryViewPlanAction::Create);
+        assert!(
+            plan.entries[0].archive_identity.is_some(),
+            "the plan must carry a fingerprint for this proof to be meaningful"
+        );
+
+        // A different file, with a different size, replaces the catalogued
+        // one at the exact same path.
+        fs::write(&archive_path, b"a-completely-different-and-longer-payload").unwrap();
+
+        let report = apply_library_view(&view, &plan, &manifest, &data_dir).unwrap();
+        assert_eq!(report.created, 0);
+        assert_eq!(report.failed, 1);
+        assert!(!destination.join("NES").join("Game.zip").exists());
+    }
+
+    /// Control case: an unchanged target between planning and Apply must
+    /// still succeed normally - fresh reproof is not a general slowdown or
+    /// a false-positive source of failures.
+    #[test]
+    fn apply_creates_a_link_when_the_target_is_unchanged_since_planning() {
+        let root = temp_dir("reproof-target-unchanged");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Game.zip");
+        write_file(&archive_path, b"zip-bytes");
+        let destination = root.join("dest");
+        let data_dir = root.join("data");
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("NES"));
+        let view = make_view("view-1", &destination, vec![], vec![]);
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(
+            &view,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &manifest,
+            None,
+        );
+        let report = apply_library_view(&view, &plan, &manifest, &data_dir).unwrap();
+        assert_eq!(report.created, 1);
+        assert_eq!(report.failed, 0);
+        assert_eq!(
+            fs::read_link(destination.join("NES").join("Game.zip")).unwrap(),
+            archive_path
+        );
+    }
+
+    /// Test: Repair must refuse the same destination-side escape as
+    /// Create - a managed directory replaced by an outside-pointing
+    /// symlink after planning already decided the link inside it needs
+    /// repairing.
+    #[test]
+    fn apply_refuses_to_repair_through_a_symlinked_destination_parent() {
+        let root = temp_dir("destination-symlink-escape-repair");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Game.zip");
+        let wrong_target = root.join("wrong-target.zip");
+        write_file(&archive_path, b"zip-bytes");
+        write_file(&wrong_target, b"other-bytes");
+        let destination = root.join("dest");
+        let data_dir = root.join("data");
+        let link_path = destination.join("NES").join("Game.zip");
+        fs::create_dir_all(link_path.parent().unwrap()).unwrap();
+        symlink(&wrong_target, &link_path).unwrap();
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("NES"));
+        let view = make_view("view-1", &destination, vec![], vec![]);
+        let manifest = LibraryViewManifest {
+            view_id: view.id.clone(),
+            destination_root: destination.clone(),
+            entries: vec![LibraryViewManifestEntry {
+                relative_link_path: PathBuf::from("NES/Game.zip"),
+                target_path: wrong_target.clone(),
+                archive_identity: None,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+                platform: "NES".to_string(),
+                source_folder_path: source_dir.clone(),
+                object_kind: LibraryViewObjectKind::Symlink,
+                content_hash: None,
+                rendering_version: None,
+            }],
+            view_fingerprint: None,
+            profile_version: 0,
+            created_directories: Vec::new(),
+        };
+
+        let plan = plan_library_view(
+            &view,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &manifest,
+            None,
+        );
+        assert_eq!(plan.entries[0].action, LibraryViewPlanAction::Repair);
+
+        // Attack: the managed `NES` directory is replaced with a symlink
+        // pointing outside the destination root, after planning already
+        // decided to repair the link inside it.
+        fs::remove_dir_all(destination.join("NES")).unwrap();
+        let outside_dir = root.join("outside");
+        fs::create_dir_all(&outside_dir).unwrap();
+        symlink(&outside_dir, destination.join("NES")).unwrap();
+
+        let report = apply_library_view(&view, &plan, &manifest, &data_dir).unwrap();
+        assert_eq!(
+            report.repaired, 0,
+            "nothing may be repaired through a symlinked destination parent"
+        );
+        assert_eq!(report.failed, 1);
+        assert!(
+            fs::read_dir(&outside_dir).unwrap().next().is_none(),
+            "the escape target must remain completely untouched"
+        );
+    }
+
+    /// Test: `maybe_remove_empty_managed_directories` must never remove a
+    /// real, empty directory reached only by resolving through a
+    /// symlinked *intermediate* ancestor component (`dest/roms` a symlink,
+    /// the removal candidate itself - `dest/roms/c128` - a real directory
+    /// one hop further in). This is the one case the OS's own `rmdir`
+    /// symlink protection does not cover on its own: `rmdir` refuses a
+    /// path whose *final* component is a symlink, but still transparently
+    /// follows a symlink that is merely an intermediate component.
+    #[test]
+    fn maybe_remove_empty_managed_directories_skips_a_directory_reached_through_a_symlinked_ancestor()
+     {
+        let root = temp_dir("cleanup-symlinked-ancestor");
+        let destination = root.join("dest");
+        fs::create_dir_all(&destination).unwrap();
+
+        // A real, empty directory outside the destination root that would
+        // otherwise qualify for removal.
+        let outside_dir = root.join("outside");
+        let outside_target_subdir = outside_dir.join("c128");
+        fs::create_dir_all(&outside_target_subdir).unwrap();
+
+        // `dest/roms` is a symlink to `outside_dir` - the escape. The
+        // removal candidate (`dest/roms/c128`) is reached only by
+        // resolving through it.
+        symlink(&outside_dir, destination.join("roms")).unwrap();
+
+        // A manifest entry naming `roms/c128/...` is enough to seed
+        // `roms/c128` as a cleanup candidate - this function derives
+        // candidates purely from recorded relative paths, never from what
+        // currently exists on disk.
+        let manifest = LibraryViewManifest {
+            view_id: "view-1".to_string(),
+            destination_root: destination.clone(),
+            entries: vec![LibraryViewManifestEntry {
+                relative_link_path: PathBuf::from("roms/c128/Game.d64"),
+                target_path: root.join("source").join("Game.d64"),
+                archive_identity: None,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+                platform: "Commodore 128".to_string(),
+                source_folder_path: root.join("source"),
+                object_kind: LibraryViewObjectKind::Symlink,
+                content_hash: None,
+                rendering_version: None,
+            }],
+            view_fingerprint: None,
+            profile_version: 0,
+            created_directories: Vec::new(),
+        };
+
+        maybe_remove_empty_managed_directories(&destination, &manifest);
+
+        assert!(
+            outside_target_subdir.exists(),
+            "a real directory reached only through a destination-side symlinked ancestor must \
+             never be removed"
+        );
+    }
+
+    /// Test: a two-hop destination-side symlink chain, nested one level
+    /// below the destination root's immediate child (`dest/roms` is a real
+    /// directory; `dest/roms/c128` is a symlink to another symlink, which
+    /// itself points outside the destination root) must still fail closed.
+    /// `fs::canonicalize` resolves an arbitrarily long symlink chain in one
+    /// call, so this proves the containment check is not limited to a
+    /// single hop.
+    #[test]
+    fn apply_refuses_to_create_through_a_nested_destination_symlink_chain() {
+        let root = temp_dir("destination-symlink-chain");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Game.d64");
+        write_file(&archive_path, b"d64-bytes");
+        let destination = root.join("dest");
+        fs::create_dir_all(destination.join("roms")).unwrap();
+        let data_dir = root.join("data");
+
+        let outside_dir = root.join("outside");
+        fs::create_dir_all(&outside_dir).unwrap();
+        let intermediate_link = root.join("intermediate-link");
+        symlink(&outside_dir, &intermediate_link).unwrap();
+        // `dest/roms/c128` -> `intermediate-link` -> `outside_dir`.
+        symlink(&intermediate_link, destination.join("roms").join("c128")).unwrap();
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("Commodore 128"));
+        let view = romm_view_with_override("view-chain", &destination, "Commodore 128", "c128");
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(
+            &view,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &manifest,
+            None,
+        );
+        assert_eq!(plan.entries[0].action, LibraryViewPlanAction::Create);
+
+        let report = apply_library_view(&view, &plan, &manifest, &data_dir).unwrap();
+        assert_eq!(
+            report.created, 0,
+            "nothing may be created through a nested destination symlink chain"
+        );
+        assert_eq!(report.failed, 1);
+        assert!(
+            fs::read_dir(&outside_dir).unwrap().next().is_none(),
+            "the escape target must remain completely untouched"
+        );
     }
 }
