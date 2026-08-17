@@ -63982,6 +63982,7 @@ $Instant Growth [Nayr]\n";
             source_folders: Vec::new(),
             platforms: Vec::new(),
             layout_template: LibraryViewLayoutTemplate::PlatformFilename,
+            profile: archivefs_core::FrontendProfile::default(),
         }
     }
 
@@ -64143,6 +64144,9 @@ $Instant Growth [Nayr]\n";
                 archive_identity: None,
             }],
             unsafe_root_error: None,
+            profile_fingerprint: String::new(),
+            fingerprint_conflict: None,
+            profile_error: None,
         };
         let mut filter = LibraryViewPlanFilter::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
@@ -66238,6 +66242,9 @@ $Instant Growth [Nayr]\n";
                 archive_identity: None,
             }],
             unsafe_root_error: None,
+            profile_fingerprint: String::new(),
+            fingerprint_conflict: None,
+            profile_error: None,
         };
         let last_plan = (view, plan);
 

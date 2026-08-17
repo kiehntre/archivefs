@@ -53,18 +53,23 @@ pub mod game_identity;
 
 mod library_views;
 pub use library_views::{
+    FrontendPlatformMapping, FrontendProfile, FrontendProfileKind, FrontendProfilePolicy,
     LibraryViewApplyEntryResult, LibraryViewApplyOutcome, LibraryViewApplyReport,
-    LibraryViewConfig, LibraryViewLayoutTemplate, LibraryViewManifest, LibraryViewManifestEntry,
-    LibraryViewPlan, LibraryViewPlanAction, LibraryViewPlanCounts, LibraryViewPlanEntry,
-    add_library_view_default, apply_library_view, apply_library_view_default,
-    default_library_views_config_path, default_library_views_data_dir, edit_library_view_default,
-    generate_library_view_id, generate_relative_link_path, library_view_manifest_path,
-    load_library_view_configs_default, load_library_view_configs_from,
-    load_library_view_manifest_at, load_library_view_manifest_default, plan_library_view,
-    preview_library_view_default, remove_library_view_default, remove_library_view_symlinks,
-    repair_library_view, repair_library_view_default, resolve_library_view_identifier,
-    save_library_view_configs_default, save_library_view_configs_to,
-    set_library_view_enabled_default, validate_library_view_destination,
+    LibraryViewConfig, LibraryViewGeneratedFilePlan, LibraryViewLayoutTemplate,
+    LibraryViewManifest, LibraryViewManifestEntry, LibraryViewObjectClassification,
+    LibraryViewObjectKind, LibraryViewPlan, LibraryViewPlanAction, LibraryViewPlanCounts,
+    LibraryViewPlanEntry, MultidiscHandlingPolicy, SymlinkTargetStrategy, TitleSelectionPolicy,
+    VariantHandlingPolicy, add_library_view_default, apply_library_view,
+    apply_library_view_default, classify_library_view_object, compute_view_profile_fingerprint,
+    default_library_views_config_path, default_library_views_data_dir, derive_view_filename,
+    edit_library_view_default, generate_library_view_id, generate_relative_link_path,
+    library_view_manifest_path, load_library_view_configs_default, load_library_view_configs_from,
+    load_library_view_manifest_at, load_library_view_manifest_default, plan_generated_file,
+    plan_library_view, preview_library_view_default, remove_library_view_default,
+    remove_library_view_symlinks, repair_library_view, repair_library_view_default,
+    resolve_library_view_identifier, save_library_view_configs_default,
+    save_library_view_configs_to, set_library_view_enabled_default,
+    validate_library_view_destination,
 };
 
 /// The single authoritative platform registry and the evidence-based

@@ -3570,6 +3570,16 @@ fn print_library_view_plan(view: &LibraryViewConfig, plan: &LibraryViewPlan) {
         println!("UNSAFE - Apply is refused: {error}");
         return;
     }
+    if let Some(error) = &plan.profile_error {
+        println!();
+        println!("UNSUPPORTED PROFILE - Apply is refused: {error}");
+        return;
+    }
+    if let Some(conflict) = &plan.fingerprint_conflict {
+        println!();
+        println!("REVIEW NEEDED - Apply is refused: {conflict}");
+        return;
+    }
     println!();
     println!("Create:    {}", plan.counts.create);
     println!("Correct:   {}", plan.counts.correct);

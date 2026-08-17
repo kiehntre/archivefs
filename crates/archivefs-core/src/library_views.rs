@@ -30,7 +30,8 @@ use crate::{
     default_database_path,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
@@ -206,6 +207,16 @@ pub struct LibraryViewConfig {
     /// `plan_library_view`'s doc comment).
     pub platforms: Vec<String>,
     pub layout_template: LibraryViewLayoutTemplate,
+    /// Which frontend this view is nominally aimed at, and the (currently
+    /// mostly-default) policy governing its output shape. Added by the
+    /// Frontend Profiles milestone - `#[serde(default)]` so every
+    /// `library_views.json` written before this field existed keeps loading
+    /// unchanged, always resolving to `FrontendProfile::default()` (the
+    /// `Generic` kind, whose behaviour is byte-for-byte the pre-existing
+    /// `PlatformFilename` behaviour). `RomM`/`EsDe` are vocabulary only in
+    /// this milestone - see `FrontendProfileKind`'s doc comment.
+    #[serde(default)]
+    pub profile: FrontendProfile,
 }
 
 /// The only layout template this milestone supports - see the milestone's
@@ -223,6 +234,262 @@ impl LibraryViewLayoutTemplate {
             Self::PlatformFilename => "{platform}/{filename}",
         }
     }
+}
+
+// ---------------------------------------------------------------------
+// Frontend profiles: configuration/planning vocabulary only. Stage 1/2 of
+// the Frontend Profiles milestone. `RomM` and `EsDe` never perform any
+// frontend-specific materialization here - no `roms/<slug>/` layout, no
+// ES-DE system mapping, no `.m3u`/`gamelist.xml` generation. That is all
+// explicitly out of scope; see this module's top-of-file doc comment and
+// the milestone notes. This is deliberately kept on the read-only-of-master
+// "view" axis and must never be confused with `RepairProfile::Romm` (in
+// `crate::repair::library`), which lives on the separate, mutating
+// master-organisation axis - there is no call path from anything in this
+// module into that one.
+// ---------------------------------------------------------------------
+
+/// Which frontend a Library View is nominally shaped for. `Generic` is the
+/// only kind this milestone actually plans anything for - it is
+/// byte-for-byte the pre-existing `PlatformFilename` behaviour. `RomM` and
+/// `EsDe` exist so the schema and planning vocabulary do not need to churn
+/// again when their real materialization is implemented in a later
+/// milestone - but selecting either one today *fails closed*: planning a
+/// `RomM`/`EsDe` view produces a clear refusal (`LibraryViewPlan::profile_error`,
+/// and `generate_relative_link_path` itself also refuses directly), never a
+/// silent fallback to Generic's `{platform}/{filename}` output. A silent
+/// fallback would be surprising and wrong once real RomM/ES-DE
+/// materialization exists and actually differs from Generic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum FrontendProfileKind {
+    /// The existing, generic `PlatformFilename` behaviour.
+    #[default]
+    Generic,
+    /// Vocabulary only - see this section's doc comment. No RomM slug
+    /// mapping, no `roms/<slug>/` layout, no rescan API call exists yet -
+    /// planning/applying a view with this kind fails closed rather than
+    /// silently behaving like `Generic`.
+    RomM,
+    /// Vocabulary only - see this section's doc comment. No ES-DE system
+    /// mapping, no `.m3u`/`gamelist.xml` generation exists yet -
+    /// planning/applying a view with this kind fails closed rather than
+    /// silently behaving like `Generic`.
+    EsDe,
+}
+
+/// How a profile would eventually pick a title/region/language/variant when
+/// more than one archive could represent "the same" release - deliberately
+/// minimal today. Only `CanonicalArchiveFilename` (today's actual behaviour)
+/// exists; a `PreferredPerTitle` policy, a variant-index database, DAT
+/// re-audits, and multidisc grouping are explicitly out of scope for this
+/// milestone (see the milestone notes) and are left for later variants to
+/// add without needing to reshape this enum's existing case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum TitleSelectionPolicy {
+    /// Use the archive's own filename verbatim (after sanitisation) - the
+    /// only behaviour this milestone implements.
+    #[default]
+    CanonicalArchiveFilename,
+}
+
+/// How a profile would eventually treat multiple variants (regions,
+/// revisions, dumps) of what is otherwise the same title. Only `KeepAll`
+/// (today's actual behaviour - every archive that plans to a distinct
+/// destination is planned) exists in this milestone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum VariantHandlingPolicy {
+    #[default]
+    KeepAll,
+}
+
+/// How a profile would eventually group multi-disc releases. Only
+/// `Ungrouped` (today's actual behaviour - every archive is planned
+/// independently) exists in this milestone; multidisc grouping itself is
+/// explicitly out of scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum MultidiscHandlingPolicy {
+    #[default]
+    Ungrouped,
+}
+
+/// The policy knobs a `FrontendProfile` carries. Every field defaults to
+/// exactly what today's `PlatformFilename` behaviour already does, so
+/// constructing `FrontendProfilePolicy::default()` (or loading an old
+/// config, via `#[serde(default)]`) never changes existing output. Kept
+/// deliberately small - this milestone adds only the shape needed to avoid
+/// future schema churn, not the policies themselves (no `PreferredPerTitle`,
+/// no variant-index database, no DAT re-audits, no multidisc grouping - see
+/// the milestone notes).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct FrontendProfilePolicy {
+    #[serde(default)]
+    pub title_selection: TitleSelectionPolicy,
+    /// Ordered most-preferred-first; empty means "no preference expressed"
+    /// (today's actual behaviour - region is never consulted).
+    #[serde(default)]
+    pub region_preference: Vec<String>,
+    /// Ordered most-preferred-first; empty means "no preference expressed".
+    #[serde(default)]
+    pub language_preference: Vec<String>,
+    #[serde(default)]
+    pub variant_handling: VariantHandlingPolicy,
+    #[serde(default)]
+    pub multidisc_handling: MultidiscHandlingPolicy,
+    /// Overrides the catalogue platform name used for planning purposes.
+    /// Empty means "no overrides" (today's actual behaviour). See
+    /// `FrontendPlatformMapping`'s own doc comment for why this is a named
+    /// type rather than a bare map field.
+    #[serde(default)]
+    pub platform_mapping_overrides: FrontendPlatformMapping,
+    /// How a future materialization step would compute a managed symlink's
+    /// target path. Vocabulary only in this milestone - `apply_library_view`
+    /// always uses the archive's absolute host path today, regardless of
+    /// this field's value; see `SymlinkTargetStrategy`'s own doc comment for
+    /// why the seam exists now anyway.
+    #[serde(default)]
+    pub symlink_target_strategy: SymlinkTargetStrategy,
+}
+
+/// A profile's catalogue-platform-name overrides, keyed by the catalogue's
+/// own platform string. A dedicated (if today minimal) type rather than a
+/// bare `HashMap`/`BTreeMap` field, so RomM/ES-DE platform mapping has one
+/// principled place to grow into later (e.g. per-frontend-kind mapping
+/// rules, wildcard/prefix rules, a reverse lookup) without another schema
+/// migration. Backed by a `BTreeMap` so serialization/hashing
+/// (`compute_view_profile_fingerprint`) is always key-order-stable
+/// regardless of insertion order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct FrontendPlatformMapping {
+    #[serde(default)]
+    overrides: BTreeMap<String, String>,
+}
+
+impl FrontendPlatformMapping {
+    pub fn is_empty(&self) -> bool {
+        self.overrides.is_empty()
+    }
+
+    pub fn get(&self, catalogue_platform: &str) -> Option<&str> {
+        self.overrides.get(catalogue_platform).map(String::as_str)
+    }
+
+    /// Returns the previous override for `catalogue_platform`, if any -
+    /// mirrors `BTreeMap::insert`'s own return shape.
+    pub fn insert(
+        &mut self,
+        catalogue_platform: String,
+        mapped_platform: String,
+    ) -> Option<String> {
+        self.overrides.insert(catalogue_platform, mapped_platform)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.overrides
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+    }
+}
+
+/// How a managed symlink's target path would be computed. Vocabulary only
+/// in this milestone (see `FrontendProfilePolicy::symlink_target_strategy`'s
+/// doc comment) - added now, ahead of any real use, because RomM commonly
+/// runs in a container with a different mount path than the host: a plain
+/// absolute host path (`AbsoluteSourcePath`, today's only real behaviour)
+/// works for Generic's own host-side symlinks, but breaks once something
+/// *inside* the container tries to resolve the same symlink against its own
+/// (different) view of the filesystem. A relative-to-shared-ancestor target
+/// survives that kind of remount because it never encodes an absolute host
+/// path at all. Adding this enum now - even though nothing but
+/// `AbsoluteSourcePath` is implemented - means a later milestone can wire in
+/// the Docker-safe computation without another manifest/config migration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum SymlinkTargetStrategy {
+    /// Today's only real behaviour: the target is the archive's absolute
+    /// host path, exactly as `apply_library_view` already writes it.
+    #[default]
+    AbsoluteSourcePath,
+    /// Not implemented yet - vocabulary only. Would compute the target as a
+    /// path relative to the nearest shared ancestor of the destination and
+    /// the source archive, so the symlink stays valid across a container
+    /// remount (e.g. RomM's Docker deployment) that gives the destination
+    /// and source different absolute paths on each side of the mount.
+    RelativeToSharedAncestor,
+    /// Not implemented yet - vocabulary only. Explicitly requests an
+    /// absolute target - identical output to `AbsoluteSourcePath` today,
+    /// but named explicitly so a profile can pin this behaviour even after
+    /// a different strategy becomes the default.
+    Absolute,
+}
+
+/// A Library View's frontend identity: which frontend it is nominally
+/// shaped for, plus the (mostly-default) policy governing its output shape.
+/// `#[serde(default)]` on `LibraryViewConfig::profile` means an old config
+/// with no `profile` key at all deserializes to `FrontendProfile::default()`
+/// (`Generic` kind, default policy), which is defined to behave exactly
+/// like the pre-existing, profile-less code did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct FrontendProfile {
+    #[serde(default)]
+    pub kind: FrontendProfileKind,
+    #[serde(default)]
+    pub policy: FrontendProfilePolicy,
+}
+
+/// What kind of filesystem object a planned Library View entry ultimately
+/// is (or will become). Only `Symlink` is ever actually produced by
+/// `plan_library_view`/`apply_library_view` in this milestone - `GeneratedFile`
+/// and `Directory` exist so later milestones (RomM/ES-DE materialization)
+/// can extend the planner and manifest without another backward-compatibility
+/// migration. See `plan_generated_file`/`classify_library_view_object` for
+/// the planning-only seams that use the non-`Symlink` cases today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum LibraryViewObjectKind {
+    /// A managed symlink pointing at a source archive - the only kind this
+    /// milestone's `apply_library_view` ever creates.
+    #[default]
+    Symlink,
+    /// A managed regular file whose content EmuWiz itself would generate
+    /// (e.g. a future `.m3u`/`gamelist.xml`) - never a copy or hardlink of a
+    /// source archive. Not created by this milestone.
+    GeneratedFile,
+    /// A managed directory EmuWiz itself created (as opposed to a
+    /// pre-existing directory it merely wrote into) - see
+    /// `LibraryViewManifest::created_directories`. Not created as a
+    /// standalone planned object by this milestone.
+    Directory,
+}
+
+/// Derives the filename a Library View would display for `archive_path`
+/// under `profile`, without ever renaming or otherwise touching the source
+/// archive. A pure name-deriving primitive: it does not itself decide
+/// *whether* a profile is allowed to plan at all (that fail-closed gate is
+/// `generate_relative_link_path`'s - see its doc comment - so this function
+/// is in practice only ever reached for `Generic` today). In this milestone
+/// every profile kind still resolves to exactly the archive's own filename
+/// (sanitised) if called directly, so a later profile-driven rename policy
+/// has one obvious place to plug into instead of every call site
+/// re-deriving a filename by hand.
+///
+/// Rejects (never invents a fallback for): an absent filename, an empty
+/// name, `.`/`..`, any path separator, and anything else that is not a
+/// single safe path component - the exact same rules
+/// `sanitize_path_component_os` already enforces for the pre-existing
+/// generic behaviour, so `Generic`-profile output is provably unchanged.
+pub fn derive_view_filename(profile: &FrontendProfile, archive_path: &Path) -> Result<PathBuf> {
+    let source_filename = archive_path.file_name().ok_or_else(|| {
+        ArchiveFsError::Config(format!(
+            "{} has no filename to use in a Library View",
+            archive_path.display()
+        ))
+    })?;
+    let derived: OsString = match profile.kind {
+        // Stage 1/2: every kind derives the same filename as the source
+        // archive - see the function doc comment for why.
+        FrontendProfileKind::Generic | FrontendProfileKind::RomM | FrontendProfileKind::EsDe => {
+            source_filename.to_os_string()
+        }
+    };
+    sanitize_path_component_os(&derived)
 }
 
 /// Resolves the config-y "list of views" file: `library_views.json` under the
@@ -331,14 +598,89 @@ pub struct LibraryViewManifestEntry {
     pub platform: String,
     #[serde(with = "path_json")]
     pub source_folder_path: PathBuf,
+    /// What kind of filesystem object this entry owns. `#[serde(default)]`
+    /// resolves every entry written before this field existed to `Symlink`,
+    /// which is exactly what every such entry actually is, since Symlink
+    /// was the only kind `apply_library_view` could ever produce before
+    /// this milestone.
+    #[serde(default)]
+    pub object_kind: LibraryViewObjectKind,
+    /// The content hash a future `GeneratedFile` entry's managed content
+    /// would be identified by. Always `None` in this milestone - no entry's
+    /// `object_kind` is ever `GeneratedFile` yet, since nothing creates one.
+    #[serde(default)]
+    pub content_hash: Option<String>,
+    /// The version of the (future) rendering rules used to produce this
+    /// entry's content, for a `GeneratedFile` entry. Always `None` in this
+    /// milestone, for the same reason as `content_hash`.
+    #[serde(default)]
+    pub rendering_version: Option<u32>,
 }
 
+/// # Schema evolution / backward compatibility
+///
+/// Every field the Frontend Profiles milestone added to this struct and to
+/// `LibraryViewManifestEntry` (`object_kind`, `content_hash`,
+/// `rendering_version`, `view_fingerprint`, `profile_version`,
+/// `created_directories`) carries `#[serde(default)]`, so a manifest JSON
+/// file written before this milestone existed - one with none of these keys
+/// at all - deserializes exactly as it always did, with:
+///
+/// - `object_kind` resolving to `Symlink` on every existing entry, which is
+///   exactly correct: `Symlink` was the only kind any manifest-writing code
+///   could ever have produced before this milestone.
+/// - `content_hash`/`rendering_version` resolving to `None` - meaningless
+///   for a `Symlink` entry, and no `GeneratedFile` entry existed yet to have
+///   had them.
+/// - `view_fingerprint` resolving to `None` - deliberately distinct from
+///   "recorded and matches the current profile": `plan_library_view` only
+///   ever reports `LibraryViewPlan::fingerprint_conflict` when a fingerprint
+///   *was* recorded and it disagrees, so an old manifest predating the field
+///   is never treated as incompatible merely for predating it.
+/// - `profile_version` resolving to `0` - a write-format counter, not a
+///   per-edit revision; `apply_library_view` always writes `1` from this
+///   milestone onward.
+/// - `created_directories` resolving to an empty `Vec` - correct, since no
+///   apply before this milestone ever recorded directory ownership; the
+///   field is not yet populated by this milestone's `apply_library_view`
+///   either (see the field's own doc comment), so it round-trips whatever a
+///   later milestone starts writing into it without this one clobbering it.
+///
+/// Every one of these defaults was chosen to be the value that describes
+/// what *already happened* under the pre-Frontend-Profiles code, never a
+/// value that would silently change interpretation of old data.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LibraryViewManifest {
     pub view_id: String,
     #[serde(with = "path_json")]
     pub destination_root: PathBuf,
     pub entries: Vec<LibraryViewManifestEntry>,
+    /// The `compute_view_profile_fingerprint` value of the view's
+    /// configuration at the time this manifest was last written by
+    /// `apply_library_view`/`repair_library_view`. `#[serde(default)]`
+    /// resolves a pre-Frontend-Profiles manifest to `None` - deliberately
+    /// distinct from "recorded and matches", so `plan_library_view` never
+    /// treats an old manifest as fingerprint-incompatible merely for
+    /// predating this field (see `LibraryViewPlan::fingerprint_conflict`).
+    #[serde(default)]
+    pub view_fingerprint: Option<String>,
+    /// A simple write-format counter (not a per-edit revision number):
+    /// `0` for any manifest written before this milestone's
+    /// fingerprint-aware apply path existed (`#[serde(default)]`), `1` for
+    /// every manifest `apply_library_view` writes now.
+    #[serde(default)]
+    pub profile_version: u32,
+    /// Directories `apply_library_view` itself created under
+    /// `destination_root` (never a directory that already existed) - the
+    /// same "only record what EmuWiz itself created" ownership rule
+    /// `LibraryViewManifestEntry` already applies to symlinks. Not yet
+    /// populated or consulted by this milestone's `apply_library_view`
+    /// (which does not create standalone managed directories or generated
+    /// files - see the milestone notes); the field exists purely so a
+    /// pre-existing manifest keeps loading once a later milestone starts
+    /// writing into it, without another migration.
+    #[serde(default, with = "vec_path_json")]
+    pub created_directories: Vec<PathBuf>,
 }
 
 impl LibraryViewManifest {
@@ -347,6 +689,9 @@ impl LibraryViewManifest {
             view_id: view_id.to_string(),
             destination_root: destination_root.to_path_buf(),
             entries: Vec::new(),
+            view_fingerprint: None,
+            profile_version: 0,
+            created_directories: Vec::new(),
         }
     }
 }
@@ -483,6 +828,33 @@ fn canonical_or_nearest_existing_ancestor(path: &Path) -> Result<PathBuf> {
     Ok(canonical_parent.join(suffix))
 }
 
+/// Confirms a planned symlink target (`archive_path`) actually resolves
+/// inside `source_root` - the same canonicalize-then-`starts_with`
+/// containment check `validate_library_view_destination` already applies to
+/// a view's *destination*, applied here to the *source* side instead:
+/// `plan_library_view` must never plan a symlink whose target has escaped
+/// the trusted source root the catalogue says it came from (e.g. via a
+/// symlink planted inside a source folder that itself points somewhere
+/// untrusted, discovered after the catalogue record was written). A
+/// read-only check (`fs::canonicalize`/`fs::metadata` only, via
+/// `canonical_or_nearest_existing_ancestor`) - consistent with planning
+/// never mutating anything.
+fn validate_symlink_target_within_source(archive_path: &Path, source_root: &Path) -> Result<()> {
+    let archive_canonical = canonical_or_nearest_existing_ancestor(archive_path)?;
+    let source_canonical =
+        fs::canonicalize(source_root).unwrap_or_else(|_| source_root.to_path_buf());
+    if archive_canonical.starts_with(&source_canonical) {
+        Ok(())
+    } else {
+        Err(ArchiveFsError::Config(format!(
+            "{} does not resolve inside its configured source folder {} - refusing to plan a \
+             symlink target that could escape the trusted source root",
+            archive_path.display(),
+            source_root.display()
+        )))
+    }
+}
+
 // ---------------------------------------------------------------------
 // Layout / path generation.
 // ---------------------------------------------------------------------
@@ -495,18 +867,26 @@ fn canonical_or_nearest_existing_ancestor(path: &Path) -> Result<PathBuf> {
 /// preserved exactly rather than mangled or rejected outright.
 pub fn generate_relative_link_path(
     template: LibraryViewLayoutTemplate,
+    profile: &FrontendProfile,
     platform: &str,
     archive_path: &Path,
 ) -> Result<PathBuf> {
     let LibraryViewLayoutTemplate::PlatformFilename = template;
+    // Fail closed for a not-yet-implemented frontend kind - defense in
+    // depth alongside `plan_library_view`'s own `profile_error` check, so
+    // any other caller of this function gets the same refusal rather than
+    // a silent `Generic`-shaped path. See `FrontendProfileKind`'s doc
+    // comment for why this must never silently degrade.
+    if profile.kind != FrontendProfileKind::Generic {
+        return Err(ArchiveFsError::Config(format!(
+            "the {:?} frontend profile does not implement real Library View materialization \
+             yet in this milestone - refusing to plan a path rather than silently falling back \
+             to Generic behaviour",
+            profile.kind
+        )));
+    }
     let platform_component = sanitize_path_component_str(platform)?;
-    let filename = archive_path.file_name().ok_or_else(|| {
-        ArchiveFsError::Config(format!(
-            "{} has no filename to use in a Library View",
-            archive_path.display()
-        ))
-    })?;
-    let filename_component = sanitize_path_component_os(filename)?;
+    let filename_component = derive_view_filename(profile, archive_path)?;
     Ok(PathBuf::from(platform_component).join(filename_component))
 }
 
@@ -656,11 +1036,35 @@ pub struct LibraryViewPlan {
     /// the individual entries look (milestone requirement: "no Apply
     /// button until planning succeeds without unsafe-root errors").
     pub unsafe_root_error: Option<String>,
+    /// The fingerprint (`compute_view_profile_fingerprint`) of `view`'s
+    /// *current* configuration, as planned just now.
+    pub profile_fingerprint: String,
+    /// `Some` when the manifest this plan was computed against already
+    /// recorded a `view_fingerprint` (i.e. it was written by a
+    /// fingerprint-aware apply) and that recorded fingerprint does not match
+    /// `profile_fingerprint` - meaning the view's profile/layout changed in
+    /// an output-affecting way since the manifest was last written. The
+    /// GUI/CLI must refuse Apply while this is set: this milestone never
+    /// automatically destroys or rebuilds an existing view under a changed
+    /// profile, it only surfaces the conflict for review. `None` (not a
+    /// conflict) whenever the manifest recorded no fingerprint at all - an
+    /// old, pre-Frontend-Profiles manifest is never treated as "incompatible"
+    /// merely for predating this field.
+    pub fingerprint_conflict: Option<String>,
+    /// `Some` when `view.profile.kind` is not `Generic` - `RomM`/`EsDe`
+    /// materialization is not implemented in this milestone, so planning
+    /// fails closed with a clear refusal here rather than silently
+    /// producing `Generic`-shaped output (see `FrontendProfileKind`'s doc
+    /// comment). The GUI/CLI must refuse Apply while this is set, exactly
+    /// like `unsafe_root_error`/`fingerprint_conflict`.
+    pub profile_error: Option<String>,
 }
 
 impl LibraryViewPlan {
     pub fn is_safe_to_apply(&self) -> bool {
         self.unsafe_root_error.is_none()
+            && self.fingerprint_conflict.is_none()
+            && self.profile_error.is_none()
     }
 }
 
@@ -706,6 +1110,22 @@ pub fn plan_library_view(
             Ok(_) => None,
             Err(error) => Some(error.to_string()),
         };
+    // Fail closed for a not-yet-implemented frontend kind - see
+    // `FrontendProfileKind`'s doc comment. Computed once here (rather than
+    // only inside `generate_relative_link_path`'s own per-record refusal)
+    // so the plan carries one clear, top-level reason Apply is refused,
+    // in addition to every individual candidate also reporting
+    // `SkipInvalidPath` with the same underlying cause.
+    let profile_error = if view.profile.kind == FrontendProfileKind::Generic {
+        None
+    } else {
+        Some(format!(
+            "the {:?} frontend profile does not implement real Library View materialization \
+             yet in this milestone - refusing to plan/apply rather than silently falling back \
+             to Generic behaviour",
+            view.profile.kind
+        ))
+    };
 
     let source_by_id: HashMap<i64, &SourceFolderRecord> = source_folders
         .iter()
@@ -775,6 +1195,7 @@ pub fn plan_library_view(
 
         let relative_link_path = match generate_relative_link_path(
             view.layout_template,
+            &view.profile,
             &platform,
             &record.absolute_path,
         ) {
@@ -795,6 +1216,30 @@ pub fn plan_library_view(
                 continue;
             }
         };
+        // Source-side containment: the planned symlink target must itself
+        // resolve inside the trusted source root the catalogue says it
+        // came from - never touched by ordinary scans (which only ever
+        // discover archives under a source folder), but this refuses to
+        // plan a symlink target that has since been made to escape that
+        // root (e.g. a symlink planted inside the source folder pointing
+        // somewhere untrusted). See `validate_symlink_target_within_source`.
+        if let Err(error) =
+            validate_symlink_target_within_source(&record.absolute_path, &source.path)
+        {
+            entries.push(LibraryViewPlanEntry {
+                action: LibraryViewPlanAction::SkipInvalidPath,
+                archive_path: Some(record.absolute_path.clone()),
+                relative_link_path: None,
+                destination_path: None,
+                platform: Some(platform),
+                reason: Some(error.to_string()),
+                colliding_with: None,
+                source_folder_path: None,
+                archive_identity: None,
+            });
+            counts.add(LibraryViewPlanAction::SkipInvalidPath.count_bucket());
+            continue;
+        }
         let destination_path = view.destination_root.join(&relative_link_path);
         let archive_identity = record
             .size_bytes
@@ -888,13 +1333,81 @@ pub fn plan_library_view(
         counts.add(LibraryViewPlanAction::RemoveStale.count_bucket());
     }
 
+    // Deterministic output: `wanted` above is a `HashMap`, so its iteration
+    // order (and therefore the order entries were pushed in passes 1-3) is
+    // not guaranteed stable across runs/platforms. Sort once, at the very
+    // end, by `(view_relative_path, source_path)` - repeated planning from
+    // identical inputs must always produce an identical plan vector. Entries
+    // with no relative/archive path (the two catalogue-only skip reasons)
+    // sort together at the front under the empty-path key, ordered by
+    // archive path as the tiebreaker; that is still fully deterministic,
+    // just not alphabetically interleaved with path-bearing entries.
+    entries.sort_by(|a, b| {
+        let a_key = (
+            a.relative_link_path.clone().unwrap_or_default(),
+            a.archive_path.clone().unwrap_or_default(),
+        );
+        let b_key = (
+            b.relative_link_path.clone().unwrap_or_default(),
+            b.archive_path.clone().unwrap_or_default(),
+        );
+        a_key.cmp(&b_key)
+    });
+
+    let profile_fingerprint = compute_view_profile_fingerprint(view);
+    let fingerprint_conflict = manifest.view_fingerprint.as_ref().and_then(|recorded| {
+        if *recorded == profile_fingerprint {
+            None
+        } else {
+            Some(format!(
+                "this view's existing manifest was written under a different frontend profile \
+                 fingerprint ({recorded}) than its current configuration ({profile_fingerprint}) \
+                 produces - refusing to apply automatically; review the profile change (or the \
+                 manifest) before re-applying"
+            ))
+        }
+    });
+
     LibraryViewPlan {
         view_id: view.id.clone(),
         destination_root: view.destination_root.clone(),
         counts,
         entries,
         unsafe_root_error,
+        profile_fingerprint,
+        fingerprint_conflict,
+        profile_error,
     }
+}
+
+/// A deterministic fingerprint of everything about `view` that affects the
+/// *shape* of its planned output - the layout template and the frontend
+/// profile (kind + policy). Two views with the same fingerprint are
+/// guaranteed to plan identical relative link paths for the same catalogue
+/// input; two views that differ only in fields that do not affect output
+/// shape (`id`, `name`, `enabled`, `source_folders`, `platforms`,
+/// `destination_root`) are *not* guaranteed to differ.
+///
+/// Deliberately excludes anything time-based, random, or HashMap-ordered:
+/// `FrontendPlatformMapping` is backed by a `BTreeMap` specifically so this
+/// fingerprint's input JSON always serializes its keys in the same (sorted)
+/// order regardless of insertion order. Uses `sha2` (already a dependency -
+/// see `Cargo.toml`) rather than adding a new hash crate just for this.
+pub fn compute_view_profile_fingerprint(view: &LibraryViewConfig) -> String {
+    #[derive(Serialize)]
+    struct FingerprintInput<'a> {
+        layout_template: LibraryViewLayoutTemplate,
+        profile: &'a FrontendProfile,
+    }
+    let input = FingerprintInput {
+        layout_template: view.layout_template,
+        profile: &view.profile,
+    };
+    let canonical = serde_json::to_string(&input)
+        .expect("FingerprintInput has no non-serializable field (no maps/floats/NaN)");
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.as_bytes());
+    encode_hex(&hasher.finalize())
 }
 
 /// Classifies what already exists at `destination_path` against what the
@@ -943,6 +1456,181 @@ fn classify_existing_path(
                 Some("an existing symlink at this path could not be read".to_string()),
             ),
         },
+    }
+}
+
+// ---------------------------------------------------------------------
+// Stage 2 ownership model: generalizes `classify_existing_path`'s
+// Symlink-specific classification to the full `LibraryViewObjectKind`
+// vocabulary, for planning/dry-run use by a later milestone's `GeneratedFile`/
+// `Directory` materialization. Read-only, exactly like `classify_existing_path`
+// - `fs::symlink_metadata`/`fs::read_link` only, never a mutation. Not yet
+// wired into `plan_library_view` itself (which only ever plans `Symlink`
+// entries in this milestone); exists so the ownership rules below are
+// already implemented, tested, and stable before anything calls them from
+// the main planning pass.
+// ---------------------------------------------------------------------
+
+/// What a path on disk turned out to be, classified against what a
+/// (possibly hypothetical, not-yet-real) managed object of `expected_kind`
+/// would look like there. Never assigns `Owned*` merely because a path's
+/// *name* matches something the manifest recorded - ownership additionally
+/// requires the recorded entry to exist for that exact relative path
+/// (`is_owned_by_manifest`) *and* the actual filesystem object to be
+/// consistent with what that entry says it should be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LibraryViewObjectClassification {
+    /// Nothing exists at this path yet.
+    Missing,
+    /// A manifest-owned object of the expected kind, matching what the
+    /// manifest recorded for it (for `Symlink`: pointing at the recorded
+    /// target).
+    OwnedCorrect,
+    /// A manifest-owned object of the expected kind, but not matching what
+    /// the manifest recorded (for `Symlink`: pointing somewhere else) -
+    /// drift since the last apply, safe to repair.
+    OwnedStale,
+    /// A real (non-symlink) file or directory exists here, and it is not
+    /// recorded as manifest-owned - never touched.
+    ForeignRealFile,
+    /// A symlink exists here, and it is not recorded as manifest-owned -
+    /// never touched, even if it happens to point at the same target a
+    /// managed symlink would.
+    ForeignSymlink,
+    /// Something is recorded as manifest-owned at this exact relative path,
+    /// but what is actually on disk is not the kind of object the manifest
+    /// says it should be (e.g. the manifest says `Symlink` but a real
+    /// directory sits there now) - never touched; this is a refusal state,
+    /// not something to be silently reinterpreted.
+    WrongObjectKind,
+}
+
+/// Classifies whatever is at `path` against a managed object of
+/// `expected_kind` - `expected_target` is only meaningful for
+/// `LibraryViewObjectKind::Symlink` (the exact symlink target the manifest
+/// recorded); `is_owned_by_manifest` must be computed by the caller from an
+/// actual manifest lookup (e.g. "does some entry's `relative_link_path`
+/// equal this path's relative form"), never inferred from the path's name
+/// alone - see `LibraryViewObjectClassification`'s doc comment.
+pub fn classify_library_view_object(
+    path: &Path,
+    expected_kind: LibraryViewObjectKind,
+    expected_target: Option<&Path>,
+    is_owned_by_manifest: bool,
+) -> LibraryViewObjectClassification {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(_) => return LibraryViewObjectClassification::Missing,
+    };
+    let file_type = metadata.file_type();
+
+    match expected_kind {
+        LibraryViewObjectKind::Symlink => {
+            if !file_type.is_symlink() {
+                return if is_owned_by_manifest {
+                    LibraryViewObjectClassification::WrongObjectKind
+                } else {
+                    LibraryViewObjectClassification::ForeignRealFile
+                };
+            }
+            match fs::read_link(path) {
+                Ok(actual_target) if Some(actual_target.as_path()) == expected_target => {
+                    LibraryViewObjectClassification::OwnedCorrect
+                }
+                _ if is_owned_by_manifest => LibraryViewObjectClassification::OwnedStale,
+                _ => LibraryViewObjectClassification::ForeignSymlink,
+            }
+        }
+        LibraryViewObjectKind::GeneratedFile => {
+            if file_type.is_symlink() {
+                return if is_owned_by_manifest {
+                    LibraryViewObjectClassification::WrongObjectKind
+                } else {
+                    LibraryViewObjectClassification::ForeignSymlink
+                };
+            }
+            if !file_type.is_file() {
+                return LibraryViewObjectClassification::WrongObjectKind;
+            }
+            if is_owned_by_manifest {
+                // Content-hash comparison (the real "still correct?" check
+                // for a GeneratedFile) is future work - nothing creates a
+                // GeneratedFile yet, so there is no real content to compare
+                // against. Conservatively `OwnedStale` rather than
+                // `OwnedCorrect`: never claim a not-yet-implemented check
+                // passed.
+                LibraryViewObjectClassification::OwnedStale
+            } else {
+                LibraryViewObjectClassification::ForeignRealFile
+            }
+        }
+        LibraryViewObjectKind::Directory => {
+            if !file_type.is_dir() {
+                return if is_owned_by_manifest {
+                    LibraryViewObjectClassification::WrongObjectKind
+                } else {
+                    LibraryViewObjectClassification::ForeignRealFile
+                };
+            }
+            if is_owned_by_manifest {
+                LibraryViewObjectClassification::OwnedCorrect
+            } else {
+                LibraryViewObjectClassification::ForeignRealFile
+            }
+        }
+    }
+}
+
+/// A planned (never written) future `GeneratedFile` entry: the relative
+/// path it would occupy, and the content hash its intended content would
+/// have. Model/planning only - nothing in this milestone ever writes the
+/// file `intended_content_hash` describes; see `plan_generated_file`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LibraryViewGeneratedFilePlan {
+    #[serde(with = "path_json")]
+    pub relative_path: PathBuf,
+    pub intended_content_hash: String,
+    /// What `classify_library_view_object` reports for this path against
+    /// the view's current manifest/filesystem state - i.e. what applying
+    /// this (still-hypothetical) `GeneratedFile` entry would actually do,
+    /// without doing it.
+    pub classification: LibraryViewObjectClassification,
+}
+
+/// Computes what a future `GeneratedFile` entry at `relative_path` (under
+/// `destination_root`) would contain (`intended_content_hash`, via `sha2` -
+/// already a dependency, see `Cargo.toml`) and what applying it would find
+/// on disk right now (`classification`) - entirely a dry-run read: this
+/// never creates `content`, `relative_path`, or any directory. The single
+/// seam a later milestone's real `GeneratedFile` materialization (e.g. a
+/// RomM `.m3u` or an ES-DE `gamelist.xml`) can build on without this
+/// milestone having guessed at its content format.
+pub fn plan_generated_file(
+    destination_root: &Path,
+    relative_path: PathBuf,
+    content: &[u8],
+    manifest: &LibraryViewManifest,
+) -> LibraryViewGeneratedFilePlan {
+    let mut hasher = Sha256::new();
+    hasher.update(content);
+    let intended_content_hash = encode_hex(&hasher.finalize());
+
+    let is_owned_by_manifest = manifest.entries.iter().any(|entry| {
+        entry.relative_link_path == relative_path
+            && entry.object_kind == LibraryViewObjectKind::GeneratedFile
+    });
+    let destination_path = destination_root.join(&relative_path);
+    let classification = classify_library_view_object(
+        &destination_path,
+        LibraryViewObjectKind::GeneratedFile,
+        None,
+        is_owned_by_manifest,
+    );
+
+    LibraryViewGeneratedFilePlan {
+        relative_path,
+        intended_content_hash,
+        classification,
     }
 }
 
@@ -1013,9 +1701,13 @@ pub fn apply_library_view(
 ) -> Result<LibraryViewApplyReport> {
     if !plan.is_safe_to_apply() {
         return Err(ArchiveFsError::Config(
-            plan.unsafe_root_error.clone().unwrap_or_else(|| {
-                "this library view's destination is unsafe to apply".to_string()
-            }),
+            plan.unsafe_root_error
+                .clone()
+                .or_else(|| plan.profile_error.clone())
+                .or_else(|| plan.fingerprint_conflict.clone())
+                .unwrap_or_else(|| {
+                    "this library view's destination is unsafe to apply".to_string()
+                }),
         ));
     }
     fs::create_dir_all(&view.destination_root)
@@ -1061,6 +1753,9 @@ pub fn apply_library_view(
                         updated_at: now.clone(),
                         platform: entry.platform.clone().unwrap_or_default(),
                         source_folder_path: entry.source_folder_path.clone().unwrap_or_default(),
+                        object_kind: LibraryViewObjectKind::Symlink,
+                        content_hash: None,
+                        rendering_version: None,
                     },
                 );
                 report.unchanged += 1;
@@ -1102,6 +1797,9 @@ pub fn apply_library_view(
                                     .source_folder_path
                                     .clone()
                                     .unwrap_or_default(),
+                                object_kind: LibraryViewObjectKind::Symlink,
+                                content_hash: None,
+                                rendering_version: None,
                             },
                         );
                         if is_repair {
@@ -1183,10 +1881,23 @@ pub fn apply_library_view(
         }
     }
 
+    let mut new_entries: Vec<LibraryViewManifestEntry> = entries_by_path.into_values().collect();
+    // Deterministic output, same reasoning as `plan_library_view`'s final
+    // sort: `entries_by_path` is a `HashMap`, so its iteration order is not
+    // guaranteed stable.
+    new_entries.sort_by(|a, b| a.relative_link_path.cmp(&b.relative_link_path));
+
     let new_manifest = LibraryViewManifest {
         view_id: view.id.clone(),
         destination_root: view.destination_root.clone(),
-        entries: entries_by_path.into_values().collect(),
+        entries: new_entries,
+        view_fingerprint: Some(compute_view_profile_fingerprint(view)),
+        profile_version: 1,
+        // Not yet populated by this milestone's apply (see the field's own
+        // doc comment) - carried forward unchanged rather than reset, so a
+        // later milestone that does start populating it is never silently
+        // wiped by an apply from this one.
+        created_directories: manifest.created_directories.clone(),
     };
     save_library_view_manifest_at(data_dir, &new_manifest)?;
     maybe_remove_empty_managed_directories(&view.destination_root, &new_manifest);
@@ -1274,6 +1985,13 @@ pub fn remove_library_view_symlinks(
         view_id: view.id.clone(),
         destination_root: view.destination_root.clone(),
         entries: remaining,
+        // Removal does not re-plan or re-apply a profile - it only drops
+        // symlinks the previous manifest already owned - so the previous
+        // fingerprint/version/directory-ownership bookkeeping is carried
+        // forward unchanged rather than reset or recomputed here.
+        view_fingerprint: manifest.view_fingerprint.clone(),
+        profile_version: manifest.profile_version,
+        created_directories: manifest.created_directories.clone(),
     };
     save_library_view_manifest_at(data_dir, &new_manifest)?;
     maybe_remove_empty_managed_directories(&view.destination_root, &new_manifest);
@@ -1423,6 +2141,7 @@ pub fn add_library_view_default(
         source_folders,
         platforms,
         layout_template,
+        profile: FrontendProfile::default(),
     };
 
     let mut views = load_library_view_configs_default()?;
@@ -1711,6 +2430,7 @@ mod tests {
             source_folders,
             platforms,
             layout_template: LibraryViewLayoutTemplate::PlatformFilename,
+            profile: FrontendProfile::default(),
         }
     }
 
@@ -1899,7 +2619,13 @@ mod tests {
                 updated_at: "2026-01-01T00:00:00Z".to_string(),
                 platform: "NES".to_string(),
                 source_folder_path: source_dir.clone(),
+                object_kind: LibraryViewObjectKind::Symlink,
+                content_hash: None,
+                rendering_version: None,
             }],
+            view_fingerprint: None,
+            profile_version: 0,
+            created_directories: Vec::new(),
         };
 
         let plan = plan_library_view(&view, &[archive], &[source], &manifest);
@@ -2111,7 +2837,13 @@ mod tests {
                 updated_at: "2026-01-01T00:00:00Z".to_string(),
                 platform: "NES".to_string(),
                 source_folder_path: source_dir.clone(),
+                object_kind: LibraryViewObjectKind::Symlink,
+                content_hash: None,
+                rendering_version: None,
             }],
+            view_fingerprint: None,
+            profile_version: 0,
+            created_directories: Vec::new(),
         };
 
         // The path the manifest thinks is a managed symlink has since been
@@ -2329,7 +3061,13 @@ mod tests {
                 updated_at: "2026-01-01T00:00:00Z".to_string(),
                 platform: "NES".to_string(),
                 source_folder_path: PathBuf::from("/somewhere"),
+                object_kind: LibraryViewObjectKind::Symlink,
+                content_hash: None,
+                rendering_version: None,
             }],
+            view_fingerprint: None,
+            profile_version: 0,
+            created_directories: Vec::new(),
         };
         save_library_view_manifest_at(&data_dir, &existing_manifest).unwrap();
         let manifest_path = library_view_manifest_path(&data_dir, &view.id);
@@ -2341,6 +3079,9 @@ mod tests {
             counts: LibraryViewPlanCounts::default(),
             entries: vec![],
             unsafe_root_error: Some("destination is inside a source folder".to_string()),
+            profile_fingerprint: compute_view_profile_fingerprint(&view),
+            fingerprint_conflict: None,
+            profile_error: None,
         };
 
         let result = apply_library_view(&view, &unsafe_plan, &existing_manifest, &data_dir);
@@ -2415,6 +3156,671 @@ mod tests {
         assert_eq!(
             plan.counts, recomputed,
             "CLI and GUI both read plan.counts directly - it must always match the entries list exactly"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Frontend Profiles milestone - Stage 1.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn old_config_without_profile_field_deserializes_unchanged() {
+        let json = r#"[
+            {
+                "id": "view-1",
+                "name": "Old View",
+                "destination_root": "/tmp/old-dest",
+                "enabled": true,
+                "source_folders": [],
+                "platforms": [],
+                "layout_template": "PlatformFilename"
+            }
+        ]"#;
+        let views = parse_library_view_configs(json).unwrap();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].id, "view-1");
+        assert_eq!(
+            views[0].profile,
+            FrontendProfile::default(),
+            "a config predating the profile field must resolve to the default profile"
+        );
+        assert_eq!(views[0].profile.kind, FrontendProfileKind::Generic);
+    }
+
+    #[test]
+    fn new_profile_default_preserves_platform_filename_behavior() {
+        let root = temp_dir("profile-defaults-preserve-behavior");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Super Mario Bros. (USA) (Rev 1) [!].zip");
+        write_file(&archive_path, b"zip-bytes");
+        let destination = root.join("dest");
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("NES"));
+
+        // `FrontendProfile::default()` (Generic, default policy) - what
+        // `make_view` already constructs - must plan exactly the
+        // pre-existing `PlatformFilename` output.
+        let view = make_view("view-generic", &destination, vec![], vec![]);
+        assert_eq!(view.profile.kind, FrontendProfileKind::Generic);
+        let manifest = empty_manifest(&view.id, &destination);
+        let plan = plan_library_view(&view, &[archive], &[source], &manifest);
+
+        assert_eq!(plan.profile_error, None);
+        assert_eq!(
+            plan.entries[0].relative_link_path,
+            Some(PathBuf::from("NES/Super Mario Bros. (USA) (Rev 1) [!].zip"))
+        );
+        assert_eq!(plan.entries[0].action, LibraryViewPlanAction::Create);
+    }
+
+    #[test]
+    fn romm_and_esde_profile_kinds_fail_closed_never_silently_fall_back_to_generic() {
+        let root = temp_dir("romm-esde-fail-closed");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Super Mario Bros. (USA) (Rev 1) [!].zip");
+        write_file(&archive_path, b"zip-bytes");
+        let destination = root.join("dest");
+        let data_dir = root.join("data");
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("NES"));
+
+        for kind in [FrontendProfileKind::RomM, FrontendProfileKind::EsDe] {
+            let mut view = make_view(&format!("view-{kind:?}"), &destination, vec![], vec![]);
+            view.profile.kind = kind;
+            let manifest = empty_manifest(&view.id, &destination);
+            let plan = plan_library_view(
+                &view,
+                std::slice::from_ref(&archive),
+                std::slice::from_ref(&source),
+                &manifest,
+            );
+
+            assert!(
+                plan.profile_error.is_some(),
+                "{kind:?} must surface a clear planning refusal, not a silent fallback"
+            );
+            assert!(!plan.is_safe_to_apply());
+            // Never silently degrades to Generic's Create entry - either no
+            // entry is produced for this candidate, or it is explicitly
+            // reported as skipped, but it must never be `Create`.
+            assert!(
+                plan.entries
+                    .iter()
+                    .all(|entry| entry.action != LibraryViewPlanAction::Create),
+                "{kind:?} must never silently produce a Generic-shaped Create entry"
+            );
+
+            let result = apply_library_view(&view, &plan, &manifest, &data_dir);
+            assert!(
+                result.is_err(),
+                "{kind:?} apply must be refused, not silently applied"
+            );
+
+            // Defense in depth: the lower-level path generator refuses
+            // directly too, for any caller that bypasses plan_library_view.
+            assert!(
+                generate_relative_link_path(
+                    view.layout_template,
+                    &view.profile,
+                    "NES",
+                    &archive_path,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn plan_is_deterministic_across_repeated_calls_and_input_order() {
+        let root = temp_dir("plan-determinism");
+        let source_dir = root.join("source");
+        let mut archives = Vec::new();
+        for (index, (platform, name)) in [
+            ("NES", "Alpha.zip"),
+            ("NES", "Beta.zip"),
+            ("SNES", "Charlie.zip"),
+            ("SNES", "Delta.zip"),
+            ("GBA", "Echo.zip"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = source_dir.join(name);
+            write_file(&path, b"zip-bytes");
+            archives.push(make_archive(index as i64 + 1, 1, &path, Some(platform)));
+        }
+        let destination = root.join("dest");
+        let source = make_source(1, &source_dir);
+        let view = make_view("view-1", &destination, vec![], vec![]);
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan_a = plan_library_view(&view, &archives, std::slice::from_ref(&source), &manifest);
+        // Re-plan from a differently-ordered (reversed) input Vec - a real
+        // HashMap-ordering hazard would show up as a different entries
+        // order here.
+        let mut reversed = archives.clone();
+        reversed.reverse();
+        let plan_b = plan_library_view(&view, &reversed, std::slice::from_ref(&source), &manifest);
+        let plan_c = plan_library_view(&view, &archives, &[source], &manifest);
+
+        assert_eq!(
+            plan_a.entries, plan_b.entries,
+            "planning from a reordered input must still produce an identically ordered plan"
+        );
+        assert_eq!(
+            plan_a.entries, plan_c.entries,
+            "repeated planning from identical inputs must produce identical plan vectors"
+        );
+
+        // The stated ordering rule: (view_relative_path, source_path),
+        // non-decreasing.
+        let keys: Vec<(PathBuf, PathBuf)> = plan_a
+            .entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.relative_link_path.clone().unwrap_or_default(),
+                    entry.archive_path.clone().unwrap_or_default(),
+                )
+            })
+            .collect();
+        let mut sorted_keys = keys.clone();
+        sorted_keys.sort();
+        assert_eq!(
+            keys, sorted_keys,
+            "plan entries must be sorted by (view_relative_path, source_path)"
+        );
+    }
+
+    #[test]
+    fn derived_filename_sanitisation_rejects_unsafe_components() {
+        assert!(
+            sanitize_path_component_str("").is_err(),
+            "empty must be rejected"
+        );
+        assert!(
+            sanitize_path_component_str(".").is_err(),
+            "'.' must be rejected"
+        );
+        assert!(
+            sanitize_path_component_str("..").is_err(),
+            "'..' must be rejected"
+        );
+        assert!(
+            sanitize_path_component_str("a/b").is_err(),
+            "an embedded path separator must be rejected"
+        );
+        assert!(
+            sanitize_path_component_str("/etc/passwd").is_err(),
+            "an absolute path must be rejected"
+        );
+        assert!(
+            sanitize_path_component_str("../../etc/passwd").is_err(),
+            "a traversal attempt must be rejected"
+        );
+        assert!(sanitize_path_component_str("Game.zip").is_ok());
+
+        assert!(sanitize_path_component_os(OsStr::new("")).is_err());
+        assert!(sanitize_path_component_os(OsStr::new("..")).is_err());
+        assert!(sanitize_path_component_os(OsStr::new("a/b")).is_err());
+        assert!(sanitize_path_component_os(OsStr::new("Game.zip")).is_ok());
+    }
+
+    #[test]
+    fn derive_view_filename_rejects_archive_path_with_no_filename() {
+        let profile = FrontendProfile::default();
+        assert!(derive_view_filename(&profile, Path::new("/")).is_err());
+        assert!(derive_view_filename(&profile, Path::new(".")).is_err());
+    }
+
+    #[test]
+    fn derive_view_filename_never_invents_a_fallback_and_never_renames_source() {
+        let profile = FrontendProfile::default();
+        let archive_path = Path::new("/roms/nes/Game (USA).zip");
+        let derived = derive_view_filename(&profile, archive_path).unwrap();
+        assert_eq!(
+            derived,
+            PathBuf::from("Game (USA).zip"),
+            "Stage 1 default behaviour must equal the source filename exactly"
+        );
+        // The archive itself is never touched by deriving its view filename.
+        assert_eq!(archive_path.file_name().unwrap(), "Game (USA).zip");
+    }
+
+    #[test]
+    fn duplicate_derived_destination_is_reported_as_collision_not_silently_disambiguated() {
+        let root = temp_dir("derived-destination-collision");
+        let source_dir_a = root.join("source-a");
+        let source_dir_b = root.join("source-b");
+        let archive_a = source_dir_a.join("Game.zip");
+        let archive_b = source_dir_b.join("Game.zip");
+        write_file(&archive_a, b"a");
+        write_file(&archive_b, b"b");
+        let destination = root.join("dest");
+
+        let source_a = make_source(1, &source_dir_a);
+        let source_b = make_source(2, &source_dir_b);
+        let record_a = make_archive(1, 1, &archive_a, Some("NES"));
+        let record_b = make_archive(2, 2, &archive_b, Some("NES"));
+        let view = make_view("view-1", &destination, vec![], vec![]);
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(
+            &view,
+            &[record_a, record_b],
+            &[source_a, source_b],
+            &manifest,
+        );
+
+        assert_eq!(plan.counts.collision, 2);
+        assert!(
+            plan.entries
+                .iter()
+                .all(|entry| entry.action != LibraryViewPlanAction::Create),
+            "two archives that derive the same destination must never be silently disambiguated"
+        );
+    }
+
+    #[test]
+    fn planning_never_mutates_the_source_archive_under_any_profile_kind() {
+        let root = temp_dir("no-mutation-any-profile");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Game.zip");
+        write_file(&archive_path, b"original-bytes");
+        let destination = root.join("dest");
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("NES"));
+        let mut view = make_view("view-1", &destination, vec![], vec![]);
+        view.profile.kind = FrontendProfileKind::RomM;
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let _plan = plan_library_view(&view, &[archive], &[source], &manifest);
+
+        assert_eq!(fs::read(&archive_path).unwrap(), b"original-bytes");
+        assert!(
+            !destination.exists(),
+            "planning must never create the destination directory either"
+        );
+    }
+
+    #[test]
+    fn frontend_profile_kinds_serialize_and_deserialize_safely() {
+        for kind in [
+            FrontendProfileKind::Generic,
+            FrontendProfileKind::RomM,
+            FrontendProfileKind::EsDe,
+        ] {
+            let profile = FrontendProfile {
+                kind,
+                policy: FrontendProfilePolicy::default(),
+            };
+            let json = serde_json::to_string(&profile).unwrap();
+            let round_tripped: FrontendProfile = serde_json::from_str(&json).unwrap();
+            assert_eq!(profile, round_tripped);
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Frontend Profiles milestone - Stage 2.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn old_manifest_without_new_fields_deserializes_unchanged() {
+        let json = r#"{
+            "view_id": "view-1",
+            "destination_root": "/tmp/dest",
+            "entries": [
+                {
+                    "relative_link_path": "NES/Game.zip",
+                    "target_path": "/source/Game.zip",
+                    "archive_identity": null,
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "updated_at": "2026-01-01T00:00:00Z",
+                    "platform": "NES",
+                    "source_folder_path": "/source"
+                }
+            ]
+        }"#;
+        let manifest: LibraryViewManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(manifest.entries.len(), 1);
+        assert_eq!(
+            manifest.entries[0].object_kind,
+            LibraryViewObjectKind::Symlink
+        );
+        assert_eq!(manifest.entries[0].content_hash, None);
+        assert_eq!(manifest.entries[0].rendering_version, None);
+        assert_eq!(manifest.view_fingerprint, None);
+        assert_eq!(manifest.profile_version, 0);
+        assert_eq!(manifest.created_directories, Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn new_manifest_fields_serde_default_correctly() {
+        let manifest = LibraryViewManifest::empty("view-1", Path::new("/tmp/dest"));
+        let json = serde_json::to_string(&manifest).unwrap();
+        let round_tripped: LibraryViewManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(manifest, round_tripped);
+        assert_eq!(round_tripped.view_fingerprint, None);
+        assert_eq!(round_tripped.profile_version, 0);
+        assert!(round_tripped.created_directories.is_empty());
+    }
+
+    #[test]
+    fn object_kind_round_trips_through_json_for_every_variant() {
+        for kind in [
+            LibraryViewObjectKind::Symlink,
+            LibraryViewObjectKind::GeneratedFile,
+            LibraryViewObjectKind::Directory,
+        ] {
+            let json = serde_json::to_string(&kind).unwrap();
+            let round_tripped: LibraryViewObjectKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(kind, round_tripped);
+        }
+    }
+
+    #[test]
+    fn profile_fingerprint_is_deterministic() {
+        let view = make_view("view-1", Path::new("/tmp/dest"), vec![], vec![]);
+        let a = compute_view_profile_fingerprint(&view);
+        let b = compute_view_profile_fingerprint(&view);
+        assert_eq!(a, b);
+
+        let other = make_view("view-2", Path::new("/tmp/dest"), vec![], vec![]);
+        assert_eq!(
+            a,
+            compute_view_profile_fingerprint(&other),
+            "fingerprint depends only on layout_template/profile, not id/name/destination"
+        );
+    }
+
+    #[test]
+    fn profile_fingerprint_changes_for_output_affecting_policy() {
+        let base = make_view("view-1", Path::new("/tmp/dest"), vec![], vec![]);
+        let base_fingerprint = compute_view_profile_fingerprint(&base);
+
+        let mut kind_changed = base.clone();
+        kind_changed.profile.kind = FrontendProfileKind::RomM;
+        assert_ne!(
+            base_fingerprint,
+            compute_view_profile_fingerprint(&kind_changed)
+        );
+
+        let mut policy_changed = base.clone();
+        policy_changed.profile.policy.region_preference = vec!["USA".to_string()];
+        assert_ne!(
+            base_fingerprint,
+            compute_view_profile_fingerprint(&policy_changed)
+        );
+
+        let mut platform_override_changed = base.clone();
+        platform_override_changed
+            .profile
+            .policy
+            .platform_mapping_overrides
+            .insert("NES".to_string(), "Nintendo".to_string());
+        assert_ne!(
+            base_fingerprint,
+            compute_view_profile_fingerprint(&platform_override_changed)
+        );
+
+        // Fields that do not affect output shape must never change the
+        // fingerprint.
+        let mut cosmetic_changed = base.clone();
+        cosmetic_changed.name = "Renamed".to_string();
+        cosmetic_changed.enabled = false;
+        cosmetic_changed.source_folders = vec![PathBuf::from("/somewhere")];
+        cosmetic_changed.platforms = vec!["NES".to_string()];
+        cosmetic_changed.destination_root = PathBuf::from("/elsewhere");
+        assert_eq!(
+            base_fingerprint,
+            compute_view_profile_fingerprint(&cosmetic_changed),
+            "id/name/enabled/source_folders/platforms/destination_root must not affect the fingerprint"
+        );
+    }
+
+    #[test]
+    fn incompatible_manifest_fingerprint_produces_refusal_never_silent_overwrite() {
+        let root = temp_dir("fingerprint-conflict-refusal");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Game.zip");
+        write_file(&archive_path, b"zip-bytes");
+        let destination = root.join("dest");
+        let data_dir = root.join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("NES"));
+        let view = make_view("view-1", &destination, vec![], vec![]);
+
+        // A manifest recorded under some other (unrelated) fingerprint -
+        // simulating a profile change since the manifest was last written.
+        let mut existing_manifest = empty_manifest(&view.id, &destination);
+        existing_manifest.view_fingerprint = Some("not-the-current-fingerprint".to_string());
+        save_library_view_manifest_at(&data_dir, &existing_manifest).unwrap();
+        let manifest_path = library_view_manifest_path(&data_dir, &view.id);
+        let before = fs::read_to_string(&manifest_path).unwrap();
+
+        let plan = plan_library_view(&view, &[archive], &[source], &existing_manifest);
+        assert!(
+            plan.fingerprint_conflict.is_some(),
+            "a manifest recorded under a different fingerprint must surface a conflict"
+        );
+        assert!(!plan.is_safe_to_apply());
+
+        let result = apply_library_view(&view, &plan, &existing_manifest, &data_dir);
+        assert!(
+            result.is_err(),
+            "apply must refuse rather than silently overwrite"
+        );
+
+        let after = fs::read_to_string(&manifest_path).unwrap();
+        assert_eq!(
+            before, after,
+            "a refused apply must never touch the previous manifest"
+        );
+    }
+
+    #[test]
+    fn no_fingerprint_recorded_is_never_treated_as_a_conflict() {
+        // An empty/pre-Frontend-Profiles manifest never records a
+        // fingerprint at all - that must never be treated as
+        // "incompatible", only an actual mismatch should be.
+        let root = temp_dir("no-fingerprint-not-a-conflict");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Game.zip");
+        write_file(&archive_path, b"zip-bytes");
+        let destination = root.join("dest");
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("NES"));
+        let view = make_view("view-1", &destination, vec![], vec![]);
+        let manifest = empty_manifest(&view.id, &destination);
+        assert_eq!(manifest.view_fingerprint, None);
+
+        let plan = plan_library_view(&view, &[archive], &[source], &manifest);
+        assert_eq!(plan.fingerprint_conflict, None);
+        assert!(plan.is_safe_to_apply());
+    }
+
+    #[test]
+    fn classify_foreign_real_file_is_preserved_not_owned() {
+        let root = temp_dir("classify-foreign-real-file");
+        let path = root.join("Game.zip");
+        write_file(&path, b"a real file");
+        let classification = classify_library_view_object(
+            &path,
+            LibraryViewObjectKind::Symlink,
+            Some(Path::new("/somewhere/Game.zip")),
+            false,
+        );
+        assert_eq!(
+            classification,
+            LibraryViewObjectClassification::ForeignRealFile
+        );
+    }
+
+    #[test]
+    fn classify_foreign_symlink_is_preserved_not_owned() {
+        let root = temp_dir("classify-foreign-symlink");
+        let target = root.join("elsewhere.zip");
+        write_file(&target, b"x");
+        let path = root.join("Game.zip");
+        symlink(&target, &path).unwrap();
+        let classification = classify_library_view_object(
+            &path,
+            LibraryViewObjectKind::Symlink,
+            Some(Path::new("/somewhere/Game.zip")),
+            false,
+        );
+        assert_eq!(
+            classification,
+            LibraryViewObjectClassification::ForeignSymlink
+        );
+    }
+
+    #[test]
+    fn classify_wrong_object_kind_is_detected_for_every_expected_kind() {
+        let root = temp_dir("classify-wrong-object-kind");
+
+        let real_file = root.join("owned-as-symlink.zip");
+        write_file(&real_file, b"x");
+        assert_eq!(
+            classify_library_view_object(&real_file, LibraryViewObjectKind::Symlink, None, true),
+            LibraryViewObjectClassification::WrongObjectKind
+        );
+
+        let a_directory = root.join("owned-as-generated-file");
+        fs::create_dir_all(&a_directory).unwrap();
+        assert_eq!(
+            classify_library_view_object(
+                &a_directory,
+                LibraryViewObjectKind::GeneratedFile,
+                None,
+                true
+            ),
+            LibraryViewObjectClassification::WrongObjectKind
+        );
+
+        let a_file = root.join("owned-as-directory");
+        write_file(&a_file, b"x");
+        assert_eq!(
+            classify_library_view_object(&a_file, LibraryViewObjectKind::Directory, None, true),
+            LibraryViewObjectClassification::WrongObjectKind
+        );
+    }
+
+    #[test]
+    fn classify_stale_owned_symlink_behavior_is_unchanged() {
+        let root = temp_dir("classify-stale-owned-symlink");
+        let wrong_target = root.join("wrong.zip");
+        write_file(&wrong_target, b"x");
+        let path = root.join("Game.zip");
+        symlink(&wrong_target, &path).unwrap();
+
+        let classification = classify_library_view_object(
+            &path,
+            LibraryViewObjectKind::Symlink,
+            Some(Path::new("/expected/Game.zip")),
+            true,
+        );
+        assert_eq!(classification, LibraryViewObjectClassification::OwnedStale);
+    }
+
+    #[test]
+    fn classify_missing_when_nothing_exists() {
+        let root = temp_dir("classify-missing");
+        let path = root.join("does-not-exist.zip");
+        assert_eq!(
+            classify_library_view_object(&path, LibraryViewObjectKind::Symlink, None, true),
+            LibraryViewObjectClassification::Missing
+        );
+    }
+
+    #[test]
+    fn generated_file_content_hash_planning_never_writes_a_file() {
+        let root = temp_dir("generated-file-planning-no-write");
+        let destination = root.join("dest");
+        fs::create_dir_all(&destination).unwrap();
+        let manifest = empty_manifest("view-1", &destination);
+        let content = b"<gamelist/>";
+
+        let planned = plan_generated_file(
+            &destination,
+            PathBuf::from("NES/gamelist.xml"),
+            content,
+            &manifest,
+        );
+
+        let mut hasher = Sha256::new();
+        hasher.update(content);
+        let expected_hash = encode_hex(&hasher.finalize());
+        assert_eq!(planned.intended_content_hash, expected_hash);
+        assert_eq!(
+            planned.classification,
+            LibraryViewObjectClassification::Missing
+        );
+        assert!(
+            !destination.join("NES/gamelist.xml").exists(),
+            "planning a GeneratedFile entry must never write it to disk"
+        );
+    }
+
+    #[test]
+    fn created_directories_field_is_backwards_compatible_and_round_trips() {
+        let json_without_field = r#"{
+            "view_id": "view-1",
+            "destination_root": "/tmp/dest",
+            "entries": []
+        }"#;
+        let manifest: LibraryViewManifest = serde_json::from_str(json_without_field).unwrap();
+        assert!(manifest.created_directories.is_empty());
+
+        let mut populated = manifest.clone();
+        populated.created_directories = vec![PathBuf::from("NES"), PathBuf::from("SNES/discs")];
+        let json = serde_json::to_string(&populated).unwrap();
+        let round_tripped: LibraryViewManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            round_tripped.created_directories,
+            populated.created_directories
+        );
+    }
+
+    #[test]
+    fn applied_manifest_entries_are_written_in_deterministic_order() {
+        let root = temp_dir("deterministic-manifest-order");
+        let source_dir = root.join("source");
+        let mut archives = Vec::new();
+        for (index, (platform, name)) in [
+            ("NES", "Zulu.zip"),
+            ("NES", "Alpha.zip"),
+            ("SNES", "Mike.zip"),
+            ("GBA", "Bravo.zip"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = source_dir.join(name);
+            write_file(&path, b"zip-bytes");
+            archives.push(make_archive(index as i64 + 1, 1, &path, Some(platform)));
+        }
+        let destination = root.join("dest");
+        let data_dir = root.join("data");
+        let source = make_source(1, &source_dir);
+        let view = make_view("view-1", &destination, vec![], vec![]);
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(&view, &archives, &[source], &manifest);
+        apply_library_view(&view, &plan, &manifest, &data_dir).unwrap();
+        let written = load_library_view_manifest_at(&data_dir, &view.id).unwrap();
+
+        let mut expected = written.entries.clone();
+        expected.sort_by(|a, b| a.relative_link_path.cmp(&b.relative_link_path));
+        assert_eq!(
+            written.entries, expected,
+            "manifest entries must be written in a deterministic (sorted) order"
         );
     }
 }
