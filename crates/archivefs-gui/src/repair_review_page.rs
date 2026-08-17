@@ -43,13 +43,19 @@ use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
+use archivefs_core::Config;
+use archivefs_core::dat::limits::DatLimits;
 use archivefs_core::dat::rename_apply::model::EntryState;
+use archivefs_core::dat::sources::{
+    DatSourceEntry, DatSourceRegistry, default_dat_sources_config_path,
+    load_dat_sources_config_from,
+};
 use archivefs_core::repair::execute::{
     RepairExecutionOptions, RepairReverifyOutcome, RepairTransactionResult,
 };
 use archivefs_core::repair::library::{
-    ApplySavedPlanSelectedError, CombinedApplyResult, LibraryRepairPlan, ReportCounts,
-    apply_saved_plan_selected,
+    ApplySavedPlanSelectedError, CombinedApplyResult, LibraryRepairPlan, LibraryScanRequest,
+    RepairProfile, ReportCounts, apply_saved_plan_selected, plan_file_from_scan, run_library_scan,
 };
 use archivefs_core::repair::proposal::{RepairEvidenceKind, RepairProposal, RepairProposalId};
 use archivefs_core::safe_read::TrustedRoots;
@@ -373,6 +379,52 @@ struct RepairApplyJob {
     messages: Receiver<RepairApplyMessage>,
 }
 
+/// The one-time setup for a whole-library repair scan: which DAT catalogue
+/// to audit against, and which directory on disk to scan. Neither input can
+/// be resolved automatically today - no config or registry anywhere records
+/// which library directory a given DAT source should be audited against -
+/// so both are collected here before the scan itself is ever spawned.
+///
+/// Deliberately holds only what the picker UI needs (loaded once, when the
+/// dialog opens): registered DAT sources (mirrors `dat_sources_page`'s own
+/// registry load) and the configured library source folders (mirrors
+/// `dat_sources_page`'s own `library_folders`, offered the same way -
+/// buttons plus "Choose another folder…").
+#[derive(Debug, Default)]
+pub(crate) struct ScanSetupState {
+    pub(crate) dat_sources: Vec<DatSourceEntry>,
+    /// Surfaced, never swallowed: an unreadable/unparseable DAT sources
+    /// config means the picker has nothing to offer, and that must be
+    /// visible rather than presented as an empty registry.
+    pub(crate) dat_load_error: Option<String>,
+    pub(crate) library_folders: Vec<PathBuf>,
+    pub(crate) selected_dat_id: Option<String>,
+    pub(crate) chosen_scan_root: Option<PathBuf>,
+}
+
+/// The one terminal message a background whole-library scan sends back.
+enum RepairScanMessage {
+    Completed(Box<LibraryRepairPlan>),
+    Failed(String),
+}
+
+/// The running background whole-library scan job. Same one-shot channel
+/// shape as [`RepairApplyJob`].
+struct RepairScanJob {
+    messages: Receiver<RepairScanMessage>,
+}
+
+/// Simple status for the whole-library scan action. Deliberately no
+/// elaborate progress reporting in this stage - `run_library_scan`'s
+/// `on_progress` callback is passed a no-op, exactly as the CLI's own
+/// `repair scan` does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LibraryScanStatus {
+    Scanning,
+    Completed,
+    Failed(String),
+}
+
 /// The page's authoritative state.
 #[derive(Default)]
 pub(crate) struct RepairReviewPageState {
@@ -433,6 +485,16 @@ pub(crate) struct RepairReviewPageState {
     /// `RepairExecutionOptions::journal_dir` the production path already
     /// threads through unchanged.
     pub(crate) journal_dir_override: Option<PathBuf>,
+    /// The pending "Scan library for repairs" setup dialog. `None` means the
+    /// dialog is closed; opening it loads the DAT registry and configured
+    /// library folders once, up front (see [`ScanSetupState`]).
+    pub(crate) scan_setup: Option<ScanSetupState>,
+    scan_job: Option<RepairScanJob>,
+    /// The whole-library scan's own status, entirely separate from
+    /// [`Self::error`] (which is only ever set by [`Self::load_plan`]'s
+    /// file-load path) - a scan failure must never be presented as, or
+    /// confused with, a plan-file parse failure.
+    pub(crate) scan_status: Option<LibraryScanStatus>,
 }
 
 impl RepairReviewPageState {
@@ -447,26 +509,200 @@ impl RepairReviewPageState {
                     .map(|plan| (plan, CountsAvailability::from_raw_json(&text)))
             });
         match result {
-            Ok((plan, availability)) => {
-                self.plan = Some(plan);
-                self.plan_path = Some(path);
-                self.selected.clear();
-                self.details_id = None;
-                self.error = None;
-                self.counts_availability = availability;
-                self.plan_version = self.plan_version.wrapping_add(1);
-                // A freshly loaded plan supersedes any previous apply result,
-                // failure, staleness warning, or pending confirmation - all of
-                // those describe the *previous* plan, not this one. A running
-                // job is left alone: it was started against the plan it holds
-                // its own clone of, and finishes independently of what the
-                // page loads next.
-                self.apply_confirm = None;
-                self.apply_result = None;
-                self.apply_failure = None;
-                self.plan_stale = false;
-            }
+            Ok((plan, availability)) => self.adopt_loaded_plan(plan, Some(path), availability),
             Err(message) => self.error = Some(message),
+        }
+    }
+
+    /// Adopts a freshly obtained [`LibraryRepairPlan`] as the page's current
+    /// plan - shared by [`Self::load_plan`] (a plan read from a file) and
+    /// [`Self::handle_scan_message`] (a plan `run_library_scan` just
+    /// produced in-process). Resets exactly the same state either way: a
+    /// freshly loaded plan supersedes any previous apply result, failure,
+    /// staleness warning, pending confirmation, or stale load error - all of
+    /// those describe the *previous* plan (or a previous failed attempt to
+    /// load one), not this one. `self.error` is cleared here (not just in
+    /// `load_plan`) so a successful scan clears a stale error from an
+    /// earlier failed file load exactly as a successful file load already
+    /// did - see the regression this fixes:
+    /// `a_successful_scan_clears_a_stale_load_error`. A running apply job is
+    /// left alone: it was started against the plan it holds its own clone
+    /// of, and finishes independently of what the page loads next.
+    fn adopt_loaded_plan(
+        &mut self,
+        plan: LibraryRepairPlan,
+        plan_path: Option<PathBuf>,
+        availability: CountsAvailability,
+    ) {
+        self.plan = Some(plan);
+        self.plan_path = plan_path;
+        self.selected.clear();
+        self.details_id = None;
+        self.error = None;
+        self.counts_availability = availability;
+        self.plan_version = self.plan_version.wrapping_add(1);
+        self.apply_confirm = None;
+        self.apply_result = None;
+        self.apply_failure = None;
+        self.plan_stale = false;
+    }
+
+    /// Opens the "Scan library for repairs" setup dialog, loading the
+    /// registered DAT sources and the configured library folders once - the
+    /// same two inputs, resolved the same way, `dat_sources_page` already
+    /// uses for its own per-source audit action. A no-op while a scan is
+    /// already running.
+    pub(crate) fn open_scan_setup(&mut self) {
+        if self.scan_job.is_some() {
+            return;
+        }
+        let (dat_sources, dat_load_error) = match default_dat_sources_config_path() {
+            Ok(path) => match load_dat_sources_config_from(&path) {
+                Ok(config) => {
+                    let (registry, _problems) = DatSourceRegistry::from_config(&config);
+                    (
+                        registry
+                            .entries()
+                            .iter()
+                            .filter(|entry| entry.enabled)
+                            .cloned()
+                            .collect(),
+                        None,
+                    )
+                }
+                Err(error) => (Vec::new(), Some(error.to_string())),
+            },
+            Err(error) => (Vec::new(), Some(error.to_string())),
+        };
+        let library_folders = Config::load_default()
+            .map(|config| config.source_folders)
+            .unwrap_or_default();
+        self.scan_setup = Some(ScanSetupState {
+            dat_sources,
+            dat_load_error,
+            library_folders,
+            selected_dat_id: None,
+            chosen_scan_root: None,
+        });
+        self.scan_status = None;
+    }
+
+    /// Dismisses the scan setup dialog without starting anything.
+    pub(crate) fn cancel_scan_setup(&mut self) {
+        self.scan_setup = None;
+    }
+
+    /// Whether a scan is currently running.
+    pub(crate) fn is_scan_running(&self) -> bool {
+        self.scan_job.is_some()
+    }
+
+    /// Whether the setup dialog has both required inputs chosen and no scan
+    /// is already running.
+    pub(crate) fn can_start_scan(&self) -> bool {
+        self.scan_job.is_none()
+            && self.scan_setup.as_ref().is_some_and(|setup| {
+                setup.selected_dat_id.is_some() && setup.chosen_scan_root.is_some()
+            })
+    }
+
+    /// Spawns the background whole-library repair scan. The GUI never plans
+    /// or scans on the UI thread and never builds a second planner: this
+    /// calls the *exact* existing engine path
+    /// ([`run_library_scan`] + [`plan_file_from_scan`]) on a dedicated
+    /// thread, then relays only the terminal result back. Read-only - the
+    /// scan never renames, moves, or deletes anything; the only mutation
+    /// path anywhere on this page remains [`apply_saved_plan_selected`],
+    /// invoked solely from [`Self::spawn_apply`].
+    pub(crate) fn start_scan(&mut self) {
+        if self.scan_job.is_some() {
+            return;
+        }
+        let ready = self.scan_setup.as_ref().is_some_and(|setup| {
+            setup.selected_dat_id.is_some() && setup.chosen_scan_root.is_some()
+        });
+        if !ready {
+            return;
+        }
+        let Some(setup) = self.scan_setup.take() else {
+            return;
+        };
+        let (Some(dat_id), Some(scan_root)) = (setup.selected_dat_id, setup.chosen_scan_root)
+        else {
+            return;
+        };
+        let Some(entry) = setup
+            .dat_sources
+            .iter()
+            .find(|entry| entry.id == dat_id)
+            .cloned()
+        else {
+            return;
+        };
+
+        let request = LibraryScanRequest {
+            source_id: entry.id,
+            source_display_name: entry.display_name,
+            dat_path: entry.path,
+            dat_kind: entry.kind,
+            scan_root,
+            limits: DatLimits::default(),
+            profile: RepairProfile::CanonicalInPlace,
+        };
+        let trusted = TrustedRoots::from_paths([&request.scan_root]);
+        let cancel = AtomicBool::new(false);
+        let (sender, messages) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || {
+            let message = match run_library_scan(&request, &trusted, &cancel, &|_| {}) {
+                Ok(outcome) => {
+                    RepairScanMessage::Completed(Box::new(plan_file_from_scan(&outcome)))
+                }
+                Err(error) => RepairScanMessage::Failed(error.to_string()),
+            };
+            let _ = sender.send(message);
+        });
+
+        self.scan_job = Some(RepairScanJob { messages });
+        self.scan_status = Some(LibraryScanStatus::Scanning);
+    }
+
+    /// Drains the background scan job's channel, if one is running. Returns
+    /// whether anything changed (so the caller can request a repaint).
+    pub(crate) fn poll_scan(&mut self) -> bool {
+        let Some(job) = self.scan_job.as_mut() else {
+            return false;
+        };
+        match job.messages.try_recv() {
+            Ok(message) => {
+                self.handle_scan_message(message);
+                self.scan_job = None;
+                true
+            }
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                self.scan_status = Some(LibraryScanStatus::Failed(
+                    "the scan worker disconnected unexpectedly".to_string(),
+                ));
+                self.scan_job = None;
+                true
+            }
+        }
+    }
+
+    /// Applies one terminal message from the scan worker to page state. A
+    /// failure never touches `self.plan`/`self.plan_path` at all - whatever
+    /// was loaded before (or nothing) is left exactly as it was, so a failed
+    /// scan can never leave a stale or half-loaded plan in the review UI.
+    fn handle_scan_message(&mut self, message: RepairScanMessage) {
+        match message {
+            RepairScanMessage::Completed(plan) => {
+                self.adopt_loaded_plan(*plan, None, CountsAvailability::CURRENT);
+                self.scan_status = Some(LibraryScanStatus::Completed);
+            }
+            RepairScanMessage::Failed(detail) => {
+                self.scan_status = Some(LibraryScanStatus::Failed(detail));
+            }
         }
     }
 
@@ -839,10 +1075,12 @@ pub(crate) fn show_repair_review_page(ui: &mut egui::Ui, state: &mut RepairRevie
         "Preview a saved whole-library plan, then apply exactly the repairs you select.",
     );
 
-    // The confirmation dialog floats above everything else on the page and
-    // is drawn unconditionally so it stays visible (and actionable) no
-    // matter what else changed underneath it this frame.
+    // The confirmation dialog and the scan setup dialog float above
+    // everything else on the page and are drawn unconditionally so either
+    // stays visible (and actionable) no matter what else changed underneath
+    // it this frame.
     show_apply_confirmation_dialog(ui, state);
+    show_scan_setup_dialog(ui, state);
 
     // Load control.
     widgets::card(ui, |ui| {
@@ -852,17 +1090,32 @@ pub(crate) fn show_repair_review_page(ui: &mut egui::Ui, state: &mut RepairRevie
             {
                 open_plan_dialog(state);
             }
+            if widgets::action_button(
+                ui,
+                "Scan library for repairs",
+                widgets::ActionStyle::Secondary,
+                !state.is_scan_running(),
+            )
+            .clicked()
+            {
+                state.open_scan_setup();
+            }
             if let Some(path) = &state.plan_path {
                 ui.label(egui::RichText::new(path.display().to_string()).color(theme::muted(ui)));
             }
         });
         ui.label(
             egui::RichText::new(
-                "Loads a plan saved by the CLI's 'repair scan --plan-out' contract. Preview only.",
+                "'Load repair plan' loads a plan saved by the CLI's 'repair scan --plan-out' \
+                 contract. 'Scan library for repairs' runs the same whole-library scan directly \
+                 and loads its result here. Either way, this page only previews - nothing is \
+                 changed on disk until you select repairs and apply them.",
             )
             .color(theme::muted(ui)),
         );
     });
+
+    show_scan_status(ui, state);
 
     if let Some(error) = &state.error {
         ui.add_space(6.0);
@@ -1293,6 +1546,166 @@ fn open_plan_dialog(state: &mut RepairReviewPageState) {
         .pick_file()
     {
         state.load_plan(path);
+    }
+}
+
+/// The simple Scanning / Completed / Failed status banner for the
+/// whole-library scan action. Deliberately minimal - no elaborate progress
+/// reporting in this stage.
+fn show_scan_status(ui: &mut egui::Ui, state: &RepairReviewPageState) {
+    let Some(status) = &state.scan_status else {
+        return;
+    };
+    ui.add_space(6.0);
+    match status {
+        LibraryScanStatus::Scanning => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Scanning library for repairs…");
+            });
+        }
+        LibraryScanStatus::Completed => {
+            widgets::banner(
+                ui,
+                "Scan complete",
+                "The whole-library scan finished; its plan is shown below.",
+                widgets::StatusTone::Success,
+            );
+        }
+        LibraryScanStatus::Failed(detail) => {
+            widgets::banner(ui, "Scan failed", detail, widgets::StatusTone::Blocked);
+        }
+    }
+}
+
+/// The "Scan library for repairs" setup dialog: choose a registered DAT
+/// source, then a scan root, then start. A no-op draw when nothing is
+/// pending. Cancel is favoured, same as the apply confirmation dialog:
+/// closing the window (e.g. Esc) is wired to Cancel, not Start.
+fn show_scan_setup_dialog(ui: &mut egui::Ui, state: &mut RepairReviewPageState) {
+    if state.scan_setup.is_none() {
+        return;
+    }
+    let mut open = true;
+    let mut cancel_clicked = false;
+    let mut start_clicked = false;
+
+    let can_start = state.can_start_scan();
+    egui::Window::new("Scan library for repairs")
+        .collapsible(false)
+        .resizable(false)
+        .open(&mut open)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ui.ctx(), |ui| {
+            let Some(setup) = state.scan_setup.as_mut() else {
+                return;
+            };
+            ui.label(egui::RichText::new("1. Choose a DAT catalogue").strong());
+            if let Some(error) = &setup.dat_load_error {
+                widgets::banner(
+                    ui,
+                    "Could not read the DAT sources registry",
+                    error,
+                    widgets::StatusTone::Blocked,
+                );
+            } else if setup.dat_sources.is_empty() {
+                ui.label(
+                    egui::RichText::new(
+                        "No enabled DAT sources are registered. Add one on the DAT Sources page \
+                         first.",
+                    )
+                    .color(theme::muted(ui)),
+                );
+            } else {
+                for entry in &setup.dat_sources {
+                    let selected = setup.selected_dat_id.as_deref() == Some(entry.id.as_str());
+                    let clicked = egui::Frame::new()
+                        .fill(if selected {
+                            ui.visuals().selection.bg_fill.gamma_multiply(0.35)
+                        } else {
+                            theme::card_fill(ui)
+                        })
+                        .stroke(theme::border(ui))
+                        .corner_radius(6)
+                        .inner_margin(egui::Margin::symmetric(12, 8))
+                        .show(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(egui::RichText::new(&entry.display_name).strong());
+                                ui.label(
+                                    egui::RichText::new(entry.path.display().to_string())
+                                        .color(theme::muted(ui))
+                                        .small(),
+                                );
+                            });
+                        })
+                        .response
+                        .interact(egui::Sense::click());
+                    if clicked.clicked() {
+                        setup.selected_dat_id = Some(entry.id.clone());
+                    }
+                }
+            }
+
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("2. Choose a library folder to scan").strong());
+            for folder in &setup.library_folders {
+                let selected = setup.chosen_scan_root.as_deref() == Some(folder.as_path());
+                let clicked = egui::Frame::new()
+                    .fill(if selected {
+                        ui.visuals().selection.bg_fill.gamma_multiply(0.35)
+                    } else {
+                        theme::card_fill(ui)
+                    })
+                    .stroke(theme::border(ui))
+                    .corner_radius(6)
+                    .inner_margin(egui::Margin::symmetric(12, 8))
+                    .show(ui, |ui| {
+                        ui.label(folder.display().to_string());
+                    })
+                    .response
+                    .interact(egui::Sense::click());
+                if clicked.clicked() {
+                    setup.chosen_scan_root = Some(folder.clone());
+                }
+            }
+            if widgets::action_button(
+                ui,
+                "Choose another folder…",
+                widgets::ActionStyle::Quiet,
+                true,
+            )
+            .clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .set_title("Choose a library folder to scan")
+                    .pick_folder()
+            {
+                setup.chosen_scan_root = Some(path);
+            }
+            if let Some(root) = &setup.chosen_scan_root {
+                ui.label(
+                    egui::RichText::new(format!("Selected: {}", root.display()))
+                        .color(theme::muted(ui)),
+                );
+            }
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.add(egui::Button::new("Cancel")).clicked() {
+                    cancel_clicked = true;
+                }
+                if ui
+                    .add_enabled(can_start, egui::Button::new("Start scan"))
+                    .clicked()
+                {
+                    start_clicked = true;
+                }
+            });
+        });
+
+    if cancel_clicked || !open {
+        state.cancel_scan_setup();
+    } else if start_clicked {
+        state.start_scan();
     }
 }
 

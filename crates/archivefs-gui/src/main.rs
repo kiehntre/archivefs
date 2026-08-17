@@ -4987,10 +4987,13 @@ impl ArchiveFsApp {
         let page = self
             .repair_review_page
             .get_or_insert_with(repair_review_page::RepairReviewPageState::default);
-        // Drained before the view is built, so a running apply keeps
+        // Drained before the view is built, so a running apply or scan keeps
         // repainting (progress/result reach the screen promptly) without the
         // page needing its own render loop.
         if page.poll_apply() || page.is_apply_running() {
+            ui.ctx().request_repaint();
+        }
+        if page.poll_scan() || page.is_scan_running() {
             ui.ctx().request_repaint();
         }
         repair_review_page::show_repair_review_page(ui, page);
