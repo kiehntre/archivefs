@@ -4231,6 +4231,73 @@ fn an_interrupted_transaction_is_offered_for_recovery_and_never_auto_resumes() {
     assert!(!rendered_text_contains(&output, "Resume renames"));
 }
 
+/// Regression for the transaction-level reconciliation gap behind
+/// `an_applied_transaction_is_rediscovered_after_restart_and_rollbackable`
+/// (CI's occasional failure there): a journal whose transaction-level
+/// `state` is stuck at `Applying` - exactly what a final journal write that
+/// failed to land after every entry already settled looks like - but whose
+/// sole entry is already durably `Applied`, must load as `Applied`, not
+/// `Applying`. Deterministic (no background job, no timing dependency): the
+/// journal is hand-written directly, so this exercises the restart/load
+/// path in isolation from whatever caused the CI flake.
+#[test]
+fn a_transaction_stuck_applying_with_an_applied_entry_loads_as_applied_after_restart() {
+    let fixture = Fixture::new();
+    let journal = fixture.dir("journal");
+    let tx = archivefs_core::dat::rename_apply::RenameTransaction {
+        transaction_id: "stuck-applying-test".to_string(),
+        plan_generation: 1,
+        classifier_version: Some(
+            archivefs_core::dat::classification::CLASSIFIER_VERSION.to_string(),
+        ),
+        created_at_unix: 1,
+        source_scan_root: "/tmp/roms".to_string(),
+        state: archivefs_core::dat::rename_apply::TransactionState::Applying,
+        entries: vec![archivefs_core::dat::rename_apply::TransactionEntry {
+            source_path: PathBuf::from("/tmp/roms/a.bin"),
+            destination_path: PathBuf::from("/tmp/roms/b.bin"),
+            original_basename: "a.bin".to_string(),
+            proposed_basename: "b.bin".to_string(),
+            identity: archivefs_core::dat::rename_apply::ObjectIdentity {
+                size_bytes: 1,
+                modified_unix: 1,
+                kind: archivefs_core::dat::rename_apply::ObjectKind::RegularFile,
+                #[cfg(unix)]
+                ino: 1,
+                #[cfg(unix)]
+                dev: 1,
+            },
+            preflight_passed: true,
+            preflight_failures: Vec::new(),
+            state: archivefs_core::dat::rename_apply::EntryState::Applied,
+            failure_reason: None,
+            applied_at_unix: Some(1),
+            rolled_back_at_unix: None,
+            unknown: Default::default(),
+        }],
+        created_directories: Vec::new(),
+        unknown: Default::default(),
+    };
+    archivefs_core::dat::rename_apply::write_journal(&journal, &tx).unwrap();
+
+    // A fresh page load, exactly what a real restart does - never a running
+    // page's own `refresh_recovery`.
+    let restarted = DatSourcesPageState::load_with_transaction_dir(
+        fixture.config_path.clone(),
+        Vec::new(),
+        TrustedRoots::none(),
+        journal,
+    );
+    let view = restarted.view();
+    assert_eq!(view.rename_apply.recovery.len(), 1);
+    assert_eq!(
+        view.rename_apply.recovery[0].state,
+        TransactionState::Applied,
+        "a transaction whose every entry is already durably Applied must load as Applied, not \
+         stay stuck at Applying"
+    );
+}
+
 #[test]
 fn an_applied_transaction_is_rediscovered_after_restart_and_rollbackable() {
     let (fixture, roms, mut page) = page_with_apply_plan(1);
