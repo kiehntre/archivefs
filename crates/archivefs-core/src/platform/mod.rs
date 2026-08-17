@@ -118,6 +118,17 @@ impl Platform {
         self.weak_extensions.contains(&extension)
     }
 
+    /// Whether `extension` (lowercased, no dot) is valid evidence for this
+    /// platform at all - strong or weak, it makes no difference here. This
+    /// is deliberately the platform registry's own answer to "is this
+    /// extension plausible for this platform", so callers outside this
+    /// module (e.g. gating a `DirectGameImage`'s platform assignment) never
+    /// need to duplicate or re-derive `strong_extensions`/`weak_extensions`
+    /// knowledge themselves.
+    pub fn accepts_extension(&self, extension: &str) -> bool {
+        self.has_strong_extension(extension) || self.has_weak_extension(extension)
+    }
+
     /// How much this platform's own evidence is worth relative to others.
     /// A platform with a real signature can be confirmed outright; one with
     /// only folder evidence never claims more than the folder gives it.
@@ -577,12 +588,12 @@ pub const PLATFORMS: &[Platform] = &[
         folder_aliases: &["commodore128", "c128", "commodorec128", "c128d"],
         filename_aliases: &[],
         strong_extensions: &["d71", "d81"],
-        weak_extensions: &["d64", "prg", "crt", "tap"],
+        weak_extensions: &["d64", "g64", "prg", "crt", "tap"],
         magic: &[],
         layout: &[],
         conflicts_with: &["Commodore 64"],
         preferred_emulator: None,
-        explanation: "1571/1581 images (`.d71`/`.d81`) are C128-era formats. A plain `.d64` is far more often a C64 image, so it is only weak evidence here.",
+        explanation: "1571/1581 images (`.d71`/`.d81`) are C128-era formats. A plain `.d64`/`.g64` is far more often a C64 image, so both are only weak evidence here; a 1571 drive can read GCR `.g64` images too.",
     },
     Platform {
         id: "Commodore 64",
@@ -1026,7 +1037,7 @@ pub const PLATFORMS: &[Platform] = &[
         folder_aliases: &["wii", "nintendowii"],
         filename_aliases: &[],
         strong_extensions: &["wbfs", "wad"],
-        weak_extensions: &["iso", "rvz", "ciso", "wia", "zip"],
+        weak_extensions: &["iso", "gcz", "rvz", "ciso", "wia", "zip"],
         magic: &[MagicRule {
             offset: 0x18,
             bytes: b"\x5d\x1c\x9e\xa3",

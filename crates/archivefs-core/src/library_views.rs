@@ -5540,4 +5540,256 @@ mod tests {
         assert_eq!(plan.counts.create, 1);
         assert_eq!(plan.counts.skip, 0);
     }
+
+    // -------------------------------------------------------------------
+    // Loose game-media (2026-08-17 C128 smoke case): once the catalogue
+    // contains a `.d64`/`.g64` `PersistedArchive` row (see
+    // `archive_kind` in `lib.rs`, which is what actually gained the new
+    // recognition - nothing here changed), `plan_library_view` needs zero
+    // changes to plan it: it already never reads `archive_kind` at all,
+    // only `platform`/`source_folder_id`/`absolute_path`/
+    // `last_verified_missing_at`. These tests prove that directly, using
+    // the same `make_archive` fixture helper every other test already
+    // uses, just with a `.d64`/`.g64` filename instead of `.zip`.
+    // -------------------------------------------------------------------
+
+    /// Test 4: a view restricted to the loose-media source must never plan
+    /// an archive belonging to a different, unselected source - identical
+    /// isolation guarantee as archive-backed media (see
+    /// `selected_source_never_plans_an_archive_from_an_unselected_source`).
+    #[test]
+    fn loose_media_selected_source_isolation_matches_archive_backed_behavior() {
+        let root = temp_dir("loose-media-source-isolation");
+        let c128_dir = root.join("c128");
+        let other_dir = root.join("other-source");
+        let d64 = c128_dir.join("BurgerWhop!.d64");
+        let other_zip = other_dir.join("Unrelated.zip");
+        write_file(&d64, b"d64-bytes");
+        write_file(&other_zip, b"zip-bytes");
+        let destination = root.join("dest");
+
+        let c128_source = make_source(1, &c128_dir);
+        let other_source = make_source(2, &other_dir);
+        let d64_record = make_archive(1, 1, &d64, Some("Commodore 128"));
+        let other_record = make_archive(2, 2, &other_zip, Some("Commodore 128"));
+
+        let view = make_view(
+            "view-1",
+            &destination,
+            vec![c128_dir.clone()],
+            vec!["Commodore 128".to_string()],
+        );
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(
+            &view,
+            &[d64_record, other_record],
+            &[c128_source, other_source],
+            &manifest,
+            None,
+        );
+
+        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(plan.entries[0].archive_path, Some(d64));
+        assert_eq!(plan.entries[0].action, LibraryViewPlanAction::Create);
+    }
+
+    /// Test 5: platform filtering composes with a loose-media candidate
+    /// exactly as it does for an archive-backed one.
+    #[test]
+    fn loose_media_platform_filter_composition_matches_archive_backed_behavior() {
+        let root = temp_dir("loose-media-platform-filter");
+        let c128_dir = root.join("c128");
+        let matching = c128_dir.join("BurgerWhop!.d64");
+        let wrong_platform = c128_dir.join("SomeAmiga.adf");
+        write_file(&matching, b"a");
+        write_file(&wrong_platform, b"b");
+        let destination = root.join("dest");
+
+        let source = make_source(1, &c128_dir);
+        let record_matching = make_archive(1, 1, &matching, Some("Commodore 128"));
+        let record_wrong_platform = make_archive(2, 1, &wrong_platform, Some("Amiga"));
+
+        let view = make_view(
+            "view-1",
+            &destination,
+            vec![c128_dir.clone()],
+            vec!["Commodore 128".to_string()],
+        );
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(
+            &view,
+            &[record_matching, record_wrong_platform],
+            &[source],
+            &manifest,
+            None,
+        );
+
+        assert_eq!(
+            plan.entries.len(),
+            1,
+            "the wrong-platform loose file is silently excluded"
+        );
+        assert_eq!(plan.entries[0].archive_path, Some(matching));
+        assert_eq!(plan.counts.create, 1);
+        assert_eq!(plan.counts.skip, 0);
+    }
+
+    /// Test 6: a loose-media archive the catalogue's last scan reported
+    /// missing must be `SkipMissingSourceArchive`, never `Create` -
+    /// identical rule to an archive-backed file.
+    #[test]
+    fn loose_media_missing_source_file_is_reported_not_created() {
+        let root = temp_dir("loose-media-missing");
+        let c128_dir = root.join("c128");
+        let g64 = c128_dir.join("Ultima V (Disk 1).g64");
+        write_file(&g64, b"g64-bytes");
+        let destination = root.join("dest");
+
+        let source = make_source(1, &c128_dir);
+        let mut record = make_archive(1, 1, &g64, Some("Commodore 128"));
+        record.last_verified_missing_at = Some("2026-08-17T00:00:00Z".to_string());
+
+        let view = make_view("view-1", &destination, vec![c128_dir], vec![]);
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(&view, &[record], &[source], &manifest, None);
+
+        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(
+            plan.entries[0].action,
+            LibraryViewPlanAction::SkipMissingSourceArchive
+        );
+        assert_eq!(
+            plan.counts.create, 0,
+            "a missing loose-media source file must never be Create"
+        );
+    }
+
+    /// Test 7: archive-backed (`.zip`) planning behaviour is byte-for-byte
+    /// unchanged - a mixed catalogue of loose media and zip archives plans
+    /// each according to the exact same rules, with no cross-influence.
+    #[test]
+    fn archive_backed_behavior_is_unchanged_alongside_loose_media() {
+        let root = temp_dir("mixed-loose-and-archive");
+        let c128_dir = root.join("c128");
+        let d64 = c128_dir.join("BurgerWhop!.d64");
+        let zip = c128_dir.join("SomeGame.zip");
+        write_file(&d64, b"d64-bytes");
+        write_file(&zip, b"zip-bytes");
+        let destination = root.join("dest");
+
+        let source = make_source(1, &c128_dir);
+        let d64_record = make_archive(1, 1, &d64, Some("Commodore 128"));
+        let zip_record = make_archive(2, 1, &zip, Some("Commodore 128"));
+
+        let view = make_view(
+            "view-1",
+            &destination,
+            vec![c128_dir],
+            vec!["Commodore 128".to_string()],
+        );
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(&view, &[d64_record, zip_record], &[source], &manifest, None);
+
+        assert_eq!(plan.entries.len(), 2);
+        assert!(
+            plan.entries
+                .iter()
+                .all(|entry| entry.action == LibraryViewPlanAction::Create)
+        );
+        assert_eq!(plan.counts.create, 2);
+    }
+
+    /// Test 8: planning a loose-media catalogue is exactly as deterministic
+    /// as an archive-backed one - repeated calls, and calls with reordered
+    /// input, produce identical plan vectors.
+    #[test]
+    fn loose_media_planning_is_deterministic() {
+        let root = temp_dir("loose-media-deterministic");
+        let c128_dir = root.join("c128");
+        let mut records = Vec::new();
+        for (index, name) in [
+            "BurgerWhop!.d64",
+            "Ultima V (Disk 1).g64",
+            "Ultima V (Disk 2).g64",
+            "Yahtzee.d64",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = c128_dir.join(name);
+            write_file(&path, b"bytes");
+            records.push(make_archive(
+                index as i64 + 1,
+                1,
+                &path,
+                Some("Commodore 128"),
+            ));
+        }
+        let destination = root.join("dest");
+        let source = make_source(1, &c128_dir);
+        let view = make_view("view-1", &destination, vec![c128_dir], vec![]);
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan_a = plan_library_view(
+            &view,
+            &records,
+            std::slice::from_ref(&source),
+            &manifest,
+            None,
+        );
+        let mut reversed = records.clone();
+        reversed.reverse();
+        let plan_b = plan_library_view(&view, &reversed, &[source], &manifest, None);
+
+        assert_eq!(plan_a.entries, plan_b.entries);
+        let keys: Vec<PathBuf> = plan_a
+            .entries
+            .iter()
+            .map(|entry| entry.relative_link_path.clone().unwrap_or_default())
+            .collect();
+        let mut sorted_keys = keys.clone();
+        sorted_keys.sort();
+        assert_eq!(keys, sorted_keys);
+    }
+
+    /// Test 9: the RomM profile plans a real `roms/<slug>/<filename>` path
+    /// for a loose-media candidate exactly as it does for an archive-backed
+    /// one - the planner never renamed/wrapped/copied the `.d64` file, and
+    /// slug resolution follows the same override -> cache -> fail-closed
+    /// precedence.
+    #[test]
+    fn romm_profile_plans_a_real_path_for_a_loose_media_candidate() {
+        let root = temp_dir("loose-media-romm-path");
+        let c128_dir = root.join("c128");
+        let d64 = c128_dir.join("BurgerWhop!.d64");
+        write_file(&d64, b"d64-bytes");
+        let destination = root.join("dest");
+
+        let source = make_source(1, &c128_dir);
+        let record = make_archive(1, 1, &d64, Some("Commodore 128"));
+        let view = romm_view_with_override("view-1", &destination, "Commodore 128", "c128");
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(
+            &view,
+            std::slice::from_ref(&record),
+            std::slice::from_ref(&source),
+            &manifest,
+            None,
+        );
+
+        assert_eq!(plan.profile_error, None);
+        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(plan.entries[0].action, LibraryViewPlanAction::Create);
+        assert_eq!(
+            plan.entries[0].relative_link_path,
+            Some(PathBuf::from("roms/c128/BurgerWhop!.d64"))
+        );
+        // The source file itself is untouched - no rename, no wrapper.
+        assert_eq!(fs::read(&d64).unwrap(), b"d64-bytes");
+    }
 }

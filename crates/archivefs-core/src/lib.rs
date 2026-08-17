@@ -99,6 +99,7 @@ pub mod repair;
 
 pub mod safe_read;
 
+pub mod media_registry;
 pub mod platform;
 
 /// Explicit, offline management of user-owned platform artwork overrides.
@@ -3306,31 +3307,19 @@ pub fn archive_kind(path: impl AsRef<Path>) -> Option<ArchiveKind> {
         return None;
     }
 
-    if filename.ends_with(".zip") {
-        Some(ArchiveKind::Zip)
-    } else if filename.ends_with(".7z") {
-        Some(ArchiveKind::SevenZip)
-    } else if filename.ends_with(".rar") {
-        Some(ArchiveKind::Rar)
-    } else if filename.ends_with(".smd") {
-        // `.smd` is a Super Magic Drive dump: Mega Drive specific, so it needs
-        // no corroboration.
-        //
-        // `.gen` deliberately does NOT appear here. It collides with Sierra
-        // SCI `RESOURCE.GEN` files, which every ScummVM game directory
-        // contains, and classifying one of those as a Mega Drive ROM is
-        // exactly the misdetection this milestone fixes. A `.gen` file is
-        // recognised as a Mega Drive ROM only once something corroborates it -
-        // see `archive_kind_in_root`.
-        Some(ArchiveKind::MegaDriveRom)
-    } else if [".iso", ".gcm", ".gcz", ".rvz", ".wbfs", ".ciso"]
-        .iter()
-        .any(|extension| filename.ends_with(extension))
-    {
-        Some(ArchiveKind::DirectGameImage)
-    } else {
-        None
-    }
+    // `.gen` deliberately never resolves here, even though it would collide
+    // with Mega Drive dumps: it also collides with Sierra SCI
+    // `RESOURCE.GEN` files, which every ScummVM game directory contains,
+    // and classifying one of those as a Mega Drive ROM is exactly the
+    // misdetection an earlier milestone fixed. A `.gen` (or `.md`/`.bin`)
+    // file is recognised as a Mega Drive ROM only once folder, source-root,
+    // or cartridge-header evidence corroborates it - see
+    // `archive_kind_in_root`. Every extension below is, by contrast,
+    // self-evidencing: the media registry is the single source of truth
+    // for it, shared with the filesystem watcher (`media_registry::
+    // is_watch_relevant_extension`) so the two can never drift apart again.
+    let extension = Path::new(&filename).extension()?.to_str()?;
+    media_registry::kind_for_extension(extension)
 }
 
 pub(crate) fn archive_kind_in_root(path: &Path, source_root: &Path) -> Option<ArchiveKind> {
@@ -3338,7 +3327,7 @@ pub(crate) fn archive_kind_in_root(path: &Path, source_root: &Path) -> Option<Ar
         return Some(kind);
     }
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
-    if !matches!(extension.as_str(), "md" | "bin" | "gen") {
+    if !media_registry::is_corroboration_candidate(&extension) {
         return None;
     }
     // Corroboration, in the same priority order detection uses everywhere:
@@ -5164,11 +5153,13 @@ fn archive_title(path: &Path) -> String {
         return filename[..filename.len() - suffix_len + 1 - part_digits].to_string();
     }
 
-    for extension in [
-        ".zip", ".7z", ".rar", ".iso", ".gcm", ".gcz", ".rvz", ".wbfs", ".ciso",
-    ] {
-        if lower.ends_with(extension) {
-            return filename[..filename.len() - extension.len()].to_string();
+    // Registry-backed, so a newly recognised media format never needs a
+    // second hardcoded extension list to strip its own suffix - see
+    // `media_registry`.
+    for format in media_registry::MEDIA_FORMATS {
+        let dotted_extension = format!(".{}", format.extension);
+        if lower.ends_with(&dotted_extension) {
+            return filename[..filename.len() - dotted_extension.len()].to_string();
         }
     }
 
@@ -5556,14 +5547,13 @@ fn watch_path_is_supported_archive(path: &Path) -> bool {
         return false;
     }
 
+    // Delegates to the same media registry `archive_kind` consults, so
+    // scanning and watching can never independently drift out of sync
+    // again - see `media_registry`.
     let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
         return false;
     };
-
-    matches!(
-        extension.to_ascii_lowercase().as_str(),
-        "zip" | "rar" | "7z" | "iso" | "md" | "gen" | "smd" | "bin"
-    )
+    media_registry::is_watch_relevant_extension(&extension.to_ascii_lowercase())
 }
 
 pub fn is_temporary_or_incomplete_path(path: impl AsRef<Path>) -> bool {
@@ -7449,6 +7439,272 @@ mod tests {
                 && archive.identity.platform_provenance == Some(PlatformProvenance::FolderAlias)
         }));
         let _ = fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// Test 1/2/3 (loose Commodore media milestone): `.d64` and `.g64`
+    /// under a `c128`-aliased folder are discovered as
+    /// `ArchiveKind::DirectGameImage`, assigned `Commodore 128` by the same
+    /// folder-alias heuristic every other platform already uses, while
+    /// `images/`, `videos/`, and `gamelist.xml` - none of them a
+    /// recognised extension - are never discovered as candidates at all.
+    #[test]
+    fn loose_c128_d64_and_g64_are_discovered_but_companion_assets_are_not() {
+        let root = test_root("loose-c128-media").join("c128");
+        fs::create_dir_all(root.join("images")).unwrap();
+        fs::create_dir_all(root.join("videos")).unwrap();
+        fs::write(root.join("BurgerWhop!.d64"), vec![0_u8; 174_848]).unwrap();
+        fs::write(
+            root.join("Ultima V - Warriors of Destiny(Disk 1 of 4 Side A)(Main).g64"),
+            vec![0_u8; 278_234],
+        )
+        .unwrap();
+        fs::write(root.join("gamelist.xml"), b"<gameList/>").unwrap();
+        fs::write(
+            root.join("images").join("BurgerWhop-boxart.png"),
+            b"png fixture",
+        )
+        .unwrap();
+        fs::write(
+            root.join("videos").join("BurgerWhop-video.mp4"),
+            b"mp4 fixture",
+        )
+        .unwrap();
+
+        let config = Config {
+            source_folders: vec![root.clone()],
+            mount_root: root.join("mount"),
+            ratarmount_bin: "ratarmount".into(),
+            master_rom_root: None,
+        };
+        let discovery = ArchiveScanner::new(&config)
+            .scan_archives_with_summary()
+            .unwrap();
+
+        assert_eq!(
+            discovery.archives.len(),
+            2,
+            "only the two recognised loose disk images may be discovered - got {:?}",
+            discovery
+                .archives
+                .iter()
+                .map(|archive| archive.path.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            discovery
+                .archives
+                .iter()
+                .all(|archive| archive.kind == ArchiveKind::DirectGameImage),
+            "loose Commodore media is catalogued directly, never wrapped or copied"
+        );
+        assert!(
+            discovery
+                .archives
+                .iter()
+                .all(|archive| archive.identity.platform.as_deref() == Some("Commodore 128")),
+            "the `c128` folder alias must resolve both `.d64` and `.g64` to Commodore 128, \
+             exactly like every other weak/shared extension already does"
+        );
+        assert!(
+            discovery
+                .archives
+                .iter()
+                .any(|archive| archive.path.ends_with("BurgerWhop!.d64"))
+        );
+        assert!(discovery.archives.iter().any(|archive| {
+            archive
+                .path
+                .ends_with("Ultima V - Warriors of Destiny(Disk 1 of 4 Side A)(Main).g64")
+        }));
+        assert!(
+            discovery.archives.iter().all(|archive| !archive
+                .path
+                .to_string_lossy()
+                .contains("images")
+                && !archive.path.to_string_lossy().contains("videos")
+                && !archive.path.ends_with("gamelist.xml")),
+            "images/, videos/, and gamelist.xml must never become candidates"
+        );
+        assert_eq!(
+            discovery.skipped_unsupported_extension, 3,
+            "gamelist.xml, the .png, and the .mp4 are each an unsupported extension - counted, \
+             never silently dropped"
+        );
+        assert_eq!(discovery.skipped_ambiguous_platform, 0);
+
+        let _ = fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// Media/platform-responsibility review: `.g64` is strong extension
+    /// evidence for Commodore 64 and only weak evidence for Commodore 128
+    /// (see `platform::PLATFORMS`) - a real, standing conflict between the
+    /// two platforms' own extension tables. Folder-alias evidence must
+    /// still win over that conflicting strong extension, exactly as it
+    /// already does for every other weak/shared extension: the media
+    /// registry only ever decides "this is recognised media"; which
+    /// platform it belongs to is entirely `detect_platform_with_provenance`'s
+    /// folder-alias-first precedence, unchanged by this work.
+    #[test]
+    fn folder_alias_wins_over_conflicting_strong_extension_for_g64_in_c128_folder() {
+        let root = test_root("g64-folder-alias-precedence").join("c128");
+        fs::create_dir_all(&root).unwrap();
+        let g64 = root.join("Ultima V.g64");
+        fs::write(&g64, vec![0_u8; 1024]).unwrap();
+
+        let archive = Archive::from_path_in_root(&g64, &root).unwrap();
+        assert_eq!(archive.kind, ArchiveKind::DirectGameImage);
+        assert_eq!(
+            archive.identity.platform.as_deref(),
+            Some("Commodore 128"),
+            "a `c128`-aliased folder must resolve `.g64` to Commodore 128, not Commodore 64, \
+             even though `.g64` is C64's own strong extension"
+        );
+        assert_eq!(
+            archive.identity.platform_provenance,
+            Some(PlatformProvenance::FolderAlias)
+        );
+
+        let _ = fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// Platform-safety review: `.chd` (like `.d64`/`.g64`) is deliberately
+    /// never strong evidence for any single platform on its own - it is
+    /// shared across Neo Geo CD, Sega CD, arcade sets, and more. A `.chd`
+    /// with no corroborating folder/source/header evidence must resolve no
+    /// platform at all, never default to any one of the platforms that
+    /// merely lists it as weak evidence.
+    #[test]
+    fn a_bare_chd_with_no_corroborating_evidence_resolves_no_platform() {
+        let root = test_root("chd-no-corroboration").join("random");
+        fs::create_dir_all(&root).unwrap();
+        let chd = root.join("Game.chd");
+        fs::write(&chd, vec![0_u8; 1024]).unwrap();
+
+        let archive = Archive::from_path_in_root(&chd, &root).unwrap();
+        assert_eq!(archive.kind, ArchiveKind::DirectGameImage);
+        assert_eq!(
+            archive.identity.platform, None,
+            "a `.chd` outside any recognised folder must never be assumed to be Neo Geo CD \
+             (or any other platform) by extension alone"
+        );
+
+        let _ = fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// The mirror case: a `neogeocd`-aliased folder still resolves `.chd`
+    /// to Neo Geo CD, exactly like every other weak/shared extension.
+    #[test]
+    fn chd_resolves_neo_geo_cd_when_folder_evidence_corroborates_it() {
+        let root = test_root("chd-neogeocd-folder-alias").join("neogeocd");
+        fs::create_dir_all(&root).unwrap();
+        let chd = root.join("Metal Slug.chd");
+        fs::write(&chd, vec![0_u8; 1024]).unwrap();
+
+        let archive = Archive::from_path_in_root(&chd, &root).unwrap();
+        assert_eq!(archive.identity.platform.as_deref(), Some("Neo Geo CD"));
+        assert_eq!(
+            archive.identity.platform_provenance,
+            Some(PlatformProvenance::FolderAlias)
+        );
+
+        let _ = fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn archive_kind_recognizes_loose_commodore_disk_images() {
+        assert_eq!(
+            archive_kind(Path::new("BurgerWhop!.d64")),
+            Some(ArchiveKind::DirectGameImage)
+        );
+        assert_eq!(
+            archive_kind(Path::new("Ultima V.g64")),
+            Some(ArchiveKind::DirectGameImage)
+        );
+        assert_eq!(
+            archive_kind(Path::new("BurgerWhop!.D64")),
+            Some(ArchiveKind::DirectGameImage)
+        );
+        // Existing archive-format recognition is unaffected by this addition.
+        assert_eq!(archive_kind(Path::new("Sonic.zip")), Some(ArchiveKind::Zip));
+        assert_eq!(archive_kind(Path::new("gamelist.xml")), None);
+        assert_eq!(archive_kind(Path::new("boxart.png")), None);
+    }
+
+    #[test]
+    fn archive_title_strips_loose_commodore_disk_image_extensions() {
+        assert_eq!(archive_title(Path::new("BurgerWhop!.d64")), "BurgerWhop!");
+        assert_eq!(
+            archive_title(Path::new(
+                "Ultima V - Warriors of Destiny(Disk 1 of 4 Side A)(Main).g64"
+            )),
+            "Ultima V - Warriors of Destiny(Disk 1 of 4 Side A)(Main)"
+        );
+        // Existing archive-format title stripping is unaffected.
+        assert_eq!(archive_title(Path::new("Sonic.zip")), "Sonic");
+    }
+
+    // -------------------------------------------------------------------
+    // Media-registry review follow-up: CHD recognition/title handling and
+    // scan/watch parity.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn archive_kind_recognizes_chd() {
+        assert_eq!(
+            archive_kind(Path::new("Metal Slug.chd")),
+            Some(ArchiveKind::DirectGameImage)
+        );
+        assert_eq!(
+            archive_kind(Path::new("Metal Slug.CHD")),
+            Some(ArchiveKind::DirectGameImage)
+        );
+    }
+
+    #[test]
+    fn archive_title_strips_chd_extension() {
+        // Registry-backed title stripping (see `media_registry`): a newly
+        // registered format must never need its own second hardcoded
+        // extension list here to have its suffix stripped.
+        assert_eq!(archive_title(Path::new("Metal Slug.chd")), "Metal Slug");
+        assert_ne!(archive_title(Path::new("Metal Slug.chd")), "Metal Slug.chd");
+    }
+
+    #[test]
+    fn scan_and_watch_recognize_exactly_the_same_media_registry_extensions() {
+        // Every extension `archive_kind` (scanning) recognises on its own
+        // must also be watch-relevant, and vice versa for anything the
+        // watcher does not additionally treat as a Mega Drive corroboration
+        // candidate - both must derive from `media_registry`, never two
+        // independently maintained lists.
+        for format in media_registry::MEDIA_FORMATS {
+            let dotted = format!("Game.{}", format.extension);
+            assert_eq!(
+                archive_kind(Path::new(&dotted)),
+                Some(format.kind),
+                "archive_kind must recognise `.{}`",
+                format.extension
+            );
+            assert!(
+                watch_path_is_supported_archive(Path::new(&format!("/roms/{dotted}"))),
+                "the watcher must recognise `.{}` - previously gcz/rvz/wbfs/ciso/d64/g64/chd \
+                 were missing from its own separate, stale extension list",
+                format.extension
+            );
+        }
+    }
+
+    #[test]
+    fn watch_closes_the_previously_missing_direct_image_extension_gaps() {
+        // These four extensions were already recognised by `archive_kind`
+        // (scanning) before this change, but were absent from the
+        // watcher's own separate hardcoded list - a real scan/watch
+        // disagreement this change closes.
+        for extension in ["gcz", "rvz", "wbfs", "ciso"] {
+            assert!(
+                watch_path_is_supported_archive(Path::new(&format!("/roms/Game.{extension}"))),
+                "the watcher must recognise `.{extension}`"
+            );
+        }
     }
 
     #[test]
