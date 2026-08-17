@@ -264,17 +264,31 @@ impl IdentityCache {
     }
 
     /// The RomM platform slug this imported instance uses for a canonical
-    /// EmuWiz platform. This is the safe future directory-organisation seam:
+    /// EmuWiz platform. This is the safe forward directory-organisation seam:
     /// it returns provider data already mapped through the registry, never a
-    /// slug guessed from a display label. If an instance reports duplicates,
-    /// the lexicographically first slug is chosen deterministically.
+    /// slug guessed from a display label.
+    ///
+    /// Fails closed on ambiguity: when the instance reports more than one
+    /// *distinct* provider slug for the same canonical platform (for example
+    /// `fds` and `nes` both normalise to `NES`), there is no sound way to pick
+    /// one for filesystem path generation, so `None` is returned rather than a
+    /// lexicographically-first guess that could be the wrong directory.
+    /// Duplicate identical provider entries collapse to one and never create
+    /// ambiguity on their own.
     pub fn romm_slug_for_platform(&self, canonical_platform: &str) -> Option<&str> {
         crate::platform::platform_by_id(canonical_platform)?;
-        self.platforms
+        let mut distinct: Vec<&str> = self
+            .platforms
             .iter()
             .filter(|platform| platform.canonical.as_deref() == Some(canonical_platform))
             .map(|platform| platform.provider_slug.as_str())
-            .min()
+            .collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        match distinct.as_slice() {
+            [only] => Some(*only),
+            _ => None,
+        }
     }
 
     /// Every record with a conflict.

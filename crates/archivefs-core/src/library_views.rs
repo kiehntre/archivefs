@@ -30,7 +30,8 @@ use crate::{
     default_database_path,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
@@ -206,6 +207,16 @@ pub struct LibraryViewConfig {
     /// `plan_library_view`'s doc comment).
     pub platforms: Vec<String>,
     pub layout_template: LibraryViewLayoutTemplate,
+    /// Which frontend this view is nominally aimed at, and the (currently
+    /// mostly-default) policy governing its output shape. Added by the
+    /// Frontend Profiles milestone - `#[serde(default)]` so every
+    /// `library_views.json` written before this field existed keeps loading
+    /// unchanged, always resolving to `FrontendProfile::default()` (the
+    /// `Generic` kind, whose behaviour is byte-for-byte the pre-existing
+    /// `PlatformFilename` behaviour). `Romm` plans real paths; `EsDe` is
+    /// still vocabulary only - see `FrontendProfileKind`'s doc comment.
+    #[serde(default)]
+    pub profile: FrontendProfile,
 }
 
 /// The only layout template this milestone supports - see the milestone's
@@ -223,6 +234,265 @@ impl LibraryViewLayoutTemplate {
             Self::PlatformFilename => "{platform}/{filename}",
         }
     }
+}
+
+// ---------------------------------------------------------------------
+// Frontend profiles. Stage 1/2 of the Frontend Profiles milestone added the
+// vocabulary; this stage makes `Romm` plan real `roms/<slug>/<filename>`
+// paths (see `generate_relative_link_path`, `resolve_romm_platform_slug`) -
+// still only ever a managed *symlink* to the source archive, never a copy,
+// hardlink, `.m3u`, `gamelist.xml`, or RomM rescan API call. `EsDe` remains
+// vocabulary only and still fails closed - no ES-DE system mapping exists
+// yet; see this module's top-of-file doc comment and the milestone notes.
+// This is deliberately kept on the read-only-of-master "view" axis and must
+// never be confused with `RepairProfile::Romm` (in `crate::repair::library`),
+// which lives on the separate, mutating master-organisation axis - there is
+// no call path from anything in this module into that one.
+// ---------------------------------------------------------------------
+
+/// Which frontend a Library View is nominally shaped for. `Generic` is
+/// byte-for-byte the pre-existing `PlatformFilename` behaviour. `Romm` plans
+/// real `roms/<resolved-slug>/<filename>` paths once every selected
+/// archive's platform resolves to a RomM slug (see
+/// `resolve_romm_platform_slug`) - an archive whose platform does not
+/// resolve is refused individually (`SkipInvalidPath`), never silently
+/// planned under a `Generic`-shaped path. `EsDe` exists so the schema does
+/// not need to churn again when its real materialization is implemented in
+/// a later milestone, but selecting it today *fails closed* entirely:
+/// planning an `EsDe` view produces a clear refusal
+/// (`LibraryViewPlan::profile_error`, and `generate_relative_link_path`
+/// itself also refuses directly), never a silent fallback to Generic's
+/// `{platform}/{filename}` output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum FrontendProfileKind {
+    /// The existing, generic `PlatformFilename` behaviour.
+    #[default]
+    Generic,
+    /// Plans real `roms/<resolved-romm-slug>/<filename>` symlink paths - see
+    /// this section's doc comment and `resolve_romm_platform_slug`. Still no
+    /// RomM rescan API call, no `.m3u`/`gamelist.xml`, no copy/hardlink -
+    /// only the existing managed-symlink materialization path.
+    Romm,
+    /// Vocabulary only - see this section's doc comment. No ES-DE system
+    /// mapping, no `.m3u`/`gamelist.xml` generation exists yet -
+    /// planning/applying a view with this kind fails closed rather than
+    /// silently behaving like `Generic`.
+    EsDe,
+}
+
+/// How a profile would eventually pick a title/region/language/variant when
+/// more than one archive could represent "the same" release - deliberately
+/// minimal today. Only `CanonicalArchiveFilename` (today's actual behaviour)
+/// exists; a `PreferredPerTitle` policy, a variant-index database, DAT
+/// re-audits, and multidisc grouping are explicitly out of scope for this
+/// milestone (see the milestone notes) and are left for later variants to
+/// add without needing to reshape this enum's existing case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum TitleSelectionPolicy {
+    /// Use the archive's own filename verbatim (after sanitisation) - the
+    /// only behaviour this milestone implements.
+    #[default]
+    CanonicalArchiveFilename,
+}
+
+/// How a profile would eventually treat multiple variants (regions,
+/// revisions, dumps) of what is otherwise the same title. Only `KeepAll`
+/// (today's actual behaviour - every archive that plans to a distinct
+/// destination is planned) exists in this milestone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum VariantHandlingPolicy {
+    #[default]
+    KeepAll,
+}
+
+/// How a profile would eventually group multi-disc releases. Only
+/// `Ungrouped` (today's actual behaviour - every archive is planned
+/// independently) exists in this milestone; multidisc grouping itself is
+/// explicitly out of scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum MultidiscHandlingPolicy {
+    #[default]
+    Ungrouped,
+}
+
+/// The policy knobs a `FrontendProfile` carries. Every field defaults to
+/// exactly what today's `PlatformFilename` behaviour already does, so
+/// constructing `FrontendProfilePolicy::default()` (or loading an old
+/// config, via `#[serde(default)]`) never changes existing output. Kept
+/// deliberately small - this milestone adds only the shape needed to avoid
+/// future schema churn, not the policies themselves (no `PreferredPerTitle`,
+/// no variant-index database, no DAT re-audits, no multidisc grouping - see
+/// the milestone notes).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct FrontendProfilePolicy {
+    #[serde(default)]
+    pub title_selection: TitleSelectionPolicy,
+    /// Ordered most-preferred-first; empty means "no preference expressed"
+    /// (today's actual behaviour - region is never consulted).
+    #[serde(default)]
+    pub region_preference: Vec<String>,
+    /// Ordered most-preferred-first; empty means "no preference expressed".
+    #[serde(default)]
+    pub language_preference: Vec<String>,
+    #[serde(default)]
+    pub variant_handling: VariantHandlingPolicy,
+    #[serde(default)]
+    pub multidisc_handling: MultidiscHandlingPolicy,
+    /// Overrides the catalogue platform name used for planning purposes.
+    /// Empty means "no overrides" (today's actual behaviour). See
+    /// `FrontendPlatformMapping`'s own doc comment for why this is a named
+    /// type rather than a bare map field.
+    #[serde(default)]
+    pub platform_mapping_overrides: FrontendPlatformMapping,
+    /// How a future materialization step would compute a managed symlink's
+    /// target path. Vocabulary only in this milestone - `apply_library_view`
+    /// always uses the archive's absolute host path today, regardless of
+    /// this field's value; see `SymlinkTargetStrategy`'s own doc comment for
+    /// why the seam exists now anyway.
+    #[serde(default)]
+    pub symlink_target_strategy: SymlinkTargetStrategy,
+}
+
+/// A profile's catalogue-platform-name overrides, keyed by the catalogue's
+/// own platform string. A dedicated (if today minimal) type rather than a
+/// bare `HashMap`/`BTreeMap` field, so RomM/ES-DE platform mapping has one
+/// principled place to grow into later (e.g. per-frontend-kind mapping
+/// rules, wildcard/prefix rules, a reverse lookup) without another schema
+/// migration. Backed by a `BTreeMap` so serialization/hashing
+/// (`compute_view_profile_fingerprint`) is always key-order-stable
+/// regardless of insertion order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct FrontendPlatformMapping {
+    #[serde(default)]
+    overrides: BTreeMap<String, String>,
+}
+
+impl FrontendPlatformMapping {
+    pub fn is_empty(&self) -> bool {
+        self.overrides.is_empty()
+    }
+
+    pub fn get(&self, catalogue_platform: &str) -> Option<&str> {
+        self.overrides.get(catalogue_platform).map(String::as_str)
+    }
+
+    /// Returns the previous override for `catalogue_platform`, if any -
+    /// mirrors `BTreeMap::insert`'s own return shape.
+    pub fn insert(
+        &mut self,
+        catalogue_platform: String,
+        mapped_platform: String,
+    ) -> Option<String> {
+        self.overrides.insert(catalogue_platform, mapped_platform)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.overrides
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+    }
+}
+
+/// How a managed symlink's target path would be computed. Vocabulary only
+/// in this milestone (see `FrontendProfilePolicy::symlink_target_strategy`'s
+/// doc comment) - added now, ahead of any real use, because RomM commonly
+/// runs in a container with a different mount path than the host: a plain
+/// absolute host path (`AbsoluteSourcePath`, today's only real behaviour)
+/// works for Generic's own host-side symlinks, but breaks once something
+/// *inside* the container tries to resolve the same symlink against its own
+/// (different) view of the filesystem. A relative-to-shared-ancestor target
+/// survives that kind of remount because it never encodes an absolute host
+/// path at all. Adding this enum now - even though nothing but
+/// `AbsoluteSourcePath` is implemented - means a later milestone can wire in
+/// the Docker-safe computation without another manifest/config migration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum SymlinkTargetStrategy {
+    /// Today's only real behaviour: the target is the archive's absolute
+    /// host path, exactly as `apply_library_view` already writes it.
+    #[default]
+    AbsoluteSourcePath,
+    /// Not implemented yet - vocabulary only. Would compute the target as a
+    /// path relative to the nearest shared ancestor of the destination and
+    /// the source archive, so the symlink stays valid across a container
+    /// remount (e.g. RomM's Docker deployment) that gives the destination
+    /// and source different absolute paths on each side of the mount.
+    RelativeToSharedAncestor,
+    /// Not implemented yet - vocabulary only. Explicitly requests an
+    /// absolute target - identical output to `AbsoluteSourcePath` today,
+    /// but named explicitly so a profile can pin this behaviour even after
+    /// a different strategy becomes the default.
+    Absolute,
+}
+
+/// A Library View's frontend identity: which frontend it is nominally
+/// shaped for, plus the (mostly-default) policy governing its output shape.
+/// `#[serde(default)]` on `LibraryViewConfig::profile` means an old config
+/// with no `profile` key at all deserializes to `FrontendProfile::default()`
+/// (`Generic` kind, default policy), which is defined to behave exactly
+/// like the pre-existing, profile-less code did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct FrontendProfile {
+    #[serde(default)]
+    pub kind: FrontendProfileKind,
+    #[serde(default)]
+    pub policy: FrontendProfilePolicy,
+}
+
+/// What kind of filesystem object a planned Library View entry ultimately
+/// is (or will become). Only `Symlink` is ever actually produced by
+/// `plan_library_view`/`apply_library_view` in this milestone - `GeneratedFile`
+/// and `Directory` exist so later milestones (RomM/ES-DE materialization)
+/// can extend the planner and manifest without another backward-compatibility
+/// migration. See `plan_generated_file`/`classify_library_view_object` for
+/// the planning-only seams that use the non-`Symlink` cases today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum LibraryViewObjectKind {
+    /// A managed symlink pointing at a source archive - the only kind this
+    /// milestone's `apply_library_view` ever creates.
+    #[default]
+    Symlink,
+    /// A managed regular file whose content EmuWiz itself would generate
+    /// (e.g. a future `.m3u`/`gamelist.xml`) - never a copy or hardlink of a
+    /// source archive. Not created by this milestone.
+    GeneratedFile,
+    /// A managed directory EmuWiz itself created (as opposed to a
+    /// pre-existing directory it merely wrote into) - see
+    /// `LibraryViewManifest::created_directories`. Not created as a
+    /// standalone planned object by this milestone.
+    Directory,
+}
+
+/// Derives the filename a Library View would display for `archive_path`
+/// under `profile`, without ever renaming or otherwise touching the source
+/// archive. A pure name-deriving primitive: it does not itself decide
+/// *whether* a profile is allowed to plan at all (that fail-closed gate is
+/// `generate_relative_link_path`'s - see its doc comment - so this function
+/// is in practice only ever reached for `Generic` today). In this milestone
+/// every profile kind still resolves to exactly the archive's own filename
+/// (sanitised) if called directly, so a later profile-driven rename policy
+/// has one obvious place to plug into instead of every call site
+/// re-deriving a filename by hand.
+///
+/// Rejects (never invents a fallback for): an absent filename, an empty
+/// name, `.`/`..`, any path separator, and anything else that is not a
+/// single safe path component - the exact same rules
+/// `sanitize_path_component_os` already enforces for the pre-existing
+/// generic behaviour, so `Generic`-profile output is provably unchanged.
+pub fn derive_view_filename(profile: &FrontendProfile, archive_path: &Path) -> Result<PathBuf> {
+    let source_filename = archive_path.file_name().ok_or_else(|| {
+        ArchiveFsError::Config(format!(
+            "{} has no filename to use in a Library View",
+            archive_path.display()
+        ))
+    })?;
+    let derived: OsString = match profile.kind {
+        // Stage 1/2: every kind derives the same filename as the source
+        // archive - see the function doc comment for why.
+        FrontendProfileKind::Generic | FrontendProfileKind::Romm | FrontendProfileKind::EsDe => {
+            source_filename.to_os_string()
+        }
+    };
+    sanitize_path_component_os(&derived)
 }
 
 /// Resolves the config-y "list of views" file: `library_views.json` under the
@@ -331,14 +601,89 @@ pub struct LibraryViewManifestEntry {
     pub platform: String,
     #[serde(with = "path_json")]
     pub source_folder_path: PathBuf,
+    /// What kind of filesystem object this entry owns. `#[serde(default)]`
+    /// resolves every entry written before this field existed to `Symlink`,
+    /// which is exactly what every such entry actually is, since Symlink
+    /// was the only kind `apply_library_view` could ever produce before
+    /// this milestone.
+    #[serde(default)]
+    pub object_kind: LibraryViewObjectKind,
+    /// The content hash a future `GeneratedFile` entry's managed content
+    /// would be identified by. Always `None` in this milestone - no entry's
+    /// `object_kind` is ever `GeneratedFile` yet, since nothing creates one.
+    #[serde(default)]
+    pub content_hash: Option<String>,
+    /// The version of the (future) rendering rules used to produce this
+    /// entry's content, for a `GeneratedFile` entry. Always `None` in this
+    /// milestone, for the same reason as `content_hash`.
+    #[serde(default)]
+    pub rendering_version: Option<u32>,
 }
 
+/// # Schema evolution / backward compatibility
+///
+/// Every field the Frontend Profiles milestone added to this struct and to
+/// `LibraryViewManifestEntry` (`object_kind`, `content_hash`,
+/// `rendering_version`, `view_fingerprint`, `profile_version`,
+/// `created_directories`) carries `#[serde(default)]`, so a manifest JSON
+/// file written before this milestone existed - one with none of these keys
+/// at all - deserializes exactly as it always did, with:
+///
+/// - `object_kind` resolving to `Symlink` on every existing entry, which is
+///   exactly correct: `Symlink` was the only kind any manifest-writing code
+///   could ever have produced before this milestone.
+/// - `content_hash`/`rendering_version` resolving to `None` - meaningless
+///   for a `Symlink` entry, and no `GeneratedFile` entry existed yet to have
+///   had them.
+/// - `view_fingerprint` resolving to `None` - deliberately distinct from
+///   "recorded and matches the current profile": `plan_library_view` only
+///   ever reports `LibraryViewPlan::fingerprint_conflict` when a fingerprint
+///   *was* recorded and it disagrees, so an old manifest predating the field
+///   is never treated as incompatible merely for predating it.
+/// - `profile_version` resolving to `0` - a write-format counter, not a
+///   per-edit revision; `apply_library_view` always writes `1` from this
+///   milestone onward.
+/// - `created_directories` resolving to an empty `Vec` - correct, since no
+///   apply before this milestone ever recorded directory ownership; the
+///   field is not yet populated by this milestone's `apply_library_view`
+///   either (see the field's own doc comment), so it round-trips whatever a
+///   later milestone starts writing into it without this one clobbering it.
+///
+/// Every one of these defaults was chosen to be the value that describes
+/// what *already happened* under the pre-Frontend-Profiles code, never a
+/// value that would silently change interpretation of old data.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LibraryViewManifest {
     pub view_id: String,
     #[serde(with = "path_json")]
     pub destination_root: PathBuf,
     pub entries: Vec<LibraryViewManifestEntry>,
+    /// The `compute_view_profile_fingerprint` value of the view's
+    /// configuration at the time this manifest was last written by
+    /// `apply_library_view`/`repair_library_view`. `#[serde(default)]`
+    /// resolves a pre-Frontend-Profiles manifest to `None` - deliberately
+    /// distinct from "recorded and matches", so `plan_library_view` never
+    /// treats an old manifest as fingerprint-incompatible merely for
+    /// predating this field (see `LibraryViewPlan::fingerprint_conflict`).
+    #[serde(default)]
+    pub view_fingerprint: Option<String>,
+    /// A simple write-format counter (not a per-edit revision number):
+    /// `0` for any manifest written before this milestone's
+    /// fingerprint-aware apply path existed (`#[serde(default)]`), `1` for
+    /// every manifest `apply_library_view` writes now.
+    #[serde(default)]
+    pub profile_version: u32,
+    /// Directories `apply_library_view` itself created under
+    /// `destination_root` (never a directory that already existed) - the
+    /// same "only record what EmuWiz itself created" ownership rule
+    /// `LibraryViewManifestEntry` already applies to symlinks. Not yet
+    /// populated or consulted by this milestone's `apply_library_view`
+    /// (which does not create standalone managed directories or generated
+    /// files - see the milestone notes); the field exists purely so a
+    /// pre-existing manifest keeps loading once a later milestone starts
+    /// writing into it, without another migration.
+    #[serde(default, with = "vec_path_json")]
+    pub created_directories: Vec<PathBuf>,
 }
 
 impl LibraryViewManifest {
@@ -347,6 +692,9 @@ impl LibraryViewManifest {
             view_id: view_id.to_string(),
             destination_root: destination_root.to_path_buf(),
             entries: Vec::new(),
+            view_fingerprint: None,
+            profile_version: 0,
+            created_directories: Vec::new(),
         }
     }
 }
@@ -483,6 +831,33 @@ fn canonical_or_nearest_existing_ancestor(path: &Path) -> Result<PathBuf> {
     Ok(canonical_parent.join(suffix))
 }
 
+/// Confirms a planned symlink target (`archive_path`) actually resolves
+/// inside `source_root` - the same canonicalize-then-`starts_with`
+/// containment check `validate_library_view_destination` already applies to
+/// a view's *destination*, applied here to the *source* side instead:
+/// `plan_library_view` must never plan a symlink whose target has escaped
+/// the trusted source root the catalogue says it came from (e.g. via a
+/// symlink planted inside a source folder that itself points somewhere
+/// untrusted, discovered after the catalogue record was written). A
+/// read-only check (`fs::canonicalize`/`fs::metadata` only, via
+/// `canonical_or_nearest_existing_ancestor`) - consistent with planning
+/// never mutating anything.
+fn validate_symlink_target_within_source(archive_path: &Path, source_root: &Path) -> Result<()> {
+    let archive_canonical = canonical_or_nearest_existing_ancestor(archive_path)?;
+    let source_canonical =
+        fs::canonicalize(source_root).unwrap_or_else(|_| source_root.to_path_buf());
+    if archive_canonical.starts_with(&source_canonical) {
+        Ok(())
+    } else {
+        Err(ArchiveFsError::Config(format!(
+            "{} does not resolve inside its configured source folder {} - refusing to plan a \
+             symlink target that could escape the trusted source root",
+            archive_path.display(),
+            source_root.display()
+        )))
+    }
+}
+
 // ---------------------------------------------------------------------
 // Layout / path generation.
 // ---------------------------------------------------------------------
@@ -490,24 +865,109 @@ fn canonical_or_nearest_existing_ancestor(path: &Path) -> Result<PathBuf> {
 /// Builds the relative link path for one archive under `template`,
 /// rejecting anything that could escape the destination root (milestone
 /// requirement: "reject path traversal through generated names"). The
-/// filename is taken directly from `archive_path.file_name()` (an
-/// `OsStr`, never lossily converted), so a non-UTF-8 archive filename is
-/// preserved exactly rather than mangled or rejected outright.
+/// filename component always goes through `derive_view_filename`, so a
+/// non-UTF-8 archive filename is preserved exactly rather than mangled or
+/// rejected outright.
+///
+/// The *directory* shape depends on `profile.kind`:
+/// - `Generic`: `{platform}/{filename}` - the catalogue's own platform
+///   string, sanitised, exactly as before this milestone.
+/// - `Romm`: `roms/{resolved-romm-slug}/{filename}` - see
+///   `resolve_romm_platform_slug` for how the slug is resolved (never
+///   invented from the catalogue platform string or from a display name).
+///   `romm_identity_cache` is threaded through only for this tier.
+/// - `EsDe`: always refused - no real materialization exists yet (see
+///   `FrontendProfileKind`'s doc comment); this is defense in depth
+///   alongside `plan_library_view`'s own `profile_error` check, so any other
+///   caller of this function gets the same refusal rather than a silent
+///   `Generic`-shaped path.
 pub fn generate_relative_link_path(
     template: LibraryViewLayoutTemplate,
+    profile: &FrontendProfile,
     platform: &str,
     archive_path: &Path,
+    romm_identity_cache: Option<&crate::identity_source::cache::IdentityCache>,
 ) -> Result<PathBuf> {
     let LibraryViewLayoutTemplate::PlatformFilename = template;
-    let platform_component = sanitize_path_component_str(platform)?;
-    let filename = archive_path.file_name().ok_or_else(|| {
-        ArchiveFsError::Config(format!(
-            "{} has no filename to use in a Library View",
-            archive_path.display()
-        ))
-    })?;
-    let filename_component = sanitize_path_component_os(filename)?;
-    Ok(PathBuf::from(platform_component).join(filename_component))
+    let filename_component = derive_view_filename(profile, archive_path)?;
+    match profile.kind {
+        FrontendProfileKind::Generic => {
+            let platform_component = sanitize_path_component_str(platform)?;
+            Ok(PathBuf::from(platform_component).join(filename_component))
+        }
+        FrontendProfileKind::Romm => {
+            let slug = resolve_romm_platform_slug(
+                platform,
+                &profile.policy.platform_mapping_overrides,
+                romm_identity_cache,
+            )
+            .ok_or_else(|| {
+                ArchiveFsError::Config(format!(
+                    "no RomM platform slug could be resolved for catalogue platform \
+                     {platform:?} - refusing to plan a RomM path rather than guessing one \
+                     (add an explicit platform_mapping_overrides entry, or import this \
+                     platform from a connected RomM instance first)"
+                ))
+            })?;
+            let slug_component = sanitize_path_component_str(&slug)?;
+            Ok(PathBuf::from("roms")
+                .join(slug_component)
+                .join(filename_component))
+        }
+        FrontendProfileKind::EsDe => Err(ArchiveFsError::Config(
+            "the EsDe frontend profile does not implement real Library View materialization \
+             yet in this milestone - refusing to plan a path rather than silently falling back \
+             to Generic behaviour"
+                .to_string(),
+        )),
+    }
+}
+
+/// Resolves the RomM platform slug `catalogue_platform` (the catalogue's own
+/// canonical platform id - never changed or re-derived by this function) maps
+/// to, trying each tier in strict precedence order and stopping at the first
+/// that answers:
+///
+/// 1. `overrides` - an explicit user override
+///    (`FrontendProfilePolicy::platform_mapping_overrides`).
+/// 2. `identity_cache` - a locally published, previously imported RomM
+///    instance's own reported slug for this platform
+///    (`IdentityCache::romm_slug_for_platform`) - read entirely offline, no
+///    network request. `None` when no cache was loaded/available, which is
+///    simply "this tier has nothing to say", not a refusal.
+///
+/// Returns `None` when neither tier answers - callers must fail closed
+/// rather than inventing a slug (e.g. lower-casing or otherwise sanitising
+/// the canonical platform id and assuming RomM accepts it).
+///
+/// # No bundled/default static table
+///
+/// This was evaluated and deliberately rejected: the repo's only existing
+/// RomM-slug table (`identity_source::romm::normalise::canonical_platform_for_romm_slug`'s
+/// `ROMM_SLUG_ALIASES`) resolves *inbound* provider slugs to a canonical
+/// platform, and several of its entries are intentionally approximate,
+/// many-to-one associations for that purpose (e.g. `fds` -> `NES`, `pc-fx` ->
+/// `PC Engine`, `xboxone` -> `Xbox` - see that table's own doc comment).
+/// Inverting it to pick a *default output* slug for a canonical platform
+/// would silently produce a wrong-but-plausible-looking slug for exactly
+/// those platforms (`NES`'s real RomM slug is `nes`, never `fds`) - which is
+/// worse than failing closed, not safer. If a genuinely 1:1, vetted forward
+/// table is added later, it belongs here as a third tier below the two
+/// above; guessing one now was out of scope.
+pub fn resolve_romm_platform_slug(
+    catalogue_platform: &str,
+    overrides: &FrontendPlatformMapping,
+    identity_cache: Option<&crate::identity_source::cache::IdentityCache>,
+) -> Option<String> {
+    if let Some(slug) = overrides.get(catalogue_platform) {
+        return Some(slug.to_string());
+    }
+    if let Some(slug) =
+        identity_cache.and_then(|cache| cache.romm_slug_for_platform(catalogue_platform))
+    {
+        return Some(slug.to_string());
+    }
+    None
 }
 
 /// Rejects an empty string, `.`/`..`, or anything containing a path
@@ -656,11 +1116,35 @@ pub struct LibraryViewPlan {
     /// the individual entries look (milestone requirement: "no Apply
     /// button until planning succeeds without unsafe-root errors").
     pub unsafe_root_error: Option<String>,
+    /// The fingerprint (`compute_view_profile_fingerprint`) of `view`'s
+    /// *current* configuration, as planned just now.
+    pub profile_fingerprint: String,
+    /// `Some` when the manifest this plan was computed against already
+    /// recorded a `view_fingerprint` (i.e. it was written by a
+    /// fingerprint-aware apply) and that recorded fingerprint does not match
+    /// `profile_fingerprint` - meaning the view's profile/layout changed in
+    /// an output-affecting way since the manifest was last written. The
+    /// GUI/CLI must refuse Apply while this is set: this milestone never
+    /// automatically destroys or rebuilds an existing view under a changed
+    /// profile, it only surfaces the conflict for review. `None` (not a
+    /// conflict) whenever the manifest recorded no fingerprint at all - an
+    /// old, pre-Frontend-Profiles manifest is never treated as "incompatible"
+    /// merely for predating this field.
+    pub fingerprint_conflict: Option<String>,
+    /// `Some` when `view.profile.kind` is not `Generic` - `RomM`/`EsDe`
+    /// materialization is not implemented in this milestone, so planning
+    /// fails closed with a clear refusal here rather than silently
+    /// producing `Generic`-shaped output (see `FrontendProfileKind`'s doc
+    /// comment). The GUI/CLI must refuse Apply while this is set, exactly
+    /// like `unsafe_root_error`/`fingerprint_conflict`.
+    pub profile_error: Option<String>,
 }
 
 impl LibraryViewPlan {
     pub fn is_safe_to_apply(&self) -> bool {
         self.unsafe_root_error.is_none()
+            && self.fingerprint_conflict.is_none()
+            && self.profile_error.is_none()
     }
 }
 
@@ -696,6 +1180,7 @@ pub fn plan_library_view(
     records: &[PersistedArchive],
     source_folders: &[SourceFolderRecord],
     manifest: &LibraryViewManifest,
+    romm_identity_cache: Option<&crate::identity_source::cache::IdentityCache>,
 ) -> LibraryViewPlan {
     let mut counts = LibraryViewPlanCounts::default();
     let mut entries = Vec::new();
@@ -706,6 +1191,30 @@ pub fn plan_library_view(
             Ok(_) => None,
             Err(error) => Some(error.to_string()),
         };
+    // Fail closed for a not-yet-implemented frontend kind - see
+    // `FrontendProfileKind`'s doc comment. Computed once here (rather than
+    // only inside `generate_relative_link_path`'s own per-record refusal)
+    // so the plan carries one clear, top-level reason Apply is refused,
+    // in addition to every individual candidate also reporting
+    // `SkipInvalidPath` with the same underlying cause.
+    // `Romm` is no longer blanket-refused here: it plans real
+    // `roms/<slug>/<filename>` paths when every selected archive's platform
+    // resolves to a RomM slug (see `resolve_romm_platform_slug`), and each
+    // archive whose platform does *not* resolve is refused individually as
+    // `SkipInvalidPath` by `generate_relative_link_path` below - reusing the
+    // exact same per-record refusal path `Generic` already uses for an
+    // unsafe derived filename, rather than a new plan-wide field. `EsDe`
+    // still has no real materialization at all, so it keeps the blanket,
+    // plan-wide refusal.
+    let profile_error = match view.profile.kind {
+        FrontendProfileKind::Generic | FrontendProfileKind::Romm => None,
+        FrontendProfileKind::EsDe => Some(format!(
+            "the {:?} frontend profile does not implement real Library View materialization \
+             yet in this milestone - refusing to plan/apply rather than silently falling back \
+             to Generic behaviour",
+            view.profile.kind
+        )),
+    };
 
     let source_by_id: HashMap<i64, &SourceFolderRecord> = source_folders
         .iter()
@@ -725,6 +1234,15 @@ pub fn plan_library_view(
     // Pass 1: for every catalogue-included archive, either report why it
     // is skipped or compute the one destination path it wants.
     let mut wanted: HashMap<PathBuf, Vec<LibraryViewCandidate<'_>>> = HashMap::new();
+    // Only ever populated for a `Romm` profile, and only with platforms this
+    // plan actually resolved successfully (never a guessed/unresolved
+    // value) - folded into `profile_fingerprint` below via
+    // `compute_view_profile_fingerprint_with_resolved_romm_mapping` so a
+    // resolved-mapping change (e.g. a re-imported RomM cache reporting a
+    // different slug) is visible as a fingerprint change, not silently
+    // invisible drift. A `BTreeMap` so its key order - and therefore the
+    // fingerprint - never depends on `records`' own iteration order.
+    let mut resolved_romm_mapping: BTreeMap<String, String> = BTreeMap::new();
     for record in records {
         let Some(source) = source_by_id.get(&record.source_folder_id) else {
             continue;
@@ -775,8 +1293,10 @@ pub fn plan_library_view(
 
         let relative_link_path = match generate_relative_link_path(
             view.layout_template,
+            &view.profile,
             &platform,
             &record.absolute_path,
+            romm_identity_cache,
         ) {
             Ok(path) => path,
             Err(error) => {
@@ -795,6 +1315,39 @@ pub fn plan_library_view(
                 continue;
             }
         };
+        if view.profile.kind == FrontendProfileKind::Romm
+            && let Some(slug) = resolve_romm_platform_slug(
+                &platform,
+                &view.profile.policy.platform_mapping_overrides,
+                romm_identity_cache,
+            )
+        {
+            resolved_romm_mapping.insert(platform.clone(), slug);
+        }
+        // Source-side containment: the planned symlink target must itself
+        // resolve inside the trusted source root the catalogue says it
+        // came from - never touched by ordinary scans (which only ever
+        // discover archives under a source folder), but this refuses to
+        // plan a symlink target that has since been made to escape that
+        // root (e.g. a symlink planted inside the source folder pointing
+        // somewhere untrusted). See `validate_symlink_target_within_source`.
+        if let Err(error) =
+            validate_symlink_target_within_source(&record.absolute_path, &source.path)
+        {
+            entries.push(LibraryViewPlanEntry {
+                action: LibraryViewPlanAction::SkipInvalidPath,
+                archive_path: Some(record.absolute_path.clone()),
+                relative_link_path: None,
+                destination_path: None,
+                platform: Some(platform),
+                reason: Some(error.to_string()),
+                colliding_with: None,
+                source_folder_path: None,
+                archive_identity: None,
+            });
+            counts.add(LibraryViewPlanAction::SkipInvalidPath.count_bucket());
+            continue;
+        }
         let destination_path = view.destination_root.join(&relative_link_path);
         let archive_identity = record
             .size_bytes
@@ -888,13 +1441,117 @@ pub fn plan_library_view(
         counts.add(LibraryViewPlanAction::RemoveStale.count_bucket());
     }
 
+    // Deterministic output: `wanted` above is a `HashMap`, so its iteration
+    // order (and therefore the order entries were pushed in passes 1-3) is
+    // not guaranteed stable across runs/platforms. Sort once, at the very
+    // end, by `(view_relative_path, source_path)` - repeated planning from
+    // identical inputs must always produce an identical plan vector. Entries
+    // with no relative/archive path (the two catalogue-only skip reasons)
+    // sort together at the front under the empty-path key, ordered by
+    // archive path as the tiebreaker; that is still fully deterministic,
+    // just not alphabetically interleaved with path-bearing entries.
+    entries.sort_by(|a, b| {
+        let a_key = (
+            a.relative_link_path.clone().unwrap_or_default(),
+            a.archive_path.clone().unwrap_or_default(),
+        );
+        let b_key = (
+            b.relative_link_path.clone().unwrap_or_default(),
+            b.archive_path.clone().unwrap_or_default(),
+        );
+        a_key.cmp(&b_key)
+    });
+
+    let profile_fingerprint =
+        compute_view_profile_fingerprint_with_resolved_romm_mapping(view, resolved_romm_mapping);
+    let fingerprint_conflict = manifest.view_fingerprint.as_ref().and_then(|recorded| {
+        if *recorded == profile_fingerprint {
+            None
+        } else {
+            Some(format!(
+                "this view's existing manifest was written under a different frontend profile \
+                 fingerprint ({recorded}) than its current configuration ({profile_fingerprint}) \
+                 produces - refusing to apply automatically; review the profile change (or the \
+                 manifest) before re-applying"
+            ))
+        }
+    });
+
     LibraryViewPlan {
         view_id: view.id.clone(),
         destination_root: view.destination_root.clone(),
         counts,
         entries,
         unsafe_root_error,
+        profile_fingerprint,
+        fingerprint_conflict,
+        profile_error,
     }
+}
+
+/// A deterministic fingerprint of everything about `view` that affects the
+/// *shape* of its planned output - the layout template and the frontend
+/// profile (kind + policy). Two views with the same fingerprint are
+/// guaranteed to plan identical relative link paths for the same catalogue
+/// input; two views that differ only in fields that do not affect output
+/// shape (`id`, `name`, `enabled`, `source_folders`, `platforms`,
+/// `destination_root`) are *not* guaranteed to differ.
+///
+/// Deliberately excludes anything time-based, random, or HashMap-ordered:
+/// `FrontendPlatformMapping` is backed by a `BTreeMap` specifically so this
+/// fingerprint's input JSON always serializes its keys in the same (sorted)
+/// order regardless of insertion order. Uses `sha2` (already a dependency -
+/// see `Cargo.toml`) rather than adding a new hash crate just for this.
+pub fn compute_view_profile_fingerprint(view: &LibraryViewConfig) -> String {
+    compute_view_profile_fingerprint_with_resolved_romm_mapping(view, BTreeMap::new())
+}
+
+/// Like `compute_view_profile_fingerprint`, but also folds in the exact
+/// canonical-platform -> RomM-slug mappings a `Romm`-profile plan actually
+/// resolved and used (see `resolve_romm_platform_slug`) - a `BTreeMap` for
+/// deterministic (canonical-platform-ordered), insertion-order-independent
+/// serialization, exactly like `FrontendPlatformMapping`'s own backing.
+///
+/// This closes a real drift gap: RomM output depends on a resolved mapping
+/// that can itself change independently of `view` (e.g. a locally cached
+/// RomM instance is re-imported with a different slug for the same
+/// platform) - `layout_template`/`profile` alone cannot see that. Only the
+/// mappings *actually used by this plan* are hashed (never every platform
+/// the cache happens to know about), so an unrelated platform changing in
+/// the cache never perturbs a plan that never touched it. An unresolved
+/// platform is never represented here at all (never a guessed value) -
+/// it stays visible only as that record's own `SkipInvalidPath` entry.
+///
+/// `#[serde(skip_serializing_if = "...")]` means an empty map serializes to
+/// exactly the same JSON `compute_view_profile_fingerprint` already
+/// produced before this existed - so a `Generic`/`EsDe` view's fingerprint
+/// (and a `Romm` view that resolved nothing at all) is provably byte-for-byte
+/// unchanged, and no fingerprint recorded by the already-committed Stage 1/2
+/// code is ever invalidated by this addition. (No previously *applied*
+/// `Romm` manifest could exist to invalidate in any case: Stage 1/2's `Romm`
+/// was blanket fail-closed, so `apply_library_view` could never have
+/// succeeded and written one.)
+fn compute_view_profile_fingerprint_with_resolved_romm_mapping(
+    view: &LibraryViewConfig,
+    resolved_romm_mapping: BTreeMap<String, String>,
+) -> String {
+    #[derive(Serialize)]
+    struct FingerprintInput<'a> {
+        layout_template: LibraryViewLayoutTemplate,
+        profile: &'a FrontendProfile,
+        #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+        resolved_romm_mapping: BTreeMap<String, String>,
+    }
+    let input = FingerprintInput {
+        layout_template: view.layout_template,
+        profile: &view.profile,
+        resolved_romm_mapping,
+    };
+    let canonical = serde_json::to_string(&input)
+        .expect("FingerprintInput has no non-serializable field (no maps/floats/NaN)");
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.as_bytes());
+    encode_hex(&hasher.finalize())
 }
 
 /// Classifies what already exists at `destination_path` against what the
@@ -943,6 +1600,181 @@ fn classify_existing_path(
                 Some("an existing symlink at this path could not be read".to_string()),
             ),
         },
+    }
+}
+
+// ---------------------------------------------------------------------
+// Stage 2 ownership model: generalizes `classify_existing_path`'s
+// Symlink-specific classification to the full `LibraryViewObjectKind`
+// vocabulary, for planning/dry-run use by a later milestone's `GeneratedFile`/
+// `Directory` materialization. Read-only, exactly like `classify_existing_path`
+// - `fs::symlink_metadata`/`fs::read_link` only, never a mutation. Not yet
+// wired into `plan_library_view` itself (which only ever plans `Symlink`
+// entries in this milestone); exists so the ownership rules below are
+// already implemented, tested, and stable before anything calls them from
+// the main planning pass.
+// ---------------------------------------------------------------------
+
+/// What a path on disk turned out to be, classified against what a
+/// (possibly hypothetical, not-yet-real) managed object of `expected_kind`
+/// would look like there. Never assigns `Owned*` merely because a path's
+/// *name* matches something the manifest recorded - ownership additionally
+/// requires the recorded entry to exist for that exact relative path
+/// (`is_owned_by_manifest`) *and* the actual filesystem object to be
+/// consistent with what that entry says it should be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LibraryViewObjectClassification {
+    /// Nothing exists at this path yet.
+    Missing,
+    /// A manifest-owned object of the expected kind, matching what the
+    /// manifest recorded for it (for `Symlink`: pointing at the recorded
+    /// target).
+    OwnedCorrect,
+    /// A manifest-owned object of the expected kind, but not matching what
+    /// the manifest recorded (for `Symlink`: pointing somewhere else) -
+    /// drift since the last apply, safe to repair.
+    OwnedStale,
+    /// A real (non-symlink) file or directory exists here, and it is not
+    /// recorded as manifest-owned - never touched.
+    ForeignRealFile,
+    /// A symlink exists here, and it is not recorded as manifest-owned -
+    /// never touched, even if it happens to point at the same target a
+    /// managed symlink would.
+    ForeignSymlink,
+    /// Something is recorded as manifest-owned at this exact relative path,
+    /// but what is actually on disk is not the kind of object the manifest
+    /// says it should be (e.g. the manifest says `Symlink` but a real
+    /// directory sits there now) - never touched; this is a refusal state,
+    /// not something to be silently reinterpreted.
+    WrongObjectKind,
+}
+
+/// Classifies whatever is at `path` against a managed object of
+/// `expected_kind` - `expected_target` is only meaningful for
+/// `LibraryViewObjectKind::Symlink` (the exact symlink target the manifest
+/// recorded); `is_owned_by_manifest` must be computed by the caller from an
+/// actual manifest lookup (e.g. "does some entry's `relative_link_path`
+/// equal this path's relative form"), never inferred from the path's name
+/// alone - see `LibraryViewObjectClassification`'s doc comment.
+pub fn classify_library_view_object(
+    path: &Path,
+    expected_kind: LibraryViewObjectKind,
+    expected_target: Option<&Path>,
+    is_owned_by_manifest: bool,
+) -> LibraryViewObjectClassification {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(_) => return LibraryViewObjectClassification::Missing,
+    };
+    let file_type = metadata.file_type();
+
+    match expected_kind {
+        LibraryViewObjectKind::Symlink => {
+            if !file_type.is_symlink() {
+                return if is_owned_by_manifest {
+                    LibraryViewObjectClassification::WrongObjectKind
+                } else {
+                    LibraryViewObjectClassification::ForeignRealFile
+                };
+            }
+            match fs::read_link(path) {
+                Ok(actual_target) if Some(actual_target.as_path()) == expected_target => {
+                    LibraryViewObjectClassification::OwnedCorrect
+                }
+                _ if is_owned_by_manifest => LibraryViewObjectClassification::OwnedStale,
+                _ => LibraryViewObjectClassification::ForeignSymlink,
+            }
+        }
+        LibraryViewObjectKind::GeneratedFile => {
+            if file_type.is_symlink() {
+                return if is_owned_by_manifest {
+                    LibraryViewObjectClassification::WrongObjectKind
+                } else {
+                    LibraryViewObjectClassification::ForeignSymlink
+                };
+            }
+            if !file_type.is_file() {
+                return LibraryViewObjectClassification::WrongObjectKind;
+            }
+            if is_owned_by_manifest {
+                // Content-hash comparison (the real "still correct?" check
+                // for a GeneratedFile) is future work - nothing creates a
+                // GeneratedFile yet, so there is no real content to compare
+                // against. Conservatively `OwnedStale` rather than
+                // `OwnedCorrect`: never claim a not-yet-implemented check
+                // passed.
+                LibraryViewObjectClassification::OwnedStale
+            } else {
+                LibraryViewObjectClassification::ForeignRealFile
+            }
+        }
+        LibraryViewObjectKind::Directory => {
+            if !file_type.is_dir() {
+                return if is_owned_by_manifest {
+                    LibraryViewObjectClassification::WrongObjectKind
+                } else {
+                    LibraryViewObjectClassification::ForeignRealFile
+                };
+            }
+            if is_owned_by_manifest {
+                LibraryViewObjectClassification::OwnedCorrect
+            } else {
+                LibraryViewObjectClassification::ForeignRealFile
+            }
+        }
+    }
+}
+
+/// A planned (never written) future `GeneratedFile` entry: the relative
+/// path it would occupy, and the content hash its intended content would
+/// have. Model/planning only - nothing in this milestone ever writes the
+/// file `intended_content_hash` describes; see `plan_generated_file`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LibraryViewGeneratedFilePlan {
+    #[serde(with = "path_json")]
+    pub relative_path: PathBuf,
+    pub intended_content_hash: String,
+    /// What `classify_library_view_object` reports for this path against
+    /// the view's current manifest/filesystem state - i.e. what applying
+    /// this (still-hypothetical) `GeneratedFile` entry would actually do,
+    /// without doing it.
+    pub classification: LibraryViewObjectClassification,
+}
+
+/// Computes what a future `GeneratedFile` entry at `relative_path` (under
+/// `destination_root`) would contain (`intended_content_hash`, via `sha2` -
+/// already a dependency, see `Cargo.toml`) and what applying it would find
+/// on disk right now (`classification`) - entirely a dry-run read: this
+/// never creates `content`, `relative_path`, or any directory. The single
+/// seam a later milestone's real `GeneratedFile` materialization (e.g. a
+/// RomM `.m3u` or an ES-DE `gamelist.xml`) can build on without this
+/// milestone having guessed at its content format.
+pub fn plan_generated_file(
+    destination_root: &Path,
+    relative_path: PathBuf,
+    content: &[u8],
+    manifest: &LibraryViewManifest,
+) -> LibraryViewGeneratedFilePlan {
+    let mut hasher = Sha256::new();
+    hasher.update(content);
+    let intended_content_hash = encode_hex(&hasher.finalize());
+
+    let is_owned_by_manifest = manifest.entries.iter().any(|entry| {
+        entry.relative_link_path == relative_path
+            && entry.object_kind == LibraryViewObjectKind::GeneratedFile
+    });
+    let destination_path = destination_root.join(&relative_path);
+    let classification = classify_library_view_object(
+        &destination_path,
+        LibraryViewObjectKind::GeneratedFile,
+        None,
+        is_owned_by_manifest,
+    );
+
+    LibraryViewGeneratedFilePlan {
+        relative_path,
+        intended_content_hash,
+        classification,
     }
 }
 
@@ -1013,9 +1845,13 @@ pub fn apply_library_view(
 ) -> Result<LibraryViewApplyReport> {
     if !plan.is_safe_to_apply() {
         return Err(ArchiveFsError::Config(
-            plan.unsafe_root_error.clone().unwrap_or_else(|| {
-                "this library view's destination is unsafe to apply".to_string()
-            }),
+            plan.unsafe_root_error
+                .clone()
+                .or_else(|| plan.profile_error.clone())
+                .or_else(|| plan.fingerprint_conflict.clone())
+                .unwrap_or_else(|| {
+                    "this library view's destination is unsafe to apply".to_string()
+                }),
         ));
     }
     fs::create_dir_all(&view.destination_root)
@@ -1061,6 +1897,9 @@ pub fn apply_library_view(
                         updated_at: now.clone(),
                         platform: entry.platform.clone().unwrap_or_default(),
                         source_folder_path: entry.source_folder_path.clone().unwrap_or_default(),
+                        object_kind: LibraryViewObjectKind::Symlink,
+                        content_hash: None,
+                        rendering_version: None,
                     },
                 );
                 report.unchanged += 1;
@@ -1079,7 +1918,19 @@ pub fn apply_library_view(
                     continue;
                 };
                 let is_repair = entry.action == LibraryViewPlanAction::Repair;
-                match create_or_repair_symlink(&destination_path, &archive_path) {
+                let outcome = reproof_symlink_target(
+                    &archive_path,
+                    entry.source_folder_path.as_deref(),
+                    entry.archive_identity.as_deref(),
+                )
+                .and_then(|()| {
+                    create_or_repair_symlink(
+                        &view.destination_root,
+                        &destination_path,
+                        &archive_path,
+                    )
+                });
+                match outcome {
                     Ok(()) => {
                         let created_at = if is_repair {
                             entries_by_path
@@ -1102,6 +1953,9 @@ pub fn apply_library_view(
                                     .source_folder_path
                                     .clone()
                                     .unwrap_or_default(),
+                                object_kind: LibraryViewObjectKind::Symlink,
+                                content_hash: None,
+                                rendering_version: None,
                             },
                         );
                         if is_repair {
@@ -1143,7 +1997,11 @@ pub fn apply_library_view(
                 else {
                     continue;
                 };
-                match remove_managed_symlink(&destination_path, &recorded.target_path) {
+                match remove_managed_symlink(
+                    &view.destination_root,
+                    &destination_path,
+                    &recorded.target_path,
+                ) {
                     Ok(true) => {
                         entries_by_path.remove(&relative_link_path);
                         report.removed += 1;
@@ -1183,10 +2041,32 @@ pub fn apply_library_view(
         }
     }
 
+    let mut new_entries: Vec<LibraryViewManifestEntry> = entries_by_path.into_values().collect();
+    // Deterministic output, same reasoning as `plan_library_view`'s final
+    // sort: `entries_by_path` is a `HashMap`, so its iteration order is not
+    // guaranteed stable.
+    new_entries.sort_by(|a, b| a.relative_link_path.cmp(&b.relative_link_path));
+
     let new_manifest = LibraryViewManifest {
         view_id: view.id.clone(),
         destination_root: view.destination_root.clone(),
-        entries: entries_by_path.into_values().collect(),
+        entries: new_entries,
+        // Reuses the fingerprint `plan_library_view` already computed
+        // (rather than recomputing it from `view` alone) so the recorded
+        // fingerprint always matches exactly what was planned - including,
+        // for a `Romm` profile, the resolved canonical-platform -> RomM-slug
+        // mappings this plan actually used (see
+        // `compute_view_profile_fingerprint_with_resolved_romm_mapping`).
+        // Recomputing from `view` here would silently drop that resolved-
+        // mapping component and let a later plan's fingerprint mismatch one
+        // this very apply just wrote.
+        view_fingerprint: Some(plan.profile_fingerprint.clone()),
+        profile_version: 1,
+        // Not yet populated by this milestone's apply (see the field's own
+        // doc comment) - carried forward unchanged rather than reset, so a
+        // later milestone that does start populating it is never silently
+        // wiped by an apply from this one.
+        created_directories: manifest.created_directories.clone(),
     };
     save_library_view_manifest_at(data_dir, &new_manifest)?;
     maybe_remove_empty_managed_directories(&view.destination_root, &new_manifest);
@@ -1237,7 +2117,7 @@ pub fn remove_library_view_symlinks(
 
     for entry in &manifest.entries {
         let destination = view.destination_root.join(&entry.relative_link_path);
-        match remove_managed_symlink(&destination, &entry.target_path) {
+        match remove_managed_symlink(&view.destination_root, &destination, &entry.target_path) {
             Ok(true) => {
                 report.removed += 1;
                 report.results.push(LibraryViewApplyEntryResult {
@@ -1274,6 +2154,13 @@ pub fn remove_library_view_symlinks(
         view_id: view.id.clone(),
         destination_root: view.destination_root.clone(),
         entries: remaining,
+        // Removal does not re-plan or re-apply a profile - it only drops
+        // symlinks the previous manifest already owned - so the previous
+        // fingerprint/version/directory-ownership bookkeeping is carried
+        // forward unchanged rather than reset or recomputed here.
+        view_fingerprint: manifest.view_fingerprint.clone(),
+        profile_version: manifest.profile_version,
+        created_directories: manifest.created_directories.clone(),
     };
     save_library_view_manifest_at(data_dir, &new_manifest)?;
     maybe_remove_empty_managed_directories(&view.destination_root, &new_manifest);
@@ -1333,6 +2220,50 @@ fn load_catalogue_for_planning_at(
     Ok((archives, source_folders))
 }
 
+/// Loads the locally published RomM identity cache for `resolve_romm_platform_slug`'s
+/// tier 2, if one exists and is usable - entirely offline (`load_cache`'s own
+/// doc comment: "makes no network request of any kind"). Any reason the
+/// cache cannot be used (missing, unreadable, wrong format version, from a
+/// different server than expected) simply means this tier has nothing to
+/// say for this plan - it is not escalated to a planning error, since a
+/// `Generic` or `EsDe` view (or a `Romm` view whose platforms are all
+/// resolved via an explicit override) never needed it in the first place.
+/// Whether `IdentityCache.server_id` could be checked against the currently
+/// configured RomM source without adding network access, before trusting
+/// the cache for planning: investigated and deliberately **not done**.
+///
+/// `IdentityCache.server_id` is stamped from `ValidatedRommSource::server_id()`
+/// (`self.endpoint.origin()` - the *validated, normalised* endpoint), not
+/// from the raw `RommSourceConfig.url` string `config.json` stores. Building
+/// a `ValidatedRommSource` to reproduce that exact value requires
+/// `ValidatedRommSource::validate`, which needs a `HostResolver` and a
+/// loaded token - not a pure local-file read, and not obviously free of
+/// resolver-level network activity (DNS) depending on the resolver
+/// implementation passed in. Comparing against the raw, unvalidated `url`
+/// string instead would risk a false mismatch against the normalised origin
+/// the cache was actually stamped with (scheme/port/trailing-slash
+/// differences) - a *second*, subtly different notion of "the configured
+/// server" that could disagree with the one `server_id()` already defines.
+/// That would be worse than not checking at all: a spurious refusal is a
+/// working feature reported broken, and a spurious pass is what it exists
+/// to prevent.
+///
+/// So this is deferred rather than invented: `load_cache` below is called
+/// with `expected_server: None`, meaning "accept a cache from any server" -
+/// exactly the same acceptance behaviour Stage 1/2 already had for RomM
+/// (which never read a cache at all). Revisit if `ValidatedRommSource`
+/// grows a way to reconstruct/compare its `server_id` from `config.json`
+/// alone.
+fn load_romm_identity_cache_for_default_planning()
+-> Option<crate::identity_source::cache::IdentityCache> {
+    let identity_root = crate::identity_source::settings::default_identity_root().ok()?;
+    let location = crate::identity_source::cache::IdentityCacheLocation::new(
+        &identity_root,
+        crate::identity_source::model::IdentityProvider::Romm,
+    );
+    crate::identity_source::cache::load_cache(&location, None).ok()
+}
+
 /// Builds a fresh `LibraryViewPlan` for the view identified by
 /// `identifier` against the current catalogue and the view's
 /// last-applied manifest - performs no filesystem mutation. The single
@@ -1345,7 +2276,20 @@ pub fn preview_library_view_default(
     let view = resolve_library_view_identifier(identifier, &views)?;
     let (archives, source_folders) = load_catalogue_for_planning()?;
     let manifest = load_library_view_manifest_default(&view.id)?;
-    let plan = plan_library_view(&view, &archives, &source_folders, &manifest);
+    // Only a `Romm` profile ever consults this tier - loading it otherwise
+    // would be a needless read with no planning effect.
+    let romm_identity_cache = if view.profile.kind == FrontendProfileKind::Romm {
+        load_romm_identity_cache_for_default_planning()
+    } else {
+        None
+    };
+    let plan = plan_library_view(
+        &view,
+        &archives,
+        &source_folders,
+        &manifest,
+        romm_identity_cache.as_ref(),
+    );
     Ok((view, plan))
 }
 
@@ -1407,6 +2351,7 @@ pub fn add_library_view_default(
     source_folders: Vec<PathBuf>,
     platforms: Vec<String>,
     layout_template: LibraryViewLayoutTemplate,
+    profile: FrontendProfile,
 ) -> Result<LibraryViewConfig> {
     let (_, all_source_folders) = load_catalogue_for_planning()?;
     let all_source_paths: Vec<PathBuf> = all_source_folders
@@ -1423,6 +2368,7 @@ pub fn add_library_view_default(
         source_folders,
         platforms,
         layout_template,
+        profile,
     };
 
     let mut views = load_library_view_configs_default()?;
@@ -1476,6 +2422,7 @@ pub fn edit_library_view_default(
     destination_root: PathBuf,
     source_folders: Vec<PathBuf>,
     platforms: Vec<String>,
+    profile: FrontendProfile,
 ) -> Result<LibraryViewConfig> {
     let (_, all_source_folders) = load_catalogue_for_planning()?;
     let all_source_paths: Vec<PathBuf> = all_source_folders
@@ -1488,6 +2435,7 @@ pub fn edit_library_view_default(
         view.destination_root = destination_root;
         view.source_folders = source_folders;
         view.platforms = platforms;
+        view.profile = profile;
     })
 }
 
@@ -1502,10 +2450,127 @@ pub fn edit_library_view_default(
 /// Only ever called for `Create`/`Repair` entries, which `plan_library_view`
 /// has already proven safe to write: either nothing real is at
 /// `destination`, or what is there is a symlink this view already owns.
-fn create_or_repair_symlink(destination: &Path, target: &Path) -> Result<()> {
+/// Verifies that `path` (nominally somewhere under `destination_root`)
+/// cannot be reached by following a pre-existing symlinked ancestor
+/// component out of `destination_root` - the destination-side mirror of
+/// `validate_symlink_target_within_source`.
+///
+/// A Library View's destination tree is built incrementally
+/// (`fs::create_dir_all`, symlink creation, rename, directory cleanup), and
+/// every one of those filesystem calls transparently follows any symlink it
+/// encounters among a path's *existing* ancestor components - that is
+/// ordinary POSIX path resolution, not a bug in any single call. If
+/// something has replaced an intermediate directory (e.g.
+/// `destination_root/roms`) with a symlink pointing outside
+/// `destination_root` - possibly into a source or preservation
+/// directory - every one of those calls would silently operate on whatever
+/// the symlink points at instead. This function is the one check every
+/// mutating call site below must pass first: it resolves `path`'s nearest
+/// *existing* ancestor (`canonical_or_nearest_existing_ancestor`, the same
+/// helper `validate_library_view_destination` and
+/// `validate_symlink_target_within_source` already use) and fails closed -
+/// refusing rather than writing/removing anything - unless that resolved
+/// ancestor is still provably inside the destination root. A component that
+/// does not exist yet can never be a symlink, so nothing is lost by only
+/// checking the existing prefix.
+fn verify_destination_containment(destination_root: &Path, path: &Path) -> Result<()> {
+    let destination_root_canonical = canonical_or_nearest_existing_ancestor(destination_root)?;
+    let resolved = canonical_or_nearest_existing_ancestor(path)?;
+    if resolved.starts_with(&destination_root_canonical) {
+        Ok(())
+    } else {
+        Err(ArchiveFsError::Config(format!(
+            "{} would escape the Library View destination root {} through a pre-existing \
+             symlinked ancestor directory - refusing to write or remove anything outside the \
+             real destination",
+            path.display(),
+            destination_root.display()
+        )))
+    }
+}
+
+/// Re-verifies a planned symlink target immediately before Create/Repair
+/// mutates anything. A plan is computed from catalogue and filesystem state
+/// that may already be stale by the time Apply actually runs - scanning and
+/// applying are never one atomic operation - so this re-checks, right
+/// before the symlink is created, everything the plan already assumed:
+///
+/// - the target still exists,
+/// - the target has not itself become a symlink (a catalogued archive is
+///   never expected to be one; if it now is, whatever made it one is not
+///   something this function trusts),
+/// - the target still resolves inside its registered source root (the same
+///   check `plan_library_view` already performs at plan time, reused here
+///   because a symlink can be planted after planning just as easily as
+///   before it), and
+/// - if the catalogue recorded a `size:mtime` fingerprint for the target
+///   (`archive_identity`), a fresh read still matches it - proving the
+///   file at this path is still the same object, not a different file that
+///   was swapped in at the same path since scanning.
+///
+/// Fails closed on any mismatch: this never creates a dangling link, and
+/// never links to something other than what was actually planned. It is
+/// not a content hash and cannot catch every possible replacement (a
+/// same-size, same-second replacement is invisible to it) - it only ever
+/// refuses on a *provable* mismatch; an unchanged target with no recorded
+/// fingerprint at all is still allowed through, since absence of evidence
+/// is not evidence of tampering.
+fn reproof_symlink_target(
+    archive_path: &Path,
+    source_folder_path: Option<&Path>,
+    expected_identity: Option<&str>,
+) -> Result<()> {
+    let metadata = fs::symlink_metadata(archive_path).map_err(|source| {
+        ArchiveFsError::Config(format!(
+            "{} no longer exists - refusing to create a dangling Library View symlink ({source})",
+            archive_path.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(ArchiveFsError::Config(format!(
+            "{} has become a symlink since it was catalogued - refusing to link to it",
+            archive_path.display()
+        )));
+    }
+    if let Some(source_folder_path) = source_folder_path {
+        validate_symlink_target_within_source(archive_path, source_folder_path)?;
+    }
+    if let Some(expected) = expected_identity {
+        let fresh_modified = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or(0);
+        let fresh = format!("{}:{fresh_modified}", metadata.len());
+        if fresh != expected {
+            return Err(ArchiveFsError::Config(format!(
+                "{} no longer matches the size/modified-time fingerprint recorded when it was \
+                 catalogued - it was likely replaced since scanning; refusing to link to it",
+                archive_path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn create_or_repair_symlink(
+    destination_root: &Path,
+    destination: &Path,
+    target: &Path,
+) -> Result<()> {
     let parent = destination.parent().ok_or_else(|| {
         ArchiveFsError::Config(format!("{} has no parent directory", destination.display()))
     })?;
+    // Checked against `parent`, never `destination` itself: `destination`
+    // is expected to already exist as a symlink in the Repair case (that is
+    // exactly what is being replaced), and `canonical_or_nearest_existing_
+    // ancestor` follows an existing path's own symlink-ness when resolving
+    // it - checking `destination` directly would therefore validate
+    // wherever the *old, possibly-wrong* symlink already points, not
+    // whether the directory it lives in is safe. The directory this
+    // symlink will be created/replaced in is what must be proven contained.
+    verify_destination_containment(destination_root, parent)?;
     fs::create_dir_all(parent)
         .map_err(|source| ArchiveFsError::io(parent.to_path_buf(), source))?;
 
@@ -1534,7 +2599,27 @@ fn create_or_repair_symlink(destination: &Path, target: &Path) -> Result<()> {
 /// case nothing is touched at all, satisfying "never remove anything
 /// EmuWiz did not record as managed" even when the manifest is stale
 /// relative to the filesystem.
-fn remove_managed_symlink(destination: &Path, recorded_target: &Path) -> Result<bool> {
+///
+/// Checks destination containment (`verify_destination_containment`)
+/// first and returns `Err` - never `Ok(false)` - if `destination` cannot be
+/// proven to stay inside `destination_root`: a stale-manifest mismatch is
+/// an expected, quiet no-op, but a containment escape is a real, distinct
+/// failure that must be reported, not silently swallowed as "left
+/// unchanged".
+fn remove_managed_symlink(
+    destination_root: &Path,
+    destination: &Path,
+    recorded_target: &Path,
+) -> Result<bool> {
+    // Checked against `destination`'s parent, not `destination` itself, for
+    // the same reason `create_or_repair_symlink` does: `destination` is
+    // expected to already be a symlink, and resolving it directly would
+    // follow it to wherever it currently points rather than proving the
+    // directory it lives in is safe.
+    let parent = destination.parent().ok_or_else(|| {
+        ArchiveFsError::Config(format!("{} has no parent directory", destination.display()))
+    })?;
+    verify_destination_containment(destination_root, parent)?;
     let metadata = match fs::symlink_metadata(destination) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
@@ -1593,6 +2678,18 @@ fn maybe_remove_empty_managed_directories(destination_root: &Path, manifest: &Li
     ordered.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
     for dir in ordered {
         if dir == destination_root || !dir.starts_with(destination_root) {
+            continue;
+        }
+        // Canonicalization-based containment, not just the textual
+        // `starts_with` above: a candidate directory reached through a
+        // pre-existing symlinked ancestor (e.g. `destination_root/roms`
+        // replaced by a symlink pointing outside `destination_root`) would
+        // still textually start with `destination_root` while physically
+        // resolving `fs::remove_dir` to somewhere else entirely - deleting
+        // a real, possibly-outside-any-source-or-destination directory.
+        // `verify_destination_containment` is the same check every other
+        // mutating call site in this module now goes through first.
+        if verify_destination_containment(destination_root, &dir).is_err() {
             continue;
         }
         let _ = fs::remove_dir(&dir);
@@ -1678,6 +2775,23 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .to_string();
+        // Mirrors the real file's actual size/mtime when it exists, so the
+        // `archive_identity` fingerprint `plan_library_view` derives from
+        // this fixture matches what `reproof_symlink_target` reads fresh at
+        // Apply time - exactly like a real scan would. Falls back to fixed
+        // placeholder values only for a path that was never written (tests
+        // deliberately covering a missing/not-yet-created source).
+        let (size_bytes, modified_time_unix_seconds) = fs::metadata(absolute_path)
+            .ok()
+            .map(|metadata| {
+                let modified = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_secs() as i64);
+                (Some(metadata.len()), modified)
+            })
+            .unwrap_or((Some(1234), Some(1_700_000_000)));
         PersistedArchive {
             id,
             source_folder_id,
@@ -1686,8 +2800,8 @@ mod tests {
             archive_kind: "zip".to_string(),
             display_name: file_name.clone(),
             normalized_name: file_name.to_lowercase(),
-            size_bytes: Some(1234),
-            modified_time_unix_seconds: Some(1_700_000_000),
+            size_bytes,
+            modified_time_unix_seconds,
             platform: platform.map(|p| p.to_string()),
             platform_source: platform.map(|_| "heuristic-path-detector".to_string()),
             last_known_health: "ok".to_string(),
@@ -1711,6 +2825,7 @@ mod tests {
             source_folders,
             platforms,
             layout_template: LibraryViewLayoutTemplate::PlatformFilename,
+            profile: FrontendProfile::default(),
         }
     }
 
@@ -1731,7 +2846,7 @@ mod tests {
         let view = make_view("view-1", &destination, vec![], vec![]);
         let manifest = empty_manifest(&view.id, &destination);
 
-        let _plan = plan_library_view(&view, &[archive], &[source], &manifest);
+        let _plan = plan_library_view(&view, &[archive], &[source], &manifest, None);
 
         assert!(
             !destination.exists(),
@@ -1752,7 +2867,7 @@ mod tests {
         let view = make_view("view-1", &destination, vec![], vec![]);
         let manifest = empty_manifest(&view.id, &destination);
 
-        let plan = plan_library_view(&view, &[archive], &[source], &manifest);
+        let plan = plan_library_view(&view, &[archive], &[source], &manifest, None);
 
         assert_eq!(plan.counts.create, 1);
         assert_eq!(plan.entries.len(), 1);
@@ -1782,7 +2897,7 @@ mod tests {
         let view = make_view("view-1", &destination, vec![], vec![]);
         let manifest = empty_manifest(&view.id, &destination);
 
-        let plan = plan_library_view(&view, &[archive], &[source], &manifest);
+        let plan = plan_library_view(&view, &[archive], &[source], &manifest, None);
         let report = apply_library_view(&view, &plan, &manifest, &data_dir).unwrap();
 
         assert_eq!(report.created, 1);
@@ -1810,12 +2925,13 @@ mod tests {
             std::slice::from_ref(&archive),
             std::slice::from_ref(&source),
             &manifest1,
+            None,
         );
         let report1 = apply_library_view(&view, &plan1, &manifest1, &data_dir).unwrap();
         assert_eq!(report1.created, 1);
 
         let manifest2 = load_library_view_manifest_at(&data_dir, &view.id).unwrap();
-        let plan2 = plan_library_view(&view, &[archive], &[source], &manifest2);
+        let plan2 = plan_library_view(&view, &[archive], &[source], &manifest2, None);
         assert_eq!(plan2.counts.create, 0);
         assert_eq!(plan2.counts.correct, 1);
         let report2 = apply_library_view(&view, &plan2, &manifest2, &data_dir).unwrap();
@@ -1844,7 +2960,7 @@ mod tests {
         // would put it.
         let manifest = empty_manifest(&view.id, &destination);
 
-        let plan = plan_library_view(&view, &[archive], &[source], &manifest);
+        let plan = plan_library_view(&view, &[archive], &[source], &manifest, None);
         assert_eq!(
             plan.entries[0].action,
             LibraryViewPlanAction::AlreadyCorrect
@@ -1899,10 +3015,16 @@ mod tests {
                 updated_at: "2026-01-01T00:00:00Z".to_string(),
                 platform: "NES".to_string(),
                 source_folder_path: source_dir.clone(),
+                object_kind: LibraryViewObjectKind::Symlink,
+                content_hash: None,
+                rendering_version: None,
             }],
+            view_fingerprint: None,
+            profile_version: 0,
+            created_directories: Vec::new(),
         };
 
-        let plan = plan_library_view(&view, &[archive], &[source], &manifest);
+        let plan = plan_library_view(&view, &[archive], &[source], &manifest, None);
         assert_eq!(plan.entries[0].action, LibraryViewPlanAction::Repair);
 
         let report = apply_library_view(&view, &plan, &manifest, &data_dir).unwrap();
@@ -1927,7 +3049,7 @@ mod tests {
         let view = make_view("view-1", &destination, vec![], vec![]);
         let manifest = empty_manifest(&view.id, &destination);
 
-        let plan = plan_library_view(&view, &[archive], &[source], &manifest);
+        let plan = plan_library_view(&view, &[archive], &[source], &manifest, None);
         assert_eq!(plan.entries[0].action, LibraryViewPlanAction::Collision);
         assert_eq!(plan.counts.collision, 1);
 
@@ -1964,7 +3086,7 @@ mod tests {
         let view = make_view("view-1", &destination, vec![], vec![]);
         let manifest = empty_manifest(&view.id, &destination); // not managed by us
 
-        let plan = plan_library_view(&view, &[archive], &[source], &manifest);
+        let plan = plan_library_view(&view, &[archive], &[source], &manifest, None);
         assert_eq!(plan.entries[0].action, LibraryViewPlanAction::Collision);
 
         apply_library_view(&view, &plan, &manifest, &data_dir).unwrap();
@@ -1996,6 +3118,7 @@ mod tests {
             &[record_a, record_b],
             &[source_a, source_b],
             &manifest,
+            None,
         );
 
         assert_eq!(plan.counts.collision, 2);
@@ -2071,13 +3194,19 @@ mod tests {
         let manifest = empty_manifest(&view.id, &destination);
 
         // First apply: creates the managed link, manifest now owns it.
-        let plan = plan_library_view(&view, &[archive], std::slice::from_ref(&source), &manifest);
+        let plan = plan_library_view(
+            &view,
+            &[archive],
+            std::slice::from_ref(&source),
+            &manifest,
+            None,
+        );
         apply_library_view(&view, &plan, &manifest, &data_dir).unwrap();
         let manifest_after_first = load_library_view_manifest_at(&data_dir, &view.id).unwrap();
 
         // Second plan against an empty catalogue: the managed link becomes
         // stale and should be the only thing removed.
-        let plan2 = plan_library_view(&view, &[], &[source], &manifest_after_first);
+        let plan2 = plan_library_view(&view, &[], &[source], &manifest_after_first, None);
         assert_eq!(plan2.counts.remove, 1);
         let report2 = apply_library_view(&view, &plan2, &manifest_after_first, &data_dir).unwrap();
         assert_eq!(report2.removed, 1);
@@ -2111,14 +3240,20 @@ mod tests {
                 updated_at: "2026-01-01T00:00:00Z".to_string(),
                 platform: "NES".to_string(),
                 source_folder_path: source_dir.clone(),
+                object_kind: LibraryViewObjectKind::Symlink,
+                content_hash: None,
+                rendering_version: None,
             }],
+            view_fingerprint: None,
+            profile_version: 0,
+            created_directories: Vec::new(),
         };
 
         // The path the manifest thinks is a managed symlink has since been
         // replaced by a real file - e.g. by the user, outside EmuWiz.
         write_file(&link_path, b"a real file now sits here");
 
-        let removed = remove_managed_symlink(&link_path, &archive_path).unwrap();
+        let removed = remove_managed_symlink(&destination, &link_path, &archive_path).unwrap();
         assert!(!removed);
         assert_eq!(fs::read(&link_path).unwrap(), b"a real file now sits here");
 
@@ -2146,7 +3281,7 @@ mod tests {
         let view = make_view("view-1", &destination, vec![], vec![]);
         let manifest = empty_manifest(&view.id, &destination);
 
-        let plan = plan_library_view(&view, &[archive], &[source], &manifest);
+        let plan = plan_library_view(&view, &[archive], &[source], &manifest, None);
         apply_library_view(&view, &plan, &manifest, &data_dir).unwrap();
 
         assert_eq!(fs::read(&archive_path).unwrap(), b"original-bytes");
@@ -2171,7 +3306,7 @@ mod tests {
         let view = make_view("view-1", &destination, vec![], vec![]);
         let manifest = empty_manifest(&view.id, &destination);
 
-        let plan = plan_library_view(&view, &[archive], &[source], &manifest);
+        let plan = plan_library_view(&view, &[archive], &[source], &manifest, None);
         assert_eq!(plan.entries.len(), 1);
         assert_eq!(
             plan.entries[0].action,
@@ -2193,7 +3328,7 @@ mod tests {
         let view = make_view("view-1", &destination, vec![], vec![]);
         let manifest = empty_manifest(&view.id, &destination);
 
-        let plan = plan_library_view(&view, &[archive], &[source], &manifest);
+        let plan = plan_library_view(&view, &[archive], &[source], &manifest, None);
         assert_eq!(plan.entries.len(), 1);
         assert_eq!(
             plan.entries[0].action,
@@ -2240,6 +3375,7 @@ mod tests {
             ],
             &[source_included, source_excluded],
             &manifest,
+            None,
         );
 
         assert_eq!(
@@ -2270,7 +3406,7 @@ mod tests {
         let view = make_view("view-1", &destination, vec![], vec![]);
         let manifest = empty_manifest(&view.id, &destination);
 
-        let plan = plan_library_view(&view, &[archive], &[source], &manifest);
+        let plan = plan_library_view(&view, &[archive], &[source], &manifest, None);
         assert_eq!(plan.entries.len(), 1);
         assert_eq!(plan.entries[0].action, LibraryViewPlanAction::Create);
 
@@ -2296,7 +3432,7 @@ mod tests {
         let view = make_view("view-1", &destination, vec![], vec![]);
         let manifest = empty_manifest(&view.id, &destination);
 
-        let plan = plan_library_view(&view, &[archive], &[source], &manifest);
+        let plan = plan_library_view(&view, &[archive], &[source], &manifest, None);
         apply_library_view(&view, &plan, &manifest, &data_dir).unwrap();
 
         let leftover_temp_files: Vec<_> = fs::read_dir(&data_dir)
@@ -2329,7 +3465,13 @@ mod tests {
                 updated_at: "2026-01-01T00:00:00Z".to_string(),
                 platform: "NES".to_string(),
                 source_folder_path: PathBuf::from("/somewhere"),
+                object_kind: LibraryViewObjectKind::Symlink,
+                content_hash: None,
+                rendering_version: None,
             }],
+            view_fingerprint: None,
+            profile_version: 0,
+            created_directories: Vec::new(),
         };
         save_library_view_manifest_at(&data_dir, &existing_manifest).unwrap();
         let manifest_path = library_view_manifest_path(&data_dir, &view.id);
@@ -2341,6 +3483,9 @@ mod tests {
             counts: LibraryViewPlanCounts::default(),
             entries: vec![],
             unsafe_root_error: Some("destination is inside a source folder".to_string()),
+            profile_fingerprint: compute_view_profile_fingerprint(&view),
+            fingerprint_conflict: None,
+            profile_error: None,
         };
 
         let result = apply_library_view(&view, &unsafe_plan, &existing_manifest, &data_dir);
@@ -2367,7 +3512,7 @@ mod tests {
         let view = make_view("view-1", &destination, vec![], vec![]);
         let manifest = empty_manifest(&view.id, &destination);
 
-        let plan = plan_library_view(&view, &[archive], &[source], &manifest);
+        let plan = plan_library_view(&view, &[archive], &[source], &manifest, None);
         apply_library_view(&view, &plan, &manifest, &data_dir).unwrap();
         let manifest_after = load_library_view_manifest_at(&data_dir, &view.id).unwrap();
 
@@ -2393,7 +3538,13 @@ mod tests {
         let view = make_view("view-1", &destination, vec![], vec![]);
         let manifest = empty_manifest(&view.id, &destination);
 
-        let plan = plan_library_view(&view, &[record_ok, record_unknown], &[source], &manifest);
+        let plan = plan_library_view(
+            &view,
+            &[record_ok, record_unknown],
+            &[source],
+            &manifest,
+            None,
+        );
 
         let recomputed =
             plan.entries
@@ -2415,6 +3566,2952 @@ mod tests {
         assert_eq!(
             plan.counts, recomputed,
             "CLI and GUI both read plan.counts directly - it must always match the entries list exactly"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Frontend Profiles milestone - Stage 1.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn old_config_without_profile_field_deserializes_unchanged() {
+        let json = r#"[
+            {
+                "id": "view-1",
+                "name": "Old View",
+                "destination_root": "/tmp/old-dest",
+                "enabled": true,
+                "source_folders": [],
+                "platforms": [],
+                "layout_template": "PlatformFilename"
+            }
+        ]"#;
+        let views = parse_library_view_configs(json).unwrap();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].id, "view-1");
+        assert_eq!(
+            views[0].profile,
+            FrontendProfile::default(),
+            "a config predating the profile field must resolve to the default profile"
+        );
+        assert_eq!(views[0].profile.kind, FrontendProfileKind::Generic);
+    }
+
+    #[test]
+    fn new_profile_default_preserves_platform_filename_behavior() {
+        let root = temp_dir("profile-defaults-preserve-behavior");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Super Mario Bros. (USA) (Rev 1) [!].zip");
+        write_file(&archive_path, b"zip-bytes");
+        let destination = root.join("dest");
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("NES"));
+
+        // `FrontendProfile::default()` (Generic, default policy) - what
+        // `make_view` already constructs - must plan exactly the
+        // pre-existing `PlatformFilename` output.
+        let view = make_view("view-generic", &destination, vec![], vec![]);
+        assert_eq!(view.profile.kind, FrontendProfileKind::Generic);
+        let manifest = empty_manifest(&view.id, &destination);
+        let plan = plan_library_view(&view, &[archive], &[source], &manifest, None);
+
+        assert_eq!(plan.profile_error, None);
+        assert_eq!(
+            plan.entries[0].relative_link_path,
+            Some(PathBuf::from("NES/Super Mario Bros. (USA) (Rev 1) [!].zip"))
+        );
+        assert_eq!(plan.entries[0].action, LibraryViewPlanAction::Create);
+    }
+
+    #[test]
+    fn esde_profile_kind_fails_closed_never_silently_falls_back_to_generic() {
+        let root = temp_dir("esde-fail-closed");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Super Mario Bros. (USA) (Rev 1) [!].zip");
+        write_file(&archive_path, b"zip-bytes");
+        let destination = root.join("dest");
+        let data_dir = root.join("data");
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("NES"));
+
+        let mut view = make_view("view-esde", &destination, vec![], vec![]);
+        view.profile.kind = FrontendProfileKind::EsDe;
+        let manifest = empty_manifest(&view.id, &destination);
+        let plan = plan_library_view(
+            &view,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &manifest,
+            None,
+        );
+
+        assert!(
+            plan.profile_error.is_some(),
+            "EsDe must surface a clear planning refusal, not a silent fallback"
+        );
+        assert!(!plan.is_safe_to_apply());
+        // Never silently degrades to Generic's Create entry - either no
+        // entry is produced for this candidate, or it is explicitly
+        // reported as skipped, but it must never be `Create`.
+        assert!(
+            plan.entries
+                .iter()
+                .all(|entry| entry.action != LibraryViewPlanAction::Create),
+            "EsDe must never silently produce a Generic-shaped Create entry"
+        );
+
+        let result = apply_library_view(&view, &plan, &manifest, &data_dir);
+        assert!(
+            result.is_err(),
+            "EsDe apply must be refused, not silently applied"
+        );
+
+        // Defense in depth: the lower-level path generator refuses directly
+        // too, for any caller that bypasses plan_library_view.
+        assert!(
+            generate_relative_link_path(
+                view.layout_template,
+                &view.profile,
+                "NES",
+                &archive_path,
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn romm_profile_kind_fails_closed_per_entry_for_an_unresolved_platform() {
+        // "3DO" has no RomM slug in any tier used here (no override, no
+        // cache, and it is not one of `ROMM_SLUG_ALIASES`'s targets) - see
+        // `resolve_romm_platform_slug`.
+        let root = temp_dir("romm-unresolved-platform");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Game.zip");
+        write_file(&archive_path, b"zip-bytes");
+        let destination = root.join("dest");
+        let data_dir = root.join("data");
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("3DO"));
+        let mut view = make_view("view-romm-unresolved", &destination, vec![], vec![]);
+        view.profile.kind = FrontendProfileKind::Romm;
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(
+            &view,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &manifest,
+            None,
+        );
+
+        // Romm is not blanket-refused at the plan level - only EsDe is.
+        assert_eq!(plan.profile_error, None);
+        // But the one candidate, whose platform cannot be resolved to a
+        // RomM slug, must be refused individually and never silently
+        // produce a Generic-shaped Create entry.
+        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(
+            plan.entries[0].action,
+            LibraryViewPlanAction::SkipInvalidPath
+        );
+        assert!(
+            plan.entries
+                .iter()
+                .all(|entry| entry.action != LibraryViewPlanAction::Create),
+            "an unresolved RomM platform must never silently produce a Generic-shaped Create entry"
+        );
+
+        // Apply never creates anything for a Skip entry (the same rule
+        // every other Skip* reason already relies on).
+        let report = apply_library_view(&view, &plan, &manifest, &data_dir).unwrap();
+        assert_eq!(report.created, 0);
+        assert!(!destination.join("roms").exists());
+
+        // Defense in depth: the lower-level path generator refuses directly
+        // too, for any caller that bypasses plan_library_view.
+        assert!(
+            generate_relative_link_path(
+                view.layout_template,
+                &view.profile,
+                "3DO",
+                &archive_path,
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn plan_is_deterministic_across_repeated_calls_and_input_order() {
+        let root = temp_dir("plan-determinism");
+        let source_dir = root.join("source");
+        let mut archives = Vec::new();
+        for (index, (platform, name)) in [
+            ("NES", "Alpha.zip"),
+            ("NES", "Beta.zip"),
+            ("SNES", "Charlie.zip"),
+            ("SNES", "Delta.zip"),
+            ("GBA", "Echo.zip"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = source_dir.join(name);
+            write_file(&path, b"zip-bytes");
+            archives.push(make_archive(index as i64 + 1, 1, &path, Some(platform)));
+        }
+        let destination = root.join("dest");
+        let source = make_source(1, &source_dir);
+        let view = make_view("view-1", &destination, vec![], vec![]);
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan_a = plan_library_view(
+            &view,
+            &archives,
+            std::slice::from_ref(&source),
+            &manifest,
+            None,
+        );
+        // Re-plan from a differently-ordered (reversed) input Vec - a real
+        // HashMap-ordering hazard would show up as a different entries
+        // order here.
+        let mut reversed = archives.clone();
+        reversed.reverse();
+        let plan_b = plan_library_view(
+            &view,
+            &reversed,
+            std::slice::from_ref(&source),
+            &manifest,
+            None,
+        );
+        let plan_c = plan_library_view(&view, &archives, &[source], &manifest, None);
+
+        assert_eq!(
+            plan_a.entries, plan_b.entries,
+            "planning from a reordered input must still produce an identically ordered plan"
+        );
+        assert_eq!(
+            plan_a.entries, plan_c.entries,
+            "repeated planning from identical inputs must produce identical plan vectors"
+        );
+
+        // The stated ordering rule: (view_relative_path, source_path),
+        // non-decreasing.
+        let keys: Vec<(PathBuf, PathBuf)> = plan_a
+            .entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.relative_link_path.clone().unwrap_or_default(),
+                    entry.archive_path.clone().unwrap_or_default(),
+                )
+            })
+            .collect();
+        let mut sorted_keys = keys.clone();
+        sorted_keys.sort();
+        assert_eq!(
+            keys, sorted_keys,
+            "plan entries must be sorted by (view_relative_path, source_path)"
+        );
+    }
+
+    #[test]
+    fn derived_filename_sanitisation_rejects_unsafe_components() {
+        assert!(
+            sanitize_path_component_str("").is_err(),
+            "empty must be rejected"
+        );
+        assert!(
+            sanitize_path_component_str(".").is_err(),
+            "'.' must be rejected"
+        );
+        assert!(
+            sanitize_path_component_str("..").is_err(),
+            "'..' must be rejected"
+        );
+        assert!(
+            sanitize_path_component_str("a/b").is_err(),
+            "an embedded path separator must be rejected"
+        );
+        assert!(
+            sanitize_path_component_str("/etc/passwd").is_err(),
+            "an absolute path must be rejected"
+        );
+        assert!(
+            sanitize_path_component_str("../../etc/passwd").is_err(),
+            "a traversal attempt must be rejected"
+        );
+        assert!(sanitize_path_component_str("Game.zip").is_ok());
+
+        assert!(sanitize_path_component_os(OsStr::new("")).is_err());
+        assert!(sanitize_path_component_os(OsStr::new("..")).is_err());
+        assert!(sanitize_path_component_os(OsStr::new("a/b")).is_err());
+        assert!(sanitize_path_component_os(OsStr::new("Game.zip")).is_ok());
+    }
+
+    #[test]
+    fn derive_view_filename_rejects_archive_path_with_no_filename() {
+        let profile = FrontendProfile::default();
+        assert!(derive_view_filename(&profile, Path::new("/")).is_err());
+        assert!(derive_view_filename(&profile, Path::new(".")).is_err());
+    }
+
+    #[test]
+    fn derive_view_filename_never_invents_a_fallback_and_never_renames_source() {
+        let profile = FrontendProfile::default();
+        let archive_path = Path::new("/roms/nes/Game (USA).zip");
+        let derived = derive_view_filename(&profile, archive_path).unwrap();
+        assert_eq!(
+            derived,
+            PathBuf::from("Game (USA).zip"),
+            "Stage 1 default behaviour must equal the source filename exactly"
+        );
+        // The archive itself is never touched by deriving its view filename.
+        assert_eq!(archive_path.file_name().unwrap(), "Game (USA).zip");
+    }
+
+    #[test]
+    fn duplicate_derived_destination_is_reported_as_collision_not_silently_disambiguated() {
+        let root = temp_dir("derived-destination-collision");
+        let source_dir_a = root.join("source-a");
+        let source_dir_b = root.join("source-b");
+        let archive_a = source_dir_a.join("Game.zip");
+        let archive_b = source_dir_b.join("Game.zip");
+        write_file(&archive_a, b"a");
+        write_file(&archive_b, b"b");
+        let destination = root.join("dest");
+
+        let source_a = make_source(1, &source_dir_a);
+        let source_b = make_source(2, &source_dir_b);
+        let record_a = make_archive(1, 1, &archive_a, Some("NES"));
+        let record_b = make_archive(2, 2, &archive_b, Some("NES"));
+        let view = make_view("view-1", &destination, vec![], vec![]);
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(
+            &view,
+            &[record_a, record_b],
+            &[source_a, source_b],
+            &manifest,
+            None,
+        );
+
+        assert_eq!(plan.counts.collision, 2);
+        assert!(
+            plan.entries
+                .iter()
+                .all(|entry| entry.action != LibraryViewPlanAction::Create),
+            "two archives that derive the same destination must never be silently disambiguated"
+        );
+    }
+
+    #[test]
+    fn planning_never_mutates_the_source_archive_under_any_profile_kind() {
+        let root = temp_dir("no-mutation-any-profile");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Game.zip");
+        write_file(&archive_path, b"original-bytes");
+        let destination = root.join("dest");
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("NES"));
+        let mut view = make_view("view-1", &destination, vec![], vec![]);
+        view.profile.kind = FrontendProfileKind::Romm;
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let _plan = plan_library_view(&view, &[archive], &[source], &manifest, None);
+
+        assert_eq!(fs::read(&archive_path).unwrap(), b"original-bytes");
+        assert!(
+            !destination.exists(),
+            "planning must never create the destination directory either"
+        );
+    }
+
+    #[test]
+    fn frontend_profile_kinds_serialize_and_deserialize_safely() {
+        for kind in [
+            FrontendProfileKind::Generic,
+            FrontendProfileKind::Romm,
+            FrontendProfileKind::EsDe,
+        ] {
+            let profile = FrontendProfile {
+                kind,
+                policy: FrontendProfilePolicy::default(),
+            };
+            let json = serde_json::to_string(&profile).unwrap();
+            let round_tripped: FrontendProfile = serde_json::from_str(&json).unwrap();
+            assert_eq!(profile, round_tripped);
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Frontend Profiles milestone - Stage 2.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn old_manifest_without_new_fields_deserializes_unchanged() {
+        let json = r#"{
+            "view_id": "view-1",
+            "destination_root": "/tmp/dest",
+            "entries": [
+                {
+                    "relative_link_path": "NES/Game.zip",
+                    "target_path": "/source/Game.zip",
+                    "archive_identity": null,
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "updated_at": "2026-01-01T00:00:00Z",
+                    "platform": "NES",
+                    "source_folder_path": "/source"
+                }
+            ]
+        }"#;
+        let manifest: LibraryViewManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(manifest.entries.len(), 1);
+        assert_eq!(
+            manifest.entries[0].object_kind,
+            LibraryViewObjectKind::Symlink
+        );
+        assert_eq!(manifest.entries[0].content_hash, None);
+        assert_eq!(manifest.entries[0].rendering_version, None);
+        assert_eq!(manifest.view_fingerprint, None);
+        assert_eq!(manifest.profile_version, 0);
+        assert_eq!(manifest.created_directories, Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn new_manifest_fields_serde_default_correctly() {
+        let manifest = LibraryViewManifest::empty("view-1", Path::new("/tmp/dest"));
+        let json = serde_json::to_string(&manifest).unwrap();
+        let round_tripped: LibraryViewManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(manifest, round_tripped);
+        assert_eq!(round_tripped.view_fingerprint, None);
+        assert_eq!(round_tripped.profile_version, 0);
+        assert!(round_tripped.created_directories.is_empty());
+    }
+
+    #[test]
+    fn object_kind_round_trips_through_json_for_every_variant() {
+        for kind in [
+            LibraryViewObjectKind::Symlink,
+            LibraryViewObjectKind::GeneratedFile,
+            LibraryViewObjectKind::Directory,
+        ] {
+            let json = serde_json::to_string(&kind).unwrap();
+            let round_tripped: LibraryViewObjectKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(kind, round_tripped);
+        }
+    }
+
+    #[test]
+    fn profile_fingerprint_is_deterministic() {
+        let view = make_view("view-1", Path::new("/tmp/dest"), vec![], vec![]);
+        let a = compute_view_profile_fingerprint(&view);
+        let b = compute_view_profile_fingerprint(&view);
+        assert_eq!(a, b);
+
+        let other = make_view("view-2", Path::new("/tmp/dest"), vec![], vec![]);
+        assert_eq!(
+            a,
+            compute_view_profile_fingerprint(&other),
+            "fingerprint depends only on layout_template/profile, not id/name/destination"
+        );
+    }
+
+    #[test]
+    fn profile_fingerprint_changes_for_output_affecting_policy() {
+        let base = make_view("view-1", Path::new("/tmp/dest"), vec![], vec![]);
+        let base_fingerprint = compute_view_profile_fingerprint(&base);
+
+        let mut kind_changed = base.clone();
+        kind_changed.profile.kind = FrontendProfileKind::Romm;
+        assert_ne!(
+            base_fingerprint,
+            compute_view_profile_fingerprint(&kind_changed)
+        );
+
+        let mut policy_changed = base.clone();
+        policy_changed.profile.policy.region_preference = vec!["USA".to_string()];
+        assert_ne!(
+            base_fingerprint,
+            compute_view_profile_fingerprint(&policy_changed)
+        );
+
+        let mut platform_override_changed = base.clone();
+        platform_override_changed
+            .profile
+            .policy
+            .platform_mapping_overrides
+            .insert("NES".to_string(), "Nintendo".to_string());
+        assert_ne!(
+            base_fingerprint,
+            compute_view_profile_fingerprint(&platform_override_changed)
+        );
+
+        // Fields that do not affect output shape must never change the
+        // fingerprint.
+        let mut cosmetic_changed = base.clone();
+        cosmetic_changed.name = "Renamed".to_string();
+        cosmetic_changed.enabled = false;
+        cosmetic_changed.source_folders = vec![PathBuf::from("/somewhere")];
+        cosmetic_changed.platforms = vec!["NES".to_string()];
+        cosmetic_changed.destination_root = PathBuf::from("/elsewhere");
+        assert_eq!(
+            base_fingerprint,
+            compute_view_profile_fingerprint(&cosmetic_changed),
+            "id/name/enabled/source_folders/platforms/destination_root must not affect the fingerprint"
+        );
+    }
+
+    #[test]
+    fn incompatible_manifest_fingerprint_produces_refusal_never_silent_overwrite() {
+        let root = temp_dir("fingerprint-conflict-refusal");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Game.zip");
+        write_file(&archive_path, b"zip-bytes");
+        let destination = root.join("dest");
+        let data_dir = root.join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("NES"));
+        let view = make_view("view-1", &destination, vec![], vec![]);
+
+        // A manifest recorded under some other (unrelated) fingerprint -
+        // simulating a profile change since the manifest was last written.
+        let mut existing_manifest = empty_manifest(&view.id, &destination);
+        existing_manifest.view_fingerprint = Some("not-the-current-fingerprint".to_string());
+        save_library_view_manifest_at(&data_dir, &existing_manifest).unwrap();
+        let manifest_path = library_view_manifest_path(&data_dir, &view.id);
+        let before = fs::read_to_string(&manifest_path).unwrap();
+
+        let plan = plan_library_view(&view, &[archive], &[source], &existing_manifest, None);
+        assert!(
+            plan.fingerprint_conflict.is_some(),
+            "a manifest recorded under a different fingerprint must surface a conflict"
+        );
+        assert!(!plan.is_safe_to_apply());
+
+        let result = apply_library_view(&view, &plan, &existing_manifest, &data_dir);
+        assert!(
+            result.is_err(),
+            "apply must refuse rather than silently overwrite"
+        );
+
+        let after = fs::read_to_string(&manifest_path).unwrap();
+        assert_eq!(
+            before, after,
+            "a refused apply must never touch the previous manifest"
+        );
+    }
+
+    #[test]
+    fn no_fingerprint_recorded_is_never_treated_as_a_conflict() {
+        // An empty/pre-Frontend-Profiles manifest never records a
+        // fingerprint at all - that must never be treated as
+        // "incompatible", only an actual mismatch should be.
+        let root = temp_dir("no-fingerprint-not-a-conflict");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Game.zip");
+        write_file(&archive_path, b"zip-bytes");
+        let destination = root.join("dest");
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("NES"));
+        let view = make_view("view-1", &destination, vec![], vec![]);
+        let manifest = empty_manifest(&view.id, &destination);
+        assert_eq!(manifest.view_fingerprint, None);
+
+        let plan = plan_library_view(&view, &[archive], &[source], &manifest, None);
+        assert_eq!(plan.fingerprint_conflict, None);
+        assert!(plan.is_safe_to_apply());
+    }
+
+    #[test]
+    fn classify_foreign_real_file_is_preserved_not_owned() {
+        let root = temp_dir("classify-foreign-real-file");
+        let path = root.join("Game.zip");
+        write_file(&path, b"a real file");
+        let classification = classify_library_view_object(
+            &path,
+            LibraryViewObjectKind::Symlink,
+            Some(Path::new("/somewhere/Game.zip")),
+            false,
+        );
+        assert_eq!(
+            classification,
+            LibraryViewObjectClassification::ForeignRealFile
+        );
+    }
+
+    #[test]
+    fn classify_foreign_symlink_is_preserved_not_owned() {
+        let root = temp_dir("classify-foreign-symlink");
+        let target = root.join("elsewhere.zip");
+        write_file(&target, b"x");
+        let path = root.join("Game.zip");
+        symlink(&target, &path).unwrap();
+        let classification = classify_library_view_object(
+            &path,
+            LibraryViewObjectKind::Symlink,
+            Some(Path::new("/somewhere/Game.zip")),
+            false,
+        );
+        assert_eq!(
+            classification,
+            LibraryViewObjectClassification::ForeignSymlink
+        );
+    }
+
+    #[test]
+    fn classify_wrong_object_kind_is_detected_for_every_expected_kind() {
+        let root = temp_dir("classify-wrong-object-kind");
+
+        let real_file = root.join("owned-as-symlink.zip");
+        write_file(&real_file, b"x");
+        assert_eq!(
+            classify_library_view_object(&real_file, LibraryViewObjectKind::Symlink, None, true),
+            LibraryViewObjectClassification::WrongObjectKind
+        );
+
+        let a_directory = root.join("owned-as-generated-file");
+        fs::create_dir_all(&a_directory).unwrap();
+        assert_eq!(
+            classify_library_view_object(
+                &a_directory,
+                LibraryViewObjectKind::GeneratedFile,
+                None,
+                true
+            ),
+            LibraryViewObjectClassification::WrongObjectKind
+        );
+
+        let a_file = root.join("owned-as-directory");
+        write_file(&a_file, b"x");
+        assert_eq!(
+            classify_library_view_object(&a_file, LibraryViewObjectKind::Directory, None, true),
+            LibraryViewObjectClassification::WrongObjectKind
+        );
+    }
+
+    #[test]
+    fn classify_stale_owned_symlink_behavior_is_unchanged() {
+        let root = temp_dir("classify-stale-owned-symlink");
+        let wrong_target = root.join("wrong.zip");
+        write_file(&wrong_target, b"x");
+        let path = root.join("Game.zip");
+        symlink(&wrong_target, &path).unwrap();
+
+        let classification = classify_library_view_object(
+            &path,
+            LibraryViewObjectKind::Symlink,
+            Some(Path::new("/expected/Game.zip")),
+            true,
+        );
+        assert_eq!(classification, LibraryViewObjectClassification::OwnedStale);
+    }
+
+    #[test]
+    fn classify_missing_when_nothing_exists() {
+        let root = temp_dir("classify-missing");
+        let path = root.join("does-not-exist.zip");
+        assert_eq!(
+            classify_library_view_object(&path, LibraryViewObjectKind::Symlink, None, true),
+            LibraryViewObjectClassification::Missing
+        );
+    }
+
+    #[test]
+    fn generated_file_content_hash_planning_never_writes_a_file() {
+        let root = temp_dir("generated-file-planning-no-write");
+        let destination = root.join("dest");
+        fs::create_dir_all(&destination).unwrap();
+        let manifest = empty_manifest("view-1", &destination);
+        let content = b"<gamelist/>";
+
+        let planned = plan_generated_file(
+            &destination,
+            PathBuf::from("NES/gamelist.xml"),
+            content,
+            &manifest,
+        );
+
+        let mut hasher = Sha256::new();
+        hasher.update(content);
+        let expected_hash = encode_hex(&hasher.finalize());
+        assert_eq!(planned.intended_content_hash, expected_hash);
+        assert_eq!(
+            planned.classification,
+            LibraryViewObjectClassification::Missing
+        );
+        assert!(
+            !destination.join("NES/gamelist.xml").exists(),
+            "planning a GeneratedFile entry must never write it to disk"
+        );
+    }
+
+    #[test]
+    fn created_directories_field_is_backwards_compatible_and_round_trips() {
+        let json_without_field = r#"{
+            "view_id": "view-1",
+            "destination_root": "/tmp/dest",
+            "entries": []
+        }"#;
+        let manifest: LibraryViewManifest = serde_json::from_str(json_without_field).unwrap();
+        assert!(manifest.created_directories.is_empty());
+
+        let mut populated = manifest.clone();
+        populated.created_directories = vec![PathBuf::from("NES"), PathBuf::from("SNES/discs")];
+        let json = serde_json::to_string(&populated).unwrap();
+        let round_tripped: LibraryViewManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            round_tripped.created_directories,
+            populated.created_directories
+        );
+    }
+
+    #[test]
+    fn applied_manifest_entries_are_written_in_deterministic_order() {
+        let root = temp_dir("deterministic-manifest-order");
+        let source_dir = root.join("source");
+        let mut archives = Vec::new();
+        for (index, (platform, name)) in [
+            ("NES", "Zulu.zip"),
+            ("NES", "Alpha.zip"),
+            ("SNES", "Mike.zip"),
+            ("GBA", "Bravo.zip"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = source_dir.join(name);
+            write_file(&path, b"zip-bytes");
+            archives.push(make_archive(index as i64 + 1, 1, &path, Some(platform)));
+        }
+        let destination = root.join("dest");
+        let data_dir = root.join("data");
+        let source = make_source(1, &source_dir);
+        let view = make_view("view-1", &destination, vec![], vec![]);
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(&view, &archives, &[source], &manifest, None);
+        apply_library_view(&view, &plan, &manifest, &data_dir).unwrap();
+        let written = load_library_view_manifest_at(&data_dir, &view.id).unwrap();
+
+        let mut expected = written.entries.clone();
+        expected.sort_by(|a, b| a.relative_link_path.cmp(&b.relative_link_path));
+        assert_eq!(
+            written.entries, expected,
+            "manifest entries must be written in a deterministic (sorted) order"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // RomM real planning slice.
+    // -------------------------------------------------------------------
+
+    fn romm_view_with_override(
+        id: &str,
+        destination: &Path,
+        catalogue_platform: &str,
+        slug: &str,
+    ) -> LibraryViewConfig {
+        let mut view = make_view(id, destination, vec![], vec![]);
+        view.profile.kind = FrontendProfileKind::Romm;
+        view.profile
+            .policy
+            .platform_mapping_overrides
+            .insert(catalogue_platform.to_string(), slug.to_string());
+        view
+    }
+
+    fn identity_cache_with_romm_slug(
+        catalogue_platform: &str,
+        slug: &str,
+    ) -> crate::identity_source::cache::IdentityCache {
+        crate::identity_source::cache::IdentityCache {
+            format_version: crate::identity_source::cache::CACHE_FORMAT_VERSION,
+            provider: crate::identity_source::model::IdentityProvider::Romm,
+            server_id: "test-server".to_string(),
+            server_version: None,
+            source_fingerprint: "test-fingerprint".to_string(),
+            imported_at_unix_seconds: 0,
+            platforms: vec![
+                crate::identity_source::romm::normalise::NormalisedPlatform {
+                    provider_platform_id: None,
+                    provider_slug: slug.to_string(),
+                    provider_name: None,
+                    canonical: Some(catalogue_platform.to_string()),
+                    rom_count: None,
+                },
+            ],
+            records: Vec::new(),
+            rejected_hashes: Vec::new(),
+            unknown_platforms: Vec::new(),
+            server_reported_total: None,
+        }
+    }
+
+    /// Builds an identity cache whose `platforms` list is exactly the given
+    /// `(provider_slug, canonical)` pairs, so a test can exercise the
+    /// ambiguous-mapping case (two distinct slugs for one canonical platform).
+    fn identity_cache_with_romm_platforms(
+        platforms: Vec<(&str, &str)>,
+    ) -> crate::identity_source::cache::IdentityCache {
+        crate::identity_source::cache::IdentityCache {
+            format_version: crate::identity_source::cache::CACHE_FORMAT_VERSION,
+            provider: crate::identity_source::model::IdentityProvider::Romm,
+            server_id: "test-server".to_string(),
+            server_version: None,
+            source_fingerprint: "test-fingerprint".to_string(),
+            imported_at_unix_seconds: 0,
+            platforms: platforms
+                .into_iter()
+                .enumerate()
+                .map(|(index, (slug, canonical))| {
+                    crate::identity_source::romm::normalise::NormalisedPlatform {
+                        provider_platform_id: Some(index.to_string()),
+                        provider_slug: slug.to_string(),
+                        provider_name: None,
+                        canonical: Some(canonical.to_string()),
+                        rom_count: None,
+                    }
+                })
+                .collect(),
+            records: Vec::new(),
+            rejected_hashes: Vec::new(),
+            unknown_platforms: Vec::new(),
+            server_reported_total: None,
+        }
+    }
+
+    /// Test A: a known canonical platform ID maps to the expected
+    /// `roms/<slug>/<filename>` path.
+    #[test]
+    fn romm_profile_maps_a_known_platform_to_the_expected_roms_slug_path() {
+        let root = temp_dir("romm-known-platform-path");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Super Mario Bros. (USA) (Rev 1) [!].zip");
+        write_file(&archive_path, b"zip-bytes");
+        let destination = root.join("dest");
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("NES"));
+        let view = romm_view_with_override("view-romm", &destination, "NES", "nes");
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(
+            &view,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &manifest,
+            None,
+        );
+
+        assert_eq!(plan.profile_error, None);
+        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(plan.entries[0].action, LibraryViewPlanAction::Create);
+        assert_eq!(
+            plan.entries[0].relative_link_path,
+            Some(PathBuf::from(
+                "roms/nes/Super Mario Bros. (USA) (Rev 1) [!].zip"
+            ))
+        );
+        assert_eq!(
+            plan.entries[0].destination_path,
+            Some(
+                destination
+                    .join("roms")
+                    .join("nes")
+                    .join("Super Mario Bros. (USA) (Rev 1) [!].zip")
+            )
+        );
+    }
+
+    /// Test B: an explicit user override wins over a locally cached
+    /// instance's own reported slug.
+    #[test]
+    fn romm_explicit_override_wins_over_the_local_identity_cache() {
+        let root = temp_dir("romm-override-beats-cache");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Game.zip");
+        write_file(&archive_path, b"zip-bytes");
+        let destination = root.join("dest");
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("NES"));
+        // Override says "nes-override"; the cache (a lower-precedence tier)
+        // disagrees and says "nes-from-cache" - the override must win.
+        let view = romm_view_with_override("view-romm", &destination, "NES", "nes-override");
+        let cache = identity_cache_with_romm_slug("NES", "nes-from-cache");
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(
+            &view,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &manifest,
+            Some(&cache),
+        );
+
+        assert_eq!(
+            plan.entries[0].relative_link_path,
+            Some(PathBuf::from("roms/nes-override/Game.zip"))
+        );
+
+        // And directly at the resolver level, for good measure.
+        assert_eq!(
+            resolve_romm_platform_slug(
+                "NES",
+                &view.profile.policy.platform_mapping_overrides,
+                Some(&cache)
+            ),
+            Some("nes-override".to_string())
+        );
+    }
+
+    /// The local identity cache tier works on its own too (no override
+    /// present), confirming tier 2 is actually consulted, not just
+    /// shadowed by tier 1 in the test above.
+    #[test]
+    fn romm_local_identity_cache_resolves_a_platform_with_no_override() {
+        let root = temp_dir("romm-cache-only");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Game.zip");
+        write_file(&archive_path, b"zip-bytes");
+        let destination = root.join("dest");
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("NES"));
+        let mut view = make_view("view-romm", &destination, vec![], vec![]);
+        view.profile.kind = FrontendProfileKind::Romm;
+        let cache = identity_cache_with_romm_slug("NES", "nes-from-cache");
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(
+            &view,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &manifest,
+            Some(&cache),
+        );
+
+        assert_eq!(
+            plan.entries[0].relative_link_path,
+            Some(PathBuf::from("roms/nes-from-cache/Game.zip"))
+        );
+    }
+
+    /// An identity cache reporting *two distinct* provider slugs for the
+    /// same canonical platform (e.g. a RomM instance with both an `fds` and
+    /// an `nes` filesystem folder that both normalise to `NES`) is
+    /// ambiguous - `IdentityCache::romm_slug_for_platform` now fails closed
+    /// (`None`) rather than silently picking the lexicographically-first
+    /// one, since a plausible-looking but arbitrary directory choice is
+    /// exactly the kind of guess this milestone must never make. Planning
+    /// must therefore refuse that entry individually (`SkipInvalidPath`),
+    /// the same as any other unresolved platform - never fall back to a
+    /// Generic-shaped path, and never guess between the two candidates.
+    #[test]
+    fn romm_local_identity_cache_ambiguous_mapping_fails_closed_not_a_silent_winner() {
+        let root = temp_dir("romm-cache-ambiguous");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Game.zip");
+        write_file(&archive_path, b"zip-bytes");
+        let destination = root.join("dest");
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("NES"));
+        let mut view = make_view("view-romm", &destination, vec![], vec![]);
+        view.profile.kind = FrontendProfileKind::Romm;
+        let cache = identity_cache_with_romm_platforms(vec![("fds", "NES"), ("nes", "NES")]);
+        let manifest = empty_manifest(&view.id, &destination);
+
+        // The resolver itself already refuses ambiguity.
+        assert_eq!(
+            resolve_romm_platform_slug(
+                "NES",
+                &view.profile.policy.platform_mapping_overrides,
+                Some(&cache)
+            ),
+            None
+        );
+
+        let plan = plan_library_view(
+            &view,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &manifest,
+            Some(&cache),
+        );
+
+        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(
+            plan.entries[0].action,
+            LibraryViewPlanAction::SkipInvalidPath
+        );
+        assert_eq!(plan.entries[0].relative_link_path, None);
+        assert!(
+            plan.entries
+                .iter()
+                .all(|entry| entry.action != LibraryViewPlanAction::Create),
+            "an ambiguous cache mapping must never silently pick a winner or fall back to Generic"
+        );
+
+        // An explicit override still takes precedence over an ambiguous
+        // cache and resolves the entry normally.
+        let mut overridden = view.clone();
+        overridden
+            .profile
+            .policy
+            .platform_mapping_overrides
+            .insert("NES".to_string(), "nes-pinned".to_string());
+        let plan_overridden = plan_library_view(
+            &overridden,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &manifest,
+            Some(&cache),
+        );
+        assert_eq!(
+            plan_overridden.entries[0].relative_link_path,
+            Some(PathBuf::from("roms/nes-pinned/Game.zip"))
+        );
+    }
+
+    /// Test C (see also `romm_profile_kind_fails_closed_per_entry_for_an_unresolved_platform`
+    /// above): an unresolved RomM platform fails closed and never produces a
+    /// Generic-shaped path, even when other archives in the same plan do
+    /// resolve.
+    #[test]
+    fn romm_unresolved_platform_never_produces_a_generic_path_while_other_entries_stay_safe() {
+        let root = temp_dir("romm-partial-unresolved");
+        let source_dir = root.join("source");
+        let resolved_path = source_dir.join("Resolved.zip");
+        let unresolved_path = source_dir.join("Unresolved.zip");
+        write_file(&resolved_path, b"a");
+        write_file(&unresolved_path, b"b");
+        let destination = root.join("dest");
+
+        let source = make_source(1, &source_dir);
+        let resolved_archive = make_archive(1, 1, &resolved_path, Some("NES"));
+        let unresolved_archive = make_archive(2, 1, &unresolved_path, Some("3DO"));
+        let view = romm_view_with_override("view-romm", &destination, "NES", "nes");
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(
+            &view,
+            &[resolved_archive, unresolved_archive],
+            &[source],
+            &manifest,
+            None,
+        );
+
+        assert_eq!(plan.profile_error, None, "Romm is not blanket-refused");
+        assert_eq!(
+            plan.counts.create, 1,
+            "the resolved NES archive stays previewable"
+        );
+        assert_eq!(
+            plan.counts.skip, 1,
+            "the unresolved 3DO archive is refused individually"
+        );
+        let unresolved_entry = plan
+            .entries
+            .iter()
+            .find(|entry| entry.archive_path.as_deref() == Some(unresolved_path.as_path()))
+            .unwrap();
+        assert_eq!(
+            unresolved_entry.action,
+            LibraryViewPlanAction::SkipInvalidPath
+        );
+        assert_eq!(unresolved_entry.relative_link_path, None);
+        assert!(
+            plan.entries
+                .iter()
+                .all(|entry| entry.relative_link_path != Some(PathBuf::from("3DO/Unresolved.zip"))),
+            "must never silently fall back to a Generic-shaped path for the unresolved archive"
+        );
+    }
+
+    /// Test E: changing the RomM mapping changes the fingerprint.
+    #[test]
+    fn changing_romm_mapping_override_changes_the_fingerprint() {
+        let destination = Path::new("/tmp/dest-romm-fingerprint");
+        let unmapped = make_view("view-romm", destination, vec![], vec![]);
+        let mut unmapped = unmapped;
+        unmapped.profile.kind = FrontendProfileKind::Romm;
+        let mapped = romm_view_with_override("view-romm", destination, "NES", "nes");
+
+        assert_ne!(
+            compute_view_profile_fingerprint(&unmapped),
+            compute_view_profile_fingerprint(&mapped),
+            "adding a RomM platform_mapping_overrides entry must change the fingerprint"
+        );
+
+        let mapped_differently =
+            romm_view_with_override("view-romm", destination, "NES", "nintendo");
+        assert_ne!(
+            compute_view_profile_fingerprint(&mapped),
+            compute_view_profile_fingerprint(&mapped_differently),
+            "changing the mapped slug for the same platform must change the fingerprint"
+        );
+    }
+
+    /// Test F: mapping insertion order must not affect the fingerprint or
+    /// the plan - `FrontendPlatformMapping` is `BTreeMap`-backed.
+    #[test]
+    fn romm_mapping_insertion_order_never_affects_fingerprint_or_plan() {
+        let root = temp_dir("romm-insertion-order");
+        let source_dir = root.join("source");
+        let nes_path = source_dir.join("Nes.zip");
+        let snes_path = source_dir.join("Snes.zip");
+        write_file(&nes_path, b"a");
+        write_file(&snes_path, b"b");
+        let destination = root.join("dest");
+
+        let source = make_source(1, &source_dir);
+        let nes_archive = make_archive(1, 1, &nes_path, Some("NES"));
+        let snes_archive = make_archive(2, 1, &snes_path, Some("SNES"));
+
+        let mut view_a = make_view("view-romm", &destination, vec![], vec![]);
+        view_a.profile.kind = FrontendProfileKind::Romm;
+        view_a
+            .profile
+            .policy
+            .platform_mapping_overrides
+            .insert("NES".to_string(), "nes".to_string());
+        view_a
+            .profile
+            .policy
+            .platform_mapping_overrides
+            .insert("SNES".to_string(), "snes".to_string());
+
+        let mut view_b = make_view("view-romm", &destination, vec![], vec![]);
+        view_b.profile.kind = FrontendProfileKind::Romm;
+        // Same two entries, inserted in the opposite order.
+        view_b
+            .profile
+            .policy
+            .platform_mapping_overrides
+            .insert("SNES".to_string(), "snes".to_string());
+        view_b
+            .profile
+            .policy
+            .platform_mapping_overrides
+            .insert("NES".to_string(), "nes".to_string());
+
+        assert_eq!(
+            compute_view_profile_fingerprint(&view_a),
+            compute_view_profile_fingerprint(&view_b),
+            "BTreeMap-backed platform_mapping_overrides must serialize identically regardless \
+             of insertion order"
+        );
+
+        let manifest = empty_manifest("view-romm", &destination);
+        let plan_a = plan_library_view(
+            &view_a,
+            &[nes_archive.clone(), snes_archive.clone()],
+            std::slice::from_ref(&source),
+            &manifest,
+            None,
+        );
+        let plan_b = plan_library_view(
+            &view_b,
+            &[nes_archive, snes_archive],
+            std::slice::from_ref(&source),
+            &manifest,
+            None,
+        );
+        assert_eq!(plan_a.entries, plan_b.entries);
+    }
+
+    /// Test G: a duplicate RomM destination is a Collision, never a silent
+    /// winner.
+    #[test]
+    fn romm_duplicate_destination_is_collision_never_a_silent_winner() {
+        let root = temp_dir("romm-duplicate-destination");
+        let source_dir_a = root.join("source-a");
+        let source_dir_b = root.join("source-b");
+        let archive_a = source_dir_a.join("Game.zip");
+        let archive_b = source_dir_b.join("Game.zip");
+        write_file(&archive_a, b"a");
+        write_file(&archive_b, b"b");
+        let destination = root.join("dest");
+
+        let source_a = make_source(1, &source_dir_a);
+        let source_b = make_source(2, &source_dir_b);
+        let record_a = make_archive(1, 1, &archive_a, Some("NES"));
+        let record_b = make_archive(2, 2, &archive_b, Some("NES"));
+        let view = romm_view_with_override("view-romm", &destination, "NES", "nes");
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(
+            &view,
+            &[record_a, record_b],
+            &[source_a, source_b],
+            &manifest,
+            None,
+        );
+
+        assert_eq!(plan.counts.collision, 2);
+        assert_eq!(plan.counts.create, 0);
+        assert!(
+            plan.entries
+                .iter()
+                .all(|entry| entry.action != LibraryViewPlanAction::Create),
+            "two archives resolving to the same RomM destination must never be silently \
+             disambiguated"
+        );
+    }
+
+    /// Test H: a foreign real file already at the RomM destination is
+    /// preserved, never overwritten.
+    #[test]
+    fn romm_foreign_real_file_at_destination_is_preserved() {
+        let root = temp_dir("romm-foreign-real-file");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Game.zip");
+        write_file(&archive_path, b"zip-bytes");
+        let destination = root.join("dest");
+
+        let foreign_path = destination.join("roms").join("nes").join("Game.zip");
+        write_file(&foreign_path, b"a real, unmanaged file");
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("NES"));
+        let view = romm_view_with_override("view-romm", &destination, "NES", "nes");
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(
+            &view,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &manifest,
+            None,
+        );
+
+        assert_eq!(plan.entries[0].action, LibraryViewPlanAction::Collision);
+        assert_eq!(
+            fs::read(&foreign_path).unwrap(),
+            b"a real, unmanaged file",
+            "a foreign real file must never be overwritten by planning or apply"
+        );
+    }
+
+    /// Test I: a foreign symlink already at the RomM destination is
+    /// preserved, never overwritten.
+    #[test]
+    fn romm_foreign_symlink_at_destination_is_preserved() {
+        let root = temp_dir("romm-foreign-symlink");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Game.zip");
+        write_file(&archive_path, b"zip-bytes");
+        let destination = root.join("dest");
+
+        let unrelated_target = root.join("unrelated.zip");
+        write_file(&unrelated_target, b"unrelated");
+        let foreign_link = destination.join("roms").join("nes").join("Game.zip");
+        fs::create_dir_all(foreign_link.parent().unwrap()).unwrap();
+        symlink(&unrelated_target, &foreign_link).unwrap();
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("NES"));
+        let view = romm_view_with_override("view-romm", &destination, "NES", "nes");
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(
+            &view,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &manifest,
+            None,
+        );
+
+        assert_eq!(plan.entries[0].action, LibraryViewPlanAction::Collision);
+        let target = fs::read_link(&foreign_link).unwrap();
+        assert_eq!(
+            target, unrelated_target,
+            "a foreign symlink must never be repointed by planning or apply"
+        );
+    }
+
+    /// Test J: source-side containment still rejects a symlink target that
+    /// escapes its declared source folder, under the RomM profile too.
+    #[test]
+    fn romm_source_side_containment_still_rejects_escape() {
+        let root = temp_dir("romm-source-containment-escape");
+        let source_dir = root.join("source");
+        fs::create_dir_all(&source_dir).unwrap();
+        let outside_dir = root.join("outside");
+        let real_target = outside_dir.join("Elsewhere.zip");
+        write_file(&real_target, b"outside-bytes");
+        let escaping_symlink = source_dir.join("Escape.zip");
+        symlink(&real_target, &escaping_symlink).unwrap();
+        let destination = root.join("dest");
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &escaping_symlink, Some("NES"));
+        let view = romm_view_with_override("view-romm", &destination, "NES", "nes");
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(
+            &view,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &manifest,
+            None,
+        );
+
+        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(
+            plan.entries[0].action,
+            LibraryViewPlanAction::SkipInvalidPath
+        );
+        assert_eq!(plan.counts.create, 0);
+    }
+
+    /// Test K: planning a resolved RomM view never mutates the source
+    /// archive and never creates the destination directory.
+    #[test]
+    fn romm_planning_with_resolved_mapping_never_mutates_source_or_creates_destination() {
+        let root = temp_dir("romm-resolved-no-mutation");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Game.zip");
+        write_file(&archive_path, b"original-bytes");
+        let destination = root.join("dest");
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("NES"));
+        let view = romm_view_with_override("view-romm", &destination, "NES", "nes");
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(
+            &view,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &manifest,
+            None,
+        );
+
+        assert_eq!(plan.entries[0].action, LibraryViewPlanAction::Create);
+        assert_eq!(fs::read(&archive_path).unwrap(), b"original-bytes");
+        assert!(
+            !destination.exists(),
+            "planning must never create the destination directory either"
+        );
+    }
+
+    /// Test L: apply creates only a symlink under `destination_root` for a
+    /// resolved RomM entry - never a regular file, never anything outside
+    /// `destination_root`.
+    #[test]
+    fn romm_apply_creates_only_a_symlink_under_destination_root() {
+        let root = temp_dir("romm-apply-symlink-only");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Game.zip");
+        write_file(&archive_path, b"zip-bytes");
+        let destination = root.join("dest");
+        let data_dir = root.join("data");
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("NES"));
+        let view = romm_view_with_override("view-romm", &destination, "NES", "nes");
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(
+            &view,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &manifest,
+            None,
+        );
+        let report = apply_library_view(&view, &plan, &manifest, &data_dir).unwrap();
+        assert_eq!(report.created, 1);
+
+        let created_path = destination.join("roms").join("nes").join("Game.zip");
+        let metadata = fs::symlink_metadata(&created_path).unwrap();
+        assert!(
+            metadata.file_type().is_symlink(),
+            "apply must create a symlink, not a regular file"
+        );
+        assert_eq!(fs::read_link(&created_path).unwrap(), archive_path);
+
+        let written = load_library_view_manifest_at(&data_dir, &view.id).unwrap();
+        assert_eq!(written.entries.len(), 1);
+        assert_eq!(
+            written.entries[0].object_kind,
+            LibraryViewObjectKind::Symlink
+        );
+    }
+
+    /// Test N: a RomM apply never produces a manifest entry claiming a
+    /// `GeneratedFile`/`Directory` object kind - the only materialization
+    /// path this stage exercises is the pre-existing managed-symlink one.
+    #[test]
+    fn romm_apply_never_produces_a_generated_file_or_directory_object_kind() {
+        let root = temp_dir("romm-no-generated-file-or-directory");
+        let source_dir = root.join("source");
+        let nes_path = source_dir.join("Nes.zip");
+        let snes_path = source_dir.join("Snes.zip");
+        write_file(&nes_path, b"a");
+        write_file(&snes_path, b"b");
+        let destination = root.join("dest");
+        let data_dir = root.join("data");
+
+        let source = make_source(1, &source_dir);
+        let nes_archive = make_archive(1, 1, &nes_path, Some("NES"));
+        let snes_archive = make_archive(2, 1, &snes_path, Some("SNES"));
+        let mut view = romm_view_with_override("view-romm", &destination, "NES", "nes");
+        view.profile
+            .policy
+            .platform_mapping_overrides
+            .insert("SNES".to_string(), "snes".to_string());
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(
+            &view,
+            &[nes_archive, snes_archive],
+            std::slice::from_ref(&source),
+            &manifest,
+            None,
+        );
+        apply_library_view(&view, &plan, &manifest, &data_dir).unwrap();
+        let written = load_library_view_manifest_at(&data_dir, &view.id).unwrap();
+
+        assert_eq!(written.entries.len(), 2);
+        assert!(
+            written
+                .entries
+                .iter()
+                .all(|entry| entry.object_kind == LibraryViewObjectKind::Symlink),
+            "this stage must never produce a GeneratedFile or Directory manifest entry"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Resolved RomM-mapping fingerprint drift fix.
+    // -------------------------------------------------------------------
+
+    /// Test 1: identical profile and identical resolved RomM mapping ->
+    /// identical fingerprint, across independent plan calls.
+    #[test]
+    fn resolved_romm_mapping_fingerprint_is_identical_for_identical_resolution() {
+        let root = temp_dir("romm-fingerprint-identical");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Game.zip");
+        write_file(&archive_path, b"zip-bytes");
+        let destination = root.join("dest");
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("NES"));
+        let view = romm_view_with_override("view-romm", &destination, "NES", "nes");
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan_a = plan_library_view(
+            &view,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &manifest,
+            None,
+        );
+        let plan_b = plan_library_view(
+            &view,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &manifest,
+            None,
+        );
+
+        assert_eq!(plan_a.profile_fingerprint, plan_b.profile_fingerprint);
+    }
+
+    /// Test 2: same profile, but the resolved slug for the same platform
+    /// changes (via the cache tier, not the config itself) -> the
+    /// fingerprint changes.
+    #[test]
+    fn resolved_romm_mapping_fingerprint_changes_when_resolved_slug_changes() {
+        let root = temp_dir("romm-fingerprint-changed-slug");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Game.zip");
+        write_file(&archive_path, b"zip-bytes");
+        let destination = root.join("dest");
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("NES"));
+        // No override at all - the *only* thing that differs between the two
+        // plans below is what the identity cache reports.
+        let mut view = make_view("view-romm", &destination, vec![], vec![]);
+        view.profile.kind = FrontendProfileKind::Romm;
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let cache_a = identity_cache_with_romm_slug("NES", "nes");
+        let cache_b = identity_cache_with_romm_slug("NES", "nes-renamed");
+
+        let plan_a = plan_library_view(
+            &view,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &manifest,
+            Some(&cache_a),
+        );
+        let plan_b = plan_library_view(
+            &view,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &manifest,
+            Some(&cache_b),
+        );
+
+        assert_ne!(
+            plan_a.profile_fingerprint, plan_b.profile_fingerprint,
+            "the view's own config did not change, but the resolved output did - the \
+             fingerprint must reflect the resolved mapping, not just the declared profile"
+        );
+    }
+
+    /// Test 3: a manifest fingerprinted against one resolved cache mapping,
+    /// re-planned after the cache changes what it reports for the same
+    /// platform, must surface a fingerprint conflict rather than silently
+    /// treating the new resolution as equivalent.
+    #[test]
+    fn changed_cache_mapping_against_existing_manifest_produces_fingerprint_conflict() {
+        let root = temp_dir("romm-cache-drift-conflict");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Game.zip");
+        write_file(&archive_path, b"zip-bytes");
+        let destination = root.join("dest");
+        let data_dir = root.join("data");
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("NES"));
+        let mut view = make_view("view-romm", &destination, vec![], vec![]);
+        view.profile.kind = FrontendProfileKind::Romm;
+        let manifest = empty_manifest(&view.id, &destination);
+
+        // First apply, resolved via the cache reporting "nes".
+        let cache_before = identity_cache_with_romm_slug("NES", "nes");
+        let plan_before = plan_library_view(
+            &view,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &manifest,
+            Some(&cache_before),
+        );
+        assert!(plan_before.is_safe_to_apply());
+        let report = apply_library_view(&view, &plan_before, &manifest, &data_dir).unwrap();
+        assert_eq!(report.created, 1);
+        let applied_manifest = load_library_view_manifest_at(&data_dir, &view.id).unwrap();
+        assert_eq!(
+            applied_manifest.view_fingerprint,
+            Some(plan_before.profile_fingerprint.clone())
+        );
+
+        // The cache is re-imported and now reports a different slug for the
+        // very same platform - simulating a RomM instance renaming its
+        // filesystem platform folder between imports.
+        let cache_after = identity_cache_with_romm_slug("NES", "nintendo-nes");
+        let plan_after = plan_library_view(
+            &view,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &applied_manifest,
+            Some(&cache_after),
+        );
+
+        assert!(
+            plan_after.fingerprint_conflict.is_some(),
+            "a resolved-mapping change against an already-applied manifest must be a conflict"
+        );
+        assert!(!plan_after.is_safe_to_apply());
+    }
+
+    /// Test 4: that conflict actually blocks `apply_library_view` outright -
+    /// before any stale link is removed or any new link is created, not
+    /// merely reported and then ignored.
+    #[test]
+    fn fingerprint_conflict_blocks_apply_before_any_link_mutation() {
+        let root = temp_dir("romm-cache-drift-blocks-apply");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Game.zip");
+        write_file(&archive_path, b"zip-bytes");
+        let destination = root.join("dest");
+        let data_dir = root.join("data");
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("NES"));
+        let mut view = make_view("view-romm", &destination, vec![], vec![]);
+        view.profile.kind = FrontendProfileKind::Romm;
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let cache_before = identity_cache_with_romm_slug("NES", "nes");
+        let plan_before = plan_library_view(
+            &view,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &manifest,
+            Some(&cache_before),
+        );
+        apply_library_view(&view, &plan_before, &manifest, &data_dir).unwrap();
+        let applied_manifest = load_library_view_manifest_at(&data_dir, &view.id).unwrap();
+        let manifest_path = library_view_manifest_path(&data_dir, &view.id);
+        let manifest_bytes_before = fs::read(&manifest_path).unwrap();
+        let old_link = destination.join("roms").join("nes").join("Game.zip");
+        assert!(fs::symlink_metadata(&old_link).is_ok());
+
+        let cache_after = identity_cache_with_romm_slug("NES", "nintendo-nes");
+        let plan_after = plan_library_view(
+            &view,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &applied_manifest,
+            Some(&cache_after),
+        );
+        assert!(!plan_after.is_safe_to_apply());
+
+        let result = apply_library_view(&view, &plan_after, &applied_manifest, &data_dir);
+        assert!(
+            result.is_err(),
+            "apply must be refused outright, not partially performed"
+        );
+
+        // Nothing was mutated: the old symlink is exactly as it was, the new
+        // `roms/nintendo-nes/` path was never created, and the manifest file
+        // on disk is byte-for-byte unchanged.
+        assert!(
+            fs::symlink_metadata(&old_link).is_ok(),
+            "the previously managed symlink must not have been removed"
+        );
+        assert!(
+            !destination.join("roms").join("nintendo-nes").exists(),
+            "no new path may be created for a refused apply"
+        );
+        let manifest_bytes_after = fs::read(&manifest_path).unwrap();
+        assert_eq!(
+            manifest_bytes_before, manifest_bytes_after,
+            "a refused apply must never touch the manifest file"
+        );
+    }
+
+    /// Test 5: a platform this plan never touches changing in the cache must
+    /// never perturb the fingerprint - only mappings *actually used by this
+    /// plan* are hashed.
+    #[test]
+    fn unrelated_cache_platform_change_does_not_alter_fingerprint_for_an_unused_platform() {
+        let root = temp_dir("romm-unrelated-cache-change");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Game.zip");
+        write_file(&archive_path, b"zip-bytes");
+        let destination = root.join("dest");
+
+        // The plan's only record is NES; SNES is never referenced by any
+        // record in this plan at all.
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("NES"));
+        let view = romm_view_with_override("view-romm", &destination, "NES", "nes");
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let mut cache_a = identity_cache_with_romm_slug("NES", "nes-from-cache-unused-tier");
+        cache_a.platforms.push(
+            crate::identity_source::romm::normalise::NormalisedPlatform {
+                provider_platform_id: None,
+                provider_slug: "snes".to_string(),
+                provider_name: None,
+                canonical: Some("SNES".to_string()),
+                rom_count: None,
+            },
+        );
+        let mut cache_b = cache_a.clone();
+        // Only the SNES entry (never touched by this plan, and shadowed by
+        // the explicit NES override anyway) changes between the two caches.
+        cache_b
+            .platforms
+            .retain(|platform| platform.canonical.as_deref() != Some("SNES"));
+        cache_b.platforms.push(
+            crate::identity_source::romm::normalise::NormalisedPlatform {
+                provider_platform_id: None,
+                provider_slug: "super-nintendo".to_string(),
+                provider_name: None,
+                canonical: Some("SNES".to_string()),
+                rom_count: None,
+            },
+        );
+
+        let plan_a = plan_library_view(
+            &view,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &manifest,
+            Some(&cache_a),
+        );
+        let plan_b = plan_library_view(
+            &view,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &manifest,
+            Some(&cache_b),
+        );
+
+        assert_eq!(
+            plan_a.profile_fingerprint, plan_b.profile_fingerprint,
+            "a cache change for a platform this plan never resolves must not affect the \
+             fingerprint"
+        );
+    }
+
+    /// Test 6: the resolved-mapping component of the fingerprint reflects
+    /// only the actual *resolved* output string, normalised the same way
+    /// regardless of which tier produced it - not, say, provider metadata
+    /// that happens to differ between two caches that both resolve to the
+    /// same slug. Holds the declared profile/policy identical between the
+    /// two plans (neither has an explicit override) so the only variable is
+    /// the resolved mapping itself, not a confounding config difference.
+    #[test]
+    fn romm_fingerprint_reflects_resolved_output_regardless_of_origin_tier() {
+        let root = temp_dir("romm-fingerprint-resolved-output");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Game.zip");
+        write_file(&archive_path, b"zip-bytes");
+        let destination = root.join("dest");
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("NES"));
+        let mut view = make_view("view-romm", &destination, vec![], vec![]);
+        view.profile.kind = FrontendProfileKind::Romm;
+        let manifest = empty_manifest(&view.id, &destination);
+
+        // Two different caches that both resolve NES to the same final
+        // "nes" slug, but via different provider metadata (id/name/rom
+        // count) - none of which is part of the resolved-mapping
+        // representation that gets hashed.
+        let cache_a = identity_cache_with_romm_slug("NES", "nes");
+        let mut cache_b = cache_a.clone();
+        cache_b.platforms[0].provider_platform_id = Some("different-id".to_string());
+        cache_b.platforms[0].provider_name = Some("A Different Display Name".to_string());
+        cache_b.platforms[0].rom_count = Some(9999);
+        cache_b.server_id = "a-totally-different-server".to_string();
+
+        let plan_a = plan_library_view(
+            &view,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &manifest,
+            Some(&cache_a),
+        );
+        let plan_b = plan_library_view(
+            &view,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &manifest,
+            Some(&cache_b),
+        );
+
+        assert_eq!(
+            plan_a.profile_fingerprint, plan_b.profile_fingerprint,
+            "the same resolved slug must fingerprint identically regardless of unrelated \
+             provider metadata differing between the two caches that produced it"
+        );
+
+        // An explicit user override resolving to that exact same slug must
+        // *also* still be a real, distinct configuration - it legitimately
+        // fingerprints differently from "no override, resolved via cache",
+        // because the declared profile itself differs (a real override is
+        // present). This is not a contradiction: the resolved-mapping
+        // component alone is tier-agnostic (proven above); the full
+        // fingerprint also covers the declared profile, which correctly
+        // still distinguishes "explicitly pinned" from "resolved from the
+        // environment".
+        let via_override = romm_view_with_override("view-romm", &destination, "NES", "nes");
+        let plan_via_override = plan_library_view(
+            &via_override,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &manifest,
+            None,
+        );
+        assert_ne!(
+            plan_a.profile_fingerprint,
+            plan_via_override.profile_fingerprint
+        );
+
+        // But a different final slug (still via the cache tier, profile
+        // held constant) must fingerprint differently from `plan_a`.
+        let cache_different_slug = identity_cache_with_romm_slug("NES", "different-slug");
+        let plan_different = plan_library_view(
+            &view,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &manifest,
+            Some(&cache_different_slug),
+        );
+        assert_ne!(
+            plan_a.profile_fingerprint,
+            plan_different.profile_fingerprint
+        );
+    }
+
+    /// Test 7: a `Generic` profile's fingerprint is unaffected by the
+    /// presence or contents of a RomM identity cache - it never consults
+    /// one at all.
+    #[test]
+    fn generic_profile_fingerprint_unaffected_by_romm_cache_presence_or_contents() {
+        let root = temp_dir("generic-fingerprint-ignores-romm-cache");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Game.zip");
+        write_file(&archive_path, b"zip-bytes");
+        let destination = root.join("dest");
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("NES"));
+        let view = make_view("view-generic", &destination, vec![], vec![]);
+        assert_eq!(view.profile.kind, FrontendProfileKind::Generic);
+        let manifest = empty_manifest(&view.id, &destination);
+        let cache = identity_cache_with_romm_slug("NES", "nes-should-never-matter-here");
+
+        let plan_without_cache = plan_library_view(
+            &view,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &manifest,
+            None,
+        );
+        let plan_with_cache = plan_library_view(
+            &view,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &manifest,
+            Some(&cache),
+        );
+
+        assert_eq!(
+            plan_without_cache.profile_fingerprint, plan_with_cache.profile_fingerprint,
+            "a Generic profile must never be influenced by a RomM identity cache"
+        );
+        // And it must equal exactly what the pre-Stage-3 algorithm already
+        // produced for this view, proving no existing Generic fingerprint is
+        // invalidated by this addition.
+        assert_eq!(
+            plan_without_cache.profile_fingerprint,
+            compute_view_profile_fingerprint(&view)
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Source-folder filtering regression suite (2026-08-17 smoke-test
+    // incident: a view scoped to `/mnt/games/roms/sms` appeared to plan
+    // archives from `/mnt/local/downloads/jdownloader2/output`). Root cause
+    // was a stale cached GUI plan, not this planner - these tests pin down
+    // that `plan_library_view`'s own source-folder filtering is, and stays,
+    // correct in isolation, independent of the GUI fix.
+    // -------------------------------------------------------------------
+
+    /// Test A: a view whose `source_folders` names only source A must never
+    /// plan (as *any* action - Create, Skip, or Collision) an archive that
+    /// belongs to a different, unselected source B, even when B is present
+    /// in the same catalogue read and has archives with the exact same
+    /// platform/filename shape.
+    #[test]
+    fn selected_source_never_plans_an_archive_from_an_unselected_source() {
+        let root = temp_dir("source-filter-a-never-b");
+        let source_a_dir = root.join("games/roms/sms");
+        let source_b_dir = root.join("local/downloads/jdownloader2/output");
+        let archive_a = source_a_dir.join("Alex Kidd.zip");
+        let archive_b = source_b_dir.join("Agatha Christie.zip");
+        write_file(&archive_a, b"sms-bytes");
+        write_file(&archive_b, b"jdownloader-bytes");
+        let destination = root.join("dest");
+
+        let source_a = make_source(9, &source_a_dir);
+        let source_b = make_source(1, &source_b_dir);
+        // Archive B has no assigned platform - exactly the
+        // `SkipUnknownPlatform` shape the incident reported - so this test
+        // also proves an unselected source's unknown-platform archives are
+        // not merely re-bucketed as Skip, they are not planned *at all*.
+        let record_a = make_archive(1, 9, &archive_a, Some("MasterSystem"));
+        let record_b = make_archive(2, 1, &archive_b, None);
+
+        let view = make_view(
+            "view-1",
+            &destination,
+            vec![source_a_dir.clone()],
+            vec!["MasterSystem".to_string()],
+        );
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(
+            &view,
+            &[record_a, record_b],
+            &[source_a, source_b],
+            &manifest,
+            None,
+        );
+
+        assert_eq!(
+            plan.entries.len(),
+            1,
+            "an unselected source's archive must produce zero plan entries of any kind"
+        );
+        assert_eq!(plan.entries[0].action, LibraryViewPlanAction::Create);
+        assert_eq!(plan.entries[0].archive_path, Some(archive_a));
+        assert!(
+            plan.entries
+                .iter()
+                .all(|entry| entry.archive_path.as_deref() != Some(archive_b.as_path())),
+            "source B's archive must never appear in the plan, in any action bucket"
+        );
+        assert_eq!(plan.counts.skip, 0);
+        assert_eq!(plan.counts.create, 1);
+    }
+
+    /// Test B: a configured source folder is matched against the
+    /// catalogue's `SourceFolderRecord` by its registered identity (exact
+    /// `path` string, via the `source_folder_id` a record actually belongs
+    /// to) - never by textual path *containment*. A newly registered,
+    /// narrower source folder that happens to be a sub-path of an older,
+    /// already-scanned, broader source folder does not "inherit" that
+    /// broader source's archives - this is exactly the incident's
+    /// environment shape (a fresh, unscanned `/mnt/games/roms/sms`
+    /// registration sitting underneath an already-scanned
+    /// `/mnt/games/roms`): the view must see zero entries from the broader
+    /// source, not a leaked subset of it.
+    #[test]
+    fn selected_source_path_resolves_by_registered_identity_not_containment() {
+        let root = temp_dir("source-filter-containment");
+        let broad_dir = root.join("games/roms");
+        let narrow_dir = broad_dir.join("sms");
+        let archive_under_broad = narrow_dir.join("Alex Kidd.zip");
+        write_file(&archive_under_broad, b"sms-bytes");
+        let destination = root.join("dest");
+
+        // The archive is catalogued under the *broad* source's id (5, as in
+        // the real incident), even though it physically lives under what is
+        // now also a separately-registered narrower source (9). The
+        // catalogue ties every record to the source_folder_id it was
+        // scanned under - never re-derived from the path at plan time.
+        let broad_source = make_source(5, &broad_dir);
+        let narrow_source = make_source(9, &narrow_dir);
+        let record = make_archive(1, 5, &archive_under_broad, Some("MasterSystem"));
+
+        let view = make_view(
+            "view-1",
+            &destination,
+            vec![narrow_dir.clone()],
+            vec!["MasterSystem".to_string()],
+        );
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(
+            &view,
+            &[record],
+            &[broad_source, narrow_source],
+            &manifest,
+            None,
+        );
+
+        assert!(
+            plan.entries.is_empty(),
+            "a view scoped to the narrow (unscanned) source must not see the broad source's \
+             archives just because the narrow path is textually inside the broad one - \
+             got {:?}",
+            plan.entries
+        );
+        assert_eq!(plan.counts.create, 0);
+    }
+
+    /// Test C: editing a view's selected source (A -> B) replaces the
+    /// effective filter outright - the new plan reflects only B, never a
+    /// union of A and B, and never still-A.
+    #[test]
+    fn editing_selected_source_replaces_the_effective_filter() {
+        let root = temp_dir("source-filter-edit-replaces");
+        let source_a_dir = root.join("source-a");
+        let source_b_dir = root.join("source-b");
+        let archive_a = source_a_dir.join("Game.zip");
+        let archive_b = source_b_dir.join("Game.zip");
+        write_file(&archive_a, b"a");
+        write_file(&archive_b, b"b");
+        let destination = root.join("dest");
+
+        let source_a = make_source(1, &source_a_dir);
+        let source_b = make_source(2, &source_b_dir);
+        let record_a = make_archive(1, 1, &archive_a, Some("NES"));
+        let record_b = make_archive(2, 2, &archive_b, Some("NES"));
+        let records = [record_a, record_b];
+        let sources = [source_a, source_b];
+
+        let mut view = make_view("view-1", &destination, vec![source_a_dir.clone()], vec![]);
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan_before = plan_library_view(&view, &records, &sources, &manifest, None);
+        assert_eq!(plan_before.entries.len(), 1);
+        assert_eq!(plan_before.entries[0].archive_path, Some(archive_a.clone()));
+
+        // The edit: source_folders now names B instead of A.
+        view.source_folders = vec![source_b_dir.clone()];
+        let plan_after = plan_library_view(&view, &records, &sources, &manifest, None);
+        assert_eq!(plan_after.entries.len(), 1);
+        assert_eq!(plan_after.entries[0].archive_path, Some(archive_b));
+    }
+
+    /// Test D: a configured source folder that matches no registered
+    /// `SourceFolderRecord` at all (e.g. it was removed, or was never a
+    /// real source) must never be treated as "no filter" / "all sources" -
+    /// it must produce zero entries, the same as any other selection that
+    /// matches nothing.
+    #[test]
+    fn unresolvable_selected_source_never_degrades_to_all_sources() {
+        let root = temp_dir("source-filter-unresolvable");
+        let known_dir = root.join("known-source");
+        let archive = known_dir.join("Game.zip");
+        write_file(&archive, b"bytes");
+        let destination = root.join("dest");
+
+        let known_source = make_source(1, &known_dir);
+        let record = make_archive(1, 1, &archive, Some("NES"));
+
+        let unresolvable_path = root.join("this-path-was-never-registered-as-a-source");
+        let view = make_view("view-1", &destination, vec![unresolvable_path], vec![]);
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(&view, &[record], &[known_source], &manifest, None);
+
+        assert!(
+            plan.entries.is_empty(),
+            "an unresolvable source selection must plan nothing, never silently fall back to \
+             every configured source - got {:?}",
+            plan.entries
+        );
+    }
+
+    /// Test E: the documented "empty `source_folders` means every
+    /// configured source is included" semantics still hold exactly - not
+    /// affected by the source-identity matching used when the list is
+    /// non-empty.
+    #[test]
+    fn empty_source_folders_still_means_every_configured_source() {
+        let root = temp_dir("source-filter-empty-means-all");
+        let source_a_dir = root.join("source-a");
+        let source_b_dir = root.join("source-b");
+        let archive_a = source_a_dir.join("A.zip");
+        let archive_b = source_b_dir.join("B.zip");
+        write_file(&archive_a, b"a");
+        write_file(&archive_b, b"b");
+        let destination = root.join("dest");
+
+        let source_a = make_source(1, &source_a_dir);
+        let source_b = make_source(2, &source_b_dir);
+        let record_a = make_archive(1, 1, &archive_a, Some("NES"));
+        let record_b = make_archive(2, 2, &archive_b, Some("NES"));
+
+        // No source_folders selected at all.
+        let view = make_view("view-1", &destination, vec![], vec![]);
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(
+            &view,
+            &[record_a, record_b],
+            &[source_a, source_b],
+            &manifest,
+            None,
+        );
+
+        assert_eq!(plan.entries.len(), 2);
+        assert_eq!(plan.counts.create, 2);
+    }
+
+    /// Test G: `Generic` and `Romm` apply byte-identical source-folder
+    /// filtering - the profile kind only changes the *output path shape*
+    /// for an already-selected archive, never which archives are selected
+    /// in the first place.
+    #[test]
+    fn generic_and_romm_profiles_apply_identical_source_filtering() {
+        let root = temp_dir("source-filter-generic-vs-romm");
+        let source_a_dir = root.join("source-a");
+        let source_b_dir = root.join("source-b");
+        let archive_a = source_a_dir.join("Game.zip");
+        let archive_b = source_b_dir.join("Other.zip");
+        write_file(&archive_a, b"a");
+        write_file(&archive_b, b"b");
+        let destination = root.join("dest");
+
+        let source_a = make_source(1, &source_a_dir);
+        let source_b = make_source(2, &source_b_dir);
+        let record_a = make_archive(1, 1, &archive_a, Some("NES"));
+        let record_b = make_archive(2, 2, &archive_b, Some("NES"));
+        let records = [record_a, record_b];
+        let sources = [source_a, source_b];
+
+        let generic_view = make_view("view-1", &destination, vec![source_a_dir.clone()], vec![]);
+        let manifest = empty_manifest(&generic_view.id, &destination);
+        let generic_plan = plan_library_view(&generic_view, &records, &sources, &manifest, None);
+
+        let mut romm_view = romm_view_with_override("view-1", &destination, "NES", "nes");
+        romm_view.source_folders = vec![source_a_dir.clone()];
+        let romm_plan = plan_library_view(&romm_view, &records, &sources, &manifest, None);
+
+        // Same archives selected (only A's), same skip/collision shape -
+        // only the destination shape differs (Generic's `{platform}/{filename}`
+        // vs RomM's `roms/{slug}/{filename}`).
+        assert_eq!(generic_plan.entries.len(), 1);
+        assert_eq!(romm_plan.entries.len(), 1);
+        assert_eq!(
+            generic_plan.entries[0].archive_path,
+            Some(archive_a.clone())
+        );
+        assert_eq!(romm_plan.entries[0].archive_path, Some(archive_a));
+        assert_eq!(
+            generic_plan.entries[0].action,
+            LibraryViewPlanAction::Create
+        );
+        assert_eq!(romm_plan.entries[0].action, LibraryViewPlanAction::Create);
+        assert_eq!(generic_plan.counts.create, romm_plan.counts.create);
+    }
+
+    /// Test H: source filtering and platform filtering compose correctly -
+    /// an archive is only planned when it matches *both*; matching only one
+    /// of the two must silently exclude it (never a reportable Skip, per
+    /// the existing "ordinary filter" semantics), and an unselected
+    /// source's archive is excluded regardless of platform, even an
+    /// otherwise-matching one.
+    #[test]
+    fn source_and_platform_filters_compose_correctly() {
+        let root = temp_dir("source-and-platform-compose");
+        let selected_dir = root.join("selected-source");
+        let other_dir = root.join("other-source");
+        let matching = selected_dir.join("Matches.zip");
+        let wrong_platform = selected_dir.join("WrongPlatform.zip");
+        let wrong_source = other_dir.join("WrongSource.zip");
+        write_file(&matching, b"a");
+        write_file(&wrong_platform, b"b");
+        write_file(&wrong_source, b"c");
+        let destination = root.join("dest");
+
+        let selected_source = make_source(1, &selected_dir);
+        let other_source = make_source(2, &other_dir);
+        let record_matching = make_archive(1, 1, &matching, Some("MasterSystem"));
+        let record_wrong_platform = make_archive(2, 1, &wrong_platform, Some("SNES"));
+        // Same platform as the target, but from the unselected source.
+        let record_wrong_source = make_archive(3, 2, &wrong_source, Some("MasterSystem"));
+
+        let view = make_view(
+            "view-1",
+            &destination,
+            vec![selected_dir.clone()],
+            vec!["MasterSystem".to_string()],
+        );
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(
+            &view,
+            &[record_matching, record_wrong_platform, record_wrong_source],
+            &[selected_source, other_source],
+            &manifest,
+            None,
+        );
+
+        assert_eq!(
+            plan.entries.len(),
+            1,
+            "only the archive matching both filters is planned"
+        );
+        assert_eq!(plan.entries[0].archive_path, Some(matching));
+        assert_eq!(plan.entries[0].action, LibraryViewPlanAction::Create);
+        assert_eq!(plan.counts.create, 1);
+        assert_eq!(plan.counts.skip, 0);
+    }
+
+    // -------------------------------------------------------------------
+    // Loose game-media (2026-08-17 C128 smoke case): once the catalogue
+    // contains a `.d64`/`.g64` `PersistedArchive` row (see
+    // `archive_kind` in `lib.rs`, which is what actually gained the new
+    // recognition - nothing here changed), `plan_library_view` needs zero
+    // changes to plan it: it already never reads `archive_kind` at all,
+    // only `platform`/`source_folder_id`/`absolute_path`/
+    // `last_verified_missing_at`. These tests prove that directly, using
+    // the same `make_archive` fixture helper every other test already
+    // uses, just with a `.d64`/`.g64` filename instead of `.zip`.
+    // -------------------------------------------------------------------
+
+    /// Test 4: a view restricted to the loose-media source must never plan
+    /// an archive belonging to a different, unselected source - identical
+    /// isolation guarantee as archive-backed media (see
+    /// `selected_source_never_plans_an_archive_from_an_unselected_source`).
+    #[test]
+    fn loose_media_selected_source_isolation_matches_archive_backed_behavior() {
+        let root = temp_dir("loose-media-source-isolation");
+        let c128_dir = root.join("c128");
+        let other_dir = root.join("other-source");
+        let d64 = c128_dir.join("BurgerWhop!.d64");
+        let other_zip = other_dir.join("Unrelated.zip");
+        write_file(&d64, b"d64-bytes");
+        write_file(&other_zip, b"zip-bytes");
+        let destination = root.join("dest");
+
+        let c128_source = make_source(1, &c128_dir);
+        let other_source = make_source(2, &other_dir);
+        let d64_record = make_archive(1, 1, &d64, Some("Commodore 128"));
+        let other_record = make_archive(2, 2, &other_zip, Some("Commodore 128"));
+
+        let view = make_view(
+            "view-1",
+            &destination,
+            vec![c128_dir.clone()],
+            vec!["Commodore 128".to_string()],
+        );
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(
+            &view,
+            &[d64_record, other_record],
+            &[c128_source, other_source],
+            &manifest,
+            None,
+        );
+
+        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(plan.entries[0].archive_path, Some(d64));
+        assert_eq!(plan.entries[0].action, LibraryViewPlanAction::Create);
+    }
+
+    /// Test 5: platform filtering composes with a loose-media candidate
+    /// exactly as it does for an archive-backed one.
+    #[test]
+    fn loose_media_platform_filter_composition_matches_archive_backed_behavior() {
+        let root = temp_dir("loose-media-platform-filter");
+        let c128_dir = root.join("c128");
+        let matching = c128_dir.join("BurgerWhop!.d64");
+        let wrong_platform = c128_dir.join("SomeAmiga.adf");
+        write_file(&matching, b"a");
+        write_file(&wrong_platform, b"b");
+        let destination = root.join("dest");
+
+        let source = make_source(1, &c128_dir);
+        let record_matching = make_archive(1, 1, &matching, Some("Commodore 128"));
+        let record_wrong_platform = make_archive(2, 1, &wrong_platform, Some("Amiga"));
+
+        let view = make_view(
+            "view-1",
+            &destination,
+            vec![c128_dir.clone()],
+            vec!["Commodore 128".to_string()],
+        );
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(
+            &view,
+            &[record_matching, record_wrong_platform],
+            &[source],
+            &manifest,
+            None,
+        );
+
+        assert_eq!(
+            plan.entries.len(),
+            1,
+            "the wrong-platform loose file is silently excluded"
+        );
+        assert_eq!(plan.entries[0].archive_path, Some(matching));
+        assert_eq!(plan.counts.create, 1);
+        assert_eq!(plan.counts.skip, 0);
+    }
+
+    /// Test 6: a loose-media archive the catalogue's last scan reported
+    /// missing must be `SkipMissingSourceArchive`, never `Create` -
+    /// identical rule to an archive-backed file.
+    #[test]
+    fn loose_media_missing_source_file_is_reported_not_created() {
+        let root = temp_dir("loose-media-missing");
+        let c128_dir = root.join("c128");
+        let g64 = c128_dir.join("Ultima V (Disk 1).g64");
+        write_file(&g64, b"g64-bytes");
+        let destination = root.join("dest");
+
+        let source = make_source(1, &c128_dir);
+        let mut record = make_archive(1, 1, &g64, Some("Commodore 128"));
+        record.last_verified_missing_at = Some("2026-08-17T00:00:00Z".to_string());
+
+        let view = make_view("view-1", &destination, vec![c128_dir], vec![]);
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(&view, &[record], &[source], &manifest, None);
+
+        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(
+            plan.entries[0].action,
+            LibraryViewPlanAction::SkipMissingSourceArchive
+        );
+        assert_eq!(
+            plan.counts.create, 0,
+            "a missing loose-media source file must never be Create"
+        );
+    }
+
+    /// Test 7: archive-backed (`.zip`) planning behaviour is byte-for-byte
+    /// unchanged - a mixed catalogue of loose media and zip archives plans
+    /// each according to the exact same rules, with no cross-influence.
+    #[test]
+    fn archive_backed_behavior_is_unchanged_alongside_loose_media() {
+        let root = temp_dir("mixed-loose-and-archive");
+        let c128_dir = root.join("c128");
+        let d64 = c128_dir.join("BurgerWhop!.d64");
+        let zip = c128_dir.join("SomeGame.zip");
+        write_file(&d64, b"d64-bytes");
+        write_file(&zip, b"zip-bytes");
+        let destination = root.join("dest");
+
+        let source = make_source(1, &c128_dir);
+        let d64_record = make_archive(1, 1, &d64, Some("Commodore 128"));
+        let zip_record = make_archive(2, 1, &zip, Some("Commodore 128"));
+
+        let view = make_view(
+            "view-1",
+            &destination,
+            vec![c128_dir],
+            vec!["Commodore 128".to_string()],
+        );
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(&view, &[d64_record, zip_record], &[source], &manifest, None);
+
+        assert_eq!(plan.entries.len(), 2);
+        assert!(
+            plan.entries
+                .iter()
+                .all(|entry| entry.action == LibraryViewPlanAction::Create)
+        );
+        assert_eq!(plan.counts.create, 2);
+    }
+
+    /// Test 8: planning a loose-media catalogue is exactly as deterministic
+    /// as an archive-backed one - repeated calls, and calls with reordered
+    /// input, produce identical plan vectors.
+    #[test]
+    fn loose_media_planning_is_deterministic() {
+        let root = temp_dir("loose-media-deterministic");
+        let c128_dir = root.join("c128");
+        let mut records = Vec::new();
+        for (index, name) in [
+            "BurgerWhop!.d64",
+            "Ultima V (Disk 1).g64",
+            "Ultima V (Disk 2).g64",
+            "Yahtzee.d64",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = c128_dir.join(name);
+            write_file(&path, b"bytes");
+            records.push(make_archive(
+                index as i64 + 1,
+                1,
+                &path,
+                Some("Commodore 128"),
+            ));
+        }
+        let destination = root.join("dest");
+        let source = make_source(1, &c128_dir);
+        let view = make_view("view-1", &destination, vec![c128_dir], vec![]);
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan_a = plan_library_view(
+            &view,
+            &records,
+            std::slice::from_ref(&source),
+            &manifest,
+            None,
+        );
+        let mut reversed = records.clone();
+        reversed.reverse();
+        let plan_b = plan_library_view(&view, &reversed, &[source], &manifest, None);
+
+        assert_eq!(plan_a.entries, plan_b.entries);
+        let keys: Vec<PathBuf> = plan_a
+            .entries
+            .iter()
+            .map(|entry| entry.relative_link_path.clone().unwrap_or_default())
+            .collect();
+        let mut sorted_keys = keys.clone();
+        sorted_keys.sort();
+        assert_eq!(keys, sorted_keys);
+    }
+
+    /// Test 9: the RomM profile plans a real `roms/<slug>/<filename>` path
+    /// for a loose-media candidate exactly as it does for an archive-backed
+    /// one - the planner never renamed/wrapped/copied the `.d64` file, and
+    /// slug resolution follows the same override -> cache -> fail-closed
+    /// precedence.
+    #[test]
+    fn romm_profile_plans_a_real_path_for_a_loose_media_candidate() {
+        let root = temp_dir("loose-media-romm-path");
+        let c128_dir = root.join("c128");
+        let d64 = c128_dir.join("BurgerWhop!.d64");
+        write_file(&d64, b"d64-bytes");
+        let destination = root.join("dest");
+
+        let source = make_source(1, &c128_dir);
+        let record = make_archive(1, 1, &d64, Some("Commodore 128"));
+        let view = romm_view_with_override("view-1", &destination, "Commodore 128", "c128");
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(
+            &view,
+            std::slice::from_ref(&record),
+            std::slice::from_ref(&source),
+            &manifest,
+            None,
+        );
+
+        assert_eq!(plan.profile_error, None);
+        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(plan.entries[0].action, LibraryViewPlanAction::Create);
+        assert_eq!(
+            plan.entries[0].relative_link_path,
+            Some(PathBuf::from("roms/c128/BurgerWhop!.d64"))
+        );
+        // The source file itself is untouched - no rename, no wrapper.
+        assert_eq!(fs::read(&d64).unwrap(), b"d64-bytes");
+    }
+
+    // -------------------------------------------------------------------
+    // Hostile-review fix: Apply safety.
+    //
+    // BUG 1 (destination-side symlink escape) - a pre-existing symlinked
+    // ancestor directory under a view's destination root (e.g.
+    // `destination_root/roms` replaced with a symlink pointing outside
+    // `destination_root`, possibly into a source/preservation directory)
+    // must never be silently followed by Create/Repair/RemoveStale/managed-
+    // directory cleanup into a physical write outside the real destination.
+    //
+    // BUG 2 (stale source reproof) - a plan computed from catalogue/
+    // filesystem state that has since changed (target deleted, replaced by
+    // a symlink, or replaced by a different file at the same path) must
+    // never be applied as if it were still true; Create/Repair re-verify
+    // the target immediately before mutating anything.
+    // -------------------------------------------------------------------
+
+    /// Test: a pre-existing symlink at `destination_root/roms` pointing to
+    /// an arbitrary directory outside `destination_root` must refuse Apply
+    /// for every entry that would be created underneath it - nothing may be
+    /// written into the escape target.
+    #[test]
+    fn apply_refuses_to_create_through_a_symlinked_destination_parent() {
+        let root = temp_dir("destination-symlink-escape-create");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Game.zip");
+        write_file(&archive_path, b"zip-bytes");
+        let destination = root.join("dest");
+        fs::create_dir_all(&destination).unwrap();
+        let data_dir = root.join("data");
+
+        // The escape: `dest/roms` is a symlink to a directory entirely
+        // outside the destination root.
+        let outside_dir = root.join("outside");
+        fs::create_dir_all(&outside_dir).unwrap();
+        symlink(&outside_dir, destination.join("roms")).unwrap();
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("NES"));
+        let view = romm_view_with_override("view-escape", &destination, "NES", "nes");
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(
+            &view,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &manifest,
+            None,
+        );
+        assert_eq!(plan.entries[0].action, LibraryViewPlanAction::Create);
+
+        let report = apply_library_view(&view, &plan, &manifest, &data_dir).unwrap();
+        assert_eq!(
+            report.created, 0,
+            "nothing may be created through a symlinked destination parent"
+        );
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.results[0].outcome, LibraryViewApplyOutcome::Failed);
+
+        // Nothing physically appeared under the escape target.
+        assert!(
+            fs::read_dir(&outside_dir).unwrap().next().is_none(),
+            "the escape target must remain completely untouched"
+        );
+    }
+
+    /// Test: the same escape, but the symlink points at a real, separately
+    /// registered source folder - the worst case named by the review. Apply
+    /// must still refuse, and the other source folder must gain nothing.
+    #[test]
+    fn apply_refuses_to_write_into_a_source_folder_through_a_symlinked_destination_parent() {
+        let root = temp_dir("destination-symlink-escape-into-source");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Game.zip");
+        write_file(&archive_path, b"zip-bytes");
+        let other_source_dir = root.join("other-source");
+        fs::create_dir_all(&other_source_dir).unwrap();
+        let destination = root.join("dest");
+        fs::create_dir_all(&destination).unwrap();
+        let data_dir = root.join("data");
+
+        // `dest/roms` points directly into a different, real, registered
+        // source folder.
+        symlink(&other_source_dir, destination.join("roms")).unwrap();
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("NES"));
+        let view = romm_view_with_override("view-escape-source", &destination, "NES", "nes");
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(
+            &view,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &manifest,
+            None,
+        );
+        assert_eq!(plan.entries[0].action, LibraryViewPlanAction::Create);
+
+        let report = apply_library_view(&view, &plan, &manifest, &data_dir).unwrap();
+        assert_eq!(report.created, 0);
+        assert_eq!(report.failed, 1);
+        assert!(
+            fs::read_dir(&other_source_dir).unwrap().next().is_none(),
+            "a source/preservation directory reached only through a destination-side symlink \
+             must never receive a written symlink"
+        );
+    }
+
+    /// Test: RemoveStale must refuse the same escape - a managed directory
+    /// replaced by an outside-pointing symlink after a prior successful
+    /// apply must never have anything removed through it.
+    #[test]
+    fn apply_refuses_to_remove_stale_through_a_symlinked_destination_parent() {
+        let root = temp_dir("destination-symlink-escape-removestale");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Game.zip");
+        write_file(&archive_path, b"zip-bytes");
+        let destination = root.join("dest");
+        let data_dir = root.join("data");
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("NES"));
+        let view = make_view("view-1", &destination, vec![], vec![]);
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(
+            &view,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &manifest,
+            None,
+        );
+        let report = apply_library_view(&view, &plan, &manifest, &data_dir).unwrap();
+        assert_eq!(report.created, 1);
+        let manifest_after_create = load_library_view_manifest_at(&data_dir, &view.id).unwrap();
+
+        // The attack: the managed `NES` directory is replaced with a
+        // symlink pointing outside the destination root, after a real
+        // managed symlink was already recorded underneath the original
+        // (real) directory. The archive is then dropped from the
+        // catalogue, so the next plan wants the recorded entry removed.
+        fs::remove_dir_all(destination.join("NES")).unwrap();
+        let outside_dir = root.join("outside");
+        fs::create_dir_all(&outside_dir).unwrap();
+        fs::write(outside_dir.join("Game.zip"), b"unrelated-outside-file").unwrap();
+        symlink(&outside_dir, destination.join("NES")).unwrap();
+
+        let plan2 = plan_library_view(
+            &view,
+            &[],
+            std::slice::from_ref(&source),
+            &manifest_after_create,
+            None,
+        );
+        assert_eq!(plan2.counts.remove, 1);
+
+        let report2 = apply_library_view(&view, &plan2, &manifest_after_create, &data_dir).unwrap();
+        assert_eq!(
+            report2.removed, 0,
+            "nothing may be removed through a symlinked destination parent"
+        );
+        assert_eq!(report2.failed, 1);
+        assert_eq!(
+            fs::read(outside_dir.join("Game.zip")).unwrap(),
+            b"unrelated-outside-file",
+            "the file reached only through the escape symlink must survive untouched"
+        );
+    }
+
+    /// Test: with no symlinked ancestor anywhere, Create, RemoveStale, and
+    /// managed-directory cleanup all still work exactly as before - the new
+    /// containment check must never reject an ordinary, fully-real
+    /// destination tree.
+    #[test]
+    fn destination_containment_check_does_not_interfere_with_normal_real_directories() {
+        let root = temp_dir("destination-containment-normal");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Game.zip");
+        write_file(&archive_path, b"zip-bytes");
+        let destination = root.join("dest");
+        let data_dir = root.join("data");
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("NES"));
+        let view = make_view("view-normal", &destination, vec![], vec![]);
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(
+            &view,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &manifest,
+            None,
+        );
+        let report = apply_library_view(&view, &plan, &manifest, &data_dir).unwrap();
+        assert_eq!(report.created, 1);
+        assert_eq!(report.failed, 0);
+        let link_path = destination.join("NES").join("Game.zip");
+        assert_eq!(fs::read_link(&link_path).unwrap(), archive_path);
+
+        let manifest_after_create = load_library_view_manifest_at(&data_dir, &view.id).unwrap();
+        let plan2 = plan_library_view(
+            &view,
+            &[],
+            std::slice::from_ref(&source),
+            &manifest_after_create,
+            None,
+        );
+        let report2 = apply_library_view(&view, &plan2, &manifest_after_create, &data_dir).unwrap();
+        assert_eq!(report2.removed, 1);
+        assert_eq!(report2.failed, 0);
+        assert!(!link_path.exists());
+        assert!(!destination.join("NES").exists());
+    }
+
+    /// Test: the source target vanishes after planning, before Apply runs -
+    /// Apply must refuse rather than create a dangling symlink.
+    #[test]
+    fn apply_refuses_to_create_a_link_when_the_target_disappeared_since_planning() {
+        let root = temp_dir("reproof-target-deleted");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Game.zip");
+        write_file(&archive_path, b"zip-bytes");
+        let destination = root.join("dest");
+        let data_dir = root.join("data");
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("NES"));
+        let view = make_view("view-1", &destination, vec![], vec![]);
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(
+            &view,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &manifest,
+            None,
+        );
+        assert_eq!(plan.entries[0].action, LibraryViewPlanAction::Create);
+
+        // Deleted after planning, before Apply.
+        fs::remove_file(&archive_path).unwrap();
+
+        let report = apply_library_view(&view, &plan, &manifest, &data_dir).unwrap();
+        assert_eq!(report.created, 0);
+        assert_eq!(report.failed, 1);
+        assert!(!destination.join("NES").join("Game.zip").exists());
+    }
+
+    /// Test: the source target is replaced by a symlink after planning,
+    /// before Apply runs - Apply must refuse to link to it.
+    #[test]
+    fn apply_refuses_to_link_when_the_target_became_a_symlink_since_planning() {
+        let root = temp_dir("reproof-target-became-symlink");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Game.zip");
+        write_file(&archive_path, b"zip-bytes");
+        let elsewhere = root.join("elsewhere.zip");
+        write_file(&elsewhere, b"elsewhere-bytes");
+        let destination = root.join("dest");
+        let data_dir = root.join("data");
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("NES"));
+        let view = make_view("view-1", &destination, vec![], vec![]);
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(
+            &view,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &manifest,
+            None,
+        );
+        assert_eq!(plan.entries[0].action, LibraryViewPlanAction::Create);
+
+        // Replaced by a symlink after planning, before Apply.
+        fs::remove_file(&archive_path).unwrap();
+        symlink(&elsewhere, &archive_path).unwrap();
+
+        let report = apply_library_view(&view, &plan, &manifest, &data_dir).unwrap();
+        assert_eq!(report.created, 0);
+        assert_eq!(report.failed, 1);
+        assert!(!destination.join("NES").join("Game.zip").exists());
+    }
+
+    /// Test: a different file is written at the exact same path after
+    /// planning - the catalogue's own size:mtime fingerprint no longer
+    /// matches a fresh read, so Apply must fail closed rather than link to
+    /// whatever is there now.
+    #[test]
+    fn apply_refuses_to_link_when_the_target_was_replaced_by_a_different_file_at_the_same_path() {
+        let root = temp_dir("reproof-target-replaced");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Game.zip");
+        write_file(&archive_path, b"zip-bytes");
+        let destination = root.join("dest");
+        let data_dir = root.join("data");
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("NES"));
+        let view = make_view("view-1", &destination, vec![], vec![]);
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(
+            &view,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &manifest,
+            None,
+        );
+        assert_eq!(plan.entries[0].action, LibraryViewPlanAction::Create);
+        assert!(
+            plan.entries[0].archive_identity.is_some(),
+            "the plan must carry a fingerprint for this proof to be meaningful"
+        );
+
+        // A different file, with a different size, replaces the catalogued
+        // one at the exact same path.
+        fs::write(&archive_path, b"a-completely-different-and-longer-payload").unwrap();
+
+        let report = apply_library_view(&view, &plan, &manifest, &data_dir).unwrap();
+        assert_eq!(report.created, 0);
+        assert_eq!(report.failed, 1);
+        assert!(!destination.join("NES").join("Game.zip").exists());
+    }
+
+    /// Control case: an unchanged target between planning and Apply must
+    /// still succeed normally - fresh reproof is not a general slowdown or
+    /// a false-positive source of failures.
+    #[test]
+    fn apply_creates_a_link_when_the_target_is_unchanged_since_planning() {
+        let root = temp_dir("reproof-target-unchanged");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Game.zip");
+        write_file(&archive_path, b"zip-bytes");
+        let destination = root.join("dest");
+        let data_dir = root.join("data");
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("NES"));
+        let view = make_view("view-1", &destination, vec![], vec![]);
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(
+            &view,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &manifest,
+            None,
+        );
+        let report = apply_library_view(&view, &plan, &manifest, &data_dir).unwrap();
+        assert_eq!(report.created, 1);
+        assert_eq!(report.failed, 0);
+        assert_eq!(
+            fs::read_link(destination.join("NES").join("Game.zip")).unwrap(),
+            archive_path
+        );
+    }
+
+    /// Test: Repair must refuse the same destination-side escape as
+    /// Create - a managed directory replaced by an outside-pointing
+    /// symlink after planning already decided the link inside it needs
+    /// repairing.
+    #[test]
+    fn apply_refuses_to_repair_through_a_symlinked_destination_parent() {
+        let root = temp_dir("destination-symlink-escape-repair");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Game.zip");
+        let wrong_target = root.join("wrong-target.zip");
+        write_file(&archive_path, b"zip-bytes");
+        write_file(&wrong_target, b"other-bytes");
+        let destination = root.join("dest");
+        let data_dir = root.join("data");
+        let link_path = destination.join("NES").join("Game.zip");
+        fs::create_dir_all(link_path.parent().unwrap()).unwrap();
+        symlink(&wrong_target, &link_path).unwrap();
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("NES"));
+        let view = make_view("view-1", &destination, vec![], vec![]);
+        let manifest = LibraryViewManifest {
+            view_id: view.id.clone(),
+            destination_root: destination.clone(),
+            entries: vec![LibraryViewManifestEntry {
+                relative_link_path: PathBuf::from("NES/Game.zip"),
+                target_path: wrong_target.clone(),
+                archive_identity: None,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+                platform: "NES".to_string(),
+                source_folder_path: source_dir.clone(),
+                object_kind: LibraryViewObjectKind::Symlink,
+                content_hash: None,
+                rendering_version: None,
+            }],
+            view_fingerprint: None,
+            profile_version: 0,
+            created_directories: Vec::new(),
+        };
+
+        let plan = plan_library_view(
+            &view,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &manifest,
+            None,
+        );
+        assert_eq!(plan.entries[0].action, LibraryViewPlanAction::Repair);
+
+        // Attack: the managed `NES` directory is replaced with a symlink
+        // pointing outside the destination root, after planning already
+        // decided to repair the link inside it.
+        fs::remove_dir_all(destination.join("NES")).unwrap();
+        let outside_dir = root.join("outside");
+        fs::create_dir_all(&outside_dir).unwrap();
+        symlink(&outside_dir, destination.join("NES")).unwrap();
+
+        let report = apply_library_view(&view, &plan, &manifest, &data_dir).unwrap();
+        assert_eq!(
+            report.repaired, 0,
+            "nothing may be repaired through a symlinked destination parent"
+        );
+        assert_eq!(report.failed, 1);
+        assert!(
+            fs::read_dir(&outside_dir).unwrap().next().is_none(),
+            "the escape target must remain completely untouched"
+        );
+    }
+
+    /// Test: `maybe_remove_empty_managed_directories` must never remove a
+    /// real, empty directory reached only by resolving through a
+    /// symlinked *intermediate* ancestor component (`dest/roms` a symlink,
+    /// the removal candidate itself - `dest/roms/c128` - a real directory
+    /// one hop further in). This is the one case the OS's own `rmdir`
+    /// symlink protection does not cover on its own: `rmdir` refuses a
+    /// path whose *final* component is a symlink, but still transparently
+    /// follows a symlink that is merely an intermediate component.
+    #[test]
+    fn maybe_remove_empty_managed_directories_skips_a_directory_reached_through_a_symlinked_ancestor()
+     {
+        let root = temp_dir("cleanup-symlinked-ancestor");
+        let destination = root.join("dest");
+        fs::create_dir_all(&destination).unwrap();
+
+        // A real, empty directory outside the destination root that would
+        // otherwise qualify for removal.
+        let outside_dir = root.join("outside");
+        let outside_target_subdir = outside_dir.join("c128");
+        fs::create_dir_all(&outside_target_subdir).unwrap();
+
+        // `dest/roms` is a symlink to `outside_dir` - the escape. The
+        // removal candidate (`dest/roms/c128`) is reached only by
+        // resolving through it.
+        symlink(&outside_dir, destination.join("roms")).unwrap();
+
+        // A manifest entry naming `roms/c128/...` is enough to seed
+        // `roms/c128` as a cleanup candidate - this function derives
+        // candidates purely from recorded relative paths, never from what
+        // currently exists on disk.
+        let manifest = LibraryViewManifest {
+            view_id: "view-1".to_string(),
+            destination_root: destination.clone(),
+            entries: vec![LibraryViewManifestEntry {
+                relative_link_path: PathBuf::from("roms/c128/Game.d64"),
+                target_path: root.join("source").join("Game.d64"),
+                archive_identity: None,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+                platform: "Commodore 128".to_string(),
+                source_folder_path: root.join("source"),
+                object_kind: LibraryViewObjectKind::Symlink,
+                content_hash: None,
+                rendering_version: None,
+            }],
+            view_fingerprint: None,
+            profile_version: 0,
+            created_directories: Vec::new(),
+        };
+
+        maybe_remove_empty_managed_directories(&destination, &manifest);
+
+        assert!(
+            outside_target_subdir.exists(),
+            "a real directory reached only through a destination-side symlinked ancestor must \
+             never be removed"
+        );
+    }
+
+    /// Test: a two-hop destination-side symlink chain, nested one level
+    /// below the destination root's immediate child (`dest/roms` is a real
+    /// directory; `dest/roms/c128` is a symlink to another symlink, which
+    /// itself points outside the destination root) must still fail closed.
+    /// `fs::canonicalize` resolves an arbitrarily long symlink chain in one
+    /// call, so this proves the containment check is not limited to a
+    /// single hop.
+    #[test]
+    fn apply_refuses_to_create_through_a_nested_destination_symlink_chain() {
+        let root = temp_dir("destination-symlink-chain");
+        let source_dir = root.join("source");
+        let archive_path = source_dir.join("Game.d64");
+        write_file(&archive_path, b"d64-bytes");
+        let destination = root.join("dest");
+        fs::create_dir_all(destination.join("roms")).unwrap();
+        let data_dir = root.join("data");
+
+        let outside_dir = root.join("outside");
+        fs::create_dir_all(&outside_dir).unwrap();
+        let intermediate_link = root.join("intermediate-link");
+        symlink(&outside_dir, &intermediate_link).unwrap();
+        // `dest/roms/c128` -> `intermediate-link` -> `outside_dir`.
+        symlink(&intermediate_link, destination.join("roms").join("c128")).unwrap();
+
+        let source = make_source(1, &source_dir);
+        let archive = make_archive(1, 1, &archive_path, Some("Commodore 128"));
+        let view = romm_view_with_override("view-chain", &destination, "Commodore 128", "c128");
+        let manifest = empty_manifest(&view.id, &destination);
+
+        let plan = plan_library_view(
+            &view,
+            std::slice::from_ref(&archive),
+            std::slice::from_ref(&source),
+            &manifest,
+            None,
+        );
+        assert_eq!(plan.entries[0].action, LibraryViewPlanAction::Create);
+
+        let report = apply_library_view(&view, &plan, &manifest, &data_dir).unwrap();
+        assert_eq!(
+            report.created, 0,
+            "nothing may be created through a nested destination symlink chain"
+        );
+        assert_eq!(report.failed, 1);
+        assert!(
+            fs::read_dir(&outside_dir).unwrap().next().is_none(),
+            "the escape target must remain completely untouched"
         );
     }
 }

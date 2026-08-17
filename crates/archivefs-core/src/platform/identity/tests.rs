@@ -394,3 +394,51 @@ fn future_romm_directory_slug_comes_from_imported_canonical_mapping() {
     assert_eq!(cache.romm_slug_for_platform("PSP"), Some("psp"));
     assert_eq!(cache.romm_slug_for_platform("not-a-platform"), None);
 }
+
+/// Builds a minimal identity cache whose `platforms` list is exactly the
+/// given `(provider_slug, canonical)` pairs, for exercising
+/// `romm_slug_for_platform`'s ambiguity handling directly.
+fn cache_with_platforms(platforms: Vec<(&str, Option<&str>)>) -> IdentityCache {
+    IdentityCache {
+        format_version: CACHE_FORMAT_VERSION,
+        provider: IdentityProvider::Romm,
+        server_id: "https://romm.example".to_string(),
+        server_version: None,
+        source_fingerprint: "fixture".to_string(),
+        imported_at_unix_seconds: 1,
+        platforms: platforms
+            .into_iter()
+            .enumerate()
+            .map(|(index, (slug, canonical))| NormalisedPlatform {
+                provider_platform_id: Some(index.to_string()),
+                provider_slug: slug.to_string(),
+                provider_name: None,
+                canonical: canonical.map(str::to_string),
+                rom_count: Some(1),
+            })
+            .collect(),
+        records: Vec::new(),
+        rejected_hashes: Vec::new(),
+        unknown_platforms: Vec::new(),
+        server_reported_total: Some(0),
+    }
+}
+
+#[test]
+fn romm_slug_for_platform_fails_closed_on_ambiguous_mapping() {
+    // A single distinct slug resolves.
+    let cache = cache_with_platforms(vec![("nes", Some("NES"))]);
+    assert_eq!(cache.romm_slug_for_platform("NES"), Some("nes"));
+
+    // Duplicate identical entries collapse to one and still resolve.
+    let cache = cache_with_platforms(vec![("nes", Some("NES")), ("nes", Some("NES"))]);
+    assert_eq!(cache.romm_slug_for_platform("NES"), Some("nes"));
+
+    // Two distinct slugs for one canonical platform are ambiguous.
+    let cache = cache_with_platforms(vec![("fds", Some("NES")), ("nes", Some("NES"))]);
+    assert_eq!(cache.romm_slug_for_platform("NES"), None);
+
+    // Zero matching slugs is unresolved.
+    let cache = cache_with_platforms(vec![("psp", Some("PSP"))]);
+    assert_eq!(cache.romm_slug_for_platform("NES"), None);
+}

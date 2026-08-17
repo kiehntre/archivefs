@@ -53,18 +53,23 @@ pub mod game_identity;
 
 mod library_views;
 pub use library_views::{
+    FrontendPlatformMapping, FrontendProfile, FrontendProfileKind, FrontendProfilePolicy,
     LibraryViewApplyEntryResult, LibraryViewApplyOutcome, LibraryViewApplyReport,
-    LibraryViewConfig, LibraryViewLayoutTemplate, LibraryViewManifest, LibraryViewManifestEntry,
-    LibraryViewPlan, LibraryViewPlanAction, LibraryViewPlanCounts, LibraryViewPlanEntry,
-    add_library_view_default, apply_library_view, apply_library_view_default,
-    default_library_views_config_path, default_library_views_data_dir, edit_library_view_default,
-    generate_library_view_id, generate_relative_link_path, library_view_manifest_path,
-    load_library_view_configs_default, load_library_view_configs_from,
-    load_library_view_manifest_at, load_library_view_manifest_default, plan_library_view,
-    preview_library_view_default, remove_library_view_default, remove_library_view_symlinks,
-    repair_library_view, repair_library_view_default, resolve_library_view_identifier,
-    save_library_view_configs_default, save_library_view_configs_to,
-    set_library_view_enabled_default, validate_library_view_destination,
+    LibraryViewConfig, LibraryViewGeneratedFilePlan, LibraryViewLayoutTemplate,
+    LibraryViewManifest, LibraryViewManifestEntry, LibraryViewObjectClassification,
+    LibraryViewObjectKind, LibraryViewPlan, LibraryViewPlanAction, LibraryViewPlanCounts,
+    LibraryViewPlanEntry, MultidiscHandlingPolicy, SymlinkTargetStrategy, TitleSelectionPolicy,
+    VariantHandlingPolicy, add_library_view_default, apply_library_view,
+    apply_library_view_default, classify_library_view_object, compute_view_profile_fingerprint,
+    default_library_views_config_path, default_library_views_data_dir, derive_view_filename,
+    edit_library_view_default, generate_library_view_id, generate_relative_link_path,
+    library_view_manifest_path, load_library_view_configs_default, load_library_view_configs_from,
+    load_library_view_manifest_at, load_library_view_manifest_default, plan_generated_file,
+    plan_library_view, preview_library_view_default, remove_library_view_default,
+    remove_library_view_symlinks, repair_library_view, repair_library_view_default,
+    resolve_library_view_identifier, resolve_romm_platform_slug, save_library_view_configs_default,
+    save_library_view_configs_to, set_library_view_enabled_default,
+    validate_library_view_destination,
 };
 
 /// The single authoritative platform registry and the evidence-based
@@ -94,6 +99,7 @@ pub mod repair;
 
 pub mod safe_read;
 
+pub mod media_registry;
 pub mod platform;
 
 /// Explicit, offline management of user-owned platform artwork overrides.
@@ -3301,31 +3307,19 @@ pub fn archive_kind(path: impl AsRef<Path>) -> Option<ArchiveKind> {
         return None;
     }
 
-    if filename.ends_with(".zip") {
-        Some(ArchiveKind::Zip)
-    } else if filename.ends_with(".7z") {
-        Some(ArchiveKind::SevenZip)
-    } else if filename.ends_with(".rar") {
-        Some(ArchiveKind::Rar)
-    } else if filename.ends_with(".smd") {
-        // `.smd` is a Super Magic Drive dump: Mega Drive specific, so it needs
-        // no corroboration.
-        //
-        // `.gen` deliberately does NOT appear here. It collides with Sierra
-        // SCI `RESOURCE.GEN` files, which every ScummVM game directory
-        // contains, and classifying one of those as a Mega Drive ROM is
-        // exactly the misdetection this milestone fixes. A `.gen` file is
-        // recognised as a Mega Drive ROM only once something corroborates it -
-        // see `archive_kind_in_root`.
-        Some(ArchiveKind::MegaDriveRom)
-    } else if [".iso", ".gcm", ".gcz", ".rvz", ".wbfs", ".ciso"]
-        .iter()
-        .any(|extension| filename.ends_with(extension))
-    {
-        Some(ArchiveKind::DirectGameImage)
-    } else {
-        None
-    }
+    // `.gen` deliberately never resolves here, even though it would collide
+    // with Mega Drive dumps: it also collides with Sierra SCI
+    // `RESOURCE.GEN` files, which every ScummVM game directory contains,
+    // and classifying one of those as a Mega Drive ROM is exactly the
+    // misdetection an earlier milestone fixed. A `.gen` (or `.md`/`.bin`)
+    // file is recognised as a Mega Drive ROM only once folder, source-root,
+    // or cartridge-header evidence corroborates it - see
+    // `archive_kind_in_root`. Every extension below is, by contrast,
+    // self-evidencing: the media registry is the single source of truth
+    // for it, shared with the filesystem watcher (`media_registry::
+    // is_watch_relevant_extension`) so the two can never drift apart again.
+    let extension = Path::new(&filename).extension()?.to_str()?;
+    media_registry::kind_for_extension(extension)
 }
 
 pub(crate) fn archive_kind_in_root(path: &Path, source_root: &Path) -> Option<ArchiveKind> {
@@ -3333,7 +3327,7 @@ pub(crate) fn archive_kind_in_root(path: &Path, source_root: &Path) -> Option<Ar
         return Some(kind);
     }
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
-    if !matches!(extension.as_str(), "md" | "bin" | "gen") {
+    if !media_registry::is_corroboration_candidate(&extension) {
         return None;
     }
     // Corroboration, in the same priority order detection uses everywhere:
@@ -4449,11 +4443,81 @@ pub struct ArchiveScanner<'a> {
     config: &'a Config,
 }
 
+/// The maximum number of individual [`SkippedFile`] entries
+/// [`ArchiveScanDiscovery::skipped_files`] retains, regardless of how many
+/// files a scan actually skips. The aggregate counters
+/// (`skipped_unsupported_extension`/`skipped_ambiguous_platform`) always
+/// reflect the *entire* scan; `skipped_files` is a bounded, best-effort
+/// sample of that total for GUI drill-down, never a second source of truth
+/// for the count - see [`ArchiveScanDiscovery::skipped_files_truncated`].
+pub const MAX_RETAINED_SKIPPED_FILES: usize = 1000;
+
+/// Why one file was skipped during a scan - see
+/// [`ArchiveScanner::scan_source`]'s two skip branches, which are the only
+/// two ways a file is ever skipped today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SkipReason {
+    /// No extension the media registry recognises at all -
+    /// `media_registry::is_recognized_extension` returned `false` and the
+    /// extension is not one of the Mega Drive corroboration candidates
+    /// either.
+    UnsupportedExtension,
+    /// The extension is shared with `MegaDriveRom` (`.md`/`.bin`/`.gen`) but
+    /// no folder, source-root, or cartridge-header evidence corroborated it,
+    /// see `archive_kind_in_root`. A genuinely different, unrelated file
+    /// that merely shares one of these three extensions (for example a
+    /// ScummVM `RESOURCE.GEN`) is reported this way, not as unsupported.
+    AmbiguousPlatform,
+}
+
+impl SkipReason {
+    /// A short, human-readable label - what a GUI shows for this reason.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::UnsupportedExtension => "Unsupported extension",
+            Self::AmbiguousPlatform => "Ambiguous platform",
+        }
+    }
+}
+
+/// One skipped file's identity and reason - part of the bounded,
+/// best-effort sample [`ArchiveScanDiscovery::skipped_files`] retains for
+/// GUI drill-down. Never itself a classification decision: recording (or
+/// failing to record, once the bound is reached) a file here changes
+/// nothing about whether it was skipped or why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedFile {
+    pub path: PathBuf,
+    pub reason: SkipReason,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ArchiveScanDiscovery {
     pub archives: Vec<Archive>,
     pub skipped_unsupported_extension: usize,
     pub skipped_ambiguous_platform: usize,
+    /// A bounded (see [`MAX_RETAINED_SKIPPED_FILES`]) sample of individual
+    /// skipped files, for GUI drill-down. The exact totals always live in
+    /// `skipped_unsupported_extension`/`skipped_ambiguous_platform` - this
+    /// list is explanatory detail on top of those counts, never a
+    /// replacement for them; call [`Self::skipped_files_truncated`] before
+    /// presenting it as complete.
+    pub skipped_files: Vec<SkippedFile>,
+}
+
+impl ArchiveScanDiscovery {
+    /// The exact total skipped count across both reasons - always accurate,
+    /// regardless of how much detail `skipped_files` retains.
+    pub fn total_skipped(&self) -> usize {
+        self.skipped_unsupported_extension + self.skipped_ambiguous_platform
+    }
+
+    /// Whether `skipped_files` is a truncated sample of the full skip
+    /// count - true whenever more files were skipped in total than
+    /// [`MAX_RETAINED_SKIPPED_FILES`] retains detail for.
+    pub fn skipped_files_truncated(&self) -> bool {
+        self.total_skipped() > self.skipped_files.len()
+    }
 }
 
 impl<'a> ArchiveScanner<'a> {
@@ -4625,13 +4689,25 @@ impl<'a> ArchiveScanner<'a> {
                     // or a cartridge header corroborates them, so one that was
                     // skipped was skipped for an ambiguous platform - not
                     // because the extension is unsupported.
-                    if extension
+                    let reason = if extension
                         .as_deref()
                         .is_some_and(|value| matches!(value, "md" | "bin" | "gen"))
                     {
                         discovery.skipped_ambiguous_platform += 1;
+                        SkipReason::AmbiguousPlatform
                     } else {
                         discovery.skipped_unsupported_extension += 1;
+                        SkipReason::UnsupportedExtension
+                    };
+                    // Bounded: the counters above always stay exact for the
+                    // whole scan, but the retained detail list never grows
+                    // past `MAX_RETAINED_SKIPPED_FILES` - see
+                    // `ArchiveScanDiscovery::skipped_files_truncated`.
+                    if discovery.skipped_files.len() < MAX_RETAINED_SKIPPED_FILES {
+                        discovery.skipped_files.push(SkippedFile {
+                            path: path.clone(),
+                            reason,
+                        });
                     }
                 }
             }
@@ -5159,11 +5235,13 @@ fn archive_title(path: &Path) -> String {
         return filename[..filename.len() - suffix_len + 1 - part_digits].to_string();
     }
 
-    for extension in [
-        ".zip", ".7z", ".rar", ".iso", ".gcm", ".gcz", ".rvz", ".wbfs", ".ciso",
-    ] {
-        if lower.ends_with(extension) {
-            return filename[..filename.len() - extension.len()].to_string();
+    // Registry-backed, so a newly recognised media format never needs a
+    // second hardcoded extension list to strip its own suffix - see
+    // `media_registry`.
+    for format in media_registry::MEDIA_FORMATS {
+        let dotted_extension = format!(".{}", format.extension);
+        if lower.ends_with(&dotted_extension) {
+            return filename[..filename.len() - dotted_extension.len()].to_string();
         }
     }
 
@@ -5551,14 +5629,13 @@ fn watch_path_is_supported_archive(path: &Path) -> bool {
         return false;
     }
 
+    // Delegates to the same media registry `archive_kind` consults, so
+    // scanning and watching can never independently drift out of sync
+    // again - see `media_registry`.
     let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
         return false;
     };
-
-    matches!(
-        extension.to_ascii_lowercase().as_str(),
-        "zip" | "rar" | "7z" | "iso" | "md" | "gen" | "smd" | "bin"
-    )
+    media_registry::is_watch_relevant_extension(&extension.to_ascii_lowercase())
 }
 
 pub fn is_temporary_or_incomplete_path(path: impl AsRef<Path>) -> bool {
@@ -7444,6 +7521,493 @@ mod tests {
                 && archive.identity.platform_provenance == Some(PlatformProvenance::FolderAlias)
         }));
         let _ = fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// Test 1/2/3 (loose Commodore media milestone): `.d64` and `.g64`
+    /// under a `c128`-aliased folder are discovered as
+    /// `ArchiveKind::DirectGameImage`, assigned `Commodore 128` by the same
+    /// folder-alias heuristic every other platform already uses, while
+    /// `images/`, `videos/`, and `gamelist.xml` - none of them a
+    /// recognised extension - are never discovered as candidates at all.
+    #[test]
+    fn loose_c128_d64_and_g64_are_discovered_but_companion_assets_are_not() {
+        let root = test_root("loose-c128-media").join("c128");
+        fs::create_dir_all(root.join("images")).unwrap();
+        fs::create_dir_all(root.join("videos")).unwrap();
+        fs::write(root.join("BurgerWhop!.d64"), vec![0_u8; 174_848]).unwrap();
+        fs::write(
+            root.join("Ultima V - Warriors of Destiny(Disk 1 of 4 Side A)(Main).g64"),
+            vec![0_u8; 278_234],
+        )
+        .unwrap();
+        fs::write(root.join("gamelist.xml"), b"<gameList/>").unwrap();
+        fs::write(
+            root.join("images").join("BurgerWhop-boxart.png"),
+            b"png fixture",
+        )
+        .unwrap();
+        fs::write(
+            root.join("videos").join("BurgerWhop-video.mp4"),
+            b"mp4 fixture",
+        )
+        .unwrap();
+
+        let config = Config {
+            source_folders: vec![root.clone()],
+            mount_root: root.join("mount"),
+            ratarmount_bin: "ratarmount".into(),
+            master_rom_root: None,
+        };
+        let discovery = ArchiveScanner::new(&config)
+            .scan_archives_with_summary()
+            .unwrap();
+
+        assert_eq!(
+            discovery.archives.len(),
+            2,
+            "only the two recognised loose disk images may be discovered - got {:?}",
+            discovery
+                .archives
+                .iter()
+                .map(|archive| archive.path.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            discovery
+                .archives
+                .iter()
+                .all(|archive| archive.kind == ArchiveKind::DirectGameImage),
+            "loose Commodore media is catalogued directly, never wrapped or copied"
+        );
+        assert!(
+            discovery
+                .archives
+                .iter()
+                .all(|archive| archive.identity.platform.as_deref() == Some("Commodore 128")),
+            "the `c128` folder alias must resolve both `.d64` and `.g64` to Commodore 128, \
+             exactly like every other weak/shared extension already does"
+        );
+        assert!(
+            discovery
+                .archives
+                .iter()
+                .any(|archive| archive.path.ends_with("BurgerWhop!.d64"))
+        );
+        assert!(discovery.archives.iter().any(|archive| {
+            archive
+                .path
+                .ends_with("Ultima V - Warriors of Destiny(Disk 1 of 4 Side A)(Main).g64")
+        }));
+        assert!(
+            discovery.archives.iter().all(|archive| !archive
+                .path
+                .to_string_lossy()
+                .contains("images")
+                && !archive.path.to_string_lossy().contains("videos")
+                && !archive.path.ends_with("gamelist.xml")),
+            "images/, videos/, and gamelist.xml must never become candidates"
+        );
+        assert_eq!(
+            discovery.skipped_unsupported_extension, 3,
+            "gamelist.xml, the .png, and the .mp4 are each an unsupported extension - counted, \
+             never silently dropped"
+        );
+        assert_eq!(discovery.skipped_ambiguous_platform, 0);
+        // The same three files must also appear as individual skipped-file
+        // detail, each with the unsupported-extension reason and its own
+        // path - see the "Skipped files / why-skipped UI" milestone.
+        assert_eq!(discovery.skipped_files.len(), 3);
+        assert!(
+            discovery
+                .skipped_files
+                .iter()
+                .all(|item| item.reason == SkipReason::UnsupportedExtension)
+        );
+        assert!(
+            discovery
+                .skipped_files
+                .iter()
+                .any(|item| item.path.ends_with("gamelist.xml"))
+        );
+        assert!(!discovery.skipped_files_truncated());
+
+        let _ = fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    // -------------------------------------------------------------------
+    // Skipped-files detail (`SkippedFile`/`SkipReason`) - the "Skipped
+    // files / why-skipped UI" milestone.
+    // -------------------------------------------------------------------
+
+    /// Test: an unsupported-extension file produces a `SkippedFile` detail
+    /// entry with the exact right reason and path.
+    #[test]
+    fn unsupported_extension_produces_a_skipped_file_detail_entry() {
+        let root = test_root("skipped-detail-unsupported");
+        fs::create_dir_all(&root).unwrap();
+        let boxart = root.join("boxart.png");
+        fs::write(&boxart, b"not a rom").unwrap();
+
+        let config = Config {
+            source_folders: vec![root.clone()],
+            mount_root: root.join("mount"),
+            ratarmount_bin: "ratarmount".into(),
+            master_rom_root: None,
+        };
+        let discovery = ArchiveScanner::new(&config)
+            .scan_archives_with_summary()
+            .unwrap();
+
+        assert_eq!(discovery.skipped_unsupported_extension, 1);
+        assert_eq!(discovery.skipped_files.len(), 1);
+        assert_eq!(discovery.skipped_files[0].path, boxart);
+        assert_eq!(
+            discovery.skipped_files[0].reason,
+            SkipReason::UnsupportedExtension
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Test: an uncorroborated `.gen` (shared with Mega Drive, but with no
+    /// folder/source/header evidence here) produces a `SkippedFile` detail
+    /// entry with the ambiguous-platform reason, not unsupported-extension.
+    #[test]
+    fn ambiguous_platform_produces_a_skipped_file_detail_entry() {
+        let root = test_root("skipped-detail-ambiguous");
+        fs::create_dir_all(&root).unwrap();
+        let resource = root.join("RESOURCE.GEN");
+        fs::write(&resource, b"scummvm resource, not a rom").unwrap();
+
+        let config = Config {
+            source_folders: vec![root.clone()],
+            mount_root: root.join("mount"),
+            ratarmount_bin: "ratarmount".into(),
+            master_rom_root: None,
+        };
+        let discovery = ArchiveScanner::new(&config)
+            .scan_archives_with_summary()
+            .unwrap();
+
+        assert_eq!(discovery.skipped_ambiguous_platform, 1);
+        assert_eq!(discovery.skipped_unsupported_extension, 0);
+        assert_eq!(discovery.skipped_files.len(), 1);
+        assert_eq!(discovery.skipped_files[0].path, resource);
+        assert_eq!(
+            discovery.skipped_files[0].reason,
+            SkipReason::AmbiguousPlatform
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Test: a recognised archive produces no skipped-file detail at all -
+    /// explaining skips must never mention something that was not, in
+    /// fact, skipped.
+    #[test]
+    fn recognized_file_produces_no_skipped_detail() {
+        let root = test_root("skipped-detail-recognized");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("Sonic.zip"), b"zip bytes").unwrap();
+
+        let config = Config {
+            source_folders: vec![root.clone()],
+            mount_root: root.join("mount"),
+            ratarmount_bin: "ratarmount".into(),
+            master_rom_root: None,
+        };
+        let discovery = ArchiveScanner::new(&config)
+            .scan_archives_with_summary()
+            .unwrap();
+
+        assert_eq!(discovery.archives.len(), 1);
+        assert!(discovery.skipped_files.is_empty());
+        assert_eq!(discovery.total_skipped(), 0);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Test: the aggregate counters stay exact for the *entire* scan even
+    /// when the retained detail list is capped at
+    /// `MAX_RETAINED_SKIPPED_FILES` - the count is never derived from
+    /// `skipped_files.len()`, and truncation is reported honestly rather
+    /// than the list silently pretending to be complete.
+    #[test]
+    fn aggregate_counters_remain_exact_when_the_detail_list_is_capped() {
+        let root = test_root("skipped-detail-capped");
+        fs::create_dir_all(&root).unwrap();
+        let extra = 5;
+        let total_unsupported = MAX_RETAINED_SKIPPED_FILES + extra;
+        for index in 0..total_unsupported {
+            fs::write(root.join(format!("junk-{index:05}.xyz")), b"").unwrap();
+        }
+
+        let config = Config {
+            source_folders: vec![root.clone()],
+            mount_root: root.join("mount"),
+            ratarmount_bin: "ratarmount".into(),
+            master_rom_root: None,
+        };
+        let discovery = ArchiveScanner::new(&config)
+            .scan_archives_with_summary()
+            .unwrap();
+
+        assert_eq!(
+            discovery.skipped_unsupported_extension, total_unsupported,
+            "the exact aggregate count must reflect every skipped file, capped detail or not"
+        );
+        assert_eq!(discovery.total_skipped(), total_unsupported);
+        assert_eq!(
+            discovery.skipped_files.len(),
+            MAX_RETAINED_SKIPPED_FILES,
+            "the retained detail list must never grow past the bound"
+        );
+        assert!(discovery.skipped_files_truncated());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Test: no skipped file is ever recorded twice in `skipped_files`,
+    /// whether or not it shares its skip reason with others in the same
+    /// scan.
+    #[test]
+    fn no_duplicate_skipped_entries() {
+        let root = test_root("skipped-detail-no-duplicates");
+        fs::create_dir_all(&root).unwrap();
+        for name in ["a.png", "b.jpg", "c.xyz"] {
+            fs::write(root.join(name), b"").unwrap();
+        }
+        for name in ["d.gen", "e.bin"] {
+            fs::write(root.join(name), b"").unwrap();
+        }
+
+        let config = Config {
+            source_folders: vec![root.clone()],
+            mount_root: root.join("mount"),
+            ratarmount_bin: "ratarmount".into(),
+            master_rom_root: None,
+        };
+        let discovery = ArchiveScanner::new(&config)
+            .scan_archives_with_summary()
+            .unwrap();
+
+        assert_eq!(discovery.skipped_files.len(), 5);
+        let unique: std::collections::HashSet<&Path> = discovery
+            .skipped_files
+            .iter()
+            .map(|item| item.path.as_path())
+            .collect();
+        assert_eq!(unique.len(), discovery.skipped_files.len());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Media/platform-responsibility review: `.g64` is strong extension
+    /// evidence for Commodore 64 and only weak evidence for Commodore 128
+    /// (see `platform::PLATFORMS`) - a real, standing conflict between the
+    /// two platforms' own extension tables. Folder-alias evidence must
+    /// still win over that conflicting strong extension, exactly as it
+    /// already does for every other weak/shared extension: the media
+    /// registry only ever decides "this is recognised media"; which
+    /// platform it belongs to is entirely `detect_platform_with_provenance`'s
+    /// folder-alias-first precedence, unchanged by this work.
+    #[test]
+    fn folder_alias_wins_over_conflicting_strong_extension_for_g64_in_c128_folder() {
+        let root = test_root("g64-folder-alias-precedence").join("c128");
+        fs::create_dir_all(&root).unwrap();
+        let g64 = root.join("Ultima V.g64");
+        fs::write(&g64, vec![0_u8; 1024]).unwrap();
+
+        let archive = Archive::from_path_in_root(&g64, &root).unwrap();
+        assert_eq!(archive.kind, ArchiveKind::DirectGameImage);
+        assert_eq!(
+            archive.identity.platform.as_deref(),
+            Some("Commodore 128"),
+            "a `c128`-aliased folder must resolve `.g64` to Commodore 128, not Commodore 64, \
+             even though `.g64` is C64's own strong extension"
+        );
+        assert_eq!(
+            archive.identity.platform_provenance,
+            Some(PlatformProvenance::FolderAlias)
+        );
+
+        let _ = fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// Platform-safety review: `.chd` (like `.d64`/`.g64`) is deliberately
+    /// never strong evidence for any single platform on its own - it is
+    /// shared across Neo Geo CD, Sega CD, arcade sets, and more. A `.chd`
+    /// with no corroborating folder/source/header evidence must resolve no
+    /// platform at all, never default to any one of the platforms that
+    /// merely lists it as weak evidence.
+    #[test]
+    fn a_bare_chd_with_no_corroborating_evidence_resolves_no_platform() {
+        let root = test_root("chd-no-corroboration").join("random");
+        fs::create_dir_all(&root).unwrap();
+        let chd = root.join("Game.chd");
+        fs::write(&chd, vec![0_u8; 1024]).unwrap();
+
+        let archive = Archive::from_path_in_root(&chd, &root).unwrap();
+        assert_eq!(archive.kind, ArchiveKind::DirectGameImage);
+        assert_eq!(
+            archive.identity.platform, None,
+            "a `.chd` outside any recognised folder must never be assumed to be Neo Geo CD \
+             (or any other platform) by extension alone"
+        );
+
+        let _ = fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// The mirror case: a `neogeocd`-aliased folder still resolves `.chd`
+    /// to Neo Geo CD, exactly like every other weak/shared extension.
+    #[test]
+    fn chd_resolves_neo_geo_cd_when_folder_evidence_corroborates_it() {
+        let root = test_root("chd-neogeocd-folder-alias").join("neogeocd");
+        fs::create_dir_all(&root).unwrap();
+        let chd = root.join("Metal Slug.chd");
+        fs::write(&chd, vec![0_u8; 1024]).unwrap();
+
+        let archive = Archive::from_path_in_root(&chd, &root).unwrap();
+        assert_eq!(archive.identity.platform.as_deref(), Some("Neo Geo CD"));
+        assert_eq!(
+            archive.identity.platform_provenance,
+            Some(PlatformProvenance::FolderAlias)
+        );
+
+        let _ = fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// Real-world-surfaced regression: `neocdz` (the actual MAME driver
+    /// name, and what several real Neo Geo CD collections/frontends use as
+    /// a folder name) must resolve `.chd` to Neo Geo CD via folder-alias
+    /// evidence, exactly like `neogeocd`/`snkneogeocd`/`ngcd` already do.
+    /// The companion case in the same test proves this is still genuine
+    /// folder-alias corroboration, not a relaxation of CHD's ambiguity: a
+    /// `.chd` in an unrelated folder must remain unresolved.
+    #[test]
+    fn neocdz_folder_alias_resolves_chd_to_neo_geo_cd_while_an_unknown_folder_stays_unresolved() {
+        let root = test_root("chd-neocdz-folder-alias").join("neocdz");
+        fs::create_dir_all(&root).unwrap();
+        let chd = root.join("2020 Super Baseball (World).chd");
+        fs::write(&chd, vec![0_u8; 1024]).unwrap();
+
+        let archive = Archive::from_path_in_root(&chd, &root).unwrap();
+        assert_eq!(archive.kind, ArchiveKind::DirectGameImage);
+        assert_eq!(archive.identity.platform.as_deref(), Some("Neo Geo CD"));
+        assert_eq!(
+            archive.identity.platform_provenance,
+            Some(PlatformProvenance::FolderAlias)
+        );
+
+        let unknown_root = test_root("chd-neocdz-folder-alias").join("some-other-folder");
+        fs::create_dir_all(&unknown_root).unwrap();
+        let unknown_chd = unknown_root.join("Game.chd");
+        fs::write(&unknown_chd, vec![0_u8; 1024]).unwrap();
+        let unknown_archive = Archive::from_path_in_root(&unknown_chd, &unknown_root).unwrap();
+        assert_eq!(
+            unknown_archive.identity.platform, None,
+            "`.chd` must stay unresolved outside a recognised folder - the fix only adds a \
+             folder alias, it never makes `.chd` sufficient platform identity on its own"
+        );
+
+        let _ = fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn archive_kind_recognizes_loose_commodore_disk_images() {
+        assert_eq!(
+            archive_kind(Path::new("BurgerWhop!.d64")),
+            Some(ArchiveKind::DirectGameImage)
+        );
+        assert_eq!(
+            archive_kind(Path::new("Ultima V.g64")),
+            Some(ArchiveKind::DirectGameImage)
+        );
+        assert_eq!(
+            archive_kind(Path::new("BurgerWhop!.D64")),
+            Some(ArchiveKind::DirectGameImage)
+        );
+        // Existing archive-format recognition is unaffected by this addition.
+        assert_eq!(archive_kind(Path::new("Sonic.zip")), Some(ArchiveKind::Zip));
+        assert_eq!(archive_kind(Path::new("gamelist.xml")), None);
+        assert_eq!(archive_kind(Path::new("boxart.png")), None);
+    }
+
+    #[test]
+    fn archive_title_strips_loose_commodore_disk_image_extensions() {
+        assert_eq!(archive_title(Path::new("BurgerWhop!.d64")), "BurgerWhop!");
+        assert_eq!(
+            archive_title(Path::new(
+                "Ultima V - Warriors of Destiny(Disk 1 of 4 Side A)(Main).g64"
+            )),
+            "Ultima V - Warriors of Destiny(Disk 1 of 4 Side A)(Main)"
+        );
+        // Existing archive-format title stripping is unaffected.
+        assert_eq!(archive_title(Path::new("Sonic.zip")), "Sonic");
+    }
+
+    // -------------------------------------------------------------------
+    // Media-registry review follow-up: CHD recognition/title handling and
+    // scan/watch parity.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn archive_kind_recognizes_chd() {
+        assert_eq!(
+            archive_kind(Path::new("Metal Slug.chd")),
+            Some(ArchiveKind::DirectGameImage)
+        );
+        assert_eq!(
+            archive_kind(Path::new("Metal Slug.CHD")),
+            Some(ArchiveKind::DirectGameImage)
+        );
+    }
+
+    #[test]
+    fn archive_title_strips_chd_extension() {
+        // Registry-backed title stripping (see `media_registry`): a newly
+        // registered format must never need its own second hardcoded
+        // extension list here to have its suffix stripped.
+        assert_eq!(archive_title(Path::new("Metal Slug.chd")), "Metal Slug");
+        assert_ne!(archive_title(Path::new("Metal Slug.chd")), "Metal Slug.chd");
+    }
+
+    #[test]
+    fn scan_and_watch_recognize_exactly_the_same_media_registry_extensions() {
+        // Every extension `archive_kind` (scanning) recognises on its own
+        // must also be watch-relevant, and vice versa for anything the
+        // watcher does not additionally treat as a Mega Drive corroboration
+        // candidate - both must derive from `media_registry`, never two
+        // independently maintained lists.
+        for format in media_registry::MEDIA_FORMATS {
+            let dotted = format!("Game.{}", format.extension);
+            assert_eq!(
+                archive_kind(Path::new(&dotted)),
+                Some(format.kind),
+                "archive_kind must recognise `.{}`",
+                format.extension
+            );
+            assert!(
+                watch_path_is_supported_archive(Path::new(&format!("/roms/{dotted}"))),
+                "the watcher must recognise `.{}` - previously gcz/rvz/wbfs/ciso/d64/g64/chd \
+                 were missing from its own separate, stale extension list",
+                format.extension
+            );
+        }
+    }
+
+    #[test]
+    fn watch_closes_the_previously_missing_direct_image_extension_gaps() {
+        // These four extensions were already recognised by `archive_kind`
+        // (scanning) before this change, but were absent from the
+        // watcher's own separate hardcoded list - a real scan/watch
+        // disagreement this change closes.
+        for extension in ["gcz", "rvz", "wbfs", "ciso"] {
+            assert!(
+                watch_path_is_supported_archive(Path::new(&format!("/roms/Game.{extension}"))),
+                "the watcher must recognise `.{extension}`"
+            );
+        }
     }
 
     #[test]

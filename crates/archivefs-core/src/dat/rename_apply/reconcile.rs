@@ -22,7 +22,7 @@ use std::path::Path;
 
 use super::identity::{capture_identity, identity_matches};
 use super::journal::write_journal;
-use super::model::{EntryState, RenameTransaction, TransactionEntry};
+use super::model::{EntryState, RenameTransaction, TransactionEntry, TransactionState};
 
 /// Why an in-flight entry could not be cleanly classified, or what it was
 /// reconciled to.
@@ -117,10 +117,52 @@ pub fn reconcile_recovery(
         issues.push(issue);
     }
 
+    changed |= reconcile_transaction_level_state(transaction);
+
     if changed {
         write_journal(journal_dir, transaction).map_err(|error| error.to_string())?;
     }
     Ok(issues)
+}
+
+/// Repairs a transaction-level `state` left stuck at `Applying` by a final
+/// journal write that never landed, even though every entry's own (already
+/// durable, and by this point already entry-reconciled) state proves the
+/// batch actually finished.
+///
+/// [`super::executor::apply_transaction`] durably checkpoints `Applying`
+/// before its per-entry loop, then - unconditionally, as the very next
+/// statement once the loop ends with no failure - bumps `transaction.state`
+/// to `Applied` and writes that. Every *failure* branch inside that loop
+/// instead sets `transaction.state = ApplyFailed` and writes it in the same
+/// synchronous step as the entry's own failed state, so a durably observed
+/// entry failure is always paired with a durably observed `ApplyFailed` at
+/// the transaction level - the two can never disagree. That leaves exactly
+/// one way for `transaction.state` to still read `Applying` once every
+/// entry has settled: the final unconditional write above ran and (for
+/// whatever reason - a transient I/O failure) did not persist. This
+/// reconstructs the outcome that final write was always going to record,
+/// using the same "every entry settled cleanly" rule the executor itself
+/// already relies on - never a new state machine, never a guess.
+///
+/// Fails closed: an entry left in any state other than `Applied`/`Skipped`
+/// (including one this same call's entry-reconciliation pass could not
+/// safely resolve, so it is still `Applying`/`RollingBack`) means the batch
+/// cannot be proven complete, so `transaction.state` is left exactly as it
+/// was for manual review - never guessed at, never promoted.
+fn reconcile_transaction_level_state(transaction: &mut RenameTransaction) -> bool {
+    if transaction.state != TransactionState::Applying {
+        return false;
+    }
+    let every_entry_settled_clean = transaction
+        .entries
+        .iter()
+        .all(|entry| matches!(entry.state, EntryState::Applied | EntryState::Skipped));
+    if !every_entry_settled_clean {
+        return false;
+    }
+    transaction.state = TransactionState::Applied;
+    true
 }
 
 /// Classifies one in-flight entry against the live filesystem.
@@ -211,6 +253,10 @@ mod tests {
     }
 
     fn transaction_with(entry: TransactionEntry) -> RenameTransaction {
+        transaction_with_entries(vec![entry])
+    }
+
+    fn transaction_with_entries(entries: Vec<TransactionEntry>) -> RenameTransaction {
         RenameTransaction {
             transaction_id: "reconcile-test".to_string(),
             plan_generation: 1,
@@ -218,7 +264,7 @@ mod tests {
             created_at_unix: 1,
             source_scan_root: "/tmp/roms".to_string(),
             state: super::super::model::TransactionState::Applying,
-            entries: vec![entry],
+            entries,
             created_directories: Vec::new(),
             unknown: Default::default(),
         }
@@ -339,6 +385,184 @@ mod tests {
         assert_eq!(
             issues[0].kind,
             RecoveryIssueKind::DestinationIdentityChanged
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Transaction-level reconciliation: a `transaction.state` stuck at
+    // `Applying` after every entry has already durably settled (the final
+    // journal write that would have bumped it to `Applied` never landed).
+    // -------------------------------------------------------------------
+
+    /// A journal whose transaction-level state is `Applying` but whose sole
+    /// entry is already durably `Applied` must be reconciled to
+    /// `Applied` - and that correction must itself be persisted to disk,
+    /// not just held in memory.
+    #[test]
+    fn a_transaction_stuck_applying_with_an_applied_entry_is_reconciled_to_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("a.bin");
+        let destination = dir.path().join("b.bin");
+        // A placeholder so the `entry()` builder's own identity capture
+        // succeeds; overwritten below with the destination's real identity,
+        // exactly as `both_absent_is_an_unresolved_unknown` already does for
+        // the same reason.
+        std::fs::write(&source, b"placeholder").unwrap();
+        std::fs::write(&destination, b"data").unwrap();
+        let mut applied_entry = entry(&source, &destination, EntryState::Applied);
+        // The entry's own recorded identity must match the (already renamed)
+        // destination for it to be a genuinely durable `Applied` entry, not
+        // just a label - `capture_identity` was taken from `source` before
+        // it existed, so retake it from the real, already-renamed object.
+        applied_entry.identity = capture_identity(&destination).unwrap();
+        let mut tx = transaction_with(applied_entry);
+        assert_eq!(tx.state, TransactionState::Applying);
+
+        let journal = dir.path().join("journal");
+        std::fs::create_dir_all(&journal).unwrap();
+        write_journal(&journal, &tx).unwrap();
+
+        let issues = reconcile_recovery(&mut tx, &journal).unwrap();
+
+        assert_eq!(tx.state, TransactionState::Applied);
+        // The entry itself needed no reconciliation (it was never
+        // `Applying`/`RollingBack`), so there is nothing to report about it.
+        assert!(issues.is_empty());
+
+        // The correction is durable, not just an in-memory patch.
+        let path = super::super::journal::journal_path(&journal, &tx.transaction_id).unwrap();
+        let reread = super::super::journal::read_journal(&path).unwrap();
+        assert_eq!(reread.state, TransactionState::Applied);
+    }
+
+    /// The same shape, but with a `Skipped` entry alongside the `Applied`
+    /// one (a `SkipUnsafeSubset` batch) - `Skipped` is just as settled as
+    /// `Applied`, and must not block the transaction-level correction.
+    #[test]
+    fn a_transaction_stuck_applying_with_applied_and_skipped_entries_is_reconciled_to_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let applied_source = dir.path().join("a.bin");
+        let applied_destination = dir.path().join("a-renamed.bin");
+        std::fs::write(&applied_source, b"placeholder").unwrap();
+        std::fs::write(&applied_destination, b"data").unwrap();
+        let mut applied_entry = entry(&applied_source, &applied_destination, EntryState::Applied);
+        applied_entry.identity = capture_identity(&applied_destination).unwrap();
+
+        let skipped_source = dir.path().join("c.bin");
+        std::fs::write(&skipped_source, b"never touched").unwrap();
+        let skipped_destination = dir.path().join("c-renamed.bin");
+        let mut skipped_entry = entry(&skipped_source, &skipped_destination, EntryState::Skipped);
+        skipped_entry.identity = capture_identity(&skipped_source).unwrap();
+
+        let mut tx = transaction_with_entries(vec![applied_entry, skipped_entry]);
+        let journal = dir.path().join("journal");
+        std::fs::create_dir_all(&journal).unwrap();
+
+        reconcile_recovery(&mut tx, &journal).unwrap();
+
+        assert_eq!(tx.state, TransactionState::Applied);
+    }
+
+    /// Fail closed: a transaction whose overall state is `Applying` but
+    /// which still has a genuinely unresolvable in-flight entry (this
+    /// reconciliation pass could not prove what happened to it) must never
+    /// be promoted to `Applied` - the batch cannot be proven complete.
+    #[test]
+    fn a_transaction_with_a_genuinely_unresolved_entry_is_not_promoted_to_applied() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let applied_source = dir.path().join("a.bin");
+        let applied_destination = dir.path().join("a-renamed.bin");
+        std::fs::write(&applied_source, b"placeholder").unwrap();
+        std::fs::write(&applied_destination, b"data").unwrap();
+        let mut applied_entry = entry(&applied_source, &applied_destination, EntryState::Applied);
+        applied_entry.identity = capture_identity(&applied_destination).unwrap();
+
+        // A hard-linked source+destination pair is the same unresolvable
+        // "both present, matching identity" shape the existing
+        // `both_present_is_an_unresolved_conflict` test already proves stays
+        // `Applying` at the entry level.
+        let unresolved_source = dir.path().join("d.bin");
+        std::fs::write(&unresolved_source, b"ambiguous").unwrap();
+        let unresolved_destination = dir.path().join("d-renamed.bin");
+        std::fs::hard_link(&unresolved_source, &unresolved_destination).unwrap();
+        let unresolved_entry = entry(
+            &unresolved_source,
+            &unresolved_destination,
+            EntryState::Applying,
+        );
+
+        let mut tx = transaction_with_entries(vec![applied_entry, unresolved_entry]);
+        let journal = dir.path().join("journal");
+        std::fs::create_dir_all(&journal).unwrap();
+
+        let issues = reconcile_recovery(&mut tx, &journal).unwrap();
+
+        assert_eq!(
+            tx.entries[1].state,
+            EntryState::Applying,
+            "the ambiguous entry must stay unresolved"
+        );
+        assert_eq!(issues[0].kind, RecoveryIssueKind::BothSourceAndDestination);
+        assert_eq!(
+            tx.state,
+            TransactionState::Applying,
+            "the batch cannot be proven complete while one entry is still unresolved, so the \
+             transaction-level state must never be promoted"
+        );
+    }
+
+    /// A reconciled `Applied` transaction is exactly as rollbackable as one
+    /// that reached `Applied` through the normal apply path - the
+    /// reconciliation must never leave it in a state the rest of the system
+    /// treats differently.
+    #[test]
+    fn a_reconciled_transaction_remains_rollbackable() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("a.bin");
+        let destination = dir.path().join("b.bin");
+        std::fs::write(&source, b"placeholder").unwrap();
+        std::fs::write(&destination, b"data").unwrap();
+        let mut applied_entry = entry(&source, &destination, EntryState::Applied);
+        applied_entry.identity = capture_identity(&destination).unwrap();
+        let mut tx = transaction_with(applied_entry);
+
+        let journal = dir.path().join("journal");
+        std::fs::create_dir_all(&journal).unwrap();
+        reconcile_recovery(&mut tx, &journal).unwrap();
+
+        assert_eq!(tx.state, TransactionState::Applied);
+        assert!(
+            tx.is_rollbackable(),
+            "a reconciled Applied transaction with an applied entry must still be rollbackable"
+        );
+    }
+
+    /// Existing `RollingBack` recovery semantics are unchanged: a
+    /// transaction whose overall state is `RollingBack` (never `Applying`)
+    /// must never have its transaction-level state touched by the new
+    /// reconciliation step, even after its entries settle.
+    #[test]
+    fn a_rolling_back_transaction_level_state_is_never_touched_by_the_new_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("a.bin");
+        std::fs::write(&source, b"data").unwrap();
+        let destination = dir.path().join("b.bin");
+        let mut tx = transaction_with(entry(&source, &destination, EntryState::RollingBack));
+        tx.state = super::super::model::TransactionState::RollingBack;
+        // Reverse rename already happened; journal still says RollingBack.
+        let journal = dir.path().join("journal");
+        std::fs::create_dir_all(&journal).unwrap();
+
+        reconcile_recovery(&mut tx, &journal).unwrap();
+
+        assert_eq!(tx.entries[0].state, EntryState::RolledBack);
+        assert_eq!(
+            tx.state,
+            TransactionState::RollingBack,
+            "only the entry settles here; the transaction-level state is a separate concern the \
+             rollback executor itself owns, and the new Applying-only reconciliation step must \
+             never touch a RollingBack transaction"
         );
     }
 }

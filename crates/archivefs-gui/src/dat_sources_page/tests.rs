@@ -1497,7 +1497,7 @@ fn warnings_and_parser_notes_render_as_separate_sections() {
     // A parsed file carrying both a real warning and a parser note must show
     // them as two distinct, labelled sections - the note must never be counted
     // as a warning.
-    let note_text = "DOCTYPE declaration accepted as inert text";
+    let note_text = "Logiqx DTD referenced, but no trusted local copy was found. The DAT was parsed normally without DTD validation.";
     let warning_text =
         "crc attribute on a rom element is not a well-formed checksum and was dropped";
     let (_fixture, page) = page_with_report(
@@ -1607,7 +1607,7 @@ fn mixed_errors_warnings_and_notes_render_as_three_sections() {
     // badge stays driven by core health (Invalid because an error is present).
     let error_text = "one entry was refused";
     let warning_text = "a checksum was dropped";
-    let note_text = "DOCTYPE declaration accepted as inert text";
+    let note_text = "Logiqx DTD referenced, but no trusted local copy was found. The DAT was parsed normally without DTD validation.";
     let (_fixture, page) = page_with_report(
         vec![vec![error(error_text), warn(warning_text), note(note_text)]],
         DatHealthState::Invalid,
@@ -1695,7 +1695,7 @@ fn thousands_of_diagnostics_stay_bounded_and_deterministic() {
         .map(|_| (0..30).map(|_| warn("repeated checksum dropped")).collect())
         .collect();
     let mut with_second_type = per_file.clone();
-    with_second_type[0].push(note("DOCTYPE declaration accepted as inert text"));
+    with_second_type[0].push(note("Logiqx DTD referenced, but no trusted local copy was found. The DAT was parsed normally without DTD validation."));
 
     let (_fixture, page) = page_with_report(
         with_second_type,
@@ -1880,7 +1880,7 @@ fn expanding_a_group_on_one_source_does_not_open_the_same_group_on_another() {
     // Regression: the group id used to be "{code}:{message}", so expanding the
     // DOCTYPE note on source A left source B's identical note open on load. The
     // id is now scoped by source and severity.
-    let note_text = "DOCTYPE declaration accepted as inert text";
+    let note_text = "Logiqx DTD referenced, but no trusted local copy was found. The DAT was parsed normally without DTD validation.";
     let fixture = Fixture::new();
 
     // Build two independent sources that both carry the same note.
@@ -2250,7 +2250,7 @@ fn a_doctype_parser_note_shows_valid_with_no_warnings() {
     assert_eq!(row.diagnostic_occurrences(DiagnosticSeverity::Note), 1);
     let note_group = &row.groups_of(DiagnosticSeverity::Note)[0];
     assert!(
-        note_group.message.contains("DOCTYPE"),
+        note_group.message.contains("Logiqx") && note_group.message.contains("DTD"),
         "{}",
         note_group.message
     );
@@ -4229,6 +4229,73 @@ fn an_interrupted_transaction_is_offered_for_recovery_and_never_auto_resumes() {
     assert!(rendered_text_contains(&output, "Leave untouched"));
     // There is no auto-resume anywhere in the UI.
     assert!(!rendered_text_contains(&output, "Resume renames"));
+}
+
+/// Regression for the transaction-level reconciliation gap behind
+/// `an_applied_transaction_is_rediscovered_after_restart_and_rollbackable`
+/// (CI's occasional failure there): a journal whose transaction-level
+/// `state` is stuck at `Applying` - exactly what a final journal write that
+/// failed to land after every entry already settled looks like - but whose
+/// sole entry is already durably `Applied`, must load as `Applied`, not
+/// `Applying`. Deterministic (no background job, no timing dependency): the
+/// journal is hand-written directly, so this exercises the restart/load
+/// path in isolation from whatever caused the CI flake.
+#[test]
+fn a_transaction_stuck_applying_with_an_applied_entry_loads_as_applied_after_restart() {
+    let fixture = Fixture::new();
+    let journal = fixture.dir("journal");
+    let tx = archivefs_core::dat::rename_apply::RenameTransaction {
+        transaction_id: "stuck-applying-test".to_string(),
+        plan_generation: 1,
+        classifier_version: Some(
+            archivefs_core::dat::classification::CLASSIFIER_VERSION.to_string(),
+        ),
+        created_at_unix: 1,
+        source_scan_root: "/tmp/roms".to_string(),
+        state: archivefs_core::dat::rename_apply::TransactionState::Applying,
+        entries: vec![archivefs_core::dat::rename_apply::TransactionEntry {
+            source_path: PathBuf::from("/tmp/roms/a.bin"),
+            destination_path: PathBuf::from("/tmp/roms/b.bin"),
+            original_basename: "a.bin".to_string(),
+            proposed_basename: "b.bin".to_string(),
+            identity: archivefs_core::dat::rename_apply::ObjectIdentity {
+                size_bytes: 1,
+                modified_unix: 1,
+                kind: archivefs_core::dat::rename_apply::ObjectKind::RegularFile,
+                #[cfg(unix)]
+                ino: 1,
+                #[cfg(unix)]
+                dev: 1,
+            },
+            preflight_passed: true,
+            preflight_failures: Vec::new(),
+            state: archivefs_core::dat::rename_apply::EntryState::Applied,
+            failure_reason: None,
+            applied_at_unix: Some(1),
+            rolled_back_at_unix: None,
+            unknown: Default::default(),
+        }],
+        created_directories: Vec::new(),
+        unknown: Default::default(),
+    };
+    archivefs_core::dat::rename_apply::write_journal(&journal, &tx).unwrap();
+
+    // A fresh page load, exactly what a real restart does - never a running
+    // page's own `refresh_recovery`.
+    let restarted = DatSourcesPageState::load_with_transaction_dir(
+        fixture.config_path.clone(),
+        Vec::new(),
+        TrustedRoots::none(),
+        journal,
+    );
+    let view = restarted.view();
+    assert_eq!(view.rename_apply.recovery.len(), 1);
+    assert_eq!(
+        view.rename_apply.recovery[0].state,
+        TransactionState::Applied,
+        "a transaction whose every entry is already durably Applied must load as Applied, not \
+         stay stuck at Applying"
+    );
 }
 
 #[test]

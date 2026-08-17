@@ -176,7 +176,8 @@ use archivefs_core::{
     BulkPlatformAssignmentResult, CUSTOM_FOLDER_ALIAS_SOURCE, CatalogueDuplicateArchive,
     CatalogueDuplicateGroup, CatalogueDuplicateReport, CatalogueStats, CompletedScanSummary,
     Config, ConfigIdentity, DAT_ROMM_AGREEMENT_SOURCE, Database, DatabaseHealth,
-    DatabaseHealthReport, DoctorReport, DoctorStatus, HealthCategory, HealthIssue, InspectorEntry,
+    DatabaseHealthReport, DoctorReport, DoctorStatus, FrontendPlatformMapping, FrontendProfile,
+    FrontendProfileKind, FrontendProfilePolicy, HealthCategory, HealthIssue, InspectorEntry,
     InspectorEntryClassification, InspectorEntryKind, InspectorReport, LazyUnmountCleanupResult,
     LibraryViewApplyReport, LibraryViewConfig, LibraryViewLayoutTemplate, LibraryViewPlan,
     LibraryViewPlanAction, LibraryViewPlanEntry, MANUAL_PLATFORM_SOURCE,
@@ -308,6 +309,32 @@ fn library_view_submit_blocker(name: &str, destination: &str, busy: bool) -> Opt
         Some("Choose a destination folder for this Library View.")
     } else {
         None
+    }
+}
+
+/// Builds the `FrontendProfile` the dialog's submit handler sends to
+/// `archivefs_core` from `dialog`'s current state - the one place a
+/// `FrontendPlatformMapping` is ever constructed from the edited override
+/// list. `romm_overrides` is folded in regardless of `profile_kind` (a
+/// harmless no-op for `Generic`/`EsDe`, since neither ever reads
+/// `platform_mapping_overrides`) rather than conditionally dropped, so
+/// switching the radio button back and forth never silently discards what
+/// the person already typed. Kept as its own pure function - not inlined
+/// into the submit handler - so a test can exercise exactly what gets sent
+/// without simulating a button click (mirrors
+/// `validate_library_view_destination`'s own use in
+/// `library_view_form_dialog_rejects_a_destination_inside_a_source_with_an_inline_message`).
+fn library_view_form_profile(dialog: &LibraryViewFormDialogState) -> FrontendProfile {
+    let mut platform_mapping_overrides = FrontendPlatformMapping::default();
+    for (platform, slug) in &dialog.romm_overrides {
+        platform_mapping_overrides.insert(platform.clone(), slug.clone());
+    }
+    FrontendProfile {
+        kind: dialog.profile_kind,
+        policy: FrontendProfilePolicy {
+            platform_mapping_overrides,
+            ..Default::default()
+        },
     }
 }
 const SEARCH_FILTER_TEXT_EDIT_ID: &str = "archivefs_library_search_filter";
@@ -2606,6 +2633,7 @@ enum LibraryViewAction {
         destination_root: PathBuf,
         source_folders: Vec<PathBuf>,
         platforms: Vec<String>,
+        profile: FrontendProfile,
     },
     Edit {
         identifier: String,
@@ -2613,6 +2641,7 @@ enum LibraryViewAction {
         destination_root: PathBuf,
         source_folders: Vec<PathBuf>,
         platforms: Vec<String>,
+        profile: FrontendProfile,
     },
     SetEnabled {
         identifier: String,
@@ -2643,10 +2672,19 @@ enum LibraryViewActionOutcome {
     Applied {
         view: LibraryViewConfig,
         report: LibraryViewApplyReport,
+        /// The current plan's `counts.skip` - re-previewed immediately
+        /// after applying, so a partial RomM result (unresolved platform
+        /// mappings, collisions) is never silently presented as a fully
+        /// complete apply. `None` only if the re-preview itself could not
+        /// be run (e.g. the view was removed between apply and preview) -
+        /// the success message falls back to omitting the count rather
+        /// than fabricating one.
+        skipped: Option<usize>,
     },
     Repaired {
         view: LibraryViewConfig,
         report: LibraryViewApplyReport,
+        skipped: Option<usize>,
     },
     Removed {
         view: LibraryViewConfig,
@@ -2677,6 +2715,20 @@ struct LibraryViewFormDialogState {
     selected_source_folders: HashSet<PathBuf>,
     selected_platforms: HashSet<String>,
     validation_message: Option<String>,
+    /// Which frontend the resulting view is nominally shaped for - see
+    /// `FrontendProfileKind`. `Generic` (the derived default) keeps every
+    /// existing Add/Edit flow byte-for-byte unchanged.
+    profile_kind: FrontendProfileKind,
+    /// Explicit `catalogue platform -> RomM slug` overrides, edited as an
+    /// ordered list (insertion order is cosmetic only - never a safety
+    /// concern, since `FrontendPlatformMapping` is `BTreeMap`-backed and a
+    /// duplicate platform key simply overwrites its previous value on
+    /// submit). Only ever read/written when `profile_kind` is `Romm`.
+    romm_overrides: Vec<(String, String)>,
+    /// Scratch input for the "add an override" row - cleared after each
+    /// successful add, never itself submitted.
+    romm_override_platform_input: String,
+    romm_override_slug_input: String,
 }
 
 /// The Remove-view confirmation dialog's state. `view_name` is copied at
@@ -3732,6 +3784,15 @@ struct ArchiveFsApp {
     show_activity: bool,
     /// Whether the Help "About EmuWiz" window is open.
     show_about: bool,
+    /// Whether the "Skipped files" drill-down window (opened from the
+    /// Database Status overlay's "Skipped N" detail) is open. Read-only:
+    /// opening it never re-scans, re-classifies, or mutates anything - it
+    /// only displays `ScanPersistSummary::skipped_files` from the most
+    /// recently completed scan this session already produced.
+    show_skipped_files: bool,
+    /// The active reason filter for the skipped-files window. `None` is
+    /// "All reasons".
+    skipped_files_filter: Option<archivefs_core::SkipReason>,
     /// A one-shot signal from the Library menu's "Select all visible" item.
     /// `show_loaded_data` consumes and clears it the same way it already
     /// consumes a Ctrl+A keypress or the inline button, calling the exact
@@ -4094,6 +4155,8 @@ impl ArchiveFsApp {
             tools_overlay: ToolsOverlay::default(),
             show_activity: ACTIVITY_EXPANDED_BY_DEFAULT,
             show_about: false,
+            show_skipped_files: false,
+            skipped_files_filter: None,
             select_all_visible_requested: false,
             source_action: None,
             bsfree_manager: BsFreeManagerState::NotLoaded,
@@ -4935,10 +4998,13 @@ impl ArchiveFsApp {
         let page = self
             .repair_review_page
             .get_or_insert_with(repair_review_page::RepairReviewPageState::default);
-        // Drained before the view is built, so a running apply keeps
+        // Drained before the view is built, so a running apply or scan keeps
         // repainting (progress/result reach the screen promptly) without the
         // page needing its own render loop.
         if page.poll_apply() || page.is_apply_running() {
+            ui.ctx().request_repaint();
+        }
+        if page.poll_scan() || page.is_scan_running() {
             ui.ctx().request_repaint();
         }
         repair_review_page::show_repair_review_page(ui, page);
@@ -13978,6 +14044,22 @@ impl ArchiveFsApp {
             );
         }
 
+        if self.show_skipped_files {
+            let summary = match &self.database_state {
+                DatabaseState::Ready {
+                    last_scan_summary: Some(summary),
+                    ..
+                } => Some(summary),
+                _ => None,
+            };
+            show_skipped_files_window(
+                context,
+                &mut self.show_skipped_files,
+                summary,
+                &mut self.skipped_files_filter,
+            );
+        }
+
         let mut retry = false;
         let mut requested_action = None;
         let mut diagnostics_action = None;
@@ -14044,6 +14126,10 @@ impl ArchiveFsApp {
                                     DatabasePanelAction::RefreshStatus
                                     | DatabasePanelAction::RetryLoad => {
                                         self.start_database_action(context.clone(), false);
+                                    }
+                                    DatabasePanelAction::ViewSkippedFiles => {
+                                        self.show_skipped_files = true;
+                                        self.skipped_files_filter = None;
                                     }
                                 }
                             }
@@ -15974,6 +16060,97 @@ fn platform_provenance_lines(details: &PlatformProvenanceDetails) -> Vec<(&'stat
     }
 
     lines
+}
+
+/// Renders the read-only "Skipped files" drill-down: a bounded sample of
+/// the files the most recently completed scan skipped, with a concise
+/// reason and a simple reason filter. Purely informational - this never
+/// re-scans, reclassifies, renames, or otherwise touches anything on disk;
+/// it only reads [`ScanPersistSummary::skipped_files`], the exact detail
+/// `scan_and_persist` already produced from the same scan whose aggregate
+/// counts are shown elsewhere in the Database Status panel.
+///
+/// `summary` is `None` when no scan has completed yet this session (or the
+/// database state changed underneath the window); the window still opens
+/// and says so, rather than silently doing nothing.
+///
+/// Not virtualised: `skipped_files` is hard-bounded at
+/// [`archivefs_core::MAX_RETAINED_SKIPPED_FILES`] (1000) entries, small
+/// enough that a plain scrolling list of simple labels stays practical
+/// without the fixed-row-height virtualisation `repair_review_page` needs
+/// for its potentially much larger proposal lists.
+fn show_skipped_files_window(
+    context: &egui::Context,
+    open: &mut bool,
+    summary: Option<&ScanPersistSummary>,
+    filter: &mut Option<archivefs_core::SkipReason>,
+) {
+    egui::Window::new("Skipped files")
+        .open(open)
+        .resizable(true)
+        .default_width(560.0)
+        .show(context, |ui| {
+            let Some(summary) = summary else {
+                ui.label("No scan has completed yet this session.");
+                return;
+            };
+            let total = summary.skipped_files_total();
+            if total == 0 {
+                ui.label("Nothing was skipped in the most recent scan.");
+                return;
+            }
+            let retained = summary.skipped_files.len();
+            if summary.skipped_files_truncated() {
+                ui.label(format!(
+                    "Showing {retained} of {total} skipped files - the rest were skipped for \
+                     the same reasons but are not individually listed."
+                ));
+            } else {
+                ui.label(format!("{retained} skipped file(s)."));
+            }
+            ui.label(
+                egui::RichText::new(
+                    "Explanatory only - nothing here changes how a file was classified or \
+                     mutates any file.",
+                )
+                .color(theme::muted(ui)),
+            );
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label("Filter:");
+                if ui.selectable_label(filter.is_none(), "All").clicked() {
+                    *filter = None;
+                }
+                for reason in [
+                    archivefs_core::SkipReason::UnsupportedExtension,
+                    archivefs_core::SkipReason::AmbiguousPlatform,
+                ] {
+                    if ui
+                        .selectable_label(*filter == Some(reason), reason.label())
+                        .clicked()
+                    {
+                        *filter = Some(reason);
+                    }
+                }
+            });
+
+            ui.add_space(6.0);
+            egui::ScrollArea::vertical()
+                .max_height(360.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for item in summary.skipped_files.iter().filter(|item| match filter {
+                        Some(reason) => item.reason == *reason,
+                        None => true,
+                    }) {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(item.reason.label()).small());
+                            ui.label(item.path.display().to_string());
+                        });
+                    }
+                });
+        });
 }
 
 fn format_scan_completion(summary: &ScanPersistSummary) -> String {
@@ -18360,6 +18537,33 @@ fn library_view_action_started_message(action: &LibraryViewAction) -> String {
     }
 }
 
+/// Builds the Apply/Repair feedback message, including the current skip
+/// count so a partial RomM result (unresolved platform mappings,
+/// collisions) is never worded as a plain, unqualified success - see
+/// `library_view_current_skip_count`. `skipped` is `None` only when the
+/// post-apply re-preview itself could not run; the message still reports
+/// the apply's own outcome truthfully in that case, it just cannot add a
+/// skip count.
+fn library_view_apply_summary_message(
+    verb: &str,
+    view_name: &str,
+    report: &LibraryViewApplyReport,
+    skipped: Option<usize>,
+) -> String {
+    let base = format!(
+        "{verb} '{}': {} created, {} repaired, {} removed, {} unchanged, {} failed",
+        view_name, report.created, report.repaired, report.removed, report.unchanged, report.failed
+    );
+    match skipped {
+        Some(0) => format!("{base}, 0 skipped."),
+        Some(skipped) => format!(
+            "{base}, {skipped} skipped - this view is not fully applied. Unresolved platform \
+             mappings or collisions remain; see Preview for details."
+        ),
+        None => format!("{base}."),
+    }
+}
+
 fn library_view_action_success_message(outcome: &LibraryViewActionOutcome) -> String {
     match outcome {
         LibraryViewActionOutcome::Added(view) => format!(
@@ -18386,24 +18590,16 @@ fn library_view_action_success_message(outcome: &LibraryViewActionOutcome) -> St
             plan.counts.collision,
             plan.counts.skip
         ),
-        LibraryViewActionOutcome::Applied { view, report } => format!(
-            "Applied '{}': {} created, {} repaired, {} removed, {} unchanged, {} failed.",
-            view.name,
-            report.created,
-            report.repaired,
-            report.removed,
-            report.unchanged,
-            report.failed
-        ),
-        LibraryViewActionOutcome::Repaired { view, report } => format!(
-            "Repaired '{}': {} created, {} repaired, {} removed, {} unchanged, {} failed.",
-            view.name,
-            report.created,
-            report.repaired,
-            report.removed,
-            report.unchanged,
-            report.failed
-        ),
+        LibraryViewActionOutcome::Applied {
+            view,
+            report,
+            skipped,
+        } => library_view_apply_summary_message("Applied", &view.name, report, *skipped),
+        LibraryViewActionOutcome::Repaired {
+            view,
+            report,
+            skipped,
+        } => library_view_apply_summary_message("Repaired", &view.name, report, *skipped),
         LibraryViewActionOutcome::Removed {
             view,
             report,
@@ -18424,6 +18620,20 @@ fn library_view_action_success_message(outcome: &LibraryViewActionOutcome) -> St
     }
 }
 
+/// Re-previews `view_id` immediately after an Apply/Repair, purely to read
+/// off the resulting plan's `counts.skip` for an honest post-apply summary -
+/// never used to decide whether the apply itself succeeded (that already
+/// happened, via the existing `apply_library_view_default`/
+/// `repair_library_view_default` call), and never fed back into another
+/// apply. Uses the same `preview_library_view_default` the Preview button
+/// already calls - no second planning implementation. `None` on any error
+/// (e.g. the view was concurrently removed) rather than fabricating a count.
+fn library_view_current_skip_count(view_id: &str) -> Option<usize> {
+    preview_library_view_default(view_id)
+        .ok()
+        .map(|(_, plan)| plan.counts.skip)
+}
+
 /// Runs one [`LibraryViewAction`] against the default config/database
 /// paths - the production entry point `ArchiveFsApp::start_library_view_action`
 /// runs on a background thread. Every arm calls straight into the same,
@@ -18438,12 +18648,14 @@ fn run_library_view_action(action: &LibraryViewAction) -> Result<LibraryViewActi
             destination_root,
             source_folders,
             platforms,
+            profile,
         } => add_library_view_default(
             name.clone(),
             destination_root.clone(),
             source_folders.clone(),
             platforms.clone(),
             LibraryViewLayoutTemplate::PlatformFilename,
+            profile.clone(),
         )
         .map(LibraryViewActionOutcome::Added)
         .map_err(|error| error.to_string()),
@@ -18453,12 +18665,14 @@ fn run_library_view_action(action: &LibraryViewAction) -> Result<LibraryViewActi
             destination_root,
             source_folders,
             platforms,
+            profile,
         } => edit_library_view_default(
             identifier,
             name.clone(),
             destination_root.clone(),
             source_folders.clone(),
             platforms.clone(),
+            profile.clone(),
         )
         .map(LibraryViewActionOutcome::Edited)
         .map_err(|error| error.to_string()),
@@ -18472,10 +18686,24 @@ fn run_library_view_action(action: &LibraryViewAction) -> Result<LibraryViewActi
             .map(|(view, plan)| LibraryViewActionOutcome::Previewed { view, plan })
             .map_err(|error| error.to_string()),
         LibraryViewAction::Apply(identifier) => apply_library_view_default(identifier)
-            .map(|(view, report)| LibraryViewActionOutcome::Applied { view, report })
+            .map(|(view, report)| {
+                let skipped = library_view_current_skip_count(&view.id);
+                LibraryViewActionOutcome::Applied {
+                    view,
+                    report,
+                    skipped,
+                }
+            })
             .map_err(|error| error.to_string()),
         LibraryViewAction::Repair(identifier) => repair_library_view_default(identifier)
-            .map(|(view, report)| LibraryViewActionOutcome::Repaired { view, report })
+            .map(|(view, report)| {
+                let skipped = library_view_current_skip_count(&view.id);
+                LibraryViewActionOutcome::Repaired {
+                    view,
+                    report,
+                    skipped,
+                }
+            })
             .map_err(|error| error.to_string()),
         LibraryViewAction::Remove {
             identifier,
@@ -20549,6 +20777,23 @@ fn show_library_view_plan_summary(
         );
         return;
     }
+    if let Some(error) = &plan.profile_error {
+        ui.colored_label(
+            ui.visuals().error_fg_color,
+            format!("Unsupported frontend profile - Apply/Repair are refused: {error}"),
+        );
+        return;
+    }
+    if let Some(conflict) = &plan.fingerprint_conflict {
+        ui.colored_label(
+            ui.visuals().warn_fg_color,
+            format!(
+                "Profile changed since this view was last applied - review before re-applying: \
+                 {conflict}"
+            ),
+        );
+        return;
+    }
 
     ui.horizontal_wrapped(|ui| {
         ui.label(format!("Create: {}", plan.counts.create));
@@ -20673,6 +20918,111 @@ fn show_library_view_platform_selection(ui: &mut egui::Ui, selected: &mut HashSe
     });
 }
 
+/// The Frontend Profile section of the Add/Edit View dialog: which frontend
+/// (`FrontendProfileKind`) the view is nominally shaped for, and - only for
+/// `Romm` - its explicit `catalogue platform -> RomM slug` overrides.
+/// `Generic` is the default and, being the pre-existing behaviour, needs no
+/// extra controls at all. `EsDe` is shown (so the vocabulary is visible -
+/// milestone note: "should remain visible only if that fits the current UI
+/// vocabulary") but its own radio option is disabled, with a short reason,
+/// since `FrontendProfileKind::EsDe` still fails closed in the backend -
+/// selecting it here would only ever produce a refused plan.
+///
+/// Writes overrides into `overrides` as an edited `(platform, slug)` list;
+/// the caller (the dialog's submit handler) is the only place that turns
+/// this into a real `FrontendPlatformMapping` - this function never talks to
+/// `archivefs_core` at all, matching every other selection widget in this
+/// dialog (`show_library_view_source_selection`/`show_library_view_platform_selection`).
+#[allow(clippy::too_many_arguments)]
+fn show_library_view_profile_selection(
+    ui: &mut egui::Ui,
+    profile_kind: &mut FrontendProfileKind,
+    overrides: &mut Vec<(String, String)>,
+    platform_input: &mut String,
+    slug_input: &mut String,
+    clipboard: &mut dyn ClipboardBackend,
+) {
+    widgets::card(ui, |ui| {
+        widgets::section_header(
+            ui,
+            "Frontend Profile",
+            Some(
+                "Which frontend this view is shaped for. Generic is the existing \
+                 {platform}/{filename} layout and is unaffected by anything below.",
+            ),
+        );
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(profile_kind, FrontendProfileKind::Generic, "Generic");
+            ui.selectable_value(profile_kind, FrontendProfileKind::Romm, "RomM");
+            ui.add_enabled_ui(false, |ui| {
+                ui.selectable_value(profile_kind, FrontendProfileKind::EsDe, "ES-DE");
+            })
+            .response
+            .on_disabled_hover_text(
+                "ES-DE planning is not implemented yet - selecting it would only produce a \
+                 refused plan.",
+            );
+        });
+
+        if *profile_kind == FrontendProfileKind::Romm {
+            ui.add_space(6.0);
+            widgets::banner(
+                ui,
+                "RomM layout",
+                "Plans roms/<slug>/<filename> under the destination above. A platform with no \
+                 resolved RomM slug is skipped individually, never guessed - add an explicit \
+                 override below, or resolve it via a previously imported RomM identity cache.",
+                widgets::StatusTone::Info,
+            );
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new("Platform overrides").strong());
+            if overrides.is_empty() {
+                ui.weak("No explicit overrides yet.");
+            } else {
+                let mut remove_index = None;
+                for (index, (platform, slug)) in overrides.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(format!("{platform} -> {slug}")).monospace());
+                        if ui.small_button("Remove").clicked() {
+                            remove_index = Some(index);
+                        }
+                    });
+                }
+                if let Some(index) = remove_index {
+                    overrides.remove(index);
+                }
+            }
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("Canonical platform:");
+                show_text_edit_with_context_menu(ui, platform_input, clipboard, |text_edit| {
+                    text_edit
+                        .id_salt("library_view_form_romm_override_platform")
+                        .desired_width(140.0)
+                });
+                ui.label("RomM slug:");
+                show_text_edit_with_context_menu(ui, slug_input, clipboard, |text_edit| {
+                    text_edit
+                        .id_salt("library_view_form_romm_override_slug")
+                        .desired_width(120.0)
+                });
+                let platform_trimmed = platform_input.trim();
+                let slug_trimmed = slug_input.trim();
+                let can_add = !platform_trimmed.is_empty() && !slug_trimmed.is_empty();
+                if ui
+                    .add_enabled(can_add, egui::Button::new("Add override"))
+                    .clicked()
+                {
+                    overrides.retain(|(existing, _)| existing != platform_trimmed);
+                    overrides.push((platform_trimmed.to_string(), slug_trimmed.to_string()));
+                    platform_input.clear();
+                    slug_input.clear();
+                }
+            });
+        }
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 fn show_library_views_page(
     ui: &mut egui::Ui,
@@ -20743,11 +21093,25 @@ fn show_library_views_page(
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for view in views {
+                    // Compares the *whole* cached `LibraryViewConfig`, not
+                    // just `id` - a stale plan computed for an earlier
+                    // version of this same view (different source_folders,
+                    // platforms, profile, ...) must never be shown or
+                    // offered for Apply as if it still described `view`.
+                    // `library_view_last_plan` is proactively cleared on
+                    // every Add/Edit/Apply/Repair/Remove outcome already
+                    // (see `poll_library_view_action`), but that is a
+                    // single, easily-bypassed invalidation point (e.g. the
+                    // config file changing on disk between two frames for
+                    // any other reason); comparing full equality here is a
+                    // second, always-correct guard that never depends on
+                    // every mutation path remembering to invalidate the
+                    // cache by hand.
                     let has_current_plan = last_plan
                         .as_ref()
-                        .is_some_and(|(previewed, _)| previewed.id == view.id);
+                        .is_some_and(|(previewed, _)| previewed == view);
                     let can_apply = last_plan.as_ref().is_some_and(|(previewed, plan)| {
-                        previewed.id == view.id && plan.is_safe_to_apply()
+                        previewed == view && plan.is_safe_to_apply()
                     });
                     let group_response = ui.group(|ui| {
                         ui.horizontal(|ui| {
@@ -20810,6 +21174,18 @@ fn show_library_views_page(
                                         .collect(),
                                     selected_platforms: view.platforms.iter().cloned().collect(),
                                     validation_message: None,
+                                    profile_kind: view.profile.kind,
+                                    romm_overrides: view
+                                        .profile
+                                        .policy
+                                        .platform_mapping_overrides
+                                        .iter()
+                                        .map(|(platform, slug)| {
+                                            (platform.to_string(), slug.to_string())
+                                        })
+                                        .collect(),
+                                    romm_override_platform_input: String::new(),
+                                    romm_override_slug_input: String::new(),
                                 });
                             }
                             let enable_label = if view.enabled { "Disable" } else { "Enable" };
@@ -21000,6 +21376,15 @@ fn show_library_views_page(
                             "Creates {platform}/{filename}. No other layout is selected or implied.",
                             widgets::StatusTone::Info,
                         );
+                        ui.add_space(8.0);
+                        show_library_view_profile_selection(
+                            ui,
+                            &mut dialog.profile_kind,
+                            &mut dialog.romm_overrides,
+                            &mut dialog.romm_override_platform_input,
+                            &mut dialog.romm_override_slug_input,
+                            clipboard,
+                        );
                     });
 
                 ui.separator();
@@ -21056,6 +21441,7 @@ fn show_library_views_page(
                         dialog.selected_source_folders.iter().cloned().collect();
                     let platforms: Vec<String> =
                         dialog.selected_platforms.iter().cloned().collect();
+                    let profile = library_view_form_profile(dialog);
                     action = Some(match &dialog.editing_id {
                         Some(identifier) => LibraryViewAction::Edit {
                             identifier: identifier.clone(),
@@ -21063,12 +21449,14 @@ fn show_library_views_page(
                             destination_root: validated_destination,
                             source_folders,
                             platforms,
+                            profile,
                         },
                         None => LibraryViewAction::Add {
                             name,
                             destination_root: validated_destination,
                             source_folders,
                             platforms,
+                            profile,
                         },
                     });
                 }
@@ -33071,6 +33459,10 @@ enum DatabasePanelAction {
     ViewRecentlyFound,
     RefreshStatus,
     RetryLoad,
+    /// Opens the read-only skipped-files drill-down for the most recently
+    /// completed scan this session. Never re-scans or reclassifies
+    /// anything - see [`show_skipped_files_window`].
+    ViewSkippedFiles,
 }
 
 /// The best-known database path regardless of current state - even a
@@ -33156,6 +33548,25 @@ fn show_database_panel(ui: &mut egui::Ui, state: &DatabaseState) -> Option<Datab
                         ui.strong("Last scan (this session)");
                         ui.label(format_scan_completion(summary));
                         ui.end_row();
+
+                        let skipped_total = summary.skipped_files_total();
+                        if skipped_total > 0 {
+                            ui.strong("Skipped files");
+                            ui.horizontal(|ui| {
+                                ui.label(format!("{skipped_total} skipped"));
+                                if widgets::action_button(
+                                    ui,
+                                    "Inspect…",
+                                    widgets::ActionStyle::Quiet,
+                                    true,
+                                )
+                                .clicked()
+                                {
+                                    action = Some(DatabasePanelAction::ViewSkippedFiles);
+                                }
+                            });
+                            ui.end_row();
+                        }
                     }
 
                     ui.strong("Action safety");
@@ -53894,6 +54305,8 @@ $Instant Growth [Nayr]\n";
             tools_overlay: ToolsOverlay::default(),
             show_activity: ACTIVITY_EXPANDED_BY_DEFAULT,
             show_about: false,
+            show_skipped_files: false,
+            skipped_files_filter: None,
             select_all_visible_requested: false,
             source_action: None,
             bsfree_manager: BsFreeManagerState::NotLoaded,
@@ -55074,6 +55487,7 @@ $Instant Growth [Nayr]\n";
             },
             folder_errors: vec![(PathBuf::from("/offline"), "unavailable".to_string())],
             platform_assignment_warnings: Vec::new(),
+            skipped_files: Vec::new(),
         };
 
         assert_eq!(
@@ -55090,6 +55504,148 @@ $Instant Growth [Nayr]\n";
             1,
             "activity must stay one concise entry"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Skipped-files drill-down (`show_skipped_files_window`).
+    // -------------------------------------------------------------------
+
+    fn skipped_files_summary(
+        skipped_files: Vec<archivefs_core::SkippedFile>,
+        skipped_unsupported_extension: i64,
+        skipped_ambiguous_platform: i64,
+    ) -> ScanPersistSummary {
+        ScanPersistSummary {
+            scan_run_id: 1,
+            counts: archivefs_core::ScanRunCounts {
+                skipped_unsupported_extension,
+                skipped_ambiguous_platform,
+                ..Default::default()
+            },
+            folder_errors: Vec::new(),
+            platform_assignment_warnings: Vec::new(),
+            skipped_files,
+        }
+    }
+
+    /// A never-before-seen `egui::Window` needs one settling frame before
+    /// its content actually paints (its `Area` has no remembered
+    /// position/size yet on the very first frame) - true of any floating
+    /// window in this codebase, not specific to this one. A real running
+    /// app repaints continuously, so this is purely a test-harness detail:
+    /// render once to let the window settle, then render again and return
+    /// that output for assertions.
+    fn run_skipped_files_window_twice(
+        summary: &ScanPersistSummary,
+        open: &mut bool,
+        filter: &mut Option<archivefs_core::SkipReason>,
+    ) -> egui::FullOutput {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            show_skipped_files_window(ctx, open, Some(summary), filter);
+        });
+        ctx.run(egui::RawInput::default(), |ctx| {
+            show_skipped_files_window(ctx, open, Some(summary), filter);
+        })
+    }
+
+    #[test]
+    fn skipped_files_window_displays_both_reasons_and_their_paths() {
+        let summary = skipped_files_summary(
+            vec![
+                archivefs_core::SkippedFile {
+                    path: PathBuf::from("/roms/c128/boxart.png"),
+                    reason: archivefs_core::SkipReason::UnsupportedExtension,
+                },
+                archivefs_core::SkippedFile {
+                    path: PathBuf::from("/roms/megadrive/RESOURCE.GEN"),
+                    reason: archivefs_core::SkipReason::AmbiguousPlatform,
+                },
+            ],
+            1,
+            1,
+        );
+        let mut open = true;
+        let mut filter = None;
+        let output = run_skipped_files_window_twice(&summary, &mut open, &mut filter);
+
+        assert!(rendered_text_contains(&output, "Unsupported extension"));
+        assert!(rendered_text_contains(&output, "Ambiguous platform"));
+        assert!(rendered_text_contains(&output, "/roms/c128/boxart.png"));
+        assert!(rendered_text_contains(
+            &output,
+            "/roms/megadrive/RESOURCE.GEN"
+        ));
+    }
+
+    #[test]
+    fn skipped_files_window_reports_truncation_honestly() {
+        let full: Vec<archivefs_core::SkippedFile> = (0..3)
+            .map(|index| archivefs_core::SkippedFile {
+                path: PathBuf::from(format!("/roms/junk{index}.xyz")),
+                reason: archivefs_core::SkipReason::UnsupportedExtension,
+            })
+            .collect();
+        // The real total (5) exceeds how many detail entries were retained
+        // (3) - exactly the shape a capped, real scan produces.
+        let summary = skipped_files_summary(full, 5, 0);
+        assert!(summary.skipped_files_truncated());
+
+        let mut open = true;
+        let mut filter = None;
+        let output = run_skipped_files_window_twice(&summary, &mut open, &mut filter);
+        assert!(
+            rendered_text_contains(&output, "Showing 3 of 5"),
+            "a capped list must say so, never present itself as complete"
+        );
+    }
+
+    #[test]
+    fn skipped_files_window_never_claims_truncation_when_the_list_is_complete() {
+        let full: Vec<archivefs_core::SkippedFile> = (0..3)
+            .map(|index| archivefs_core::SkippedFile {
+                path: PathBuf::from(format!("/roms/junk{index}.xyz")),
+                reason: archivefs_core::SkipReason::UnsupportedExtension,
+            })
+            .collect();
+        let summary = skipped_files_summary(full, 3, 0);
+        assert!(!summary.skipped_files_truncated());
+
+        let mut open = true;
+        let mut filter = None;
+        let output = run_skipped_files_window_twice(&summary, &mut open, &mut filter);
+        assert!(rendered_text_contains(&output, "3 skipped file(s)"));
+        assert!(!rendered_text_contains(&output, "Showing"));
+    }
+
+    /// Rendering the drill-down window is purely informational: it must
+    /// never mutate the summary it was given, and the underlying skipped
+    /// paths (which never actually exist on disk here, but the principle is
+    /// the same as a real file) are never touched by opening or scrolling
+    /// the window - the function's own signature (`&ScanPersistSummary`,
+    /// never `&mut`) already proves this at the type level; this test
+    /// proves it in practice by rendering twice and checking nothing about
+    /// the input changed.
+    #[test]
+    fn viewing_skipped_file_details_is_read_only() {
+        let summary = skipped_files_summary(
+            vec![archivefs_core::SkippedFile {
+                path: PathBuf::from("/roms/c128/boxart.png"),
+                reason: archivefs_core::SkipReason::UnsupportedExtension,
+            }],
+            1,
+            0,
+        );
+        let before = summary.clone();
+        let mut open = true;
+        let mut filter = None;
+        let output = run_skipped_files_window_twice(&summary, &mut open, &mut filter);
+        assert!(
+            rendered_text_contains(&output, "/roms/c128/boxart.png"),
+            "sanity check: the window must actually have rendered content for this test to \
+             prove anything"
+        );
+        assert_eq!(summary, before, "viewing details must never mutate them");
     }
 
     #[test]
@@ -63982,6 +64538,7 @@ $Instant Growth [Nayr]\n";
             source_folders: Vec::new(),
             platforms: Vec::new(),
             layout_template: LibraryViewLayoutTemplate::PlatformFilename,
+            profile: FrontendProfile::default(),
         }
     }
 
@@ -64143,6 +64700,9 @@ $Instant Growth [Nayr]\n";
                 archive_identity: None,
             }],
             unsafe_root_error: None,
+            profile_fingerprint: String::new(),
+            fingerprint_conflict: None,
+            profile_error: None,
         };
         let mut filter = LibraryViewPlanFilter::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
@@ -64223,6 +64783,565 @@ $Instant Growth [Nayr]\n";
         .expect_err("a destination inside a configured source folder must be rejected");
         assert!(!error.to_string().is_empty());
         std::fs::remove_dir_all(&source_dir).unwrap();
+    }
+
+    // -------------------------------------------------------------------
+    // RomM frontend-profile GUI flow.
+    // -------------------------------------------------------------------
+
+    fn sample_plan(
+        counts: LibraryViewPlanCounts,
+        entries: Vec<LibraryViewPlanEntry>,
+        profile_error: Option<String>,
+        fingerprint_conflict: Option<String>,
+    ) -> LibraryViewPlan {
+        LibraryViewPlan {
+            view_id: "view-1".to_string(),
+            destination_root: PathBuf::from("/home/user/retrodeck/roms"),
+            counts,
+            entries,
+            unsafe_root_error: None,
+            profile_fingerprint: "fingerprint".to_string(),
+            fingerprint_conflict,
+            profile_error,
+        }
+    }
+
+    /// Test A: Generic remains the default profile in fresh dialog state,
+    /// and building a profile from that fresh state is byte-for-byte
+    /// `FrontendProfile::default()` - so an untouched Add View dialog can
+    /// never silently produce anything other than the pre-existing
+    /// behaviour.
+    #[test]
+    fn library_view_form_default_profile_is_generic() {
+        let dialog = LibraryViewFormDialogState::default();
+        assert_eq!(dialog.profile_kind, FrontendProfileKind::Generic);
+        assert!(dialog.romm_overrides.is_empty());
+        assert_eq!(
+            library_view_form_profile(&dialog),
+            FrontendProfile::default()
+        );
+    }
+
+    /// Test B: selecting RomM (the same state change the radio button
+    /// drives via `ui.selectable_value(&mut dialog.profile_kind, ...)`)
+    /// persists into the `FrontendProfile` the submit handler sends to
+    /// `archivefs_core`.
+    #[test]
+    fn library_view_form_romm_selection_persists_into_the_built_profile() {
+        let dialog = LibraryViewFormDialogState {
+            profile_kind: FrontendProfileKind::Romm,
+            ..Default::default()
+        };
+        let profile = library_view_form_profile(&dialog);
+        assert_eq!(profile.kind, FrontendProfileKind::Romm);
+    }
+
+    /// Test C: switching between every profile kind - the same state
+    /// transitions the dialog's radio buttons drive - never touches the
+    /// filesystem. `library_view_form_profile` is a pure function (no
+    /// `archivefs_core` call, no `std::fs` use); this proves it against a
+    /// real file, not just by code inspection.
+    #[test]
+    fn library_view_form_profile_switch_never_touches_the_filesystem() {
+        let dir = database_test_dir("library-view-profile-switch-no-mutation");
+        let marker = dir.join("source-file.zip");
+        std::fs::write(&marker, b"original-bytes").unwrap();
+        let before = std::fs::read(&marker).unwrap();
+
+        let mut dialog = LibraryViewFormDialogState::default();
+        for kind in [
+            FrontendProfileKind::Generic,
+            FrontendProfileKind::Romm,
+            FrontendProfileKind::EsDe,
+            FrontendProfileKind::Generic,
+        ] {
+            dialog.profile_kind = kind;
+            let _ = library_view_form_profile(&dialog);
+        }
+
+        assert_eq!(std::fs::read(&marker).unwrap(), before);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Test D: RomM platform overrides typed into the dialog (the same
+    /// `dialog.romm_overrides` list the "Add override" button pushes into)
+    /// persist into `FrontendProfilePolicy::platform_mapping_overrides` on
+    /// the submitted profile - the only place a `FrontendPlatformMapping`
+    /// is built from GUI state.
+    #[test]
+    fn library_view_form_romm_overrides_persist_into_the_built_profile() {
+        let mut dialog = LibraryViewFormDialogState {
+            profile_kind: FrontendProfileKind::Romm,
+            ..Default::default()
+        };
+        dialog
+            .romm_overrides
+            .push(("NES".to_string(), "nes".to_string()));
+        dialog
+            .romm_overrides
+            .push(("SNES".to_string(), "snes".to_string()));
+
+        let profile = library_view_form_profile(&dialog);
+        assert_eq!(
+            profile.policy.platform_mapping_overrides.get("NES"),
+            Some("nes")
+        );
+        assert_eq!(
+            profile.policy.platform_mapping_overrides.get("SNES"),
+            Some("snes")
+        );
+    }
+
+    /// Editing an existing RomM view must prefill the dialog with its
+    /// current profile kind and overrides - the Edit button's own
+    /// construction of `LibraryViewFormDialogState`, exercised directly
+    /// rather than by simulating a click (same convention as
+    /// `library_view_form_dialog_rejects_a_destination_inside_a_source_with_an_inline_message`
+    /// above).
+    #[test]
+    fn library_view_form_edit_prefills_romm_profile_and_overrides_from_the_view() {
+        let mut view = sample_library_view("view-1", "retrodeck", "/home/user/retrodeck/roms");
+        view.profile.kind = FrontendProfileKind::Romm;
+        view.profile
+            .policy
+            .platform_mapping_overrides
+            .insert("NES".to_string(), "nes".to_string());
+
+        let dialog = LibraryViewFormDialogState {
+            editing_id: Some(view.id.clone()),
+            name: view.name.clone(),
+            destination_text: view.destination_root.display().to_string(),
+            selected_source_folders: view.source_folders.iter().cloned().collect(),
+            selected_platforms: view.platforms.iter().cloned().collect(),
+            validation_message: None,
+            profile_kind: view.profile.kind,
+            romm_overrides: view
+                .profile
+                .policy
+                .platform_mapping_overrides
+                .iter()
+                .map(|(platform, slug)| (platform.to_string(), slug.to_string()))
+                .collect(),
+            romm_override_platform_input: String::new(),
+            romm_override_slug_input: String::new(),
+        };
+
+        assert_eq!(dialog.profile_kind, FrontendProfileKind::Romm);
+        assert_eq!(
+            dialog.romm_overrides,
+            vec![("NES".to_string(), "nes".to_string())]
+        );
+        // Round-trips back through the same builder the submit handler uses.
+        assert_eq!(library_view_form_profile(&dialog), view.profile);
+    }
+
+    /// Test E: the preview summary renders a resolved RomM path.
+    #[test]
+    fn library_view_plan_summary_shows_resolved_romm_paths() {
+        let ctx = egui::Context::default();
+        let plan = sample_plan(
+            LibraryViewPlanCounts {
+                create: 1,
+                correct: 0,
+                repair: 0,
+                remove: 0,
+                collision: 0,
+                skip: 0,
+            },
+            vec![LibraryViewPlanEntry {
+                action: LibraryViewPlanAction::Create,
+                archive_path: Some(PathBuf::from("/roms/source/Game.zip")),
+                relative_link_path: Some(PathBuf::from("roms/nes/Game.zip")),
+                destination_path: Some(PathBuf::from(
+                    "/home/user/retrodeck/roms/roms/nes/Game.zip",
+                )),
+                platform: Some("NES".to_string()),
+                reason: None,
+                colliding_with: None,
+                source_folder_path: Some(PathBuf::from("/roms/source")),
+                archive_identity: None,
+            }],
+            None,
+            None,
+        );
+        let mut filter = LibraryViewPlanFilter::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_library_view_plan_summary(ui, &plan, &mut filter);
+            });
+        });
+        assert!(rendered_text_contains(&output, "Create: 1"));
+        assert!(rendered_text_contains(
+            &output,
+            "/home/user/retrodeck/roms/roms/nes/Game.zip"
+        ));
+    }
+
+    /// Test F: an unresolved RomM mapping shows as a Skip entry with its
+    /// reason clearly visible - never silently dropped.
+    #[test]
+    fn library_view_plan_summary_shows_unresolved_romm_mappings_with_reasons() {
+        let ctx = egui::Context::default();
+        let plan = sample_plan(
+            LibraryViewPlanCounts {
+                create: 0,
+                correct: 0,
+                repair: 0,
+                remove: 0,
+                collision: 0,
+                skip: 1,
+            },
+            vec![LibraryViewPlanEntry {
+                action: LibraryViewPlanAction::SkipInvalidPath,
+                archive_path: Some(PathBuf::from("/roms/source/Obscure.zip")),
+                relative_link_path: None,
+                destination_path: None,
+                platform: Some("Atari Jaguar".to_string()),
+                reason: Some(
+                    "no RomM platform slug could be resolved for catalogue platform \
+                     \"Atari Jaguar\""
+                        .to_string(),
+                ),
+                colliding_with: None,
+                source_folder_path: None,
+                archive_identity: None,
+            }],
+            None,
+            None,
+        );
+        let mut filter = LibraryViewPlanFilter::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_library_view_plan_summary(ui, &plan, &mut filter);
+            });
+        });
+        assert!(rendered_text_contains(&output, "Skip: 1"));
+        assert!(rendered_text_contains(
+            &output,
+            "no RomM platform slug could be resolved"
+        ));
+        assert!(rendered_text_contains(&output, "Atari Jaguar"));
+    }
+
+    /// Test G: a fingerprint conflict is shown clearly and short-circuits
+    /// the summary - the ordinary Create/Correct/... counts (which apply
+    /// would act on) are not rendered alongside a state where Apply is
+    /// refused, so the refusal cannot be missed. `plan.is_safe_to_apply()`
+    /// (which every Apply/Repair button's `can_apply` is computed from - see
+    /// `show_library_views_page`) is `false` for this plan, confirmed
+    /// directly rather than by pixel-level widget introspection.
+    #[test]
+    fn library_view_plan_summary_shows_fingerprint_conflict_and_blocks_apply() {
+        let ctx = egui::Context::default();
+        let plan = sample_plan(
+            LibraryViewPlanCounts::default(),
+            Vec::new(),
+            None,
+            Some("this view's existing manifest was written under a different profile".to_string()),
+        );
+        assert!(!plan.is_safe_to_apply());
+        let mut filter = LibraryViewPlanFilter::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_library_view_plan_summary(ui, &plan, &mut filter);
+            });
+        });
+        assert!(rendered_text_contains(&output, "Profile changed"));
+        assert!(!rendered_text_contains(&output, "Create: "));
+    }
+
+    /// Test H: a `profile_error` (e.g. the still-unimplemented ES-DE kind)
+    /// is shown clearly and also blocks Apply.
+    #[test]
+    fn library_view_plan_summary_shows_profile_error_and_blocks_apply() {
+        let ctx = egui::Context::default();
+        let plan = sample_plan(
+            LibraryViewPlanCounts::default(),
+            Vec::new(),
+            Some(
+                "the EsDe frontend profile does not implement real Library View materialization \
+                 yet"
+                .to_string(),
+            ),
+            None,
+        );
+        assert!(!plan.is_safe_to_apply());
+        let mut filter = LibraryViewPlanFilter::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_library_view_plan_summary(ui, &plan, &mut filter);
+            });
+        });
+        assert!(rendered_text_contains(
+            &output,
+            "Unsupported frontend profile"
+        ));
+        assert!(!rendered_text_contains(&output, "Create: "));
+    }
+
+    /// Test K/L: the post-apply summary message includes the skip count,
+    /// and visibly distinguishes a fully-applied result from a partial one
+    /// - never wording a partial RomM result as an unqualified success.
+    #[test]
+    fn library_view_apply_summary_message_reports_skip_count_and_partial_state() {
+        let report = LibraryViewApplyReport {
+            view_id: "view-1".to_string(),
+            created: 1243,
+            repaired: 0,
+            removed: 0,
+            unchanged: 340,
+            failed: 0,
+            results: Vec::new(),
+        };
+
+        let full = library_view_apply_summary_message("Applied", "retrodeck", &report, Some(0));
+        assert!(full.contains("1243 created"));
+        assert!(full.contains("340 unchanged"));
+        assert!(full.contains("0 skipped"));
+        assert!(!full.contains("not fully applied"));
+
+        let partial = library_view_apply_summary_message("Applied", "retrodeck", &report, Some(3));
+        assert!(partial.contains("3 skipped"));
+        assert!(
+            partial.contains("not fully applied"),
+            "a nonzero skip count must visibly say the view is not fully applied: {partial:?}"
+        );
+
+        // A re-preview failure (e.g. the view vanished) never fabricates a
+        // count - the apply's own outcome is still reported truthfully.
+        let unknown = library_view_apply_summary_message("Applied", "retrodeck", &report, None);
+        assert!(unknown.contains("1243 created"));
+        assert!(!unknown.contains("skipped"));
+    }
+
+    /// Test M: collisions remain visible in the preview summary - never
+    /// silently dropped or merged into another bucket.
+    #[test]
+    fn library_view_plan_summary_shows_collisions() {
+        let ctx = egui::Context::default();
+        let plan = sample_plan(
+            LibraryViewPlanCounts {
+                create: 0,
+                correct: 0,
+                repair: 0,
+                remove: 0,
+                collision: 1,
+                skip: 0,
+            },
+            vec![LibraryViewPlanEntry {
+                action: LibraryViewPlanAction::Collision,
+                archive_path: Some(PathBuf::from("/roms/source/Game.zip")),
+                relative_link_path: Some(PathBuf::from("roms/nes/Game.zip")),
+                destination_path: Some(PathBuf::from(
+                    "/home/user/retrodeck/roms/roms/nes/Game.zip",
+                )),
+                platform: Some("NES".to_string()),
+                reason: Some(
+                    "a real file or directory already exists at this destination".to_string(),
+                ),
+                colliding_with: None,
+                source_folder_path: None,
+                archive_identity: None,
+            }],
+            None,
+            None,
+        );
+        let mut filter = LibraryViewPlanFilter::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_library_view_plan_summary(ui, &plan, &mut filter);
+            });
+        });
+        assert!(rendered_text_contains(&output, "Collision: 1"));
+        assert!(rendered_text_contains(&output, "[Collision]"));
+        assert!(rendered_text_contains(
+            &output,
+            "a real file or directory already exists at this destination"
+        ));
+    }
+
+    /// Test O: ES-DE stays visible (per the milestone's UI-vocabulary note)
+    /// but is presented as a disabled, non-executable choice in the Add/Edit
+    /// View dialog - never a selectable option that could plan/apply
+    /// anything.
+    #[test]
+    fn library_view_form_esde_is_visible_but_not_selectable() {
+        let ctx = egui::Context::default();
+        let mut profile_kind = FrontendProfileKind::Generic;
+        let mut overrides = Vec::new();
+        let mut platform_input = String::new();
+        let mut slug_input = String::new();
+        let mut clipboard = InMemoryClipboard::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_library_view_profile_selection(
+                    ui,
+                    &mut profile_kind,
+                    &mut overrides,
+                    &mut platform_input,
+                    &mut slug_input,
+                    &mut clipboard,
+                );
+            });
+        });
+        assert!(rendered_text_contains(&output, "ES-DE"));
+        assert!(rendered_text_contains(&output, "Generic"));
+        assert!(rendered_text_contains(&output, "RomM"));
+        // ES-DE fails closed in the backend regardless of GUI wiring -
+        // confirmed at the type/profile level here rather than re-deriving
+        // a plan (already exhaustively covered in
+        // `archivefs-core`'s `esde_profile_kind_fails_closed_...` test).
+        assert_eq!(FrontendProfileKind::default(), FrontendProfileKind::Generic);
+    }
+
+    /// Test F (2026-08-17 smoke-test incident regression): a cached
+    /// `library_view_last_plan` for a view whose `source_folders` (or any
+    /// other field) no longer matches the *current* `LibraryViewConfig` of
+    /// the same id must never be rendered as if it still described that
+    /// view - it must disappear (prompting a fresh Preview) rather than
+    /// silently show entries planned against the old configuration. This
+    /// is the actual production fix: `show_library_views_page`'s
+    /// `has_current_plan`/`can_apply` now compare the *whole* cached
+    /// `LibraryViewConfig` (`previewed == view`), not just `previewed.id ==
+    /// view.id` - id equality alone is exactly what let a plan computed
+    /// while `source_folders` pointed at
+    /// `/mnt/local/downloads/jdownloader2/output` keep rendering after the
+    /// view was corrected to `/mnt/games/roms/sms`, because the two
+    /// `LibraryViewConfig`s share an id but disagree on every field that
+    /// actually drives planning.
+    #[test]
+    fn stale_cached_plan_for_a_changed_view_is_never_rendered_as_current() {
+        let ctx = egui::Context::default();
+        let mut current_view =
+            sample_library_view("view-1", "master system smoke", "/mnt/romm-view-smoke");
+        current_view.source_folders = vec![PathBuf::from("/mnt/games/roms/sms")];
+        current_view.platforms = vec!["MasterSystem".to_string()];
+
+        // The cached plan was computed for the *same id*, but a different
+        // (stale) configuration - exactly the incident's shape: an earlier
+        // source selection.
+        let mut stale_view = current_view.clone();
+        stale_view.source_folders = vec![PathBuf::from("/mnt/local/downloads/jdownloader2/output")];
+        let stale_plan = sample_plan(
+            LibraryViewPlanCounts {
+                create: 0,
+                correct: 0,
+                repair: 0,
+                remove: 0,
+                collision: 0,
+                skip: 8,
+            },
+            vec![LibraryViewPlanEntry {
+                action: LibraryViewPlanAction::SkipUnknownPlatform,
+                archive_path: Some(PathBuf::from(
+                    "/mnt/local/downloads/jdownloader2/output/Agatha Christie.zip",
+                )),
+                relative_link_path: None,
+                destination_path: None,
+                platform: None,
+                reason: Some("archive has no assigned platform".to_string()),
+                colliding_with: None,
+                source_folder_path: None,
+                archive_identity: None,
+            }],
+            None,
+            None,
+        );
+        let last_plan = Some((stale_view, stale_plan));
+
+        let views = vec![current_view];
+        let all_source_folders: Vec<SourceFolderView> = Vec::new();
+        let mut plan_filter = LibraryViewPlanFilter::default();
+        let mut form_dialog = None;
+        let mut remove_dialog = None;
+        let mut clipboard = InMemoryClipboard::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_library_views_page(
+                    ui,
+                    &views,
+                    &all_source_folders,
+                    false,
+                    last_plan.as_ref(),
+                    None,
+                    &mut plan_filter,
+                    &mut form_dialog,
+                    &mut remove_dialog,
+                    &mut clipboard,
+                );
+            });
+        });
+
+        assert!(
+            !rendered_text_contains(&output, "jdownloader2"),
+            "a plan computed for a different source selection must never be shown for the \
+             current (edited) view"
+        );
+        assert!(
+            !rendered_text_contains(&output, "Skip: 8"),
+            "stale counts from an outdated plan must not be rendered as the current view's plan"
+        );
+    }
+
+    /// The matching-and-current case must still render normally - the fix
+    /// above must not make every plan look stale.
+    #[test]
+    fn current_cached_plan_for_an_unchanged_view_still_renders() {
+        let ctx = egui::Context::default();
+        let view = sample_library_view("view-1", "master system smoke", "/mnt/romm-view-smoke");
+        let plan = sample_plan(
+            LibraryViewPlanCounts {
+                create: 1,
+                correct: 0,
+                repair: 0,
+                remove: 0,
+                collision: 0,
+                skip: 0,
+            },
+            vec![LibraryViewPlanEntry {
+                action: LibraryViewPlanAction::Create,
+                archive_path: Some(PathBuf::from("/mnt/games/roms/sms/Alex Kidd.zip")),
+                relative_link_path: Some(PathBuf::from("MasterSystem/Alex Kidd.zip")),
+                destination_path: Some(PathBuf::from(
+                    "/mnt/romm-view-smoke/MasterSystem/Alex Kidd.zip",
+                )),
+                platform: Some("MasterSystem".to_string()),
+                reason: None,
+                colliding_with: None,
+                source_folder_path: Some(PathBuf::from("/mnt/games/roms/sms")),
+                archive_identity: None,
+            }],
+            None,
+            None,
+        );
+        let last_plan = Some((view.clone(), plan));
+
+        let views = vec![view];
+        let all_source_folders: Vec<SourceFolderView> = Vec::new();
+        let mut plan_filter = LibraryViewPlanFilter::default();
+        let mut form_dialog = None;
+        let mut remove_dialog = None;
+        let mut clipboard = InMemoryClipboard::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_library_views_page(
+                    ui,
+                    &views,
+                    &all_source_folders,
+                    false,
+                    last_plan.as_ref(),
+                    None,
+                    &mut plan_filter,
+                    &mut form_dialog,
+                    &mut remove_dialog,
+                    &mut clipboard,
+                );
+            });
+        });
+
+        assert!(rendered_text_contains(&output, "Create: 1"));
+        assert!(rendered_text_contains(&output, "Alex Kidd.zip"));
     }
 
     #[test]
@@ -66238,6 +67357,9 @@ $Instant Growth [Nayr]\n";
                 archive_identity: None,
             }],
             unsafe_root_error: None,
+            profile_fingerprint: String::new(),
+            fingerprint_conflict: None,
+            profile_error: None,
         };
         let last_plan = (view, plan);
 

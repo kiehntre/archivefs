@@ -11,7 +11,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use archivefs_core::dat::limits::DatLimits;
-use archivefs_core::dat::sources::DatSourceKind;
+use archivefs_core::dat::sources::{DatSourceEntry, DatSourceKind};
 use archivefs_core::repair::execute::RepairReverifyOutcome;
 use archivefs_core::repair::library::{
     LibraryRepairPlan, LibraryRepairReport, LibraryScanRequest, PlanItem, RepairProfile,
@@ -1749,4 +1749,239 @@ fn ordinary_rename_only_rows_carry_no_quarantine_signal_and_render_unchanged() {
     });
     assert!(!rendered_text_contains(&output, "Quarantine duplicate"));
     assert!(rendered_text_contains(&output, "26 safe repairs"));
+}
+
+// --- J. "Scan library for repairs" - launches the existing planner path,
+// loads a successful result into Repair Review state, and never leaves a
+// stale/half-loaded plan (or invokes apply) on failure. ---------------------
+
+/// A one-entry `ScanSetupState`, both required inputs already chosen, ready
+/// for [`RepairReviewPageState::start_scan`] - the state a real click
+/// through the setup dialog would have produced.
+fn scan_setup_fixture(dat: &std::path::Path, scan_root: &std::path::Path) -> ScanSetupState {
+    let entry = DatSourceEntry::new(
+        "test-dat".to_string(),
+        "Test catalogue".to_string(),
+        dat.to_path_buf(),
+        DatSourceKind::File,
+    );
+    ScanSetupState {
+        dat_sources: vec![entry.clone()],
+        dat_load_error: None,
+        library_folders: vec![scan_root.to_path_buf()],
+        selected_dat_id: Some(entry.id),
+        chosen_scan_root: Some(scan_root.to_path_buf()),
+    }
+}
+
+/// Blocks the calling test thread until the page's background scan job
+/// settles or a generous deadline passes, polling exactly the way the real
+/// render loop does (`poll_scan` once per tick) - the scan mirror of
+/// `wait_for_apply`.
+fn wait_for_scan(state: &mut RepairReviewPageState) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while state.is_scan_running() {
+        state.poll_scan();
+        if Instant::now() > deadline {
+            panic!("the background scan job did not finish in time");
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// Test 1: the GUI scan action runs the *exact* existing engine path
+/// (`run_library_scan` + `plan_file_from_scan`), not a second/parallel
+/// planner - proven by comparing the plan the GUI action produced against
+/// one built by calling that same engine path directly on identical inputs.
+#[test]
+fn scan_action_runs_the_existing_planner_path() {
+    let dir = TestDir::new("scan-launches-planner");
+    let (dat, roms) = write_apply_fixture(dir.path());
+    let expected = scan_apply_fixture(&dat, &roms);
+
+    let mut state = RepairReviewPageState {
+        scan_setup: Some(scan_setup_fixture(&dat, &roms)),
+        ..RepairReviewPageState::default()
+    };
+    state.start_scan();
+    wait_for_scan(&mut state);
+
+    let plan = state.plan.as_ref().expect("a plan was loaded");
+    assert_eq!(
+        plan.repair_plan.proposals.len(),
+        expected.repair_plan.proposals.len()
+    );
+    assert_eq!(plan.report.counts, expected.report.counts);
+    assert_eq!(plan.scan_root, expected.scan_root);
+    assert_eq!(plan.dat_path, expected.dat_path);
+    assert_eq!(plan.generation, expected.generation);
+}
+
+/// Test 2: a successful scan loads its plan directly into the page's
+/// existing review state - the same state `load_plan` populates from a
+/// file - with `CountsAvailability::CURRENT` (the plan was built in-process,
+/// never round-tripped through JSON) and no `plan_path` (it was never read
+/// from a file).
+#[test]
+fn successful_scan_loads_the_plan_into_repair_review_state() {
+    let dir = TestDir::new("scan-success-loads-state");
+    let (dat, roms) = write_apply_fixture(dir.path());
+
+    let mut state = RepairReviewPageState {
+        scan_setup: Some(scan_setup_fixture(&dat, &roms)),
+        ..RepairReviewPageState::default()
+    };
+    state.start_scan();
+    wait_for_scan(&mut state);
+
+    assert_eq!(state.scan_status, Some(LibraryScanStatus::Completed));
+    assert!(state.plan.is_some());
+    assert!(
+        state.plan_path.is_none(),
+        "a scanned plan was never read from a file"
+    );
+    assert_eq!(state.counts_availability, CountsAvailability::CURRENT);
+    assert_eq!(state.plan.as_ref().unwrap().report.counts.safe_repairs, 2);
+    assert!(!state.is_scan_running());
+    assert!(
+        state.scan_setup.is_none(),
+        "the setup dialog closes once the scan is started"
+    );
+}
+
+/// Regression for the lifecycle-audit bug: a stale `self.error` from an
+/// earlier failed "Load repair plan" attempt must not survive a later
+/// successful scan. Before the fix, `handle_scan_message`'s `Completed` arm
+/// called `adopt_loaded_plan` without clearing `self.error`, so the old
+/// parse-failure banner kept rendering - falsely claiming "the plan shown
+/// below ... was not replaced" - right alongside the new, successfully
+/// scanned plan.
+#[test]
+fn a_successful_scan_clears_a_stale_load_error() {
+    let dir = TestDir::new("scan-success-clears-stale-load-error");
+    let (dat, roms) = write_apply_fixture(dir.path());
+
+    // 1. Induce a prior load error exactly as a bad "Load repair plan" pick
+    // would: `load_plan` on a path that does not parse as a plan.
+    let bad_plan_path = dir.path().join("not-a-plan.json");
+    std::fs::write(&bad_plan_path, b"not valid json").unwrap();
+    let mut state = RepairReviewPageState::default();
+    state.load_plan(bad_plan_path);
+    assert!(
+        state.error.is_some(),
+        "the fixture must actually induce a load error, or this test proves nothing"
+    );
+    assert!(state.plan.is_none());
+
+    // 2. Complete a successful in-process scan.
+    state.scan_setup = Some(scan_setup_fixture(&dat, &roms));
+    state.start_scan();
+    wait_for_scan(&mut state);
+
+    // 3-5. The stale error is gone, the new scan's plan is active, and the
+    // scan status reads Completed.
+    assert!(
+        state.error.is_none(),
+        "a successful scan must clear a stale load error"
+    );
+    assert_eq!(state.scan_status, Some(LibraryScanStatus::Completed));
+    let plan = state.plan.as_ref().expect("the new scan's plan is active");
+    assert_eq!(plan.dat_path, dat.display().to_string());
+    assert_eq!(plan.scan_root, roms.display().to_string());
+    assert_eq!(plan.report.counts.safe_repairs, 2);
+}
+
+/// Test 3a: a scan that fails outright (no plan was ever loaded before it)
+/// must never leave a plan in place at all.
+#[test]
+fn failed_scan_leaves_no_stale_plan_when_none_was_loaded() {
+    let dir = TestDir::new("scan-failure-no-stale-plan");
+    // A DAT path that does not exist - the audit fails immediately.
+    let missing_dat = dir.path().join("missing.dat");
+    let roms = dir.path().join("roms");
+    std::fs::create_dir_all(&roms).unwrap();
+
+    let mut state = RepairReviewPageState::default();
+    assert!(state.plan.is_none());
+    state.scan_setup = Some(scan_setup_fixture(&missing_dat, &roms));
+    state.start_scan();
+    wait_for_scan(&mut state);
+
+    assert!(
+        state.plan.is_none(),
+        "a failed scan must never leave a half-loaded plan"
+    );
+    assert!(matches!(
+        state.scan_status,
+        Some(LibraryScanStatus::Failed(_))
+    ));
+}
+
+/// Test 3b: a scan that fails must never replace a plan that was already
+/// loaded - the previous plan (from a file, or an earlier successful scan)
+/// stays exactly as it was.
+#[test]
+fn failed_scan_never_replaces_an_already_loaded_plan() {
+    let dir = TestDir::new("scan-failure-preserves-existing-plan");
+    let (dat, roms) = write_apply_fixture(dir.path());
+    let good_plan = scan_apply_fixture(&dat, &roms);
+
+    let mut state = RepairReviewPageState::default();
+    state.adopt_loaded_plan(good_plan.clone(), None, CountsAvailability::CURRENT);
+    assert!(state.plan.is_some());
+
+    let missing_dat = dir.path().join("missing.dat");
+    state.scan_setup = Some(scan_setup_fixture(&missing_dat, &roms));
+    state.start_scan();
+    wait_for_scan(&mut state);
+
+    let plan = state
+        .plan
+        .as_ref()
+        .expect("the previous plan is still there");
+    assert_eq!(plan.dat_path, good_plan.dat_path);
+    assert_eq!(plan.report.counts, good_plan.report.counts);
+    assert!(matches!(
+        state.scan_status,
+        Some(LibraryScanStatus::Failed(_))
+    ));
+}
+
+/// Test 4: the scan path never touches the apply/mutation machinery at all -
+/// even though the fixture DAT proves two Safe repairs are available, the
+/// source ROM files are byte-identical afterwards, and every apply-related
+/// field is left in its untouched default state. The only mutation path
+/// anywhere on this page is `spawn_apply`, which the scan action never
+/// calls.
+#[test]
+fn scan_action_never_invokes_apply_or_mutates_the_library() {
+    let dir = TestDir::new("scan-never-mutates");
+    let (dat, roms) = write_apply_fixture(dir.path());
+    let before_a = std::fs::read(roms.join("a.bin")).unwrap();
+    let before_b = std::fs::read(roms.join("b.bin")).unwrap();
+
+    let mut state = RepairReviewPageState {
+        scan_setup: Some(scan_setup_fixture(&dat, &roms)),
+        ..RepairReviewPageState::default()
+    };
+    state.start_scan();
+    wait_for_scan(&mut state);
+
+    assert_eq!(state.scan_status, Some(LibraryScanStatus::Completed));
+    assert_eq!(
+        state.plan.as_ref().unwrap().report.counts.safe_repairs,
+        2,
+        "the fixture must actually have safe repairs available, or this test proves nothing"
+    );
+    assert!(!state.apply_running);
+    assert!(state.apply_job.is_none());
+    assert!(state.apply_result.is_none());
+    assert!(state.apply_failure.is_none());
+    assert!(!state.plan_stale);
+    // The files still exist under their original (wrongly-named) names -
+    // nothing was renamed - and their bytes are unchanged.
+    assert!(roms.join("a.bin").exists());
+    assert!(roms.join("b.bin").exists());
+    assert_eq!(std::fs::read(roms.join("a.bin")).unwrap(), before_a);
+    assert_eq!(std::fs::read(roms.join("b.bin")).unwrap(), before_b);
 }

@@ -322,7 +322,7 @@ pub(crate) struct DiagnosticOccurrenceView {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DiagnosticGroupView {
     pub(crate) severity: DiagnosticSeverity,
-    /// The stable parser code, e.g. "doctype_ignored".
+    /// The stable parser code, e.g. "trusted_dtd_unavailable".
     pub(crate) code: &'static str,
     /// The diagnostic message, verbatim, deduplicated by the group key.
     pub(crate) message: String,
@@ -1654,9 +1654,12 @@ impl DatSourcesPageState {
         let draft = saved.clone();
         // The durable journal directory and any transactions found in it that
         // are still actionable: settled `Applied` batches offered for rollback
-        // and interrupted batches offered for explicit crash recovery.
-        let (recovery_transactions, _recovery_problems) =
-            archivefs_core::dat::rename_apply::find_rollbackable_transactions(&transaction_dir);
+        // and interrupted batches offered for explicit crash recovery. Uses
+        // the exact same reconciliation `refresh_recovery` applies to an
+        // already-running page, so a transaction rediscovered after a
+        // restart can never disagree with one the page had open the whole
+        // time - see `load_reconciled_recovery_transactions`.
+        let recovery_transactions = Self::load_reconciled_recovery_transactions(&transaction_dir);
         Self {
             config_path,
             database_path: None,
@@ -1851,28 +1854,11 @@ impl DatSourcesPageState {
     }
 
     /// Re-reads still-actionable transactions from the journal directory,
-    /// reconciling any in-flight (`Applying`/`RollingBack`) entries against the
-    /// filesystem so the counts and rollback eligibility reflect what actually
-    /// happened. A settled `Applied` transaction is listed as-is, eligible for
-    /// rollback.
+    /// reconciling any that need it, so the counts and rollback eligibility
+    /// reflect what actually happened. A settled `Applied` transaction is
+    /// listed as-is, eligible for rollback.
     fn refresh_recovery(&mut self) {
-        let (mut recovery, _) = archivefs_core::dat::rename_apply::find_rollbackable_transactions(
-            &self.transaction_dir,
-        );
-        for transaction in &mut recovery {
-            if transaction.entries.iter().any(|entry| {
-                matches!(
-                    entry.state,
-                    archivefs_core::dat::rename_apply::EntryState::Applying
-                        | archivefs_core::dat::rename_apply::EntryState::RollingBack
-                )
-            }) {
-                let _ = archivefs_core::dat::rename_apply::reconcile_recovery(
-                    transaction,
-                    &self.transaction_dir,
-                );
-            }
-        }
+        let mut recovery = Self::load_reconciled_recovery_transactions(&self.transaction_dir);
         // The transaction applied this session is already shown by the apply
         // outcome card; do not list it a second time in the recovery list.
         if let Some(outcome) = &self.apply_outcome {
@@ -1881,6 +1867,46 @@ impl DatSourcesPageState {
             });
         }
         self.recovery_transactions = recovery;
+    }
+
+    /// Every still-actionable transaction in `transaction_dir`, reconciled
+    /// against the filesystem/entry-state evidence where needed - the one
+    /// path both [`Self::refresh_recovery`] (a page already open) and
+    /// [`Self::load_with_transaction_dir`] (a fresh load, e.g. after a
+    /// restart) use, so the two can never disagree about what a settled
+    /// transaction's state actually is.
+    ///
+    /// A transaction is reconciled (via
+    /// [`archivefs_core::dat::rename_apply::reconcile_recovery`]) whenever
+    /// either an entry is still in-flight (`Applying`/`RollingBack`) or the
+    /// transaction's own overall state is still `Applying` even though its
+    /// entries may have already durably settled - the second case is what a
+    /// final journal write that failed to land after every entry finished
+    /// looks like, and is exactly what `reconcile_recovery` now also
+    /// repairs.
+    fn load_reconciled_recovery_transactions(
+        transaction_dir: &Path,
+    ) -> Vec<archivefs_core::dat::rename_apply::RenameTransaction> {
+        let (mut recovery, _) =
+            archivefs_core::dat::rename_apply::find_rollbackable_transactions(transaction_dir);
+        for transaction in &mut recovery {
+            let needs_reconciliation = transaction.state
+                == archivefs_core::dat::rename_apply::TransactionState::Applying
+                || transaction.entries.iter().any(|entry| {
+                    matches!(
+                        entry.state,
+                        archivefs_core::dat::rename_apply::EntryState::Applying
+                            | archivefs_core::dat::rename_apply::EntryState::RollingBack
+                    )
+                });
+            if needs_reconciliation {
+                let _ = archivefs_core::dat::rename_apply::reconcile_recovery(
+                    transaction,
+                    transaction_dir,
+                );
+            }
+        }
+        recovery
     }
 
     pub(crate) fn poll(&mut self) -> bool {
