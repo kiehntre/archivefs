@@ -95,6 +95,10 @@ pub mod dat;
 
 pub mod disk_format;
 
+/// Pure content/container/media evidence, deliberately separate from
+/// canonical platform identity. See the module documentation for why.
+pub mod content_evidence;
+
 pub mod repair;
 
 pub mod safe_read;
