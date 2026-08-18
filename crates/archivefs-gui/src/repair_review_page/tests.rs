@@ -1789,6 +1789,88 @@ fn wait_for_scan(state: &mut RepairReviewPageState) {
     }
 }
 
+/// Regression for the "Scan library for repairs" dialog exceeding the
+/// available viewport (post-v0.8 usability pass): with many registered DAT
+/// sources and many discovered library folders, on a deliberately small
+/// simulated viewport (well under a real 1080p desktop), the dialog's
+/// "Cancel"/"Start scan" buttons and the selected-path readout must still
+/// actually render - proving they were not pushed below an unreachable
+/// window edge. Before the fix, the DAT/folder lists were drawn directly
+/// into the window with no internal scroll bound, so a long enough list
+/// grew the window past the screen and could leave these controls
+/// unreachable.
+#[test]
+fn scan_setup_dialog_keeps_its_controls_reachable_with_many_entries_on_a_small_viewport() {
+    let dat_sources: Vec<DatSourceEntry> = (0..40)
+        .map(|index| {
+            DatSourceEntry::new(
+                format!("dat-{index}"),
+                format!("Catalogue {index}"),
+                PathBuf::from(format!("/dats/catalogue-{index}.dat")),
+                DatSourceKind::File,
+            )
+        })
+        .collect();
+    let library_folders: Vec<PathBuf> = (0..40)
+        .map(|index| PathBuf::from(format!("/roms/folder-{index}")))
+        .collect();
+    let selected_dat_id = dat_sources[0].id.clone();
+    let chosen_scan_root = library_folders[0].clone();
+
+    let mut state = RepairReviewPageState {
+        scan_setup: Some(ScanSetupState {
+            dat_sources,
+            dat_load_error: None,
+            library_folders,
+            selected_dat_id: Some(selected_dat_id),
+            chosen_scan_root: Some(chosen_scan_root.clone()),
+        }),
+        ..RepairReviewPageState::default()
+    };
+
+    let ctx = egui::Context::default();
+    // A deliberately small viewport - the exact real-world complaint was a
+    // 1080p desktop where the bottom of the dialog became unreachable, so
+    // this must hold even well below that.
+    let input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(900.0, 500.0),
+        )),
+        ..Default::default()
+    };
+    // A never-before-seen floating `egui::Window` needs one settling frame
+    // before its content actually paints (its `Area` has no remembered
+    // position/size yet on the very first frame) - the same reason this
+    // file's other window-rendering tests run twice.
+    let _ = ctx.run(input.clone(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            show_repair_review_page(ui, &mut state);
+        });
+    });
+    let output = ctx.run(input, |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            show_repair_review_page(ui, &mut state);
+        });
+    });
+
+    assert!(
+        rendered_text_contains(&output, "Cancel"),
+        "Cancel must remain reachable even with many entries on a small viewport"
+    );
+    assert!(
+        rendered_text_contains(&output, "Start scan"),
+        "Start scan must remain reachable even with many entries on a small viewport"
+    );
+    assert!(
+        rendered_text_contains(
+            &output,
+            &format!("Selected: {}", chosen_scan_root.display())
+        ),
+        "the selected path must remain reachable even with many entries on a small viewport"
+    );
+}
+
 /// Test 1: the GUI scan action runs the *exact* existing engine path
 /// (`run_library_scan` + `plan_file_from_scan`), not a second/parallel
 /// planner - proven by comparing the plan the GUI action produced against

@@ -1591,103 +1591,126 @@ fn show_scan_setup_dialog(ui: &mut egui::Ui, state: &mut RepairReviewPageState) 
     let mut start_clicked = false;
 
     let can_start = state.can_start_scan();
-    egui::Window::new("Scan library for repairs")
-        .collapsible(false)
-        .resizable(false)
+    // Resizable (not fixed) and height-capped so this dialog always fits
+    // the real available viewport instead of growing past it with the DAT
+    // source/library folder counts - see the inner `ScrollArea` below,
+    // which is what actually keeps the choice lists bounded; this cap is
+    // the outer safety net for everything else in the window too.
+    let max_window_height = (ui.ctx().screen_rect().height() - 80.0).max(240.0);
+    widgets::centered_window("Scan library for repairs")
+        .resizable(true)
+        .max_height(max_window_height)
         .open(&mut open)
-        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .show(ui.ctx(), |ui| {
             let Some(setup) = state.scan_setup.as_mut() else {
                 return;
             };
-            ui.label(egui::RichText::new("1. Choose a DAT catalogue").strong());
-            if let Some(error) = &setup.dat_load_error {
-                widgets::banner(
-                    ui,
-                    "Could not read the DAT sources registry",
-                    error,
-                    widgets::StatusTone::Blocked,
-                );
-            } else if setup.dat_sources.is_empty() {
-                ui.label(
-                    egui::RichText::new(
-                        "No enabled DAT sources are registered. Add one on the DAT Sources page \
-                         first.",
-                    )
-                    .color(theme::muted(ui)),
-                );
-            } else {
-                for entry in &setup.dat_sources {
-                    let selected = setup.selected_dat_id.as_deref() == Some(entry.id.as_str());
-                    let clicked = egui::Frame::new()
-                        .fill(if selected {
-                            ui.visuals().selection.bg_fill.gamma_multiply(0.35)
-                        } else {
-                            theme::card_fill(ui)
-                        })
-                        .stroke(theme::border(ui))
-                        .corner_radius(6)
-                        .inner_margin(egui::Margin::symmetric(12, 8))
-                        .show(ui, |ui| {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label(egui::RichText::new(&entry.display_name).strong());
-                                ui.label(
-                                    egui::RichText::new(entry.path.display().to_string())
-                                        .color(theme::muted(ui))
-                                        .small(),
-                                );
-                            });
-                        })
-                        .response
-                        .interact(egui::Sense::click());
-                    if clicked.clicked() {
-                        setup.selected_dat_id = Some(entry.id.clone());
-                    }
-                }
-            }
-
-            ui.add_space(8.0);
-            ui.label(egui::RichText::new("2. Choose a library folder to scan").strong());
-            for folder in &setup.library_folders {
-                let selected = setup.chosen_scan_root.as_deref() == Some(folder.as_path());
-                let clicked = egui::Frame::new()
-                    .fill(if selected {
-                        ui.visuals().selection.bg_fill.gamma_multiply(0.35)
+            // The DAT source and library folder choices are the only part
+            // of this dialog whose length depends on the user's own
+            // library (potentially many registered DAT sources or many
+            // discovered folders) - scrolled internally, with a bounded
+            // height, so however long those lists get, "Selected: ..." and
+            // the Cancel/Start buttons below always stay on-screen and
+            // reachable, even if the main window is resized smaller.
+            egui::ScrollArea::vertical()
+                .id_salt("scan_setup_choices")
+                .max_height((max_window_height - 160.0).max(120.0))
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.label(egui::RichText::new("1. Choose a DAT catalogue").strong());
+                    if let Some(error) = &setup.dat_load_error {
+                        widgets::banner(
+                            ui,
+                            "Could not read the DAT sources registry",
+                            error,
+                            widgets::StatusTone::Blocked,
+                        );
+                    } else if setup.dat_sources.is_empty() {
+                        ui.label(
+                            egui::RichText::new(
+                                "No enabled DAT sources are registered. Add one on the DAT \
+                                 Sources page first.",
+                            )
+                            .color(theme::muted(ui)),
+                        );
                     } else {
-                        theme::card_fill(ui)
-                    })
-                    .stroke(theme::border(ui))
-                    .corner_radius(6)
-                    .inner_margin(egui::Margin::symmetric(12, 8))
-                    .show(ui, |ui| {
-                        ui.label(folder.display().to_string());
-                    })
-                    .response
-                    .interact(egui::Sense::click());
-                if clicked.clicked() {
-                    setup.chosen_scan_root = Some(folder.clone());
-                }
-            }
-            if widgets::action_button(
-                ui,
-                "Choose another folder…",
-                widgets::ActionStyle::Quiet,
-                true,
-            )
-            .clicked()
-                && let Some(path) = rfd::FileDialog::new()
-                    .set_title("Choose a library folder to scan")
-                    .pick_folder()
-            {
-                setup.chosen_scan_root = Some(path);
-            }
+                        for entry in &setup.dat_sources {
+                            let selected =
+                                setup.selected_dat_id.as_deref() == Some(entry.id.as_str());
+                            let clicked = egui::Frame::new()
+                                .fill(if selected {
+                                    ui.visuals().selection.bg_fill.gamma_multiply(0.35)
+                                } else {
+                                    theme::card_fill(ui)
+                                })
+                                .stroke(theme::border(ui))
+                                .corner_radius(6)
+                                .inner_margin(egui::Margin::symmetric(12, 8))
+                                .show(ui, |ui| {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(egui::RichText::new(&entry.display_name).strong());
+                                        ui.label(
+                                            egui::RichText::new(entry.path.display().to_string())
+                                                .color(theme::muted(ui))
+                                                .small(),
+                                        );
+                                    });
+                                })
+                                .response
+                                .interact(egui::Sense::click());
+                            if clicked.clicked() {
+                                setup.selected_dat_id = Some(entry.id.clone());
+                            }
+                        }
+                    }
+
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new("2. Choose a library folder to scan").strong());
+                    for folder in &setup.library_folders {
+                        let selected = setup.chosen_scan_root.as_deref() == Some(folder.as_path());
+                        let clicked = egui::Frame::new()
+                            .fill(if selected {
+                                ui.visuals().selection.bg_fill.gamma_multiply(0.35)
+                            } else {
+                                theme::card_fill(ui)
+                            })
+                            .stroke(theme::border(ui))
+                            .corner_radius(6)
+                            .inner_margin(egui::Margin::symmetric(12, 8))
+                            .show(ui, |ui| {
+                                ui.label(folder.display().to_string());
+                            })
+                            .response
+                            .interact(egui::Sense::click());
+                        if clicked.clicked() {
+                            setup.chosen_scan_root = Some(folder.clone());
+                        }
+                    }
+                    if widgets::action_button(
+                        ui,
+                        "Choose another folder…",
+                        widgets::ActionStyle::Quiet,
+                        true,
+                    )
+                    .clicked()
+                        && let Some(path) = rfd::FileDialog::new()
+                            .set_title("Choose a library folder to scan")
+                            .pick_folder()
+                    {
+                        setup.chosen_scan_root = Some(path);
+                    }
+                });
+
+            // Deliberately outside the ScrollArea above: the selected path
+            // and the Cancel/Start controls must never scroll out of view,
+            // however long the choice lists get.
+            ui.separator();
             if let Some(root) = &setup.chosen_scan_root {
                 ui.label(
                     egui::RichText::new(format!("Selected: {}", root.display()))
                         .color(theme::muted(ui)),
                 );
             }
-
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 if ui.add(egui::Button::new("Cancel")).clicked() {

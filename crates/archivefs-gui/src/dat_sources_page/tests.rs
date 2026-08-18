@@ -4001,6 +4001,347 @@ fn page_with_apply_plan(count: usize) -> (Fixture, PathBuf, DatSourcesPageState)
     (fixture, roms, page)
 }
 
+fn fixture_content_technical_view() -> ContentTechnicalView {
+    ContentTechnicalView {
+        classification: "Verified".to_string(),
+        confidence: "Exact".to_string(),
+        evidence: vec!["CRC match".to_string()],
+        original_metadata: Vec::new(),
+        classifier_version: "test".to_string(),
+    }
+}
+
+fn fixture_rename_plan_row(source_path: &str, basename: &str) -> RenamePlanRowView {
+    RenamePlanRowView {
+        source_path: PathBuf::from(source_path),
+        current_basename: basename.to_string(),
+        proposed_basename: Some(format!("{basename}.renamed")),
+        platform_display: None,
+        source_display_name: "Test source".to_string(),
+        game_name: None,
+        rom_name: None,
+        verdict_label: "Verified".to_string(),
+        content: fixture_content_technical_view(),
+        state: ProposalState::Suggested,
+        object_kind_label: "file",
+        explanations: Vec::new(),
+        ambiguity_reason: None,
+        collision_detail: None,
+        blockers: Vec::new(),
+        extension_preserved: true,
+        sanitisation_notes: Vec::new(),
+        decision: None,
+    }
+}
+
+/// Root-cause regression for the widespread duplicate-widget-ID warning on
+/// DAT Sources: `show_content_technical_details`'s "Technical
+/// classification details" `CollapsingHeader` used to have no `id_salt`,
+/// so every row calling it (every rename-plan row, every audit-entry
+/// content item) collided on the exact same ID - which is why one
+/// specific ID number kept recurring across many rows/sections at once.
+/// Two rows rendered in the same frame (the real-world shape: a rename
+/// plan with more than one file) must now toggle their own disclosure
+/// independently - proof the fix's per-row salt (`row.source_path`)
+/// actually produces distinct IDs, not just that the two rows happen to
+/// look different.
+#[test]
+fn rename_plan_rows_technical_details_toggle_independently_in_the_same_frame() {
+    let row_a = fixture_rename_plan_row("/roms/a.bin", "a.bin");
+    let row_b = fixture_rename_plan_row("/roms/b.bin", "b.bin");
+    let ctx = egui::Context::default();
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 700.0));
+    let base_input = egui::RawInput {
+        screen_rect: Some(screen),
+        ..Default::default()
+    };
+
+    let render = |ctx: &egui::Context, input: egui::RawInput| {
+        ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let mut action = None;
+                show_rename_plan_row(ui, &row_a, &mut action);
+                show_rename_plan_row(ui, &row_b, &mut action);
+            });
+        })
+    };
+
+    // Frame 1: both collapsed by default; find and click row A's header
+    // (the first "Technical classification details" painted).
+    let first = render(&ctx, base_input.clone());
+    let header_pos = find_exact_text_center(&first, "Technical classification details")
+        .expect("expected at least one disclosure header to render");
+    let click = egui::RawInput {
+        screen_rect: Some(screen),
+        events: vec![
+            egui::Event::PointerMoved(header_pos),
+            egui::Event::PointerButton {
+                pos: header_pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            },
+            egui::Event::PointerButton {
+                pos: header_pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            },
+        ],
+        ..Default::default()
+    };
+    let _ = render(&ctx, click);
+
+    // Frame 3: settle. Row A's body ("Classification: Verified") must be
+    // visible exactly once; row B must remain independently collapsed.
+    let output = render(&ctx, base_input);
+    assert_eq!(
+        rendered_text_count(&output, "Classification: Verified"),
+        1,
+        "row A's own disclosure must be open"
+    );
+}
+
+fn find_exact_text_center(output: &egui::FullOutput, needle: &str) -> Option<egui::Pos2> {
+    fn find_in_shape(shape: &egui::Shape, needle: &str) -> Option<egui::Pos2> {
+        match shape {
+            egui::Shape::Text(text_shape) => (text_shape.galley.text() == needle)
+                .then(|| text_shape.pos + text_shape.galley.size() / 2.0),
+            egui::Shape::Vec(nested) => nested.iter().find_map(|s| find_in_shape(s, needle)),
+            _ => None,
+        }
+    }
+    output
+        .shapes
+        .iter()
+        .find_map(|clipped| find_in_shape(&clipped.shape, needle))
+}
+
+fn fixture_recovery_transaction(
+    transaction_id: &str,
+    state: TransactionState,
+    human_summary: &str,
+) -> RecoveryTransactionView {
+    RecoveryTransactionView {
+        transaction_id: transaction_id.to_string(),
+        state,
+        applied_count: 1,
+        total_count: 1,
+        human_summary: human_summary.to_string(),
+    }
+}
+
+/// Follow-up regression for the DAT Sources duplicate-widget-ID report:
+/// a realistic render carrying everything the live screenshots named at
+/// once - multiple rename transactions (distinct `transaction_id`s, mixed
+/// `Applied`/interrupted states), the rename-planning banner and its
+/// All/Suggested/Already canonical/Ambiguous filter row, multiple plan
+/// rows each with their own "Technical classification details"
+/// disclosure, and the rollback/leave-untouched controls - all rendered
+/// together in one frame, sharing one `ui`, exactly as
+/// `show_dat_sources_page` composes them. Every stateful (ID-keyed)
+/// control is exercised through a real click and proven independent;
+/// every non-ID-keyed control (plain buttons, the filter selection, which
+/// lives in `ui_state` - a Rust field, not egui's own ID-keyed memory) is
+/// proven to carry the correct row-specific data back out.
+#[test]
+fn a_realistic_multi_section_dat_sources_render_has_no_cross_widget_id_collisions() {
+    let apply = RenameApplyView {
+        review: None,
+        outcome: None,
+        apply_error: None,
+        subset_available: false,
+        rollback_result: None,
+        rollback_error: None,
+        apply_running: false,
+        rollback_running: false,
+        recovery: vec![
+            fixture_recovery_transaction(
+                "tx-applied-1",
+                TransactionState::Applied,
+                "Renamed \"one.bin\" -> \"One (Europe).bin\"",
+            ),
+            fixture_recovery_transaction(
+                "tx-applied-2",
+                TransactionState::Applied,
+                "Renamed \"two.bin\" -> \"Two (Europe).bin\"",
+            ),
+            fixture_recovery_transaction(
+                "tx-interrupted-3",
+                TransactionState::ApplyFailed,
+                "Renamed 3 files",
+            ),
+        ],
+        journal_dir: "/journal".to_string(),
+    };
+    let plan = RenamePlanView {
+        generation: 1,
+        scan_root_short: "roms".to_string(),
+        platform_display: None,
+        source_display_name: "Source".to_string(),
+        counts: archivefs_core::dat::rename_plan::RenamePlanCounts {
+            suggested: 2,
+            ambiguous: 1,
+            total: 3,
+            ..Default::default()
+        },
+        audited_total: 3,
+        verified_total: 3,
+        truncated: false,
+        rows: vec![
+            fixture_rename_plan_row("/roms/a.bin", "a.bin"),
+            fixture_rename_plan_row("/roms/b.bin", "b.bin"),
+            RenamePlanRowView {
+                state: ProposalState::Ambiguous,
+                ambiguity_reason: Some("two equally-scored candidates".to_string()),
+                ..fixture_rename_plan_row("/roms/c.bin", "c.bin")
+            },
+        ],
+        error: None,
+    };
+
+    let ctx = egui::Context::default();
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 1600.0));
+    let base_input = egui::RawInput {
+        screen_rect: Some(screen),
+        ..Default::default()
+    };
+    let mut ui_state = DatSourcesPageUi::default();
+
+    let render = |ctx: &egui::Context,
+                  input: egui::RawInput,
+                  ui_state: &mut DatSourcesPageUi,
+                  action_out: &mut Option<DatSourcesPageAction>| {
+        ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let mut action = show_rename_apply_section(ui, &apply, ui_state);
+                if let Some(plan_action) = show_rename_plan_section(ui, &plan, ui_state) {
+                    action = action.or(Some(plan_action));
+                }
+                *action_out = action;
+            });
+        })
+    };
+
+    // Frame 1: settle. Every row's own "Technical classification details"
+    // header renders once, and every recovery transaction's rollback
+    // control renders with the right label for its own state.
+    let mut action = None;
+    let first = render(&ctx, base_input.clone(), &mut ui_state, &mut action);
+    assert_eq!(
+        rendered_text_count(&first, "Technical classification details"),
+        3,
+        "every plan row must render its own disclosure header"
+    );
+    assert!(rendered_text_contains(&first, "Roll back transaction"));
+    assert!(rendered_text_contains(&first, "Roll back completed steps"));
+    assert!(rendered_text_contains(&first, "Leave untouched"));
+    assert!(rendered_text_contains(&first, "All"));
+    assert!(rendered_text_contains(&first, "Suggested"));
+    assert!(rendered_text_contains(&first, "Already canonical"));
+    assert!(rendered_text_contains(&first, "Ambiguous"));
+
+    // Click the FIRST plan row's "Technical classification details"
+    // header open.
+    let header_pos = find_exact_text_center(&first, "Technical classification details")
+        .expect("expected at least one disclosure header to render");
+    let click = egui::RawInput {
+        screen_rect: Some(screen),
+        events: vec![
+            egui::Event::PointerMoved(header_pos),
+            egui::Event::PointerButton {
+                pos: header_pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            },
+            egui::Event::PointerButton {
+                pos: header_pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            },
+        ],
+        ..Default::default()
+    };
+    let _ = render(&ctx, click, &mut ui_state, &mut action);
+
+    // Frame 3: settle. Exactly one row's body must have opened - proof
+    // the three "Technical classification details" headers (row a, row b,
+    // row c) hold independent IDs, not a shared one.
+    let after_open = render(&ctx, base_input.clone(), &mut ui_state, &mut action);
+    assert_eq!(
+        rendered_text_count(&after_open, "Classification: Verified"),
+        1,
+        "opening one row's disclosure must not open any other row's"
+    );
+
+    // Click "Roll back transaction" for the SECOND applied recovery entry
+    // specifically (not the first) - proving the action returned carries
+    // that row's own transaction_id, not a neighbour's.
+    let rollback_positions: Vec<egui::Pos2> = {
+        fn collect(shape: &egui::Shape, needle: &str, out: &mut Vec<egui::Pos2>) {
+            match shape {
+                egui::Shape::Text(text_shape) if text_shape.galley.text() == needle => {
+                    out.push(text_shape.pos + text_shape.galley.size() / 2.0);
+                }
+                egui::Shape::Vec(nested) => {
+                    for s in nested {
+                        collect(s, needle, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in &after_open.shapes {
+            collect(&clipped.shape, "Roll back transaction", &mut out);
+        }
+        out
+    };
+    assert_eq!(
+        rollback_positions.len(),
+        2,
+        "both Applied recovery entries must render their own rollback button"
+    );
+    let second_rollback_pos = rollback_positions[1];
+    let click_second_rollback = egui::RawInput {
+        screen_rect: Some(screen),
+        events: vec![
+            egui::Event::PointerMoved(second_rollback_pos),
+            egui::Event::PointerButton {
+                pos: second_rollback_pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            },
+            egui::Event::PointerButton {
+                pos: second_rollback_pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            },
+        ],
+        ..Default::default()
+    };
+    let mut rollback_action = None;
+    let _ = render(
+        &ctx,
+        click_second_rollback,
+        &mut ui_state,
+        &mut rollback_action,
+    );
+    assert_eq!(
+        rollback_action,
+        Some(DatSourcesPageAction::RecoveryChoice {
+            id: "tx-applied-2".to_string(),
+            choice: RecoveryChoice::RollBack,
+        }),
+        "the second recovery card's own rollback button must roll back its own transaction, \
+         never a neighbour's"
+    );
+}
+
 fn approve_all(page: &mut DatSourcesPageState) {
     let plan = page.rename_plan.clone().unwrap();
     for proposal in &plan.proposals {
@@ -4298,6 +4639,77 @@ fn a_transaction_stuck_applying_with_an_applied_entry_loads_as_applied_after_res
     );
 }
 
+fn fixture_identity() -> archivefs_core::dat::rename_apply::ObjectIdentity {
+    archivefs_core::dat::rename_apply::ObjectIdentity {
+        size_bytes: 1,
+        modified_unix: 0,
+        kind: archivefs_core::dat::rename_apply::ObjectKind::RegularFile,
+        #[cfg(unix)]
+        ino: 0,
+        #[cfg(unix)]
+        dev: 0,
+    }
+}
+
+fn fixture_entry(original: &str, proposed: &str) -> TransactionEntry {
+    TransactionEntry {
+        source_path: PathBuf::from(original),
+        destination_path: PathBuf::from(proposed),
+        original_basename: original.to_string(),
+        proposed_basename: proposed.to_string(),
+        identity: fixture_identity(),
+        preflight_passed: true,
+        preflight_failures: Vec::new(),
+        state: EntryState::Applied,
+        failure_reason: None,
+        applied_at_unix: None,
+        rolled_back_at_unix: None,
+        unknown: Default::default(),
+    }
+}
+
+#[test]
+fn rename_transaction_human_summary_leads_with_the_single_rename_when_there_is_one() {
+    let entries = vec![fixture_entry("game0.bin", "Game 0 (Europe).bin")];
+    assert_eq!(
+        rename_transaction_human_summary(&entries),
+        "Renamed \"game0.bin\" -> \"Game 0 (Europe).bin\""
+    );
+}
+
+#[test]
+fn rename_transaction_human_summary_counts_multiple_renames_instead_of_naming_them() {
+    let entries = vec![
+        fixture_entry("game0.bin", "Game 0 (Europe).bin"),
+        fixture_entry("game1.bin", "Game 1 (Europe).bin"),
+    ];
+    assert_eq!(
+        rename_transaction_human_summary(&entries),
+        "Renamed 2 files"
+    );
+}
+
+#[test]
+fn recovery_human_state_label_collapses_every_non_settled_state_to_needs_attention() {
+    assert_eq!(
+        recovery_human_state_label(TransactionState::Applied),
+        "Applied"
+    );
+    assert_eq!(
+        recovery_human_state_label(TransactionState::RolledBack),
+        "Rolled back"
+    );
+    for unsettled in [
+        TransactionState::Planned,
+        TransactionState::Applying,
+        TransactionState::ApplyFailed,
+        TransactionState::RollingBack,
+        TransactionState::RollbackFailed,
+    ] {
+        assert_eq!(recovery_human_state_label(unsettled), "Needs attention");
+    }
+}
+
 #[test]
 fn an_applied_transaction_is_rediscovered_after_restart_and_rollbackable() {
     let (fixture, roms, mut page) = page_with_apply_plan(1);
@@ -4337,6 +4749,17 @@ fn an_applied_transaction_is_rediscovered_after_restart_and_rollbackable() {
     let output = render(&view, &mut ui_state);
     assert!(rendered_text_contains(&output, "Applied"));
     assert!(rendered_text_contains(&output, "Roll back transaction"));
+    // Post-v0.8 usability pass: the primary line leads with a human
+    // summary of what was actually renamed, not the raw transaction ID -
+    // the ID is still available, but only behind Technical details.
+    assert!(rendered_text_contains(
+        &output,
+        "Renamed \"game0.bin\" -> \"Game 0 (Europe).bin\""
+    ));
+    assert!(
+        !rendered_text_contains(&output, &id),
+        "the raw transaction ID must not appear on the primary line"
+    );
 
     // Rolling back from the rediscovered page restores the original file.
     restarted.apply(DatSourcesPageAction::RecoveryChoice {

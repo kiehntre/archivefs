@@ -55,7 +55,7 @@ use archivefs_core::dat::policy::{
 };
 use archivefs_core::dat::rename_apply::{
     ApplyError, ApplyExecution, ApplyOutcome, EntryState, HardConflictMode, RollbackOutcome,
-    RollbackResult, TransactionState, apply_transaction, rollback_transaction,
+    RollbackResult, TransactionEntry, TransactionState, apply_transaction, rollback_transaction,
 };
 use archivefs_core::dat::rename_plan::{
     ProposalState, RenamePlan, RenamePlanContext, ReviewDecision, build_rename_plan,
@@ -677,6 +677,12 @@ pub(crate) struct RecoveryTransactionView {
     pub(crate) state: TransactionState,
     pub(crate) applied_count: usize,
     pub(crate) total_count: usize,
+    /// A human-facing summary of what this transaction renamed, e.g.
+    /// `Renamed "old.zip" -> "new.zip"` (single entry) or `Renamed 12
+    /// files` (many) - computed once here, at view-build time, from the
+    /// same `TransactionEntry::original_basename`/`proposed_basename`
+    /// already recorded in the journal (never a new persisted field).
+    pub(crate) human_summary: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -2880,6 +2886,7 @@ impl DatSourcesPageState {
                 state: transaction.state,
                 applied_count: transaction.applied_count(),
                 total_count: transaction.entries.len(),
+                human_summary: rename_transaction_human_summary(&transaction.entries),
             })
             .collect();
         RenameApplyView {
@@ -4511,11 +4518,13 @@ fn show_platform_control(
             ui.label(egui::RichText::new("No platform matches.").color(theme::muted(ui)));
             return;
         }
+        // Compact selectable rows instead of one full-width button per
+        // match: the current platform (if it happens to be among the
+        // matches) is highlighted, same as any other selectable-row list
+        // in this app, rather than reading as a wall of identical buttons.
         for (id, display_name) in &choices {
-            if widgets::action_button(ui, *display_name, widgets::ActionStyle::Secondary, true)
-                .clicked()
-                && action.is_none()
-            {
+            let is_current = row.platform_display.as_deref() == Some(*display_name);
+            if ui.selectable_label(is_current, *display_name).clicked() && action.is_none() {
                 action = Some(DatSourcesPageAction::SetPlatform {
                     id: row.id.clone(),
                     platform: Some((*id).to_string()),
@@ -5298,6 +5307,43 @@ fn summary_row(ui: &mut egui::Ui, label: &str, value: &str) {
     });
 }
 
+/// A human-facing summary of what a rename transaction did, leading with
+/// the action and result rather than a raw transaction ID - e.g.
+/// `Renamed "old.zip" -> "new.zip"` for a single entry, or `Renamed 12
+/// files` for many. Built once, purely from the same
+/// `TransactionEntry::original_basename`/`proposed_basename` the journal
+/// already records - never a new persisted field, never a change to the
+/// journal format.
+fn rename_transaction_human_summary(entries: &[TransactionEntry]) -> String {
+    match entries {
+        [] => "No files".to_string(),
+        [only] => format!(
+            "Renamed \"{}\" -> \"{}\"",
+            only.original_basename, only.proposed_basename
+        ),
+        many => format!("Renamed {} files", many.len()),
+    }
+}
+
+/// The human-facing state word for a rename transaction's primary summary
+/// line - deliberately coarser than [`TransactionState::label`] (which
+/// keeps its full technical granularity for Technical details): any
+/// state that is not a settled `Applied` or `RolledBack` means something
+/// is unresolved and needs a person to look at it, not one of five
+/// different in-progress/failure words a normal user has no use for on
+/// the primary line.
+fn recovery_human_state_label(state: TransactionState) -> &'static str {
+    match state {
+        TransactionState::Applied => "Applied",
+        TransactionState::RolledBack => "Rolled back",
+        TransactionState::Planned
+        | TransactionState::Applying
+        | TransactionState::ApplyFailed
+        | TransactionState::RollingBack
+        | TransactionState::RollbackFailed => "Needs attention",
+    }
+}
+
 /// The tone of a proposal-state badge.
 fn plan_state_tone(state: ProposalState) -> widgets::StatusTone {
     match state {
@@ -5333,18 +5379,34 @@ fn show_rename_apply_section(
         widgets::card(ui, |ui| {
             for recovery in &apply.recovery {
                 ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(&recovery.human_summary).strong());
                     ui.label(
                         egui::RichText::new(format!(
-                            "{} · {} applied of {}",
-                            recovery.transaction_id, recovery.applied_count, recovery.total_count
+                            "({})",
+                            recovery_human_state_label(recovery.state)
                         ))
-                        .strong(),
-                    );
-                    ui.label(
-                        egui::RichText::new(format!("({})", recovery.state.label()))
-                            .color(theme::muted(ui)),
+                        .color(theme::muted(ui)),
                     );
                 });
+                // The raw transaction ID and exact applied/total counts are
+                // developer-facing detail, not meaningful to a normal user
+                // deciding whether to roll back - moved behind Technical
+                // details, same as History & Logs already does for its own
+                // transaction IDs. `transaction_id` is unique per real
+                // transaction, so it alone is a safe, stable per-row salt.
+                widgets::technical_details(
+                    ui,
+                    ("rename_recovery_technical_detail", &recovery.transaction_id),
+                    |ui| {
+                        widgets::copyable_value(ui, "Transaction ID", &recovery.transaction_id);
+                        ui.label(format!(
+                            "State: {} ({} applied of {})",
+                            recovery.state.label(),
+                            recovery.applied_count,
+                            recovery.total_count
+                        ));
+                    },
+                );
                 let (explanation, rollback_label) = if recovery.state == TransactionState::Applied {
                     (
                         "A completed rename transaction is still applied and can be rolled \
@@ -5805,7 +5867,11 @@ fn show_rename_plan_row(
                     .small(),
                 );
             }
-            show_content_technical_details(ui, &row.content);
+            show_content_technical_details(
+                ui,
+                ("rename_plan_row_technical_details", &row.source_path),
+                &row.content,
+            );
             if !row.explanations.is_empty() {
                 ui.add_space(2.0);
                 for line in &row.explanations {
@@ -6085,8 +6151,16 @@ fn show_audit_result(ui: &mut egui::Ui, audit: &AuditResultView) {
                                         .small(),
                                 );
                             }
-                            for content in &entry.content {
-                                show_content_technical_details(ui, content);
+                            for (content_index, content) in entry.content.iter().enumerate() {
+                                show_content_technical_details(
+                                    ui,
+                                    (
+                                        "audit_entry_technical_details",
+                                        &entry.file_name,
+                                        content_index,
+                                    ),
+                                    content,
+                                );
                             }
                         });
                     });
@@ -6153,8 +6227,26 @@ fn show_audit_result(ui: &mut egui::Ui, audit: &AuditResultView) {
     }
 }
 
-fn show_content_technical_details(ui: &mut egui::Ui, content: &ContentTechnicalView) {
+/// Root cause of the widespread duplicate-widget-ID warning on DAT
+/// Sources: this `CollapsingHeader` used to have no `id_salt` at all, and
+/// this function is called once per row from two of the busiest loops on
+/// the page - every rename-plan row (`show_rename_plan_row`, one call per
+/// file in a plan that can hold hundreds) and every audit-entry content
+/// item (the "Files" list under an audit result). With no salt, every one
+/// of those calls - across every row, both loops, and however many rows
+/// happen to be on screen at once - resolved to the exact same literal-
+/// text-derived ID, hashing to the exact same widget ID, which is why one
+/// specific number kept recurring "everywhere": it was not one collision,
+/// it was every row's identical disclosure colliding with every other
+/// row's. `id_salt` is now required from the caller, scoped to that row's
+/// own stable identity.
+fn show_content_technical_details(
+    ui: &mut egui::Ui,
+    id_salt: impl std::hash::Hash,
+    content: &ContentTechnicalView,
+) {
     egui::CollapsingHeader::new("Technical classification details")
+        .id_salt(id_salt)
         .default_open(false)
         .show(ui, |ui| {
             ui.label(format!("Classification: {}", content.classification));

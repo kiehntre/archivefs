@@ -27,6 +27,24 @@ pub(crate) fn action_button(
     ui.add_enabled(enabled, button)
 }
 
+/// The shared centered-modal convention for confirmation/review dialogs:
+/// anchored at the viewport's true center (never a hardcoded screen
+/// position, so this holds on any monitor size/aspect ratio, including
+/// ultrawide) and not collapsible - a confirmation dialog is meant to be
+/// answered and dismissed, not minimized. Callers still choose
+/// `.resizable(...)`, `.open(...)`, etc. themselves; this only fixes the
+/// one property that was wrong across several dialogs (an unset default
+/// position that could land near a screen edge, easy to miss on a large
+/// display). An anchored `egui::Window` is not draggable by the user
+/// (egui recomputes its position from the anchor every frame regardless),
+/// which is the correct, existing behavior for a centered confirmation -
+/// this helper does not need to additionally disable movement itself.
+pub(crate) fn centered_window(title: impl Into<egui::WidgetText>) -> egui::Window<'static> {
+    egui::Window::new(title)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .collapsible(false)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StatusTone {
     Success,
@@ -186,6 +204,63 @@ pub(crate) fn technical_details<R>(
         .body_returned
 }
 
+/// A compact, searchable platform picker: a filter box above a bounded,
+/// internally-scrolling list of compact selectable rows - a drop-in
+/// replacement for the "one full-height `egui::Button` per platform" wall
+/// this project had in several places (Sources' "Assign platform" menu, a
+/// Library row's "Set platform" context menu, ...). Semantics are
+/// unchanged: the same `platforms` list, the same click-to-choose action:
+/// only the presentation and (new) filtering are different.
+///
+/// The filter text lives in egui's own per-widget memory, keyed by
+/// `id_salt`, so callers need no persistent field of their own - this is
+/// deliberately reusable without adding any state to the caller's page.
+/// Returns the clicked platform name, if any, this frame.
+pub(crate) fn platform_picker(
+    ui: &mut egui::Ui,
+    id_salt: impl std::hash::Hash,
+    platforms: &[&'static str],
+    selected: Option<&str>,
+    enabled: bool,
+) -> Option<&'static str> {
+    let search_id = egui::Id::new(("platform_picker_search", &id_salt));
+    let mut search = ui
+        .data_mut(|data| data.get_temp::<String>(search_id))
+        .unwrap_or_default();
+    ui.horizontal(|ui| {
+        ui.label("Search:");
+        ui.add_enabled(enabled, egui::TextEdit::singleline(&mut search));
+    });
+    let query = search.to_lowercase();
+    let filtered: Vec<&'static str> = platforms
+        .iter()
+        .copied()
+        .filter(|name| query.is_empty() || name.to_lowercase().contains(&query))
+        .collect();
+    let mut clicked = None;
+    ui.add_enabled_ui(enabled, |ui| {
+        egui::ScrollArea::vertical()
+            .id_salt(("platform_picker_scroll", &id_salt))
+            .max_height(240.0)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if filtered.is_empty() {
+                    ui.weak("No platform matches this search.");
+                }
+                for name in &filtered {
+                    if ui
+                        .selectable_label(selected == Some(*name), *name)
+                        .clicked()
+                    {
+                        clicked = Some(*name);
+                    }
+                }
+            });
+    });
+    ui.data_mut(|data| data.insert_temp(search_id, search));
+    clicked
+}
+
 /// A compact single row of status badges, for pages that used to stack
 /// several large cards each stating one piece of status (profile, source,
 /// trust, identity, ...). Wraps onto more than one line if the available
@@ -340,6 +415,73 @@ mod tests {
             .any(|clipped| shape_contains(&clipped.shape, needle))
     }
 
+    fn find_exact_text_center(output: &egui::FullOutput, needle: &str) -> Option<egui::Pos2> {
+        fn find_in_shape(shape: &egui::Shape, needle: &str) -> Option<egui::Pos2> {
+            match shape {
+                egui::Shape::Text(text_shape) => (text_shape.galley.text() == needle)
+                    .then(|| text_shape.pos + text_shape.galley.size() / 2.0),
+                egui::Shape::Vec(nested) => nested.iter().find_map(|s| find_in_shape(s, needle)),
+                _ => None,
+            }
+        }
+        output
+            .shapes
+            .iter()
+            .find_map(|clipped| find_in_shape(&clipped.shape, needle))
+    }
+
+    /// Regression for the "Review catalogue update" dialog (and its
+    /// directly-related confirmation dialogs) opening near the top/right
+    /// instead of centered - easy to miss on a large/ultrawide display.
+    /// Renders in a deliberately wide, asymmetric viewport: a dialog that
+    /// defaulted to egui's un-anchored placement would land far from the
+    /// center, so this would fail without the fix.
+    #[test]
+    fn centered_window_opens_near_the_viewport_center_not_a_corner() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(2000.0, 1000.0));
+        let mut open = true;
+        let input = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        // A never-before-seen floating window needs one settling frame
+        // before its final anchored position is reflected in the output -
+        // same reason this file's other window-rendering tests run twice.
+        let _ = ctx.run(input.clone(), |ctx| {
+            centered_window("Test dialog")
+                .resizable(false)
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.label("dialog body text");
+                });
+        });
+        let output = ctx.run(input, |ctx| {
+            centered_window("Test dialog")
+                .resizable(false)
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.label("dialog body text");
+                });
+        });
+
+        let pos = find_exact_text_center(&output, "dialog body text")
+            .expect("the dialog's body text must render");
+        let center = screen.center();
+        assert!(
+            (pos.x - center.x).abs() < 400.0,
+            "expected the dialog near the horizontal center ({}), got x={}",
+            center.x,
+            pos.x
+        );
+        assert!(
+            (pos.y - center.y).abs() < 300.0,
+            "expected the dialog near the vertical center ({}), got y={}",
+            center.y,
+            pos.y
+        );
+    }
+
     #[test]
     fn status_strip_renders_every_item_with_its_own_label() {
         let ctx = egui::Context::default();
@@ -479,6 +621,100 @@ mod tests {
             !rendered_text_contains(&output, "provider-id-9f31"),
             "the body must stay collapsed until the user expands it"
         );
+    }
+
+    const TEST_PLATFORMS: &[&str] = &["Nintendo 64", "Nintendo Switch", "Sega Genesis", "Sega CD"];
+
+    #[test]
+    fn platform_picker_renders_every_platform_when_unfiltered() {
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = platform_picker(ui, "picker_unfiltered_test", TEST_PLATFORMS, None, true);
+            });
+        });
+        for platform in TEST_PLATFORMS {
+            assert!(
+                rendered_text_contains(&output, platform),
+                "expected {platform:?} to render unfiltered"
+            );
+        }
+    }
+
+    #[test]
+    fn platform_picker_search_narrows_the_visible_list() {
+        let ctx = egui::Context::default();
+        // Frame 1: type "sega" into the search box.
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let id = egui::Id::new(("platform_picker_search", "picker_search_test"));
+                ui.data_mut(|data| data.insert_temp(id, "sega".to_string()));
+                let _ = platform_picker(ui, "picker_search_test", TEST_PLATFORMS, None, true);
+            });
+        });
+        // Frame 2: the picker now reads back the search text it just
+        // persisted, and the list must be filtered accordingly.
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = platform_picker(ui, "picker_search_test", TEST_PLATFORMS, None, true);
+            });
+        });
+        assert!(rendered_text_contains(&output, "Sega Genesis"));
+        assert!(rendered_text_contains(&output, "Sega CD"));
+        assert!(!rendered_text_contains(&output, "Nintendo 64"));
+        assert!(!rendered_text_contains(&output, "Nintendo Switch"));
+    }
+
+    #[test]
+    fn platform_picker_reports_the_clicked_platform() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 400.0));
+        let base_input = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        let mut clicked = None;
+        let _ = ctx.run(base_input.clone(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                clicked = platform_picker(ui, "picker_click_test", TEST_PLATFORMS, None, true);
+            });
+        });
+        assert_eq!(clicked, None, "no click was simulated yet");
+
+        let output = ctx.run(base_input.clone(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = platform_picker(ui, "picker_click_test", TEST_PLATFORMS, None, true);
+            });
+        });
+        let pos = find_exact_text_center(&output, "Nintendo 64")
+            .expect("expected \"Nintendo 64\" to render as its own row");
+
+        let click = egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ],
+            ..Default::default()
+        };
+        let mut clicked = None;
+        let _ = ctx.run(click, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                clicked = platform_picker(ui, "picker_click_test", TEST_PLATFORMS, None, true);
+            });
+        });
+        assert_eq!(clicked, Some("Nintendo 64"));
     }
 
     #[test]
