@@ -38,6 +38,7 @@ pub mod classification;
 pub mod dependency;
 pub mod disk_audit;
 pub mod hash;
+pub mod identity;
 pub mod index;
 pub mod limits;
 pub mod model;

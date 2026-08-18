@@ -182,6 +182,33 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
 
                 match tag.as_str() {
                     "datafile" => {}
+                    // A bare MAME software-list DAT (e.g. `<softwarelist
+                    // name="megacd" description="Sega Mega-CD / Sega CD">`)
+                    // carries its header identity as attributes on the root
+                    // element itself rather than in a nested `<header>`. Without
+                    // this, `name`/`description` stayed `None` for every
+                    // software-list DAT that has no `<header>`, silently
+                    // discarding the only platform-identifying text the file
+                    // has. A DAT that *does* also carry a nested `<header>` is
+                    // unaffected: the existing `"name"`/`"description"` end-tag
+                    // handling below still overwrites these unconditionally, so
+                    // normal `<header>` parsing keeps winning.
+                    "softwarelist" => {
+                        name = attr_str_checked(
+                            start_bytes,
+                            b"name",
+                            limits.max_identifier_length,
+                            &mut warnings,
+                            limits.max_warnings,
+                        )?;
+                        description = attr_str_checked(
+                            start_bytes,
+                            b"description",
+                            limits.max_description_length,
+                            &mut warnings,
+                            limits.max_warnings,
+                        )?;
+                    }
                     "game" | "machine" | "software" => {
                         in_game_element = true;
                         finish_current_structure(
@@ -2051,6 +2078,48 @@ mod tests {
 </datafile>"#;
         let o2 = parse_xml(with_header).unwrap();
         assert_eq!(o2.dat.source.name.as_deref(), Some("With Header"));
+    }
+
+    #[test]
+    fn bare_software_list_root_preserves_its_own_name_and_description() {
+        // A real MAME software-list DAT has no <header> at all: its identity
+        // lives on the <softwarelist> root element's own attributes.
+        let xml = r#"<?xml version="1.0"?>
+<softwarelist name="megacd" description="Sega Mega-CD / Sega CD">
+    <software name="sonic">
+        <rom name="sonic.bin" size="1" crc="AAAAAAAA"/>
+    </software>
+</softwarelist>"#;
+        let outcome = parse_xml(xml).unwrap();
+        assert_eq!(outcome.dat.source.name.as_deref(), Some("megacd"));
+        assert_eq!(
+            outcome.dat.source.description.as_deref(),
+            Some("Sega Mega-CD / Sega CD")
+        );
+        assert_eq!(outcome.dat.games.len(), 1);
+    }
+
+    #[test]
+    fn a_nested_header_still_overrides_a_bare_software_list_root() {
+        // Belt and braces: a file that (unusually) carries both a root
+        // `name`/`description` and a nested `<header>` must still let the
+        // `<header>` win, exactly as it already does for plain `<datafile>`.
+        let xml = r#"<?xml version="1.0"?>
+<softwarelist name="root-name" description="root-description">
+    <header>
+        <name>Header Name</name>
+        <description>Header Description</description>
+    </header>
+    <software name="sonic">
+        <rom name="sonic.bin" size="1" crc="AAAAAAAA"/>
+    </software>
+</softwarelist>"#;
+        let outcome = parse_xml(xml).unwrap();
+        assert_eq!(outcome.dat.source.name.as_deref(), Some("Header Name"));
+        assert_eq!(
+            outcome.dat.source.description.as_deref(),
+            Some("Header Description")
+        );
     }
 
     #[test]

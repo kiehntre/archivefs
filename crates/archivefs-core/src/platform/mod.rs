@@ -51,6 +51,33 @@ pub use identity::{
     PlatformIdentitySource, resolve_platform_identity,
 };
 
+/// How confidently one [`MagicRule`] identifies its platform on its own.
+///
+/// This is a property of the *rule*, reviewed once by a person against what
+/// is actually known about the signature - never inferred from how many
+/// platforms in the current registry happen to declare a matching rule.
+/// Registry coverage is incomplete, so the absence of a second platform
+/// declaring the same bytes does not prove the bytes are unique to this one:
+/// Sega 32X cartridges carry the identical `SEGA` header Mega Drive checks at
+/// offset `0x100`, but 32X has no registered [`MagicRule`] of its own yet, so
+/// counting *currently matching platforms* would wrongly call that header
+/// Mega-Drive-unique. Declared weakest first so [`Ord`] gives the more
+/// confident value when more than one of a platform's rules matches the same
+/// bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MagicConfidence {
+    /// Real evidence, but the signature is either known to be shared with
+    /// another registered platform, or is a base-hardware/family convention
+    /// a closely related platform not yet in this registry plausibly shares
+    /// too. Never treated as authority on its own.
+    Corroborated,
+    /// The signature's own semantics are genuinely, specifically tied to one
+    /// platform - a literal platform name, a documented format-specific magic
+    /// number, or a boot-sector string with no known collision - reviewed and
+    /// found distinctive, not merely unmatched by anything else today.
+    Strong,
+}
+
 /// One bounded, read-only signature check.
 ///
 /// `offset` is an absolute byte offset. Reads are always exactly
@@ -63,6 +90,9 @@ pub struct MagicRule {
     pub bytes: &'static [u8],
     /// Why this signature means what it means, in a person's words.
     pub description: &'static str,
+    /// How confidently this specific signature identifies its platform.
+    /// Reviewed per rule - see [`MagicConfidence`].
+    pub confidence: MagicConfidence,
 }
 
 /// Evidence that comes from a game being a *directory of files* rather than a
@@ -209,6 +239,37 @@ pub fn normalize_alias(value: &str) -> String {
         .collect()
 }
 
+/// Fixed, conservative suffixes MAME software-list DAT names carry after the
+/// machine's base short name - `c128_flop`, `c128_cart`, `c128_cass`,
+/// `c128_rom`, `megacd_cd`.
+///
+/// This is an explicit allowlist and nothing more. It is deliberately *not* a
+/// generic "strip the final underscore-delimited token" rule: a suffix this
+/// build does not recognise might be part of the machine's real short name
+/// rather than a media-kind marker, so an unlisted suffix is left exactly as
+/// it is rather than guessed at.
+pub const MAME_SOFTWARE_LIST_SUFFIXES: &[&str] =
+    &["_flop", "_cart", "_cass", "_rom", "_cd", "_disk"];
+
+/// Strips one known MAME software-list suffix from `name`, if `name` ends in
+/// one from [`MAME_SOFTWARE_LIST_SUFFIXES`] and something is left over.
+///
+/// Returns `name` unchanged when no listed suffix matches - including when a
+/// suffix matches but stripping it would leave nothing (`"_cart"` alone stays
+/// `"_cart"`, not empty). The returned base is a plain string slice, not yet
+/// normalised: callers still run it through [`normalize_alias`] and
+/// [`platform_for_alias`] like any other hint.
+pub fn strip_mame_software_list_suffix(name: &str) -> &str {
+    for suffix in MAME_SOFTWARE_LIST_SUFFIXES {
+        if let Some(base) = name.strip_suffix(suffix)
+            && !base.is_empty()
+        {
+            return base;
+        }
+    }
+    name
+}
+
 /// The platform whose descriptor carries `id`, if any.
 pub fn platform_by_id(id: &str) -> Option<&'static Platform> {
     PLATFORMS.iter().find(|platform| platform.id == id)
@@ -248,6 +309,109 @@ pub fn platforms_with_weak_extension(extension: &str) -> Vec<&'static Platform> 
         .iter()
         .filter(|platform| platform.has_weak_extension(extension))
         .collect()
+}
+
+/// Every canonical platform id that treats `extension` as valid evidence at
+/// all - the union of [`platforms_with_strong_extension`] and
+/// [`platforms_with_weak_extension`], sorted and deduplicated so the result
+/// is stable regardless of registry iteration order.
+///
+/// This is a *candidate* list, never an answer: many real extensions
+/// (`.bin`, `.cue`, `.d64`) are valid for a dozen platforms at once, and that
+/// breadth is the whole point of returning every one of them rather than
+/// picking a winner. An extension no platform in [`PLATFORMS`] declares
+/// returns an empty list. `extension` may be given with or without a leading
+/// dot and in any case; both are normalised the same way
+/// [`extension_of`] already normalises a path's extension, so a caller never
+/// needs to pre-clean its input.
+pub fn platform_candidates_for_extension(extension: &str) -> Vec<&'static str> {
+    let normalized = extension.trim_start_matches('.').to_ascii_lowercase();
+    let mut ids: Vec<&'static str> = platforms_with_strong_extension(&normalized)
+        .into_iter()
+        .chain(platforms_with_weak_extension(&normalized))
+        .map(|platform| platform.id)
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// Every canonical platform id whose registered [`MagicRule`] matches `data`.
+///
+/// Pure: `data` is a byte slice already held in memory, indexed as if it were
+/// the start of a file (`data[0]` is offset `0`). No file is opened, no path
+/// is resolved, and no symlink policy is consulted - that I/O-bound,
+/// bounded-read, symlink-safe variant of the same rules already exists as
+/// [`detect::detect_platform_report`] for a caller that has a real path. This
+/// is for a caller that already holds the bytes (or, in a test, invented
+/// them) and wants the same canonical signatures applied without any I/O of
+/// its own.
+///
+/// A rule whose offset and length would run past the end of `data` simply
+/// does not match, exactly as a short real file would not match it either.
+/// Multiple matching platforms are returned in full - this never picks a
+/// winner - sorted and deduplicated so the result is stable regardless of
+/// [`PLATFORMS`] iteration order. Bytes nothing in the registry recognises
+/// return an empty list.
+pub fn platform_candidates_from_bytes(data: &[u8]) -> Vec<&'static str> {
+    let mut ids: Vec<&'static str> = PLATFORMS
+        .iter()
+        .filter(|platform| {
+            platform
+                .magic
+                .iter()
+                .any(|rule| magic_rule_matches(rule, data))
+        })
+        .map(|platform| platform.id)
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// Every canonical platform id whose registered [`MagicRule`] matches
+/// `data`, paired with the reviewed [`MagicConfidence`] of the best rule that
+/// matched it.
+///
+/// Distinct from [`platform_candidates_from_bytes`], which stays a plain,
+/// confidence-free candidate list: this is for a caller that needs to know
+/// how much a *specific* matching signature is actually worth, per the
+/// judgement already recorded on that rule - never inferred from how many
+/// platforms this buffer happened to match. A platform whose several rules
+/// disagree on confidence for the same buffer (not currently possible in
+/// this registry, but not structurally forbidden either) is reported at its
+/// best matching rule's confidence, never its worst.
+///
+/// Sorted by platform id and deduplicated, so the result is stable
+/// regardless of [`PLATFORMS`] iteration order. Bytes nothing in the
+/// registry recognises return an empty list.
+pub fn platform_magic_confidence_from_bytes(data: &[u8]) -> Vec<(&'static str, MagicConfidence)> {
+    let mut matches: Vec<(&'static str, MagicConfidence)> = PLATFORMS
+        .iter()
+        .filter_map(|platform| {
+            platform
+                .magic
+                .iter()
+                .filter(|rule| magic_rule_matches(rule, data))
+                .map(|rule| rule.confidence)
+                .max()
+                .map(|confidence| (platform.id, confidence))
+        })
+        .collect();
+    matches.sort_by(|left, right| left.0.cmp(right.0));
+    matches
+}
+
+/// Whether `data`, read as bytes from the start of a file, carries `rule`'s
+/// signature at its offset. This is the same equality [`detect`]'s
+/// bounded-read signature check performs on the exact bytes it reads at
+/// `rule.offset`; here the comparison is against an in-memory slice instead
+/// of a fresh bounded read, so the same [`MagicRule`] table is the only thing
+/// shared between the two, never a second copy of it.
+fn magic_rule_matches(rule: &MagicRule, data: &[u8]) -> bool {
+    data.get(rule.offset as usize..)
+        .and_then(|rest| rest.get(..rule.bytes.len()))
+        == Some(rule.bytes)
 }
 
 /// The lowercased extension of `path` without its dot, if it has one.
@@ -452,6 +616,7 @@ pub const PLATFORMS: &[Platform] = &[
             offset: 0x1,
             bytes: b"ATARI7800",
             description: "A 7800 header names `ATARI7800` at offset 0x01",
+            confidence: MagicConfidence::Strong,
         }],
         layout: &[],
         conflicts_with: &[],
@@ -504,6 +669,7 @@ pub const PLATFORMS: &[Platform] = &[
             offset: 0,
             bytes: b"LYNX",
             description: "Lynx cartridge images carry the `LYNX` header magic",
+            confidence: MagicConfidence::Strong,
         }],
         layout: &[],
         conflicts_with: &[],
@@ -627,6 +793,7 @@ pub const PLATFORMS: &[Platform] = &[
             offset: 0,
             bytes: b"DOS\x00",
             description: "OFS/FFS floppy images begin with the `DOS` boot-block identifier",
+            confidence: MagicConfidence::Strong,
         }],
         layout: &[],
         conflicts_with: &["AmigaCD32", "Acorn Archimedes", "Commodore CDTV"],
@@ -840,7 +1007,7 @@ pub const PLATFORMS: &[Platform] = &[
     Platform {
         id: "Neo Geo CD",
         display_name: "Neo Geo CD",
-        folder_aliases: &["neogeocd", "snkneogeocd", "ngcd", "neocdz"],
+        folder_aliases: &["neogeocd", "snkneogeocd", "ngcd", "neocd", "neocdz"],
         filename_aliases: &[],
         strong_extensions: &[],
         weak_extensions: &["iso", "cue", "bin", "chd", "img"],
@@ -900,6 +1067,7 @@ pub const PLATFORMS: &[Platform] = &[
             offset: 0,
             bytes: b"\x80\x37\x12\x40",
             description: "A big-endian Nintendo 64 ROM begins with 0x80371240",
+            confidence: MagicConfidence::Strong,
         }],
         layout: &[],
         conflicts_with: &[],
@@ -943,6 +1111,7 @@ pub const PLATFORMS: &[Platform] = &[
             offset: 0,
             bytes: b"NES\x1a",
             description: "An iNES ROM begins with the `NES` magic",
+            confidence: MagicConfidence::Strong,
         }],
         layout: &[],
         conflicts_with: &[],
@@ -999,6 +1168,7 @@ pub const PLATFORMS: &[Platform] = &[
             offset: 0x1c,
             bytes: b"\xc2\x33\x9f\x3d",
             description: "A GameCube disc carries the 0xC2339F3D magic word at offset 0x1C",
+            confidence: MagicConfidence::Strong,
         }],
         layout: &[],
         conflicts_with: &["Wii"],
@@ -1042,6 +1212,7 @@ pub const PLATFORMS: &[Platform] = &[
             offset: 0x18,
             bytes: b"\x5d\x1c\x9e\xa3",
             description: "A Wii disc carries the 0x5D1C9EA3 magic word at offset 0x18",
+            confidence: MagicConfidence::Strong,
         }],
         layout: &[],
         conflicts_with: &["GameCube"],
@@ -1147,6 +1318,7 @@ pub const PLATFORMS: &[Platform] = &[
             offset: 0x8008,
             bytes: b"CD-RTOS",
             description: "A CD-i disc names `CD-RTOS` as the ISO 9660 system identifier at offset 0x8008",
+            confidence: MagicConfidence::Strong,
         }],
         layout: &[],
         conflicts_with: &["PSX", "Sega CD", "3DO", "PC Engine CD"],
@@ -1221,6 +1393,7 @@ pub const PLATFORMS: &[Platform] = &[
             offset: 0,
             bytes: b"SEGA SEGAKATANA",
             description: "A Dreamcast disc boot sector begins with `SEGA SEGAKATANA`",
+            confidence: MagicConfidence::Strong,
         }],
         layout: &[],
         conflicts_with: &["Saturn", "Philips CD-i"],
@@ -1238,6 +1411,7 @@ pub const PLATFORMS: &[Platform] = &[
             offset: 0x7ff0,
             bytes: b"TMR SEGA",
             description: "The Game Gear shares the `TMR SEGA` 8-bit Sega ROM header",
+            confidence: MagicConfidence::Corroborated,
         }],
         layout: &[],
         conflicts_with: &["MasterSystem"],
@@ -1264,16 +1438,19 @@ pub const PLATFORMS: &[Platform] = &[
                 offset: 0x7ff0,
                 bytes: b"TMR SEGA",
                 description: "The `TMR SEGA` ROM header appears at 0x7FF0 in most Master System dumps",
+                confidence: MagicConfidence::Corroborated,
             },
             MagicRule {
                 offset: 0x3ff0,
                 bytes: b"TMR SEGA",
                 description: "Smaller dumps carry the same header at 0x3FF0",
+                confidence: MagicConfidence::Corroborated,
             },
             MagicRule {
                 offset: 0x1ff0,
                 bytes: b"TMR SEGA",
                 description: "The smallest dumps carry it at 0x1FF0",
+                confidence: MagicConfidence::Corroborated,
             },
         ],
         layout: &[],
@@ -1302,6 +1479,7 @@ pub const PLATFORMS: &[Platform] = &[
             offset: 0x100,
             bytes: b"SEGA",
             description: "A Mega Drive cartridge header begins with `SEGA` at offset 0x100",
+            confidence: MagicConfidence::Corroborated,
         }],
         layout: &[],
         conflicts_with: &["Sega CD", "Sega 32X", "ScummVM"],
@@ -1323,16 +1501,24 @@ pub const PLATFORMS: &[Platform] = &[
         filename_aliases: &[],
         strong_extensions: &[],
         weak_extensions: &["iso", "cue", "bin", "chd", "ccd", "mdf", "img"],
+        // Both `SEGADISCSYSTEM` rules are Corroborated for canonical
+        // platform identity: this review did not establish enough evidence
+        // that the signature is unique across every related Sega CD /
+        // 32X-CD-compatible case. It may be strong family/media evidence
+        // once a dedicated media/container model exists; it must not decide
+        // canonical Sega CD platform identity by itself yet.
         magic: &[
             MagicRule {
                 offset: 0,
                 bytes: b"SEGADISCSYSTEM",
                 description: "A Mega-CD boot sector begins with `SEGADISCSYSTEM`",
+                confidence: MagicConfidence::Corroborated,
             },
             MagicRule {
                 offset: 0x10,
                 bytes: b"SEGADISCSYSTEM",
                 description: "ISO-2048 Mega-CD dumps carry the same signature at offset 0x10",
+                confidence: MagicConfidence::Corroborated,
             },
         ],
         layout: &[],
@@ -1351,6 +1537,7 @@ pub const PLATFORMS: &[Platform] = &[
             offset: 0,
             bytes: b"SEGA SEGASATURN",
             description: "A Saturn disc boot sector begins with `SEGA SEGASATURN`",
+            confidence: MagicConfidence::Strong,
         }],
         layout: &[],
         conflicts_with: &["Sega CD", "Dreamcast"],
@@ -1394,6 +1581,7 @@ pub const PLATFORMS: &[Platform] = &[
             offset: 0x8008,
             bytes: b"PLAYSTATION",
             description: "A PlayStation disc names `PLAYSTATION` as the ISO 9660 system identifier at offset 0x8008",
+            confidence: MagicConfidence::Corroborated,
         }],
         layout: &[],
         conflicts_with: &["PS2", "Sega CD", "Philips CD-i", "3DO", "PC Engine CD"],
@@ -1411,6 +1599,7 @@ pub const PLATFORMS: &[Platform] = &[
             offset: 0x8008,
             bytes: b"PLAYSTATION",
             description: "A PlayStation 2 disc also names `PLAYSTATION` as the ISO 9660 system identifier",
+            confidence: MagicConfidence::Corroborated,
         }],
         layout: &[],
         conflicts_with: &["PSX"],
@@ -1513,6 +1702,13 @@ pub const PLATFORMS: &[Platform] = &[
             offset: 0,
             bytes: b"ZXTape!\x1a",
             description: "`.tzx` tape images begin with the literal `ZXTape!` signature",
+            // TZX/CDT is a tape-container format used by more than one
+            // platform family (ZX Spectrum and Amstrad CPC contexts both
+            // appear in real TZX/CDT usage). This signature strongly proves
+            // "TZX tape container", not uniquely "ZX Spectrum platform" -
+            // that distinction belongs to a future media/container evidence
+            // model, not to canonical platform identity.
+            confidence: MagicConfidence::Corroborated,
         }],
         layout: &[],
         conflicts_with: &["Commodore 64", "Amstrad CPC"],

@@ -1751,3 +1751,530 @@ fn a_plain_file_behaves_exactly_as_it_did_before_trusted_roots_existed() {
         "a plain file must not claim a link was followed"
     );
 }
+
+// --- MAME machine/software-list identity hygiene --------------------------
+
+/// The bare MAME front-loader shortname `neocd` must resolve to the same
+/// canonical `Neo Geo CD` platform as its existing aliases, and must never be
+/// pulled into the separate cartridge `NeoGeo` platform.
+#[test]
+fn bare_neocd_alias_resolves_to_neo_geo_cd_and_never_to_cartridge_neo_geo() {
+    assert_eq!(
+        platform_for_alias("neocd").map(|p| p.id),
+        Some("Neo Geo CD")
+    );
+    assert_eq!(
+        platform_for_alias("neocdz").map(|p| p.id),
+        Some("Neo Geo CD")
+    );
+    assert_ne!(platform_for_alias("neocd").map(|p| p.id), Some("NeoGeo"));
+}
+
+#[test]
+fn mame_software_list_suffix_strip_uses_a_fixed_allowlist_only() {
+    for (raw, expected_base) in [
+        ("c128_flop", "c128"),
+        ("c128_cart", "c128"),
+        ("c128_cass", "c128"),
+        ("c128_rom", "c128"),
+        ("megacd_cd", "megacd"),
+    ] {
+        assert_eq!(
+            strip_mame_software_list_suffix(raw),
+            expected_base,
+            "`{raw}` should strip to `{expected_base}`"
+        );
+    }
+
+    // A suffix outside the fixed allowlist is never stripped, generically or
+    // otherwise - it might be part of the machine's real short name.
+    for raw in ["c128_unknown", "c128_flop3", "c128", "_flop"] {
+        assert_eq!(
+            strip_mame_software_list_suffix(raw),
+            raw,
+            "`{raw}` must be left unchanged"
+        );
+    }
+}
+
+/// The suffix strip is only half the job: the resulting base name still has
+/// to resolve through the ordinary alias pipeline like any other hint.
+#[test]
+fn mame_software_list_suffix_strip_resolves_toward_the_right_canonical_platform() {
+    let base = strip_mame_software_list_suffix("c128_flop");
+    assert_eq!(base, "c128");
+    assert_eq!(
+        platform_for_alias(base).map(|p| p.id),
+        Some("Commodore 128")
+    );
+
+    // An unrecognised suffix is never stripped, so it must not accidentally
+    // resolve to anything either.
+    let unstripped = strip_mame_software_list_suffix("c128_unknown");
+    assert_eq!(platform_for_alias(unstripped), None);
+}
+
+// --- Extension candidate registry ------------------------------------------
+
+#[test]
+fn extension_candidates_are_case_insensitive_and_leading_dot_tolerant() {
+    let plain = platform_candidates_for_extension("nes");
+    assert_eq!(plain, vec!["NES"]);
+    assert_eq!(platform_candidates_for_extension(".nes"), plain);
+    assert_eq!(platform_candidates_for_extension("NES"), plain);
+    assert_eq!(platform_candidates_for_extension(".NES"), plain);
+}
+
+#[test]
+fn an_unknown_extension_has_no_candidates() {
+    assert_eq!(
+        platform_candidates_for_extension("not-a-real-extension"),
+        Vec::<&str>::new()
+    );
+}
+
+#[test]
+fn d64_includes_both_c64_and_c128() {
+    let candidates = platform_candidates_for_extension("d64");
+    assert!(candidates.contains(&"Commodore 64"));
+    assert!(candidates.contains(&"Commodore 128"));
+}
+
+#[test]
+fn cue_returns_several_optical_candidates() {
+    let candidates = platform_candidates_for_extension("cue");
+    assert!(
+        candidates.len() >= 5,
+        "expected several optical-disc platforms for `.cue`, got {candidates:?}"
+    );
+}
+
+#[test]
+fn bin_is_ambiguous_across_many_platforms() {
+    let candidates = platform_candidates_for_extension("bin");
+    assert!(
+        candidates.len() > 5,
+        "`.bin` should be shared by many platforms, got {candidates:?}"
+    );
+}
+
+#[test]
+fn extension_candidate_ordering_is_deterministic() {
+    let first = platform_candidates_for_extension("bin");
+    let second = platform_candidates_for_extension("bin");
+    assert_eq!(first, second);
+    let mut sorted = first.clone();
+    sorted.sort_unstable();
+    assert_eq!(first, sorted, "candidates should already be sorted by id");
+}
+
+#[test]
+fn every_extension_candidate_id_exists_in_the_registry() {
+    for platform in PLATFORMS {
+        for extension in platform
+            .strong_extensions
+            .iter()
+            .chain(platform.weak_extensions)
+        {
+            for id in platform_candidates_for_extension(extension) {
+                assert!(
+                    platform_by_id(id).is_some(),
+                    "`{id}` returned for `.{extension}` is not a registered platform"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn extension_candidates_never_contain_a_duplicate_platform_id() {
+    for extension in ["bin", "cue", "d64", "nes", "zip", "iso", "rom"] {
+        let candidates = platform_candidates_for_extension(extension);
+        let mut deduped = candidates.clone();
+        deduped.sort_unstable();
+        deduped.dedup();
+        assert_eq!(
+            candidates.len(),
+            deduped.len(),
+            "`.{extension}` returned a duplicate platform id: {candidates:?}"
+        );
+    }
+}
+
+#[test]
+fn archive_container_formats_never_resolve_a_platform_by_themselves() {
+    // `.zip`/`.7z` are shared with too many platforms to mean anything; this
+    // asserts the registry does not pretend an archive container identifies
+    // one, whatever candidates it happens to list.
+    for extension in ["zip", "7z"] {
+        let candidates = platform_candidates_for_extension(extension);
+        assert_ne!(
+            candidates.len(),
+            1,
+            "`.{extension}` must never look like a single-platform match"
+        );
+    }
+}
+
+// --- Magic candidate registry -----------------------------------------
+
+/// A zero-filled buffer with `pattern` placed at `offset`, exactly long
+/// enough to hold it - enough to exercise a real [`MagicRule`] without ever
+/// touching a filesystem.
+fn bytes_with_signature_at(offset: usize, pattern: &[u8]) -> Vec<u8> {
+    let mut buffer = vec![0u8; offset + pattern.len()];
+    buffer[offset..offset + pattern.len()].copy_from_slice(pattern);
+    buffer
+}
+
+#[test]
+fn distinctive_magic_returns_the_expected_canonical_candidate() {
+    let nes = bytes_with_signature_at(0, b"NES\x1a");
+    assert_eq!(platform_candidates_from_bytes(&nes), vec!["NES"]);
+
+    let dreamcast = bytes_with_signature_at(0, b"SEGA SEGAKATANA");
+    assert_eq!(
+        platform_candidates_from_bytes(&dreamcast),
+        vec!["Dreamcast"]
+    );
+
+    let n64 = bytes_with_signature_at(0, &[0x80, 0x37, 0x12, 0x40]);
+    assert_eq!(platform_candidates_from_bytes(&n64), vec!["N64"]);
+}
+
+#[test]
+fn unknown_bytes_have_no_magic_candidates() {
+    let random = vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    assert_eq!(platform_candidates_from_bytes(&random), Vec::<&str>::new());
+    assert_eq!(platform_candidates_from_bytes(&[]), Vec::<&str>::new());
+}
+
+#[test]
+fn magic_candidate_ordering_is_deterministic() {
+    let buffer = bytes_with_signature_at(0x7ff0, b"TMR SEGA");
+    let first = platform_candidates_from_bytes(&buffer);
+    let second = platform_candidates_from_bytes(&buffer);
+    assert_eq!(first, second);
+    let mut sorted = first.clone();
+    sorted.sort_unstable();
+    assert_eq!(first, sorted);
+}
+
+#[test]
+fn every_magic_candidate_id_exists_in_the_registry() {
+    for platform in PLATFORMS {
+        for rule in platform.magic {
+            let buffer = bytes_with_signature_at(rule.offset as usize, rule.bytes);
+            for id in platform_candidates_from_bytes(&buffer) {
+                assert!(
+                    platform_by_id(id).is_some(),
+                    "`{id}` matched from a registered rule is not a registered platform"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_platform_with_several_rules_matching_the_same_buffer_is_not_duplicated() {
+    // The Master System declares three `TMR SEGA` rules at three different
+    // offsets. A buffer big enough to satisfy all three must still report
+    // `MasterSystem` exactly once.
+    let mut buffer = vec![0u8; 0x7ff0 + 8];
+    for offset in [0x7ff0usize, 0x3ff0, 0x1ff0] {
+        buffer[offset..offset + 8].copy_from_slice(b"TMR SEGA");
+    }
+    let candidates = platform_candidates_from_bytes(&buffer);
+    assert_eq!(
+        candidates
+            .iter()
+            .filter(|id| **id == "MasterSystem")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn shared_magic_bytes_report_every_platform_that_declares_them() {
+    // `TMR SEGA` is deliberately shared by the Master System and Game Gear;
+    // `PLAYSTATION` is deliberately shared by the PS1 and PS2. Neither
+    // signature alone should look like a single-platform match.
+    let sega_header = bytes_with_signature_at(0x7ff0, b"TMR SEGA");
+    let sega_candidates = platform_candidates_from_bytes(&sega_header);
+    assert!(sega_candidates.contains(&"MasterSystem"));
+    assert!(sega_candidates.contains(&"GameGear"));
+
+    let playstation_header = bytes_with_signature_at(0x8008, b"PLAYSTATION");
+    let playstation_candidates = platform_candidates_from_bytes(&playstation_header);
+    assert!(playstation_candidates.contains(&"PSX"));
+    assert!(playstation_candidates.contains(&"PS2"));
+}
+
+#[test]
+fn platform_candidates_from_bytes_behaviour_is_unchanged_by_the_confidence_field() {
+    // The plain candidate function must still answer only "which platforms
+    // match", exactly as before - the Mega Drive `SEGA` header still yields
+    // exactly one candidate, even though that candidate is no longer treated
+    // as Strong anywhere downstream.
+    let mega_drive_header = bytes_with_signature_at(0x100, b"SEGA");
+    assert_eq!(
+        platform_candidates_from_bytes(&mega_drive_header),
+        vec!["MegaDrive"]
+    );
+    assert_eq!(platform_candidates_from_bytes(&[]), Vec::<&str>::new());
+}
+
+// --- Explicit, reviewed magic confidence -----------------------------------
+
+/// One row per [`MagicRule`] currently in the registry: `(platform id,
+/// offset, bytes, expected confidence)`. This table is the audit this chunk
+/// exists to produce - every rule in [`PLATFORMS`] must appear here exactly
+/// once, and every entry's confidence must match what the registry actually
+/// declares. Adding a new rule to the registry without adding it here is
+/// caught by [`every_magic_rule_in_the_registry_has_a_reviewed_confidence`].
+const REVIEWED_MAGIC_CONFIDENCE: &[(&str, u64, &[u8], MagicConfidence)] = &[
+    ("Atari7800", 0x1, b"ATARI7800", MagicConfidence::Strong),
+    ("Atari Lynx", 0, b"LYNX", MagicConfidence::Strong),
+    ("Amiga", 0, b"DOS\x00", MagicConfidence::Strong),
+    ("N64", 0, &[0x80, 0x37, 0x12, 0x40], MagicConfidence::Strong),
+    ("NES", 0, b"NES\x1a", MagicConfidence::Strong),
+    (
+        "GameCube",
+        0x1c,
+        &[0xc2, 0x33, 0x9f, 0x3d],
+        MagicConfidence::Strong,
+    ),
+    (
+        "Wii",
+        0x18,
+        &[0x5d, 0x1c, 0x9e, 0xa3],
+        MagicConfidence::Strong,
+    ),
+    ("Philips CD-i", 0x8008, b"CD-RTOS", MagicConfidence::Strong),
+    ("Dreamcast", 0, b"SEGA SEGAKATANA", MagicConfidence::Strong),
+    (
+        "GameGear",
+        0x7ff0,
+        b"TMR SEGA",
+        MagicConfidence::Corroborated,
+    ),
+    (
+        "MasterSystem",
+        0x7ff0,
+        b"TMR SEGA",
+        MagicConfidence::Corroborated,
+    ),
+    (
+        "MasterSystem",
+        0x3ff0,
+        b"TMR SEGA",
+        MagicConfidence::Corroborated,
+    ),
+    (
+        "MasterSystem",
+        0x1ff0,
+        b"TMR SEGA",
+        MagicConfidence::Corroborated,
+    ),
+    ("MegaDrive", 0x100, b"SEGA", MagicConfidence::Corroborated),
+    (
+        "Sega CD",
+        0,
+        b"SEGADISCSYSTEM",
+        MagicConfidence::Corroborated,
+    ),
+    (
+        "Sega CD",
+        0x10,
+        b"SEGADISCSYSTEM",
+        MagicConfidence::Corroborated,
+    ),
+    ("Saturn", 0, b"SEGA SEGASATURN", MagicConfidence::Strong),
+    ("PSX", 0x8008, b"PLAYSTATION", MagicConfidence::Corroborated),
+    ("PS2", 0x8008, b"PLAYSTATION", MagicConfidence::Corroborated),
+    (
+        "ZX Spectrum",
+        0,
+        b"ZXTape!\x1a",
+        MagicConfidence::Corroborated,
+    ),
+];
+
+#[test]
+fn every_magic_rule_in_the_registry_has_a_reviewed_confidence() {
+    // This is the audit table itself: every rule currently in `PLATFORMS`
+    // must have exactly one row here, and a future rule added to the
+    // registry without a matching row here fails this test loudly rather
+    // than silently inheriting some default confidence.
+    let mut registry_rules: Vec<(&str, u64, &[u8])> = Vec::new();
+    for platform in PLATFORMS {
+        for rule in platform.magic {
+            registry_rules.push((platform.id, rule.offset, rule.bytes));
+        }
+    }
+    let mut reviewed_rules: Vec<(&str, u64, &[u8])> = REVIEWED_MAGIC_CONFIDENCE
+        .iter()
+        .map(|(platform, offset, bytes, _)| (*platform, *offset, *bytes))
+        .collect();
+
+    registry_rules.sort();
+    reviewed_rules.sort();
+    assert_eq!(
+        registry_rules, reviewed_rules,
+        "every MagicRule in PLATFORMS must have exactly one row in \
+         REVIEWED_MAGIC_CONFIDENCE, and vice versa"
+    );
+
+    for platform in PLATFORMS {
+        for rule in platform.magic {
+            let expected = REVIEWED_MAGIC_CONFIDENCE
+                .iter()
+                .find(|(id, offset, bytes, _)| {
+                    *id == platform.id && *offset == rule.offset && *bytes == rule.bytes
+                })
+                .map(|(_, _, _, confidence)| *confidence)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{} rule at offset {:#x} has no reviewed confidence entry",
+                        platform.id, rule.offset
+                    )
+                });
+            assert_eq!(
+                rule.confidence, expected,
+                "{} rule at offset {:#x} does not match its reviewed confidence",
+                platform.id, rule.offset
+            );
+        }
+    }
+}
+
+#[test]
+fn known_shared_signatures_remain_corroborated() {
+    for (platform, offset, bytes) in [
+        ("GameGear", 0x7ff0u64, b"TMR SEGA".as_slice()),
+        ("MasterSystem", 0x7ff0, b"TMR SEGA"),
+        ("PSX", 0x8008, b"PLAYSTATION"),
+        ("PS2", 0x8008, b"PLAYSTATION"),
+    ] {
+        let rule = platform_by_id(platform)
+            .unwrap()
+            .magic
+            .iter()
+            .find(|rule| rule.offset == offset && rule.bytes == bytes)
+            .unwrap_or_else(|| panic!("{platform} has no rule at {offset:#x}"));
+        assert_eq!(
+            rule.confidence,
+            MagicConfidence::Corroborated,
+            "{platform}'s rule at {offset:#x} must remain Corroborated"
+        );
+    }
+}
+
+#[test]
+fn mega_drive_sega_header_is_corroborated_not_strong() {
+    let rule = platform_by_id("MegaDrive")
+        .unwrap()
+        .magic
+        .iter()
+        .find(|rule| rule.offset == 0x100)
+        .expect("Mega Drive has a SEGA header rule");
+    assert_eq!(
+        rule.confidence,
+        MagicConfidence::Corroborated,
+        "Sega 32X carts share this exact header and have no rule of their \
+         own yet, so this must not be treated as Mega-Drive-unique"
+    );
+}
+
+#[test]
+fn at_least_one_reviewed_rule_is_genuinely_strong() {
+    let nes_rule = platform_by_id("NES")
+        .unwrap()
+        .magic
+        .iter()
+        .find(|rule| rule.bytes == b"NES\x1a")
+        .expect("NES has an iNES header rule");
+    assert_eq!(nes_rule.confidence, MagicConfidence::Strong);
+}
+
+#[test]
+fn magic_confidence_lookup_ordering_is_deterministic() {
+    let buffer = bytes_with_signature_at(0x7ff0, b"TMR SEGA");
+    let first = platform_magic_confidence_from_bytes(&buffer);
+    let second = platform_magic_confidence_from_bytes(&buffer);
+    assert_eq!(first, second);
+    let mut sorted = first.clone();
+    sorted.sort_by(|left, right| left.0.cmp(right.0));
+    assert_eq!(first, sorted);
+}
+
+#[test]
+fn a_platform_with_mixed_confidence_rules_reports_its_best_match() {
+    // Not a real registry scenario today (every platform's rules currently
+    // share one confidence), but the lookup's own "best match wins" rule is
+    // still worth proving directly against the actual Master System entry:
+    // matching only the Strong-if-it-were-Strong offset should never be
+    // silently downgraded by an unrelated Corroborated rule on the same
+    // platform. Here all three Master System rules are Corroborated, so the
+    // result should simply be Corroborated - this is the "no accidental
+    // upgrade or downgrade across a platform's own rules" check.
+    let buffer = bytes_with_signature_at(0x1ff0, b"TMR SEGA");
+    let matches = platform_magic_confidence_from_bytes(&buffer);
+    let master_system = matches
+        .iter()
+        .find(|(id, _)| *id == "MasterSystem")
+        .expect("Master System matches its smallest-dump offset");
+    assert_eq!(master_system.1, MagicConfidence::Corroborated);
+}
+
+#[test]
+fn total_magic_rule_coverage_is_unchanged_at_twenty_rules_across_seventeen_platforms() {
+    let mut rule_count = 0usize;
+    let mut platform_count = 0usize;
+    for platform in PLATFORMS {
+        if !platform.magic.is_empty() {
+            platform_count += 1;
+        }
+        rule_count += platform.magic.len();
+    }
+    assert_eq!(rule_count, 20, "no new MagicRule coverage may be added");
+    assert_eq!(
+        platform_count, 17,
+        "no new platform may gain magic coverage"
+    );
+}
+
+#[test]
+fn zxtape_is_corroborated_not_strong() {
+    let rule = platform_by_id("ZX Spectrum")
+        .unwrap()
+        .magic
+        .iter()
+        .find(|rule| rule.bytes == b"ZXTape!\x1a")
+        .expect("ZX Spectrum has a ZXTape rule");
+    assert_eq!(
+        rule.confidence,
+        MagicConfidence::Corroborated,
+        "TZX/CDT is a tape-container format shared across more than one \
+         platform family; it must not be treated as unique ZX Spectrum \
+         platform evidence"
+    );
+}
+
+#[test]
+fn segadiscsystem_rules_are_corroborated_not_strong() {
+    for offset in [0u64, 0x10] {
+        let rule = platform_by_id("Sega CD")
+            .unwrap()
+            .magic
+            .iter()
+            .find(|rule| rule.offset == offset)
+            .unwrap_or_else(|| panic!("Sega CD has a rule at {offset:#x}"));
+        assert_eq!(
+            rule.confidence,
+            MagicConfidence::Corroborated,
+            "SEGADISCSYSTEM at {offset:#x} is not established as unique \
+             across every related Sega CD / 32X-CD-compatible case"
+        );
+    }
+}
