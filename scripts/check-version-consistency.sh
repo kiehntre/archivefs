@@ -47,8 +47,8 @@ VERSION="$(release_workspace_version "$REPO_ROOT")"
 TARGET_NAME="$(release_target_name)"
 BUNDLE_NAME="$(release_bundle_name "$VERSION" "$TARGET_NAME")"
 
-grep -Fqx "## v$VERSION (unreleased)" "$REPO_ROOT/CHANGELOG.md" ||
-    release_die "CHANGELOG.md must contain the current heading: ## v$VERSION (unreleased)"
+release_changelog_current_heading_ok "$REPO_ROOT/CHANGELOG.md" "$VERSION" ||
+    release_die "CHANGELOG.md must contain the current heading: ## v$VERSION (unreleased) or ## v$VERSION (YYYY-MM-DD)"
 grep -Fq "v$VERSION" "$REPO_ROOT/README.md" ||
     release_die "README.md does not mention current release v$VERSION"
 

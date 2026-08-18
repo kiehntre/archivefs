@@ -71,3 +71,17 @@ release_require_clean_repository() {
 release_sha256() {
     sha256sum "$1" | awk '{print $1}'
 }
+
+# Whether $changelog contains the exact current-version heading for
+# $version, in either of its two legitimate forms: pre-release
+# ("## v$version (unreleased)") or finalized at tag time
+# ("## v$version (YYYY-MM-DD)", a strict four-digit/two-digit/two-digit
+# date - not a looser date shape, and never any other version). Matched as
+# a whole line (anchored both ends), same as the single-form check this
+# replaces.
+release_changelog_current_heading_ok() {
+    local changelog=$1
+    local version=$2
+    local escaped_version=${version//./\\.}
+    grep -Eqx "## v${escaped_version} \\((unreleased|[0-9]{4}-[0-9]{2}-[0-9]{2})\\)" "$changelog"
+}
