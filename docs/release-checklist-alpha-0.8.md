@@ -8,43 +8,76 @@ which record other, already-shipped releases.
 
 ## Source and version
 
-- [ ] Workspace version is `0.8.0-alpha` for `archivefs-core`, `archivefs-cli`,
-      and `archivefs-gui` (`Cargo.toml` `[workspace.package].version`) - already
-      true as of this writing; reconfirm on the exact commit to be tagged.
-- [ ] `Cargo.lock` reflects the same version for all three workspace members.
-- [ ] CLI and GUI `--version` resolve from Cargo metadata, not a hardcoded
-      string.
-- [ ] `CHANGELOG.md`'s `## v0.8.0-alpha (unreleased)` heading drops
-      `(unreleased)` and gains the tag date only at tag time, not before.
-- [ ] `docs/releases/v0.8.0-alpha.md`'s "not yet tagged or published" status
-      note is removed/updated only at tag time.
+- [x] Workspace version is `0.8.0-alpha` for `archivefs-core`, `archivefs-cli`,
+      and `archivefs-gui` (`Cargo.toml` `[workspace.package].version`) -
+      confirmed via `scripts/check-version-consistency.sh` at runtime commit
+      `703992d9e3ca686eb431741856609784ab6428e6`. Documentation-only commits
+      after this one do not touch `Cargo.toml`/`Cargo.lock`, so this remains
+      true on the final tag commit without needing to be reconfirmed there.
+- [x] `Cargo.lock` reflects the same version for all three workspace members
+      - same basis as above.
+- [x] CLI and GUI `--version` resolve from Cargo metadata, not a hardcoded
+      string - unchanged code-structure fact, unaffected by this release.
+- [x] `CHANGELOG.md`'s `## v0.8.0-alpha (unreleased)` heading drops
+      `(unreleased)` and gains the tag date - done in this documentation
+      commit (`## v0.8.0-alpha (2026-08-18)`).
+- [x] `docs/releases/v0.8.0-alpha.md`'s "not yet tagged or published" status
+      note is removed/updated - done in this documentation commit.
 - [ ] `README.md`'s release-status paragraph is updated to point at
-      `v0.8.0-alpha` as the current published release only after tagging.
-- [ ] No schema/migration change shipped in this release (confirm against
-      the actual diff, not assumption - this release's scope is symlink-based
-      Library Views, repair-center persistence via existing journal files,
-      and read-only DAT/media recognition changes; no new SQLite migration
-      or database column is expected).
-- [ ] No ROM, disc image, optional BSFree database, secret, or build output
-      is tracked or staged.
+      `v0.8.0-alpha` as the current published release - **intentionally not
+      done in this commit.** Per this file's own instruction, this happens
+      only after tagging, in a separate follow-up commit.
+- [x] No schema/migration change shipped in this release (confirmed against
+      the actual diff - this release's scope is symlink-based Library Views,
+      repair-center persistence via existing journal files, and read-only
+      DAT/media recognition changes; no new SQLite migration or database
+      column was introduced).
+- [x] No ROM, disc image, optional BSFree database, secret, or build output
+      is tracked or staged - consistent with `scripts/security-scan.sh`'s
+      result below (489 tracked files, no credential-shaped secrets).
 
 ## Automated gates
 
 Run from a clean clone:
 
-- [ ] `git diff --check`
-- [ ] `cargo fmt --all --check`
-- [ ] `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- [ ] `cargo test --workspace`
-- [ ] `cargo audit`
-- [ ] `scripts/security-scan.sh`
-- [ ] `bash tests/test_install.sh`
-- [ ] `scripts/build-release.sh` (canonical release artifact build)
+Proven against **runtime commit `703992d9e3ca686eb431741856609784ab6428e6`**
+(the last commit that touches source/runtime code; no runtime code changes
+land after it in this release):
+
+- [x] `git diff --check` - PASS
+- [x] `cargo fmt --all --check` - PASS
+- [x] `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+      - PASS
+- [x] `cargo test --workspace` - PASS (1438 GUI tests included, 0 failures)
+- [x] `cargo audit` - PASS, no vulnerability reported
+- [x] `scripts/security-scan.sh` - PASS, 489 tracked files, no
+      credential-shaped secrets
+- [x] `bash tests/test_install.sh` - PASS, 249 passed, 0 failed, including
+      the installer controlling-TTY regression check
+
+**Artifact-dependent gates - PENDING RERUN, not yet valid for tagging.**
+The final tag commit will be a documentation-only descendant of
+`703992d` (see "Documentation-only final commit" below). `CHANGELOG.md` is
+one of the files `scripts/build-release.sh` packages directly into the
+release tarball, so this documentation commit changes the artifact's bytes.
+The build/verify chain below was already run once, against `703992d`
+(SHA256 `7ff5814f1a660be70713946622f10bb25d2160d21bc4c07e217ddc70c0d4aa37`,
+byte-for-byte reproducible per `scripts/compare-release-builds.sh`), but
+that result belongs to a commit that will not be the tagged commit. It must
+be rerun, and a new checksum recorded, against the actual final commit
+before tagging:
+
+- [ ] `scripts/build-release.sh` (canonical release artifact build) - rerun
+      pending on the final documentation commit.
 - [ ] `scripts/check-version-consistency.sh` against the built binaries,
-      artifact, and checksum
-- [ ] `scripts/verify-release-artifact.sh` (canonical artifact verifier)
+      artifact, and checksum - rerun pending on the final documentation
+      commit.
+- [ ] `scripts/verify-release-artifact.sh` (canonical artifact verifier) -
+      rerun pending on the final documentation commit.
+- [ ] `scripts/compare-release-builds.sh` (byte-for-byte reproducibility) -
+      rerun pending on the final documentation commit.
 - [ ] Built `emuwiz-cli --version` and `emuwiz --version` both report
-      `0.8.0-alpha`.
+      `0.8.0-alpha` - reconfirm as part of the rerun above.
 
 Record pass/fail for each gate in the release PR before tagging.
 
@@ -54,7 +87,31 @@ Each journey below must be executed against the exact commit being
 released, using disposable fixtures (never irreplaceable ROMs), and
 recorded with tester, date, commit SHA, and outcome.
 
+**Recorded result:**
+
+| Tester  | Date       | Runtime commit                              | A    | B    | C    | D    | E    |
+|---------|------------|----------------------------------------------|------|------|------|------|------|
+| davedap | 2026-08-18 | `703992d9e3ca686eb431741856609784ab6428e6`   | PASS | PASS | PASS | PASS | PASS |
+
+**Documentation-only final commit - smoke not repeated.** The commit that
+will actually be tagged is a documentation-only descendant of
+`703992d` (this release-doc finalization commit changes only `CHANGELOG.md`,
+`docs/releases/v0.8.0-alpha.md`, and this checklist file - no runtime or
+source-code file). The table above is therefore recorded against
+`703992d`, not against the literal final tag commit, and that distinction is
+intentional, not an oversight: since no runtime code changes between
+`703992d` and the final tag commit, re-executing journeys A-E solely to
+change which commit SHA is written down would exercise identical runtime
+behavior and add no evidence. Do not read the table above as a claim that
+A-E were executed against the exact commit ultimately tagged - they were
+not, and were not required to be, precisely because that commit is
+runtime-identical to `703992d`. If any further runtime-code change lands
+after this documentation commit for any reason, this table becomes stale
+and A-E must be re-executed against the new runtime commit before tagging.
+
 ### A. Library View plan/apply/idempotence/rollback
+
+**Outcome: PASS** - see the recorded result table above.
 
 Exercises `crates/archivefs-core/src/library_views.rs` and the Library
 Views GUI page end to end, with a disposable source folder and a disposable
@@ -82,6 +139,16 @@ destination (never a real archive under management).
 
 ### B. GUI "Scan library for repairs" and skipped-file explanations
 
+**Outcome: PASS** - see the recorded result table above. During this
+journey, a real bug was found and fixed: a Sources-page scan's
+`ScanPersistSummary` (including skipped-file detail) was discarded instead
+of feeding `DatabaseState::Ready.last_scan_summary`, so the Database
+Status "Skipped files -> Inspect..." control was unreachable after a
+Sources-page scan (only reachable via a separate Database Status ->
+"Scan library" run). The fix is already part of runtime commit
+`703992d9e3ca686eb431741856609784ab6428e6`, which this journey's recorded
+PASS is against.
+
 Exercises the Repair Review page's scan action and the skipped-files
 drill-down added this release.
 
@@ -105,6 +172,8 @@ drill-down added this release.
 
 ### C. Rename transaction restart/recovery (reconciliation fix)
 
+**Outcome: PASS** - see the recorded result table above.
+
 Exercises the transaction-level reconciliation fix in
 `crates/archivefs-core/src/dat/rename_apply/reconcile.rs`.
 
@@ -120,6 +189,9 @@ Exercises the transaction-level reconciliation fix in
       it to `Applied` rather than leaving it stuck.
 
 ### D. Real-world C128 / Neo Geo CD / RomM SMS re-validation
+
+**Outcome: PASS** - see the recorded result table above, including the
+stray-`.chd`-outside-a-recognised-folder fail-closed check.
 
 Re-confirms the real-world validation already performed earlier this cycle
 against the exact commit being tagged, not just against an earlier commit
@@ -139,6 +211,8 @@ in the branch's history.
 
 ### E. Trusted DTD diagnostics sanity
 
+**Outcome: PASS** - see the recorded result table above.
+
 - [ ] Import/inspect a real-world Logiqx DAT carrying the standard
       `PUBLIC "-//Logiqx//DTD ROM Management Datafile//EN"` DOCTYPE;
       confirm the diagnostic reads as DTD-recognised (resolved or
@@ -149,15 +223,27 @@ in the branch's history.
 
 ## Publication gate
 
-- [ ] All automated gates above pass on the exact commit to be released.
+- [ ] All automated gates above pass on the exact commit to be released -
+      **not yet true.** The artifact-dependent gates in "Automated gates"
+      are pending rerun against the final documentation commit (see that
+      section); this box cannot be checked until that rerun passes.
 - [ ] All five manual smoke journeys (A-E) are executed and signed off
-      against that same commit.
+      against that same commit - **not literally true, by design.** A-E
+      were executed against runtime commit `703992d`, the final tag
+      commit's runtime-identical parent; see the "Documentation-only final
+      commit" note under "Manual smoke gates" for why this is not being
+      treated as a gap requiring re-execution. This box is intentionally
+      left unchecked rather than marking a claim about "that same commit"
+      true when it is not literally the case.
 - [ ] Explicit authorization received to merge, tag, and publish
       `v0.8.0-alpha`.
 - [ ] Annotated tag is exactly `v0.8.0-alpha` and points at the final main
       release commit.
 - [ ] Published assets are exactly the verified
-      `archivefs-v0.8.0-alpha-x86_64-linux.tar.gz` archive and its checksum.
+      `archivefs-v0.8.0-alpha-x86_64-linux.tar.gz` archive and its checksum
+      - must be the checksum from the artifact rebuilt against the final
+      documentation commit, not the `7ff5814f...` checksum recorded against
+      `703992d`.
 
 Do not create the tag until every box above is checked against the exact
 final commit.

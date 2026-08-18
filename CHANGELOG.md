@@ -11,15 +11,12 @@ user-facing effect could not be confirmed from its message and diff alone,
 this file describes only what the code and history actually show, rather than
 guessing at intent, dates, or scope.
 
-## v0.8.0-alpha (unreleased)
+## v0.8.0-alpha (2026-08-18)
 
 Frontend Profiles / RomM Library Views and repair-workflow release
-("Alpha 2.0"). **Not yet tagged or published.** The currently published
-release remains
-[`v0.7.2-alpha`](docs/releases/v0.7.2-alpha.md); this entry describes what
-has merged to `main` toward the next alpha so far. Feature freeze is active.
-See [`docs/releases/v0.8.0-alpha.md`](docs/releases/v0.8.0-alpha.md) for
-full release notes.
+("Alpha 2.0"). See
+[`docs/releases/v0.8.0-alpha.md`](docs/releases/v0.8.0-alpha.md) for full
+release notes.
 
 ### Added
 
