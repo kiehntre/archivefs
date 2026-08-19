@@ -53,7 +53,7 @@ use archivefs_core::chd_logical_media::{ChdLogicalMediaError, open_chd_track_log
 use archivefs_core::chd_optical_specialist::open_chd_optical_specialist;
 use archivefs_core::dat::archive::hash::hash_member_stream;
 use archivefs_core::dreamcast_boot_evidence::{IP_BIN_META_BYTES, parse_ip_bin_meta};
-use archivefs_core::executable_signatures::{looks_like_elf, looks_like_xbe, looks_like_xex};
+use archivefs_core::executable_signatures::looks_like_elf;
 use archivefs_core::game_identity::MAX_SYSTEM_CNF_BYTES;
 use archivefs_core::gamecube_wii_boot_evidence::{observe_gc_wii_disc, observe_gc_wii_evidence};
 use archivefs_core::identity_source::hashing::FileFingerprint;
@@ -62,11 +62,21 @@ use archivefs_core::iso9660::{
     observe_iso9660,
 };
 use archivefs_core::logical_media::{LogicalMedia, SliceMedia};
+use archivefs_core::neogeocd_boot_evidence::{
+    MAX_IPL_TXT_BYTES, observe_neogeocd_evidence, parse_ipl_txt,
+};
 use archivefs_core::param_sfo::parse_param_sfo;
+use archivefs_core::pcfx_boot_evidence::{
+    PCFX_BOOT_SECTOR_BYTES, observe_pcfx_evidence, parse_pcfx_boot_sector,
+};
 use archivefs_core::playstation_boot_evidence::{
     PSX_EXECUTABLE_HEADER_BYTES, looks_like_psx_exe, parse_system_cnf_boot,
 };
 use archivefs_core::ps3_boot_evidence::PS3_LAYOUT_PATHS;
+use archivefs_core::ps3_disc_evidence::{
+    PKG_HEADER_BYTES, locate_ps3_game_dir, looks_like_pkg, observe_ps3_directory,
+    observe_ps3_directory_evidence, parse_pkg_header, pkg_header_evidence,
+};
 use archivefs_core::psp_boot_evidence::PSP_LAYOUT_PATHS;
 use archivefs_core::saturn_boot_evidence::{
     SATURN_SYSTEM_ID_BYTES, observe_saturn_evidence, parse_saturn_system_id,
@@ -74,27 +84,58 @@ use archivefs_core::saturn_boot_evidence::{
 use archivefs_core::segacd_boot_evidence::{
     looks_like_sega_cd_boot_sector, observe_segacd_evidence,
 };
+use archivefs_core::threedo_boot_evidence::{
+    OPERA_HEADER_BYTES, observe_threedo_evidence, parse_opera_volume_header,
+};
+use archivefs_core::xbox_boot_evidence::{observe_xbox_disc, observe_xbox_evidence};
+use archivefs_core::xbox360_boot_evidence::{observe_xbox360_disc, observe_xbox360_evidence};
 use archivefs_core::xdvdfs_signature::{XDVDFS_VOLUME_DESCRIPTOR_OFFSET, looks_like_xdvdfs};
+use archivefs_core::xdvdfs_traversal::list_root;
+use std::io::Read as _;
 
 fn main() -> ExitCode {
-    let args: Vec<_> = env::args_os().skip(1).collect();
-    let path = match args.as_slice() {
-        [single] => PathBuf::from(single),
-        [] => {
-            eprintln!("usage: disc_probe <path-to-iso-or-chd>");
+    let mut hash_requested = false;
+    let mut path_arg: Option<PathBuf> = None;
+    for arg in env::args_os().skip(1) {
+        if arg == "--hash" {
+            hash_requested = true;
+        } else if path_arg.is_none() {
+            path_arg = Some(PathBuf::from(arg));
+        } else {
+            eprintln!(
+                "usage: disc_probe [--hash] <path-to-iso-or-chd-or-pkg-or-ps3-folder>  (exactly one path)"
+            );
             return ExitCode::FAILURE;
         }
-        _ => {
-            eprintln!("usage: disc_probe <path-to-iso-or-chd>  (exactly one path, no options)");
-            return ExitCode::FAILURE;
-        }
+    }
+    let Some(path) = path_arg else {
+        eprintln!("usage: disc_probe [--hash] <path-to-iso-or-chd-or-pkg-or-ps3-folder>");
+        return ExitCode::FAILURE;
     };
 
     println!("Path: {}", path.display());
 
+    if path.is_dir() {
+        return probe_directory(&path);
+    }
+
+    // A cheap, bounded peek at just the fixed PKG header - a real .pkg can
+    // be many gigabytes, so this must never trigger a whole-file read (see
+    // probe_pkg below and the pkg_header module docs on why only this
+    // fixed header is ever read).
+    if let Ok(mut file) = std::fs::File::open(&path) {
+        let mut peek = [0u8; PKG_HEADER_BYTES];
+        if let Ok(read) = file.read(&mut peek)
+            && looks_like_pkg(&peek[..read])
+        {
+            return probe_pkg(&peek[..read]);
+        }
+    }
+
     let before = FileFingerprint::observe(&path);
 
-    // The one and only filesystem access this program performs.
+    // The one and only whole-file filesystem access this program performs
+    // (the .pkg case above deliberately avoids it).
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -115,14 +156,20 @@ fn main() -> ExitCode {
         }
     );
 
-    let physical_sha256 = match hash_bytes(&bytes) {
-        Ok(hex) => hex,
-        Err(detail) => {
-            eprintln!("failed to hash the physical bytes: {detail}");
-            return ExitCode::FAILURE;
+    // SHA-256 of a multi-gigabyte image (an uncompressed Xbox/Xbox 360 ISO
+    // in particular) is slow and, for most probe runs, not what the caller
+    // actually needs - so it is opt-in via --hash rather than mandatory.
+    if hash_requested {
+        match hash_bytes(&bytes) {
+            Ok(hex) => println!("Physical SHA-256: {hex}"),
+            Err(detail) => {
+                eprintln!("failed to hash the physical bytes: {detail}");
+                return ExitCode::FAILURE;
+            }
         }
-    };
-    println!("Physical SHA-256: {physical_sha256}");
+    } else {
+        println!("Physical SHA-256: (skipped - pass --hash to compute; large images can be slow)");
+    }
 
     if looks_like_chd(&bytes) {
         return probe_chd(&path, &bytes);
@@ -152,8 +199,111 @@ fn main() -> ExitCode {
     if looks_like_sega_cd_boot_sector(&bytes) {
         return probe_segacd(&bytes);
     }
+    if bytes.len() >= OPERA_HEADER_BYTES
+        && parse_opera_volume_header(&bytes[..OPERA_HEADER_BYTES])
+            .is_some_and(|fact| fact.header_is_valid())
+    {
+        return probe_threedo(&bytes);
+    }
+    if bytes.len() >= PCFX_BOOT_SECTOR_BYTES
+        && parse_pcfx_boot_sector(&bytes[..PCFX_BOOT_SECTOR_BYTES]).any_magic_present()
+    {
+        return probe_pcfx(&bytes[..PCFX_BOOT_SECTOR_BYTES]);
+    }
 
     println!("Container: Unknown (no recognised container/disc signature)");
+    ExitCode::SUCCESS
+}
+
+/// Directory input: currently only a PS3 folder install (`PS3_GAME/` tree)
+/// is a recognised directory shape - see the module-level policy in the
+/// task this probe was extended under: "do not turn disc_probe into a
+/// generic recursive scanner," so an unrelated directory is reported as
+/// Unknown rather than scanned for anything else.
+fn probe_directory(path: &Path) -> ExitCode {
+    println!("Input type: directory");
+    if locate_ps3_game_dir(path).is_none() {
+        println!("Container: Unknown (directory does not resolve to a PS3_GAME layout)");
+        return ExitCode::SUCCESS;
+    }
+    println!("Container: PS3 folder install");
+    let observation = observe_ps3_directory(path);
+    println!(
+        "PS3_GAME present: {}",
+        observation.layout.ps3_game_dir_present
+    );
+    println!("USRDIR present: {}", observation.layout.usrdir_present);
+    println!(
+        "EBOOT.BIN present: {}",
+        observation.layout.eboot_bin_present
+    );
+    println!(
+        "SELF magic present: {:?}",
+        observation.layout.eboot_self_magic_present
+    );
+    println!(
+        "PARAM.SFO present: {}",
+        observation.layout.param_sfo.is_some()
+    );
+    println!(
+        "TITLE_ID: {}",
+        observation.layout.title_id().unwrap_or("N/A")
+    );
+    println!("TITLE: {}", observation.layout.title().unwrap_or("N/A"));
+    println!(
+        "CATEGORY: {}",
+        observation.layout.category().unwrap_or("N/A")
+    );
+    println!(
+        "APP_VER: {}",
+        observation.layout.app_version().unwrap_or("N/A")
+    );
+    println!("PS3_DISC.SFB present: {}", observation.disc_sfb_present);
+    println!(
+        "Evidence: {:?}",
+        observe_ps3_directory_evidence(&observation)
+    );
+    ExitCode::SUCCESS
+}
+
+/// A `.pkg`'s fixed [`PKG_HEADER_BYTES`]-byte header, read as a bounded
+/// prefix by `main` - never the whole (potentially many-gigabyte) package.
+fn probe_pkg(header: &[u8]) -> ExitCode {
+    println!("Container: PS3/PSN .pkg package");
+    match parse_pkg_header(header) {
+        Some(fact) => {
+            println!("Revision: {:#06x}", fact.revision);
+            println!("Type: {:#06x}", fact.package_type);
+            println!("Item count: {}", fact.item_count);
+            println!("Total size: {} bytes", fact.total_size);
+            println!("Data offset: {}", fact.data_offset);
+            println!("Data size: {} bytes", fact.data_size);
+            println!("Content ID: {}", fact.content_id);
+            println!("Evidence: {:?}", pkg_header_evidence(&fact));
+        }
+        None => println!("PKG header did not parse (truncated?)"),
+    }
+    ExitCode::SUCCESS
+}
+
+fn probe_threedo(bytes: &[u8]) -> ExitCode {
+    println!("Container: 3DO (Opera filesystem)");
+    if let Some(fact) = parse_opera_volume_header(bytes) {
+        println!("Volume label: {}", fact.volume_label);
+        println!("Volume comment: {}", fact.volume_comment);
+        println!("Block size: {}", fact.block_size);
+        println!("Block count: {}", fact.block_count);
+        println!("Evidence: {:?}", observe_threedo_evidence(&fact));
+    }
+    ExitCode::SUCCESS
+}
+
+fn probe_pcfx(sector: &[u8]) -> ExitCode {
+    println!("Container: PC-FX boot sector");
+    let fact = parse_pcfx_boot_sector(sector);
+    println!("Primary magic present: {}", fact.primary_magic_present);
+    println!("Secondary magic present: {}", fact.secondary_magic_present);
+    println!("Evidence: {:?}", observe_pcfx_evidence(&fact));
     ExitCode::SUCCESS
 }
 
@@ -198,14 +348,49 @@ fn print_gc_wii_probe(
 fn probe_xdvdfs(bytes: &[u8]) -> ExitCode {
     println!("Container: XDVDFS volume (Xbox/Xbox 360 family)");
     println!(
-        "Filesystem: XDVDFS (magic verified, deep traversal not yet integrated - see xdvdfs_signature module docs)"
+        "Filesystem: XDVDFS (magic verified, bounded traversal - see xdvdfs_traversal module docs)"
     );
 
-    let default_xbe_header = looks_like_xbe(bytes);
-    let default_xex_header = looks_like_xex(bytes);
+    match list_root(bytes) {
+        Ok(root) => {
+            println!(
+                "XDVDFS root entries: {} (truncated: {})",
+                root.entries.len(),
+                root.truncated
+            );
+            for entry in root.entries.iter().take(50) {
+                println!(
+                    "  {} ({}, size={})",
+                    entry.name,
+                    if entry.is_directory { "dir" } else { "file" },
+                    entry.size
+                );
+            }
+        }
+        Err(error) => println!("XDVDFS root listing: unavailable ({error})"),
+    }
+
+    let xbox = observe_xbox_disc(bytes);
+    println!("default.xbe present: {}", xbox.default_xbe_present);
+    println!("XBE header parsed: {}", xbox.xbe_header.is_some());
+    if let Some(header) = &xbox.xbe_header {
+        println!("  title_id: {:?}", header.title_id);
+        println!("  title_name: {:?}", header.title_name);
+    }
+    println!("Xbox evidence: {:?}", observe_xbox_evidence(&xbox));
+
+    let xbox360 = observe_xbox360_disc(bytes);
+    println!("default.xex present: {}", xbox360.default_xex_present);
+    println!("XEX2 header parsed: {}", xbox360.xex2_header.is_some());
+    if let Some(header) = &xbox360.xex2_header {
+        println!("  media_id: {}", header.media_id);
+        println!("  title_id: {}", header.title_id);
+    }
     println!(
-        "Executable format: XBE={default_xbe_header} XEX2={default_xex_header} (checked at file start only; real discs carry these inside the filesystem, not at offset 0 - this is a conservative whole-buffer check)"
+        "Xbox 360 evidence: {:?}",
+        observe_xbox360_evidence(&xbox360)
     );
+
     ExitCode::SUCCESS
 }
 
@@ -512,6 +697,30 @@ fn print_boot_evidence<M: LogicalMedia>(media: &M, observation: &DiscFilesystemO
                 }
                 println!("PARAM.SFO ({sfo_path}): {} entries", sfo.entries.len());
             }
+        }
+    }
+
+    // Neo Geo CD: IPL.TXT lives inside a plain ISO9660 filesystem, so - like
+    // the Sony PARAM.SFO paths above - it is looked up here rather than at
+    // a raw byte offset. ISO9660 alone is never Neo Geo CD evidence; the
+    // manifest's own structural validity is the real signal.
+    if let Ok(Some(entry)) = find_path(media, observation, "IPL.TXT")
+        && !entry.is_directory
+    {
+        let bound = (entry.size as usize).min(MAX_IPL_TXT_BYTES);
+        let offset = entry.extent_lba as u64 * observation.logical_block_size as u64;
+        let mut buf = vec![0u8; bound];
+        if media.read_at(offset, &mut buf).is_ok() {
+            let fact = parse_ipl_txt(&buf);
+            println!(
+                "IPL.TXT: {} entries, required extensions present: {}",
+                fact.entries.len(),
+                fact.has_required_extensions()
+            );
+            println!(
+                "Neo Geo CD evidence: {:?}",
+                observe_neogeocd_evidence(&fact)
+            );
         }
     }
 

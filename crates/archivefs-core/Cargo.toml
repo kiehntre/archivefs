@@ -105,10 +105,20 @@ opticaldiscs = { version = "0.15", default-features = false, features = [
 # filesystem stack from scratch; only structural/header facts are read,
 # never Wii partition decryption (no keys are available to this crate).
 nod = { version = "1.4.4", default-features = false }
-# Original Xbox/Xbox 360 XDVDFS filesystem - pure Rust with only `read`+`std`
-# enabled (no `write`/`ciso`/`wax`/crypto features). Reused rather than
-# hand-writing an XDVDFS filesystem stack from scratch.
-xdvdfs = { version = "0.8.3", default-features = false, features = ["read", "std"] }
+# Original Xbox/Xbox 360 XDVDFS filesystem - pure Rust, `read`+`std`+`sync`
+# only (no `write`/`wax`/crypto). `sync` turns the crate's `maybe_async` API
+# (built on `async-trait`) into plain synchronous functions via
+# `maybe-async/is_sync`, so this crate never needs an async executor just to
+# call them; the alternative (hand-writing our own `async fn`
+# `BlockDeviceRead` impl to add read-budget cycle protection, matching the
+# crate's own `async-trait`-generated trait shape) is materially more
+# fragile than accepting `sync`'s one transitive side effect: it also
+# unconditionally enables the crate's own optional `ciso` (ISO compression)
+# feature via `ciso/sync`, which is unused here but adds only pure-Rust code
+# (`ciso`, `lz4_flex`, `ruzstd`, `twox-hash`, `arbitrary-int`, `bitbybit`) -
+# no native/C dependency. Reused rather than hand-writing an XDVDFS
+# filesystem stack from scratch.
+xdvdfs = { version = "0.8.3", default-features = false, features = ["read", "std", "sync"] }
 
 [features]
 chd-optical-specialist = ["dep:opticaldiscs"]

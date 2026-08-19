@@ -182,6 +182,11 @@ pub mod segacd_boot_evidence;
 /// [`xbox_boot_evidence`]/[`xbox360_boot_evidence`].
 pub mod xdvdfs_signature;
 
+/// Bounded, read-only XDVDFS directory/file traversal (root listing, exact
+/// path lookup, bounded file-prefix reads), built on the `xdvdfs` crate and
+/// used by [`xbox_boot_evidence`]/[`xbox360_boot_evidence`].
+pub mod xdvdfs_traversal;
+
 /// Pure, read-only original Xbox boot evidence (XDVDFS + XBE).
 pub mod xbox_boot_evidence;
 
@@ -191,6 +196,19 @@ pub mod xbox360_boot_evidence;
 /// Pure, read-only GameCube/Wii disc-structure evidence, backed by the
 /// `nod` crate rather than a hand-written optical filesystem stack.
 pub mod gamecube_wii_boot_evidence;
+
+/// Pure, read-only PS3 folder-install layout evidence (`PS3_GAME/`
+/// directory tree) and a bounded `.pkg` header observer.
+pub mod ps3_disc_evidence;
+
+/// Pure, read-only 3DO ("Opera" filesystem) boot/volume evidence.
+pub mod threedo_boot_evidence;
+
+/// Pure, read-only PC-FX boot/volume evidence.
+pub mod pcfx_boot_evidence;
+
+/// Pure, read-only Neo Geo CD boot/volume evidence.
+pub mod neogeocd_boot_evidence;
 
 pub mod repair;
 
