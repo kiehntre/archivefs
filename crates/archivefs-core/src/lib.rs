@@ -120,6 +120,16 @@ pub mod smd_normalization;
 /// already records. Reuses [`dat::archive::chd`] rather than duplicating it.
 pub mod chd_identity;
 
+/// The smallest possible read-only "bytes addressable by offset"
+/// abstraction, so a logical-filesystem reader (see [`iso9660`]) is not
+/// permanently coupled to any one container.
+pub mod logical_media;
+
+/// Pure, read-only ISO9660 logical-filesystem observation: root layout,
+/// path lookup, and well-known boot-path existence facts. A filesystem is
+/// evidence, never a platform - see the module documentation.
+pub mod iso9660;
+
 pub mod repair;
 
 pub mod safe_read;

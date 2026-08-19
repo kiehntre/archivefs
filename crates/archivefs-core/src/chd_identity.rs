@@ -683,6 +683,66 @@ fn media_class_value(class: ChdMediaClass) -> &'static str {
 }
 
 // ---------------------------------------------------------------------
+// Track selection - metadata only, never bytes
+// ---------------------------------------------------------------------
+//
+// A logical-filesystem reader (see `crate::iso9660`) needs to know *which*
+// track of a multi-track CD/GD-ROM CHD to read a filesystem from, and must
+// never mistake an audio track for one. This crate cannot yet hand that
+// reader any bytes to work with: CHD hunks are compressed (with one of
+// several codecs selected per-hunk, via a separately compressed/huffman-
+// coded map for v5), and this crate has no CHD hunk decompressor. Adding
+// one is a substantial undertaking - correctly reproducing MAME's map/hunk
+// decoding, several CD-specific codecs, and CD sector/ECC reconstruction -
+// and is out of scope for this chunk; see the crate-level report for this
+// explicit blocker. What *is* safe and useful today is choosing which
+// track a future reader would target, using only the track metadata this
+// module already parses - no bytes are read or decompressed to do this.
+
+/// A conservative choice of which CD/GD-ROM track is likely to carry a
+/// logical filesystem, based only on already-parsed track metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateDataTrack {
+    pub track: u32,
+    pub track_type: String,
+    pub media_class: ChdMediaClass,
+}
+
+/// Picks the lowest-numbered CD-ROM or GD-ROM track whose recorded
+/// `track_type` is not `"AUDIO"` (the literal token CHD's own text format
+/// uses for an audio track - verified alongside the rest of the track text
+/// format in this module's documentation). Returns `None` when there is no
+/// such track: an all-audio disc, or a metadata chain with no CD/GD-ROM
+/// track facts at all.
+///
+/// This is metadata-only track *classification*, not byte access - it
+/// answers "which track would a logical filesystem reader target", never
+/// "here are its bytes". See this section's own documentation for why
+/// producing those bytes is currently blocked.
+pub fn select_candidate_data_track(
+    metadata: &ChdMetadataObservation,
+) -> Option<CandidateDataTrack> {
+    metadata
+        .entries
+        .iter()
+        .filter_map(|entry| match &entry.fact {
+            ChdMetadataFact::CdromTrack(track) if track.track_type != "AUDIO" => {
+                Some((track.track, track.track_type.clone(), ChdMediaClass::CdRom))
+            }
+            ChdMetadataFact::GdromTrack(track) if track.track_type != "AUDIO" => {
+                Some((track.track, track.track_type.clone(), ChdMediaClass::GdRom))
+            }
+            _ => None,
+        })
+        .min_by_key(|(track, _, _)| *track)
+        .map(|(track, track_type, media_class)| CandidateDataTrack {
+            track,
+            track_type,
+            media_class,
+        })
+}
+
+// ---------------------------------------------------------------------
 // Detector
 // ---------------------------------------------------------------------
 
@@ -1361,6 +1421,56 @@ mod tests {
             .find(|fact| fact.kind == ContentEvidenceKind::MediaClass)
             .expect("hard disk media class evidence expected");
         assert_eq!(fact.confidence, ContentEvidenceConfidence::Strong);
+    }
+
+    #[test]
+    fn candidate_data_track_skips_leading_audio_track() {
+        let data = chd_with_metadata_entries(
+            [0; 20],
+            &[
+                (meta_tag::CDROM_TRACK2, b"TRACK:1 TYPE:AUDIO SUBTYPE:NONE FRAMES:100 PREGAP:0 PGTYPE:NONE PGSUB:NONE POSTGAP:0"),
+                (meta_tag::CDROM_TRACK2, b"TRACK:2 TYPE:MODE1_RAW SUBTYPE:NONE FRAMES:200 PREGAP:0 PGTYPE:NONE PGSUB:NONE POSTGAP:0"),
+            ],
+        );
+        let observation = observe_chd_identity(&data).unwrap();
+        let ChdMetadataOutcome::Observed(metadata) = observation.metadata else {
+            panic!("expected Observed metadata");
+        };
+        let candidate = select_candidate_data_track(&metadata).expect("a non-audio track exists");
+        assert_eq!(candidate.track, 2);
+        assert_eq!(candidate.track_type, "MODE1_RAW");
+        assert_eq!(candidate.media_class, ChdMediaClass::CdRom);
+    }
+
+    #[test]
+    fn candidate_data_track_is_none_for_an_all_audio_disc() {
+        let data = chd_with_metadata_entries(
+            [0; 20],
+            &[(meta_tag::CDROM_TRACK2, b"TRACK:1 TYPE:AUDIO SUBTYPE:NONE FRAMES:100 PREGAP:0 PGTYPE:NONE PGSUB:NONE POSTGAP:0")],
+        );
+        let observation = observe_chd_identity(&data).unwrap();
+        let ChdMetadataOutcome::Observed(metadata) = observation.metadata else {
+            panic!("expected Observed metadata");
+        };
+        assert!(select_candidate_data_track(&metadata).is_none());
+    }
+
+    #[test]
+    fn candidate_data_track_works_for_gd_rom() {
+        let data = chd_with_metadata_entries(
+            [0; 20],
+            &[(
+                meta_tag::GDROM_TRACK,
+                b"TRACK:3 TYPE:MODE1_RAW SUBTYPE:NONE FRAMES:2048 PAD:0 PREGAP:0 PGTYPE:NONE PGSUB:NONE POSTGAP:0",
+            )],
+        );
+        let observation = observe_chd_identity(&data).unwrap();
+        let ChdMetadataOutcome::Observed(metadata) = observation.metadata else {
+            panic!("expected Observed metadata");
+        };
+        let candidate =
+            select_candidate_data_track(&metadata).expect("a non-audio GD-ROM track exists");
+        assert_eq!(candidate.media_class, ChdMediaClass::GdRom);
     }
 
     #[test]
