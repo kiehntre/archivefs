@@ -99,6 +99,14 @@ pub mod disk_format;
 /// canonical platform identity. See the module documentation for why.
 pub mod content_evidence;
 
+/// The generic, dependency-free contract future content/media detectors
+/// implement. No detector implementation lives here.
+pub mod content_detector;
+
+/// Pure, read-only Nintendo 64 byte-order (z64/v64/n64) detection and
+/// normalization prototype. The first real [`content_detector`] example.
+pub mod n64_byte_order;
+
 pub mod repair;
 
 pub mod safe_read;
