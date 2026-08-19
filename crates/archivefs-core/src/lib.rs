@@ -107,6 +107,10 @@ pub mod content_detector;
 /// normalization prototype. The first real [`content_detector`] example.
 pub mod n64_byte_order;
 
+/// Pure, read-only recognition and removal of known, reversible fixed-length
+/// copier/container headers (iNES, FDS, Lynx, Atari 7800, SNES copier).
+pub mod header_normalization;
+
 pub mod repair;
 
 pub mod safe_read;
