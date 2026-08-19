@@ -233,6 +233,70 @@ pub mod pcfx_boot_evidence;
 /// Pure, read-only Neo Geo CD boot/volume evidence.
 pub mod neogeocd_boot_evidence;
 
+/// Shared, bounded cartridge-header primitives (ASCII field trimming,
+/// wrapping-sum checksums) reused across this crate's cartridge-header
+/// observers. Not a generic framework - each format still owns its own
+/// verified offsets.
+pub mod cartridge_header;
+
+/// Pure, read-only NES/Famicom iNES/NES 2.0 header field decoding (mapper,
+/// PRG/CHR size, flags) - deeper than [`header_normalization`]'s magic-only
+/// recognition.
+pub mod nes_header_evidence;
+
+/// Pure, read-only SNES/Super Famicom internal-header candidate evidence
+/// (LoROM/HiROM/ExHiROM), selected only by checksum/complement validation -
+/// never by title-byte plausibility alone.
+pub mod snes_header_evidence;
+
+/// Pure, read-only Game Boy / Game Boy Color cartridge header evidence
+/// (Nintendo logo, header checksum, CGB support).
+pub mod gb_header_evidence;
+
+/// Pure, read-only Game Boy Advance cartridge header evidence (fixed value,
+/// complement checksum, game code).
+pub mod gba_header_evidence;
+
+/// Pure, read-only Nintendo 64 ROM header field decoding (clock rate, boot
+/// address, CRC1/CRC2, image name, cartridge/country codes) - operates on
+/// canonical `Z64` byte order; see [`n64_byte_order`] for normalization.
+pub mod n64_header_evidence;
+
+/// Pure, read-only Sega Mega Drive / Genesis cartridge header field
+/// decoding, deeper than the platform registry's own magic-only `SEGA`
+/// check. Includes an opt-in, whole-ROM checksum verifier.
+pub mod megadrive_header_evidence;
+
+/// Pure, read-only Sega Master System / Game Gear `TMR SEGA` header
+/// evidence.
+pub mod sms_gg_header_evidence;
+
+/// Pure, read-only Sega 32X additional-evidence leg, layered on
+/// [`megadrive_header_evidence`] rather than duplicating it.
+pub mod sega32x_header_evidence;
+
+/// Pure, read-only Atari 7800 `.a78` header field decoding, deeper than
+/// [`header_normalization`]'s magic-only recognition.
+pub mod atari7800_header_evidence;
+
+/// Pure, read-only Atari Lynx `.lnx` header field decoding, deeper than
+/// [`header_normalization`]'s magic-only recognition.
+pub mod lynx_header_evidence;
+
+/// Pure, read-only Neo Geo Pocket / Neo Geo Pocket Color cartridge header
+/// evidence.
+pub mod ngp_header_evidence;
+
+/// Pure, read-only Bandai WonderSwan / WonderSwan Color ROM footer
+/// evidence, including an opt-in whole-ROM checksum verifier.
+pub mod ws_header_evidence;
+
+/// Bounded, read-only ZIP archive-member content evidence: runs this
+/// crate's cartridge/console-signature detectors over a bounded prefix of
+/// each candidate member's decompressed bytes, with an explicit multi-
+/// member policy that never silently picks a "winning" member.
+pub mod archive_member_content_evidence;
+
 pub mod repair;
 
 pub mod safe_read;
