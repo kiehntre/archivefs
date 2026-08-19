@@ -78,6 +78,15 @@ pub enum ContentEvidenceKind {
     /// A raw content signature that doesn't cleanly fit any of the above
     /// domains yet.
     ContentSignature,
+    /// A serial/product/catalog code candidate read directly from the
+    /// content itself (e.g. a PS1 `SYSTEM.CNF` boot executable filename, a
+    /// Dreamcast `IP.BIN` product number). A *candidate* only: the same
+    /// code family can span multiple platforms or reissues, and this kind
+    /// carries no claim about which canonical release - or even which
+    /// platform - the code belongs to. See
+    /// [`crate::platform`]/[`crate::dat::identity`] for where that
+    /// resolution actually happens.
+    ProductCode,
 }
 
 impl ContentEvidenceKind {
@@ -91,6 +100,7 @@ impl ContentEvidenceKind {
             Self::Filesystem => "Filesystem",
             Self::BootStructure => "Boot structure",
             Self::ContentSignature => "Content signature",
+            Self::ProductCode => "Product code",
         }
     }
 }

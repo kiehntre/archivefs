@@ -143,6 +143,14 @@ pub mod chd_logical_media;
 #[cfg(feature = "chd-optical-specialist")]
 pub mod chd_optical_specialist;
 
+/// Pure, read-only PlayStation-style boot evidence (`SYSTEM.CNF`, PS-X EXE
+/// magic) - neutral [`content_evidence`] facts, never a platform.
+pub mod playstation_boot_evidence;
+
+/// Pure, read-only Dreamcast boot-sector (`IP.BIN`) evidence - neutral
+/// [`content_evidence`] facts, never a platform.
+pub mod dreamcast_boot_evidence;
+
 pub mod repair;
 
 pub mod safe_read;

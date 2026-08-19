@@ -52,12 +52,17 @@ use archivefs_core::chd_logical_media::{ChdLogicalMediaError, open_chd_track_log
 #[cfg(feature = "chd-optical-specialist")]
 use archivefs_core::chd_optical_specialist::open_chd_optical_specialist;
 use archivefs_core::dat::archive::hash::hash_member_stream;
+use archivefs_core::dreamcast_boot_evidence::{IP_BIN_META_BYTES, parse_ip_bin_meta};
+use archivefs_core::game_identity::MAX_SYSTEM_CNF_BYTES;
 use archivefs_core::identity_source::hashing::FileFingerprint;
 use archivefs_core::iso9660::{
     DiscFilesystemObservation, INTERESTING_ROOT_PATHS, find_path, looks_like_iso9660,
     observe_iso9660,
 };
 use archivefs_core::logical_media::{LogicalMedia, SliceMedia};
+use archivefs_core::playstation_boot_evidence::{
+    PSX_EXECUTABLE_HEADER_BYTES, looks_like_psx_exe, parse_system_cnf_boot,
+};
 
 fn main() -> ExitCode {
     let args: Vec<_> = env::args_os().skip(1).collect();
@@ -192,7 +197,10 @@ fn probe_chd(path: &Path, bytes: &[u8]) -> ExitCode {
     }
 
     match observe_iso9660(&media) {
-        Ok(observation) => print_iso9660_observation(&media, &observation),
+        Ok(observation) => {
+            print_iso9660_observation(&media, &observation);
+            print_boot_evidence(&media, &observation);
+        }
         Err(error) => {
             println!("Filesystem: Unsupported (ISO9660 structure did not parse: {error})");
             print_interesting_paths_unavailable();
@@ -226,7 +234,10 @@ fn probe_chd_specialist(path: &Path) -> ExitCode {
     }
 
     match observe_iso9660(&media) {
-        Ok(observation) => print_iso9660_observation(&media, &observation),
+        Ok(observation) => {
+            print_iso9660_observation(&media, &observation);
+            print_boot_evidence(&media, &observation);
+        }
         Err(error) => {
             println!("Filesystem: Unsupported (ISO9660 structure did not parse: {error})");
             print_interesting_paths_unavailable();
@@ -294,6 +305,89 @@ fn print_iso9660_observation<M: LogicalMedia>(media: &M, observation: &DiscFiles
     }
 }
 
+/// Prints neutral internal boot/release facts - never a platform decision.
+/// `SYSTEM.CNF` is looked up through the filesystem; `IP.BIN` is read
+/// directly from `media` at offset 0 (it is not a filesystem entry - see
+/// [`archivefs_core::dreamcast_boot_evidence`]'s module documentation).
+/// A disc with neither present prints `N/A` for every field; a disc with
+/// only one populates only that backend's fields.
+fn print_boot_evidence<M: LogicalMedia>(media: &M, observation: &DiscFilesystemObservation) {
+    let mut boot_file = "N/A".to_string();
+    let mut boot_target = "N/A".to_string();
+    let mut serial_candidate = "N/A".to_string();
+    let mut executable_magic = "N/A".to_string();
+    let mut boot_signature = "N/A".to_string();
+    let mut version = "N/A".to_string();
+    let mut region = "N/A".to_string();
+
+    if let Ok(Some(entry)) = find_path(media, observation, "SYSTEM.CNF")
+        && !entry.is_directory
+        && entry.size as u64 <= MAX_SYSTEM_CNF_BYTES
+    {
+        let offset = entry.extent_lba as u64 * observation.logical_block_size as u64;
+        let mut buf = vec![0u8; entry.size as usize];
+        if media.read_at(offset, &mut buf).is_ok() {
+            boot_file = "SYSTEM.CNF".to_string();
+            if let Some(fact) = parse_system_cnf_boot(&buf) {
+                boot_target = format!("{}={}", fact.boot_key, fact.raw_value);
+                if let Some(serial) = &fact.serial_candidate {
+                    serial_candidate = serial.clone();
+                }
+                if let Some(exec_path) = &fact.executable_path
+                    && let Ok(Some(exec_entry)) = find_path(media, observation, exec_path)
+                    && !exec_entry.is_directory
+                {
+                    let header_len = (exec_entry.size as usize).min(PSX_EXECUTABLE_HEADER_BYTES);
+                    let exec_offset =
+                        exec_entry.extent_lba as u64 * observation.logical_block_size as u64;
+                    let mut header = vec![0u8; header_len];
+                    executable_magic = if media.read_at(exec_offset, &mut header).is_ok() {
+                        if looks_like_psx_exe(&header) {
+                            "PS-X EXE"
+                        } else {
+                            "NO"
+                        }
+                        .to_string()
+                    } else {
+                        "N/A (could not read executable header)".to_string()
+                    };
+                } else {
+                    executable_magic = "NO (executable not found)".to_string();
+                }
+            }
+        }
+    }
+
+    let mut ip_bin = vec![0u8; IP_BIN_META_BYTES];
+    if media.read_at(0, &mut ip_bin).is_ok()
+        && let Some(fact) = parse_ip_bin_meta(&ip_bin)
+    {
+        if fact.hardware_id_recognized {
+            boot_signature = fact.hardware_id.clone();
+            if serial_candidate == "N/A" && !fact.product_number.is_empty() {
+                serial_candidate = fact.product_number.clone();
+            }
+        }
+        if !fact.product_version.is_empty() {
+            version = fact.product_version.clone();
+        }
+        if !fact.area_symbols.is_empty() {
+            region = fact.area_symbols.clone();
+        }
+        if boot_file == "N/A" && !fact.boot_filename.is_empty() {
+            boot_file = format!("{} (declared in IP.BIN)", fact.boot_filename);
+        }
+    }
+
+    println!("Boot file: {boot_file}");
+    println!("Boot target: {boot_target}");
+    println!("Serial/product candidate: {serial_candidate}");
+    println!("Executable magic: {executable_magic}");
+    println!("Boot signature: {boot_signature}");
+    println!("Version: {version}");
+    println!("Region: {region}");
+}
+
 fn probe_iso9660(bytes: &[u8]) -> ExitCode {
     println!("Container: raw logical image (plain ISO9660 byte stream)");
     println!("Media: N/A (no CHD container to report media facts for)");
@@ -309,6 +403,7 @@ fn probe_iso9660(bytes: &[u8]) -> ExitCode {
     };
 
     print_iso9660_observation(&media, &observation);
+    print_boot_evidence(&media, &observation);
     ExitCode::SUCCESS
 }
 
