@@ -47,6 +47,25 @@ pub enum ValidationStatus {
     Deferred,
 }
 
+/// Batch 6: the smallest useful structured provenance for a
+/// [`ValidationStatus::RealValidated`] entry - which rule proved it, what
+/// class of specimen, and what container/form it was in. Deliberately no
+/// absolute filesystem path (this project's corpus lives outside the
+/// repository and is not something the registry should depend on, or leak
+/// into a report a person might share) - a short, stable, descriptive
+/// label instead, exactly as the milestone asked for
+/// (`"GameCube RVZ specimen"`, not `/mnt/games/roms/gcn/...`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RealValidationProvenance {
+    /// The [`crate::platform_evidence_fusion::FusionRule::id`] this
+    /// specimen exercised, when the platform has a fusion rule at all.
+    pub rule_id: Option<&'static str>,
+    /// A short, stable class label for the specimen - never a path.
+    pub sample_class: &'static str,
+    /// The container/form the bytes were read through.
+    pub container: &'static str,
+}
+
 /// One platform's evidence-engineering coverage. `canonical_id` must match
 /// a real [`crate::platform::Platform::id`] - enforced by this module's own
 /// test suite, never assumed.
@@ -66,6 +85,12 @@ pub struct PlatformEvidenceCoverage {
     /// own tests against the real rule table, never hand-copied here.
     pub real_validation: ValidationStatus,
     pub notes: &'static str,
+    /// Structured provenance for [`ValidationStatus::RealValidated`]
+    /// entries - `None` for every other status, and `None` for a handful
+    /// of RealValidated entries this milestone did not touch (the prose
+    /// `notes` field above still names their specimen; this field is
+    /// additive, not a replacement).
+    pub real_validation_provenance: Option<RealValidationProvenance>,
 }
 
 /// The coverage manifest - one entry per platform this crate has *any*
@@ -78,6 +103,11 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         normalization: false,
         real_validation: ValidationStatus::RealValidated,
         notes: "Real specimen: Athlete Kings (Europe) Track 01 (Batch 3/4) - raw-sector + logical-image both validated",
+        real_validation_provenance: Some(RealValidationProvenance {
+            rule_id: Some("saturn_boot_signature"),
+            sample_class: "Saturn raw2352 real corpus specimen",
+            container: "raw CD sector image",
+        }),
     },
     PlatformEvidenceCoverage {
         canonical_id: "Sega CD",
@@ -85,6 +115,7 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         normalization: false,
         real_validation: ValidationStatus::SyntheticValidated,
         notes: "No real Sega CD specimen found accessible in the corpus (Batch 3/4)",
+        real_validation_provenance: None,
     },
     PlatformEvidenceCoverage {
         canonical_id: "3DO",
@@ -92,6 +123,7 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         normalization: false,
         real_validation: ValidationStatus::SyntheticValidated,
         notes: "No real 3DO specimen found accessible in the corpus (Batch 3/4)",
+        real_validation_provenance: None,
     },
     PlatformEvidenceCoverage {
         canonical_id: "Dreamcast",
@@ -99,6 +131,7 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         normalization: false,
         real_validation: ValidationStatus::SyntheticValidated,
         notes: "Dreamcast directory in the local corpus contains no real specimen (Batch 5 search)",
+        real_validation_provenance: None,
     },
     PlatformEvidenceCoverage {
         canonical_id: "PSX",
@@ -106,20 +139,35 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         normalization: false,
         real_validation: ValidationStatus::RealValidated,
         notes: "Real specimen: Gundam Battle Assault 2 (USA).chd - resolved through platform_evidence_fusion (Batch 5)",
+        real_validation_provenance: Some(RealValidationProvenance {
+            rule_id: Some("ps1_system_cnf_boot"),
+            sample_class: "PSX real corpus specimen",
+            container: "CHD compressed disc image",
+        }),
     },
     PlatformEvidenceCoverage {
         canonical_id: "PS2",
         detector_modules: &["ps2_boot_evidence"],
         normalization: false,
         real_validation: ValidationStatus::RealValidated,
-        notes: "Real specimen: God of War (USA).iso - fires the candidate-only rule (no Strong PS2 evidence exists yet); Ambiguous, by design (Batch 5)",
+        notes: "Real specimen: God of War (USA).iso - Batch 6 added a reviewed BOOT2 strong leg (SYSTEM.CNF BOOT2= confirmed against a validated ELF executable); now Resolved: PS2, not just a candidate",
+        real_validation_provenance: Some(RealValidationProvenance {
+            rule_id: Some("ps2_system_cnf_boot2_strong"),
+            sample_class: "PS2 real corpus specimen (8.5GB single-layer ISO)",
+            container: "raw ISO9660 disc image",
+        }),
     },
     PlatformEvidenceCoverage {
         canonical_id: "PSP",
         detector_modules: &["psp_boot_evidence", "psp_pbp_evidence"],
         normalization: false,
         real_validation: ValidationStatus::RealValidated,
-        notes: "Real specimen: God of War - Ghost of Sparta UMD ISO - candidate-only (PSP evidence is Corroborated-only); Ambiguous, by design (Batch 5)",
+        notes: "Real specimen: God of War - Ghost of Sparta UMD ISO - Batch 6 added a reviewed UMD_DATA.BIN strong leg (PSP-UMD-exclusive medium-identification file); now Resolved: PSP, not just a candidate",
+        real_validation_provenance: Some(RealValidationProvenance {
+            rule_id: Some("psp_umd_data_bin_strong"),
+            sample_class: "PSP UMD real corpus specimen",
+            container: "raw ISO9660 UMD disc image",
+        }),
     },
     PlatformEvidenceCoverage {
         canonical_id: "PS3",
@@ -127,6 +175,7 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         normalization: false,
         real_validation: ValidationStatus::RealValidated,
         notes: "Real specimen: Resident Evil 4 HD .pkg (3.5GB, Batch 3)",
+        real_validation_provenance: None,
     },
     PlatformEvidenceCoverage {
         canonical_id: "Xbox",
@@ -134,6 +183,11 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         normalization: false,
         real_validation: ValidationStatus::RealValidated,
         notes: "Real specimen: Fable - The Lost Chapters (USA).iso - Resolved through fusion (Batch 5)",
+        real_validation_provenance: Some(RealValidationProvenance {
+            rule_id: Some("xbox_original_disc"),
+            sample_class: "Xbox XDVDFS/XBE real corpus specimen",
+            container: "raw XDVDFS disc image",
+        }),
     },
     PlatformEvidenceCoverage {
         canonical_id: "Xbox360",
@@ -145,13 +199,23 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         normalization: false,
         real_validation: ValidationStatus::RealValidated,
         notes: "Real specimens: Fable II (USA, Europe).iso (disc, Batch 5) and Double Dragon Neon STFS package (Batch 3)",
+        real_validation_provenance: Some(RealValidationProvenance {
+            rule_id: Some("xbox360_disc"),
+            sample_class: "Xbox360 XDVDFS/XEX2 real corpus specimen",
+            container: "raw XDVDFS disc image",
+        }),
     },
     PlatformEvidenceCoverage {
         canonical_id: "GameCube",
         detector_modules: &["gamecube_wii_boot_evidence"],
         normalization: false,
-        real_validation: ValidationStatus::Partial,
-        notes: "Real .rvz specimens exist in the corpus but this build's nod dependency has default-features disabled (no zstd/lzma/bzip2/zlib), so RVZ cannot be decoded - a pre-existing build-configuration constraint, not this module's fault (Batch 5)",
+        real_validation: ValidationStatus::RealValidated,
+        notes: "Real specimen: ZooCube (USA).rvz - Batch 6 enabled nod's compress-zstd feature (zero new crates: zstd/zstd-safe/zstd-sys were already compiled via zip's own default features); resolves GZCE51 / Resolved: GameCube",
+        real_validation_provenance: Some(RealValidationProvenance {
+            rule_id: Some("gamecube_disc_header"),
+            sample_class: "GameCube RVZ specimen",
+            container: "RVZ (zstd-compressed disc image)",
+        }),
     },
     PlatformEvidenceCoverage {
         canonical_id: "Wii",
@@ -159,6 +223,11 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         normalization: false,
         real_validation: ValidationStatus::RealValidated,
         notes: "Real specimen: New Super Mario Bros. Wii [SMNE01].wbfs - Resolved through fusion (Batch 5)",
+        real_validation_provenance: Some(RealValidationProvenance {
+            rule_id: Some("wii_disc_header"),
+            sample_class: "Wii WBFS specimen",
+            container: "WBFS (uncompressed disc image)",
+        }),
     },
     PlatformEvidenceCoverage {
         canonical_id: "NES",
@@ -166,6 +235,7 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         normalization: true,
         real_validation: ValidationStatus::SyntheticValidated,
         notes: "No real .nes specimen found accessible in the corpus (Batch 4)",
+        real_validation_provenance: None,
     },
     PlatformEvidenceCoverage {
         canonical_id: "SNES",
@@ -173,6 +243,7 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         normalization: true,
         real_validation: ValidationStatus::SyntheticValidated,
         notes: "Real corpus specimens are dominated by unlicensed pirate/multi-cart .unh dumps whose headers do not validate (Batch 4)",
+        real_validation_provenance: None,
     },
     PlatformEvidenceCoverage {
         canonical_id: "Game Boy",
@@ -180,13 +251,23 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         normalization: false,
         real_validation: ValidationStatus::RealValidated,
         notes: "Real specimen: 10-Pin Bowling (USA) (Proto).gb - Resolved through fusion (Batch 4/5)",
+        real_validation_provenance: Some(RealValidationProvenance {
+            rule_id: Some("gb_logo_and_checksum"),
+            sample_class: "DMG-only real corpus specimen",
+            container: "raw .gb cartridge dump",
+        }),
     },
     PlatformEvidenceCoverage {
         canonical_id: "Game Boy Color",
         detector_modules: &["gb_header_evidence"],
         normalization: false,
-        real_validation: ValidationStatus::Partial,
-        notes: "Real .gbc specimen validates (Arcade Hits - Joust & Defender) but the fusion rule table has no CGB-specific leg yet - it resolves to canonical \"Game Boy\", not \"Game Boy Color\" (documented gap, Batch 5)",
+        real_validation: ValidationStatus::RealValidated,
+        notes: "Real specimens: Deer Hunter.gbc and Thunderbirds.gbc (cgb_flag=0xC0, CGB-only) both Resolved: Game Boy Color; Klustar.gbc (cgb_flag=0x80, CGB-enhanced dual-mode) honestly stays Resolved: Game Boy with a corroborating dual-mode fact, never forced into an exclusive GBC claim (Batch 6 closed the Batch 5 gap)",
+        real_validation_provenance: Some(RealValidationProvenance {
+            rule_id: Some("gbc_cgb_only_logo_and_checksum"),
+            sample_class: "CGB-only real corpus specimen (cgb_flag=0xC0)",
+            container: "raw .gbc cartridge dump",
+        }),
     },
     PlatformEvidenceCoverage {
         canonical_id: "Game Boy Advance",
@@ -194,6 +275,7 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         normalization: false,
         real_validation: ValidationStatus::RealValidated,
         notes: "Real specimen: Metal Slug Advance (via ZIP) - Resolved through fusion (Batch 4/5)",
+        real_validation_provenance: None,
     },
     PlatformEvidenceCoverage {
         canonical_id: "N64",
@@ -201,6 +283,7 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         normalization: true,
         real_validation: ValidationStatus::RealValidated,
         notes: "Real specimens: Aerofighters Assault (z64) and 1080 Snowboarding (v64) - Resolved through fusion (Batch 4/5)",
+        real_validation_provenance: None,
     },
     PlatformEvidenceCoverage {
         canonical_id: "MegaDrive",
@@ -208,6 +291,7 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         normalization: true,
         real_validation: ValidationStatus::RealValidated,
         notes: "Real specimens: 3 Ninjas Kick Back .md (whole-ROM checksum validated exactly) and the 32X Doom specimen's base header - candidate-only by design (Corroborated confidence only) (Batch 4/5)",
+        real_validation_provenance: None,
     },
     PlatformEvidenceCoverage {
         canonical_id: "Sega 32X",
@@ -215,6 +299,7 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         normalization: false,
         real_validation: ValidationStatus::RealValidated,
         notes: "Real specimen: Doom (Japan, USA) (En).7z, probed in-process (no system 7z) - candidate-only by design (Batch 4/5)",
+        real_validation_provenance: None,
     },
     PlatformEvidenceCoverage {
         canonical_id: "MasterSystem",
@@ -222,6 +307,7 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         normalization: false,
         real_validation: ValidationStatus::Partial,
         notes: "Real .zip specimens exist in the corpus; not exercised end-to-end this session (Batch 4)",
+        real_validation_provenance: None,
     },
     PlatformEvidenceCoverage {
         canonical_id: "GameGear",
@@ -229,6 +315,7 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         normalization: false,
         real_validation: ValidationStatus::RealValidated,
         notes: "Real specimen: Aa Harimanada (Japan).gg - Resolved through fusion (Batch 4/5)",
+        real_validation_provenance: None,
     },
     PlatformEvidenceCoverage {
         canonical_id: "Atari7800",
@@ -236,6 +323,7 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         normalization: true,
         real_validation: ValidationStatus::SyntheticValidated,
         notes: "No real .a78 specimen found accessible in the corpus (Batch 4)",
+        real_validation_provenance: None,
     },
     PlatformEvidenceCoverage {
         canonical_id: "Atari Lynx",
@@ -243,6 +331,7 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         normalization: true,
         real_validation: ValidationStatus::RealValidated,
         notes: "Real specimen: Joust.lnx - Resolved through fusion (Batch 4/5)",
+        real_validation_provenance: None,
     },
     PlatformEvidenceCoverage {
         canonical_id: "Atari Jaguar",
@@ -250,6 +339,7 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         normalization: false,
         real_validation: ValidationStatus::Deferred,
         notes: "No corroborated generic internal header exists (per-title encrypted boot block) - deliberately not implemented (Batch 4)",
+        real_validation_provenance: None,
     },
     PlatformEvidenceCoverage {
         canonical_id: "PC Engine",
@@ -257,6 +347,7 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         normalization: false,
         real_validation: ValidationStatus::Deferred,
         notes: "No standardized internal HuCard header corroborated to this crate's two-source standard - deliberately not implemented (Batch 4)",
+        real_validation_provenance: None,
     },
     PlatformEvidenceCoverage {
         canonical_id: "Neo Geo Pocket",
@@ -264,6 +355,7 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         normalization: false,
         real_validation: ValidationStatus::SyntheticValidated,
         notes: "No real NGP specimen found accessible in the corpus (Batch 4)",
+        real_validation_provenance: None,
     },
     PlatformEvidenceCoverage {
         canonical_id: "Neo Geo Pocket Color",
@@ -271,6 +363,7 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         normalization: false,
         real_validation: ValidationStatus::SyntheticValidated,
         notes: "No real NGPC specimen found accessible in the corpus (Batch 4)",
+        real_validation_provenance: None,
     },
     PlatformEvidenceCoverage {
         canonical_id: "WonderSwan",
@@ -278,6 +371,7 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         normalization: false,
         real_validation: ValidationStatus::SyntheticValidated,
         notes: "Every local WonderSwan symlink target is missing from the decypharr store - no real specimen accessible (Batch 4)",
+        real_validation_provenance: None,
     },
     PlatformEvidenceCoverage {
         canonical_id: "WonderSwan Color",
@@ -285,6 +379,7 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         normalization: false,
         real_validation: ValidationStatus::SyntheticValidated,
         notes: "Every local WonderSwan Color symlink target is missing from the decypharr store - no real specimen accessible (Batch 4)",
+        real_validation_provenance: None,
     },
     PlatformEvidenceCoverage {
         canonical_id: "Neo Geo CD",
@@ -292,6 +387,7 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         normalization: false,
         real_validation: ValidationStatus::SyntheticValidated,
         notes: "No real Neo Geo CD specimen recorded as validated in this project's history",
+        real_validation_provenance: None,
     },
 ];
 
@@ -575,6 +671,59 @@ mod tests {
                     "{} is RealValidated but has no platform_evidence_fusion rule",
                     entry.canonical_id
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn only_real_validated_entries_ever_carry_provenance() {
+        for entry in COVERAGE {
+            if entry.real_validation_provenance.is_some() {
+                assert_eq!(
+                    entry.real_validation,
+                    ValidationStatus::RealValidated,
+                    "{} carries real_validation_provenance but is not RealValidated",
+                    entry.canonical_id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn provenance_rule_id_when_present_is_a_real_fusion_rule() {
+        use crate::platform_evidence_fusion::RULES;
+        for entry in COVERAGE {
+            if let Some(provenance) = entry.real_validation_provenance
+                && let Some(rule_id) = provenance.rule_id
+            {
+                assert!(
+                    RULES.iter().any(|rule| rule.id == rule_id),
+                    "{} names provenance rule_id {:?} which is not a real RULES entry",
+                    entry.canonical_id,
+                    rule_id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn provenance_sample_class_and_container_are_never_empty() {
+        for entry in COVERAGE {
+            if let Some(provenance) = entry.real_validation_provenance {
+                assert!(!provenance.sample_class.is_empty());
+                assert!(!provenance.container.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn provenance_never_contains_an_absolute_filesystem_path() {
+        for entry in COVERAGE {
+            if let Some(provenance) = entry.real_validation_provenance {
+                assert!(!provenance.sample_class.starts_with('/'));
+                assert!(!provenance.container.starts_with('/'));
+                assert!(!provenance.sample_class.contains("/mnt/"));
+                assert!(!provenance.sample_class.contains("/home/"));
             }
         }
     }

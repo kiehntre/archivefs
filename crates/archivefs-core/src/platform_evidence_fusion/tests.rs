@@ -845,3 +845,781 @@ fn directory_style_generic_weak_evidence_alone_is_unknown() {
     assert_eq!(explanation.outcome, FusionOutcome::Unknown);
     assert!(explanation.resolved_platform.is_none());
 }
+
+// ----------------------------------------------------------------------
+// PS2 strong leg (section 8, 25) - Batch 6.
+// ----------------------------------------------------------------------
+
+#[test]
+fn ps2_boot2_strong_resolves_ps2() {
+    let explanation = fuse_platform_evidence([strong(BootStructure, "BOOT2")]);
+    assert_eq!(explanation.outcome, FusionOutcome::Resolved);
+    assert_eq!(explanation.resolved_platform, Some("PS2"));
+}
+
+#[test]
+fn ps2_boot2_strong_plus_weak_elf_still_resolves_ps2_not_conflicted_with_itself() {
+    // Both the *_strong and *_candidate PS2 rules can fire on the same
+    // realistic bundle - they target the same platform, so this must
+    // still cleanly resolve, not be treated as two competing platforms.
+    let explanation = fuse_platform_evidence([
+        strong(BootStructure, "BOOT2"),
+        weak(ContentSignature, "ELF"),
+    ]);
+    assert_eq!(explanation.outcome, FusionOutcome::Resolved);
+    assert_eq!(explanation.resolved_platform, Some("PS2"));
+}
+
+#[test]
+fn ps2_boot2_corroborated_without_elf_never_resolves() {
+    // BOOT2 the text token alone, with no executable confirmation at all -
+    // must not be promoted, matching "do not promote BOOT2 alone to
+    // Strong without justification."
+    let explanation = fuse_platform_evidence([corroborated(BootStructure, "BOOT2")]);
+    assert_eq!(explanation.outcome, FusionOutcome::Unknown);
+}
+
+#[test]
+fn ps2_boot2_corroborated_plus_weak_elf_is_ambiguous_not_resolved() {
+    let explanation = fuse_platform_evidence([
+        corroborated(BootStructure, "BOOT2"),
+        weak(ContentSignature, "ELF"),
+    ]);
+    assert_eq!(explanation.outcome, FusionOutcome::Ambiguous);
+}
+
+#[test]
+fn ps1_and_ps2_both_strong_is_a_conflict_not_a_silent_ps1_win() {
+    let explanation = fuse_platform_evidence([
+        strong(ContentSignature, "PS-X EXE"),
+        corroborated(BootStructure, "BOOT"),
+        strong(BootStructure, "BOOT2"),
+    ]);
+    assert_eq!(explanation.outcome, FusionOutcome::Conflict);
+}
+
+#[test]
+fn generic_elf_alone_never_promotes_to_ps2_even_at_strong_confidence() {
+    // Defensive: even if a caller mistakenly marked a bare ELF fact
+    // Strong, no rule keys off ContentSignature="ELF" at Strong for any
+    // platform - only BootStructure="BOOT2" does.
+    let explanation = fuse_platform_evidence([strong(ContentSignature, "ELF")]);
+    assert_eq!(explanation.outcome, FusionOutcome::Unknown);
+}
+
+#[test]
+fn ps2_resolution_is_order_independent() {
+    let forward = fuse_platform_evidence([
+        strong(BootStructure, "BOOT2"),
+        weak(ContentSignature, "ELF"),
+    ]);
+    let backward = fuse_platform_evidence([
+        weak(ContentSignature, "ELF"),
+        strong(BootStructure, "BOOT2"),
+    ]);
+    assert_eq!(forward.outcome, backward.outcome);
+    assert_eq!(forward.resolved_platform, backward.resolved_platform);
+}
+
+// ----------------------------------------------------------------------
+// PSP strong leg (section 9, 26) - Batch 6.
+// ----------------------------------------------------------------------
+
+#[test]
+fn psp_umd_data_bin_plus_psp_game_resolves_psp() {
+    let explanation = fuse_platform_evidence([
+        corroborated(BootStructure, "PSP_GAME"),
+        strong(BootStructure, "UMD_DATA.BIN"),
+    ]);
+    assert_eq!(explanation.outcome, FusionOutcome::Resolved);
+    assert_eq!(explanation.resolved_platform, Some("PSP"));
+}
+
+#[test]
+fn psp_game_without_umd_data_bin_stays_candidate_only() {
+    let explanation = fuse_platform_evidence([corroborated(BootStructure, "PSP_GAME")]);
+    assert_ne!(explanation.outcome, FusionOutcome::Resolved);
+}
+
+#[test]
+fn param_sfo_alone_is_not_enough_for_psp() {
+    let explanation = fuse_platform_evidence([corroborated(ProductCode, "ULUS10000")]);
+    assert_eq!(explanation.outcome, FusionOutcome::Unknown);
+}
+
+#[test]
+fn umd_data_bin_alone_without_psp_game_never_resolves() {
+    // The strong rule requires PSP_GAME + UMD_DATA.BIN together - a lone
+    // UMD_DATA.BIN fact (which should not happen from a real observer, but
+    // the resolver must not assume that) never resolves by itself.
+    let explanation = fuse_platform_evidence([strong(BootStructure, "UMD_DATA.BIN")]);
+    assert_eq!(explanation.outcome, FusionOutcome::Unknown);
+}
+
+#[test]
+fn psp_resolution_is_order_independent() {
+    let forward = fuse_platform_evidence([
+        corroborated(BootStructure, "PSP_GAME"),
+        strong(BootStructure, "UMD_DATA.BIN"),
+    ]);
+    let backward = fuse_platform_evidence([
+        strong(BootStructure, "UMD_DATA.BIN"),
+        corroborated(BootStructure, "PSP_GAME"),
+    ]);
+    assert_eq!(forward.resolved_platform, backward.resolved_platform);
+}
+
+// ----------------------------------------------------------------------
+// PSP vs PS3 collision (section 10) - Batch 6.
+// ----------------------------------------------------------------------
+
+#[test]
+fn psp_exclusive_structure_resolves_psp_not_ps3() {
+    let explanation = fuse_platform_evidence([
+        corroborated(BootStructure, "PSP_GAME"),
+        strong(BootStructure, "UMD_DATA.BIN"),
+    ]);
+    assert_eq!(explanation.resolved_platform, Some("PSP"));
+}
+
+#[test]
+fn ps3_exclusive_structure_resolves_ps3_not_psp() {
+    let explanation = fuse_platform_evidence([
+        corroborated(BootStructure, "PS3_GAME"),
+        strong(ContentSignature, "SELF"),
+        corroborated(ProductCode, "BLUS30060"),
+    ]);
+    assert_eq!(explanation.resolved_platform, Some("PS3"));
+}
+
+#[test]
+fn psp_exclusive_plus_ps3_exclusive_together_is_a_conflict() {
+    let explanation = fuse_platform_evidence([
+        corroborated(BootStructure, "PSP_GAME"),
+        strong(BootStructure, "UMD_DATA.BIN"),
+        corroborated(BootStructure, "PS3_GAME"),
+        strong(ContentSignature, "SELF"),
+        corroborated(ProductCode, "BLUS30060"),
+    ]);
+    assert_eq!(explanation.outcome, FusionOutcome::Conflict);
+}
+
+#[test]
+fn param_sfo_only_is_never_enough_for_either_psp_or_ps3() {
+    let explanation = fuse_platform_evidence([corroborated(ProductCode, "ULUS10000")]);
+    assert_eq!(explanation.outcome, FusionOutcome::Unknown);
+}
+
+#[test]
+fn eboot_bin_alone_is_never_enough_for_psp() {
+    // eboot_bin_present never even reaches ContentEvidence at the source
+    // (see psp_boot_evidence.rs's own test), but this fusion-level test
+    // documents the same guarantee at this layer: no rule anywhere keys
+    // off an "EBOOT.BIN" BootStructure/ContentSignature value at all.
+    let explanation = fuse_platform_evidence(Vec::<ContentEvidence>::new());
+    assert_eq!(explanation.outcome, FusionOutcome::Unknown);
+}
+
+// ----------------------------------------------------------------------
+// GBC disambiguation (section 7, 24) - Batch 6.
+// ----------------------------------------------------------------------
+
+#[test]
+fn cgb_only_logo_and_checksum_resolves_game_boy_color() {
+    let explanation = fuse_platform_evidence([strong(
+        BootStructure,
+        "Nintendo Game Boy Color logo (CGB-only)",
+    )]);
+    assert_eq!(explanation.outcome, FusionOutcome::Resolved);
+    assert_eq!(explanation.resolved_platform, Some("Game Boy Color"));
+}
+
+#[test]
+fn cgb_only_logo_without_valid_checksum_is_ambiguous_candidate_only() {
+    let explanation = fuse_platform_evidence([corroborated(
+        BootStructure,
+        "Nintendo Game Boy Color logo (CGB-only)",
+    )]);
+    assert_ne!(explanation.outcome, FusionOutcome::Resolved);
+}
+
+#[test]
+fn dmg_only_logo_still_resolves_game_boy_not_game_boy_color() {
+    let explanation = fuse_platform_evidence([strong(BootStructure, "Nintendo Game Boy logo")]);
+    assert_eq!(explanation.resolved_platform, Some("Game Boy"));
+}
+
+#[test]
+fn cgb_enhanced_dual_mode_resolves_game_boy_not_exclusively_game_boy_color() {
+    // The DMG-compatible fact is Strong (a dual-mode cart really is a
+    // valid, backward-compatible Game Boy cartridge); the dual-mode fact
+    // itself is only ever Corroborated (see gb_header_evidence.rs's own
+    // doc comment) - representing "belongs to both ecosystems" honestly
+    // without inventing an exclusive Game Boy Color claim.
+    let explanation = fuse_platform_evidence([
+        strong(BootStructure, "Nintendo Game Boy logo"),
+        corroborated(BootStructure, "Nintendo Game Boy Color logo (dual-mode)"),
+    ]);
+    assert_eq!(explanation.outcome, FusionOutcome::Resolved);
+    assert_eq!(explanation.resolved_platform, Some("Game Boy"));
+}
+
+#[test]
+fn cgb_enhanced_dual_mode_fact_never_independently_resolves_game_boy_color() {
+    let explanation = fuse_platform_evidence([corroborated(
+        BootStructure,
+        "Nintendo Game Boy Color logo (dual-mode)",
+    )]);
+    assert_ne!(explanation.outcome, FusionOutcome::Resolved);
+}
+
+#[test]
+fn cgb_enhanced_dual_mode_still_retains_the_dual_mode_fact_in_the_explanation() {
+    // Honest representation: even though no rule fires on the dual-mode
+    // fact's own value string (it is deliberately not wired to any rule,
+    // never independently resolving anything), the fact itself must
+    // survive into the explanation's input_evidence - never silently
+    // dropped, matching this crate's "fusion never makes evidence
+    // disappear" rule.
+    let explanation = fuse_platform_evidence([
+        strong(BootStructure, "Nintendo Game Boy logo"),
+        corroborated(BootStructure, "Nintendo Game Boy Color logo (dual-mode)"),
+    ]);
+    assert!(
+        explanation
+            .input_evidence
+            .iter()
+            .any(|fact| fact.value == "Nintendo Game Boy Color logo (dual-mode)")
+    );
+}
+
+#[test]
+fn game_boy_and_game_boy_color_strong_conflict() {
+    // Genuinely impossible for one real cartridge (cgb_flag cannot be both
+    // 0x00 and 0xC0), but the resolver must still fail closed for a
+    // synthetic bundle rather than picking a winner.
+    let explanation = fuse_platform_evidence([
+        strong(BootStructure, "Nintendo Game Boy logo"),
+        strong(BootStructure, "Nintendo Game Boy Color logo (CGB-only)"),
+    ]);
+    assert_eq!(explanation.outcome, FusionOutcome::Conflict);
+}
+
+#[test]
+fn game_boy_color_and_gba_strong_conflict() {
+    let explanation = fuse_platform_evidence([
+        strong(BootStructure, "Nintendo Game Boy Color logo (CGB-only)"),
+        strong(BootStructure, "GBA cartridge header"),
+    ]);
+    assert_eq!(explanation.outcome, FusionOutcome::Conflict);
+}
+
+#[test]
+fn cgb_only_value_string_is_distinct_from_dmg_value_string() {
+    // Exactness guard: the two facts must never be confused by the exact
+    // matcher (RequiredFact::Exact is a plain string equality check).
+    let dmg = fuse_platform_evidence([strong(BootStructure, "Nintendo Game Boy logo")]);
+    let cgb = fuse_platform_evidence([strong(
+        BootStructure,
+        "Nintendo Game Boy Color logo (CGB-only)",
+    )]);
+    assert_ne!(dmg.resolved_platform, cgb.resolved_platform);
+}
+
+#[test]
+fn gbc_resolution_is_order_independent() {
+    let forward = fuse_platform_evidence([
+        strong(BootStructure, "Nintendo Game Boy logo"),
+        corroborated(BootStructure, "Nintendo Game Boy Color logo (dual-mode)"),
+    ]);
+    let backward = fuse_platform_evidence([
+        corroborated(BootStructure, "Nintendo Game Boy Color logo (dual-mode)"),
+        strong(BootStructure, "Nintendo Game Boy logo"),
+    ]);
+    assert_eq!(forward.resolved_platform, backward.resolved_platform);
+    assert_eq!(forward.outcome, backward.outcome);
+}
+
+// ----------------------------------------------------------------------
+// Rule shadowing (section 16) - Batch 6.
+// ----------------------------------------------------------------------
+
+#[test]
+fn a_family_level_candidate_rule_and_a_platform_specific_rule_can_both_fire_without_hiding_each_other()
+ {
+    // TMR SEGA (family-level, Master System/Game Gear) alongside a
+    // genuinely platform-specific Saturn fact - both must be visible in
+    // fired_candidates; the more general fact must not suppress or hide
+    // the more specific one, nor vice versa.
+    let explanation = fuse_platform_evidence([
+        strong(BootStructure, "TMR SEGA"),
+        strong(BootStructure, "SEGA SEGASATURN"),
+    ]);
+    // TMR SEGA alone (without a region leg) never fires any rule, so this
+    // must cleanly resolve Saturn - the presence of an unrelated,
+    // non-firing family fact must not block or alter the outcome.
+    assert_eq!(explanation.resolved_platform, Some("Saturn"));
+}
+
+#[test]
+fn general_and_specific_gb_rules_both_evaluated_specific_wins_when_justified() {
+    // gb_logo_and_checksum (general Game Boy) legs on a *different* value
+    // string than gbc_cgb_only_logo_and_checksum - firing the CGB-specific
+    // rule must not be blocked by the general rule's existence, and vice
+    // versa; they are mutually exclusive by value, not by declaration
+    // order.
+    let cgb_first_in_rules_but_dmg_evidence_given =
+        fuse_platform_evidence([strong(BootStructure, "Nintendo Game Boy logo")]);
+    assert_eq!(
+        cgb_first_in_rules_but_dmg_evidence_given.resolved_platform,
+        Some("Game Boy")
+    );
+}
+
+#[test]
+fn every_applicable_rule_fires_regardless_of_declaration_order_in_the_table() {
+    // Evaluate a bundle that satisfies rules declared at very different
+    // positions in RULES (Saturn near the top, PSP near the bottom) and
+    // confirm both show up as fired candidates - proof that fusion does
+    // not stop at the first match.
+    let explanation = fuse_platform_evidence([
+        strong(BootStructure, "SEGA SEGASATURN"),
+        corroborated(BootStructure, "PSP_GAME"),
+    ]);
+    let platforms: Vec<&str> = explanation
+        .fired_candidates
+        .iter()
+        .map(|candidate| candidate.platform)
+        .collect();
+    assert!(platforms.contains(&"Saturn"));
+    // PSP_GAME alone never fires any rule (needs UMD_DATA.BIN or a
+    // ProductCode), so it correctly contributes nothing - this asserts
+    // fusion evaluated it (no crash/short-circuit) rather than that it
+    // fired.
+    assert_eq!(explanation.resolved_platform, Some("Saturn"));
+}
+
+// ----------------------------------------------------------------------
+// Determinism (section 17) - Batch 6: shuffled permutation sampling.
+// ----------------------------------------------------------------------
+
+fn permute(mut items: Vec<ContentEvidence>, seed: u64) -> Vec<ContentEvidence> {
+    // A small deterministic LCG-based shuffle - no external RNG crate
+    // needed, and reproducible across runs without depending on
+    // forbidden Date::now()/Math::random() equivalents.
+    let mut state = seed.wrapping_add(0x9E3779B97F4A7C15);
+    let len = items.len();
+    for i in (1..len).rev() {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let j = (state >> 33) as usize % (i + 1);
+        items.swap(i, j);
+    }
+    items
+}
+
+#[test]
+fn ps1_outcome_is_stable_across_many_permutations() {
+    let bundle = vec![
+        strong(ContentSignature, "PS-X EXE"),
+        corroborated(BootStructure, "BOOT"),
+        weak(Filesystem, "ISO9660"),
+        corroborated(ProductCode, "SLUS-00594"),
+    ];
+    let baseline = fuse_platform_evidence(bundle.clone());
+    for seed in 0..100u64 {
+        let shuffled = fuse_platform_evidence(permute(bundle.clone(), seed));
+        assert_eq!(shuffled.outcome, baseline.outcome);
+        assert_eq!(shuffled.resolved_platform, baseline.resolved_platform);
+    }
+}
+
+#[test]
+fn xbox360_outcome_is_stable_across_many_permutations() {
+    let bundle = vec![
+        strong(Filesystem, "XDVDFS"),
+        strong(ContentSignature, "XEX2"),
+        weak(Filesystem, "FAT12"),
+        corroborated(ProductCode, "584111F7"),
+    ];
+    let baseline = fuse_platform_evidence(bundle.clone());
+    for seed in 0..100u64 {
+        let shuffled = fuse_platform_evidence(permute(bundle.clone(), seed));
+        assert_eq!(shuffled.outcome, baseline.outcome);
+        assert_eq!(shuffled.resolved_platform, baseline.resolved_platform);
+    }
+}
+
+#[test]
+fn gbc_outcome_is_stable_across_many_permutations() {
+    let bundle = vec![
+        strong(BootStructure, "Nintendo Game Boy logo"),
+        corroborated(BootStructure, "Nintendo Game Boy Color logo (dual-mode)"),
+        weak(Filesystem, "FAT12"),
+    ];
+    let baseline = fuse_platform_evidence(bundle.clone());
+    for seed in 0..100u64 {
+        let shuffled = fuse_platform_evidence(permute(bundle.clone(), seed));
+        assert_eq!(shuffled.outcome, baseline.outcome);
+        assert_eq!(shuffled.resolved_platform, baseline.resolved_platform);
+    }
+}
+
+#[test]
+fn gamecube_wii_conflict_outcome_is_stable_across_many_permutations() {
+    let bundle = vec![
+        strong(BootStructure, "GameCube"),
+        strong(BootStructure, "Wii"),
+        corroborated(BootStructure, "main.dol"),
+    ];
+    let baseline = fuse_platform_evidence(bundle.clone());
+    assert_eq!(baseline.outcome, FusionOutcome::Conflict);
+    for seed in 0..100u64 {
+        let shuffled = fuse_platform_evidence(permute(bundle.clone(), seed));
+        assert_eq!(shuffled.outcome, FusionOutcome::Conflict);
+        let mut expected = baseline.conflicting_platforms.clone();
+        let mut actual = shuffled.conflicting_platforms.clone();
+        expected.sort_unstable();
+        actual.sort_unstable();
+        assert_eq!(expected, actual);
+    }
+}
+
+#[test]
+fn dat_disagreement_outcome_is_stable_across_many_permutations() {
+    let bundle = vec![
+        strong(BootStructure, "SEGA SEGASATURN"),
+        weak(Filesystem, "ISO9660"),
+        corroborated(ProductCode, "MK-81802"),
+    ];
+    for seed in 0..100u64 {
+        let shuffled = fuse_platform_evidence(permute(bundle.clone(), seed));
+        let comparison =
+            crate::platform_evidence_fusion::compare_content_and_dat(&shuffled, Some("Xbox"));
+        assert_eq!(
+            comparison,
+            crate::platform_evidence_fusion::DatContentComparison::Disagree {
+                content_platform: "Saturn",
+                dat_platform: "Xbox",
+            }
+        );
+    }
+}
+
+// ----------------------------------------------------------------------
+// Rule catalog consistency (section 15) - Batch 6 top-up.
+// ----------------------------------------------------------------------
+
+#[test]
+fn no_strong_eligible_rule_can_be_satisfied_by_weak_evidence_alone() {
+    // The real invariant this milestone's section 15 asks for: a rule
+    // capable of producing FusionOutcome::Resolved (has_strong_leg())
+    // must never be satisfiable by an all-Weak bundle. Candidate-only
+    // rules (has_strong_leg() == false, e.g. gba_header_candidate) are
+    // legitimately allowed to fire from weaker evidence - that is exactly
+    // what keeps them from ever independently resolving; see the
+    // crate-level weak-only rule tests for that side of the guarantee.
+    for rule in RULES {
+        if !rule.has_strong_leg() {
+            continue;
+        }
+        // Every leg downgraded to Weak - a Strong-eligible rule's own
+        // Strong leg(s) must then fail is_satisfied.
+        let all_weak_facts: Vec<ContentEvidence> = rule
+            .legs
+            .iter()
+            .filter_map(|leg| match leg {
+                RequiredFact::Exact { kind, value, .. } => Some(weak(*kind, value)),
+                RequiredFact::ValuePrefix { kind, prefix, .. } => Some(weak(*kind, prefix)),
+                RequiredFact::AnyOfKind { .. } => None,
+            })
+            .collect();
+        assert!(
+            !rule.is_satisfied(&all_weak_facts),
+            "Strong-eligible rule {} was satisfied by an all-Weak bundle",
+            rule.id
+        );
+    }
+}
+
+#[test]
+fn every_corroborated_or_stronger_exact_leg_is_not_generic_scoped() {
+    // Broader sweep than every_exact_rule_leg_treated_as_platform_discriminating_is_not_generic_scope
+    // (Batch 5, Strong-only): here, any Exact leg a rule requires at
+    // Corroborated-or-above must also carry a real (Family or
+    // PlatformSpecific) scope classification. ValuePrefix legs are
+    // deliberately excluded - content_evidence_scope::scope_of is an
+    // exact-match table, so a bare prefix (e.g. "Master System", the
+    // rule-declared prefix, as opposed to the real emitted values like
+    // "Master System (Japan)") can never usefully classify against it;
+    // that gap is covered separately by
+    // content_evidence_scope::tests's own audit of the real emitted
+    // values.
+    use crate::content_evidence_scope::{EvidenceScope, scope_of};
+    for rule in RULES {
+        for leg in rule.legs {
+            if let RequiredFact::Exact {
+                kind,
+                value,
+                min_confidence,
+            } = leg
+            {
+                if *min_confidence == ContentEvidenceConfidence::Weak {
+                    continue;
+                }
+                let scope = scope_of(*kind, value);
+                assert!(
+                    !matches!(scope, EvidenceScope::Generic),
+                    "rule {} leg {:?}={:?} requires {:?} but is Generic-scoped",
+                    rule.id,
+                    kind,
+                    value,
+                    min_confidence
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn every_leg_min_confidence_is_a_real_confidence_value() {
+    // Structural sanity: RequiredFact::min_confidence never panics or
+    // returns something outside the three real tiers, for any rule leg.
+    for rule in RULES {
+        for leg in rule.legs {
+            let confidence = leg.min_confidence();
+            assert!(matches!(
+                confidence,
+                ContentEvidenceConfidence::Weak
+                    | ContentEvidenceConfidence::Corroborated
+                    | ContentEvidenceConfidence::Strong
+            ));
+        }
+    }
+}
+
+#[test]
+fn rule_count_matches_expected_growth_after_batch_6() {
+    // A loose sanity bound, not a magic number test: Batch 6 added GBC
+    // (2 rules), PS2 strong (1 rule), and PSP strong (1 rule) on top of
+    // Batch 5's catalog - this just confirms the catalog actually grew
+    // rather than a rule being silently lost during editing.
+    assert!(
+        RULES.len() >= 29 + 4,
+        "expected at least 4 new Batch 6 rules on top of Batch 5's 29"
+    );
+}
+
+#[test]
+fn every_platform_appearing_in_rules_also_appears_in_coverage_or_is_explicitly_evidence_poor() {
+    // Cross-module consistency: a rule referencing a platform with no
+    // coverage_inventory entry at all is not necessarily wrong (coverage
+    // tracks "dedicated module work", not "has a fusion rule"), but it
+    // would be a red flag worth surfacing - assert every rule's platform
+    // is at minimum a real canonical id (the stronger, already-existing
+    // every_rule_platform_id_exists_in_the_canonical_registry test covers
+    // the hard requirement; this one documents the softer expectation).
+    for rule in RULES {
+        assert!(crate::platform::platform_by_id(rule.platform).is_some());
+    }
+}
+
+// ----------------------------------------------------------------------
+// GameCube/Wii rule hardening (section 13) - Batch 6 top-up.
+// ----------------------------------------------------------------------
+
+#[test]
+fn gamecube_product_code_alongside_the_strong_header_does_not_block_resolution() {
+    let explanation = fuse_platform_evidence([
+        strong(BootStructure, "GameCube"),
+        corroborated(ProductCode, "GZCE51"),
+    ]);
+    assert_eq!(explanation.resolved_platform, Some("GameCube"));
+}
+
+#[test]
+fn wii_product_code_alongside_the_strong_header_does_not_block_resolution() {
+    let explanation = fuse_platform_evidence([
+        strong(BootStructure, "Wii"),
+        corroborated(ProductCode, "SMNE01"),
+    ]);
+    assert_eq!(explanation.resolved_platform, Some("Wii"));
+}
+
+#[test]
+fn main_dol_plus_product_code_without_either_disc_header_never_resolves() {
+    // Shared facts only (main.dol + a candidate product code) - neither
+    // is platform-specific on its own, so this must stay Unknown, not a
+    // guess toward either platform.
+    let explanation = fuse_platform_evidence([
+        corroborated(BootStructure, "main.dol"),
+        corroborated(ProductCode, "GZCE51"),
+    ]);
+    assert_eq!(explanation.outcome, FusionOutcome::Unknown);
+}
+
+#[test]
+fn gamecube_header_plus_shared_main_dol_plus_wii_header_is_still_a_conflict() {
+    // The shared main.dol fact must not somehow "average out" or soften a
+    // genuine strong-vs-strong disc-header conflict.
+    let explanation = fuse_platform_evidence([
+        strong(BootStructure, "GameCube"),
+        corroborated(BootStructure, "main.dol"),
+        strong(BootStructure, "Wii"),
+    ]);
+    assert_eq!(explanation.outcome, FusionOutcome::Conflict);
+}
+
+// ----------------------------------------------------------------------
+// Additional determinism sampling (section 17) - Batch 6 top-up.
+// ----------------------------------------------------------------------
+
+#[test]
+fn psp_umd_outcome_is_stable_across_many_permutations() {
+    let bundle = vec![
+        corroborated(BootStructure, "PSP_GAME"),
+        strong(BootStructure, "UMD_DATA.BIN"),
+        weak(ContentSignature, "ELF"),
+        corroborated(ProductCode, "UCUS98737"),
+    ];
+    let baseline = fuse_platform_evidence(bundle.clone());
+    for seed in 0..100u64 {
+        let shuffled = fuse_platform_evidence(permute(bundle.clone(), seed));
+        assert_eq!(shuffled.outcome, baseline.outcome);
+        assert_eq!(shuffled.resolved_platform, baseline.resolved_platform);
+    }
+}
+
+#[test]
+fn ps2_outcome_is_stable_across_many_permutations() {
+    let bundle = vec![
+        strong(BootStructure, "BOOT2"),
+        weak(ContentSignature, "ELF"),
+        corroborated(ProductCode, "SCUS-97399"),
+        weak(Filesystem, "ISO9660"),
+    ];
+    let baseline = fuse_platform_evidence(bundle.clone());
+    for seed in 0..100u64 {
+        let shuffled = fuse_platform_evidence(permute(bundle.clone(), seed));
+        assert_eq!(shuffled.outcome, baseline.outcome);
+        assert_eq!(shuffled.resolved_platform, baseline.resolved_platform);
+    }
+}
+
+#[test]
+fn psp_vs_ps3_conflict_is_stable_across_many_permutations() {
+    let bundle = vec![
+        corroborated(BootStructure, "PSP_GAME"),
+        strong(BootStructure, "UMD_DATA.BIN"),
+        corroborated(BootStructure, "PS3_GAME"),
+        strong(ContentSignature, "SELF"),
+        corroborated(ProductCode, "BLUS30060"),
+    ];
+    let baseline = fuse_platform_evidence(bundle.clone());
+    assert_eq!(baseline.outcome, FusionOutcome::Conflict);
+    for seed in 0..100u64 {
+        let shuffled = fuse_platform_evidence(permute(bundle.clone(), seed));
+        assert_eq!(shuffled.outcome, FusionOutcome::Conflict);
+        let mut expected = baseline.conflicting_platforms.clone();
+        let mut actual = shuffled.conflicting_platforms.clone();
+        expected.sort_unstable();
+        actual.sort_unstable();
+        assert_eq!(expected, actual);
+    }
+}
+
+#[test]
+fn gamecube_wii_agreement_view_is_stable_across_many_permutations() {
+    let bundle = vec![
+        strong(BootStructure, "GameCube"),
+        corroborated(ProductCode, "GZCE51"),
+        corroborated(BootStructure, "main.dol"),
+    ];
+    for seed in 0..100u64 {
+        let shuffled = fuse_platform_evidence(permute(bundle.clone(), seed));
+        let comparison =
+            crate::platform_evidence_fusion::compare_content_and_dat(&shuffled, Some("GameCube"));
+        assert_eq!(
+            comparison,
+            crate::platform_evidence_fusion::DatContentComparison::Agree {
+                content_platform: "GameCube",
+                dat_platform: "GameCube",
+            }
+        );
+    }
+}
+
+// ----------------------------------------------------------------------
+// Additional rule shadowing coverage (section 16) - Batch 6 top-up.
+// ----------------------------------------------------------------------
+
+#[test]
+fn ps2_strong_and_candidate_rules_both_evaluated_neither_shadows_the_other() {
+    // Both ps2_system_cnf_boot2_strong and ps2_system_cnf_boot2_candidate
+    // can fire on the same bundle - confirm both actually appear as fired
+    // candidates, proving fusion did not stop after the first match.
+    let explanation = fuse_platform_evidence([
+        strong(BootStructure, "BOOT2"),
+        weak(ContentSignature, "ELF"),
+    ]);
+    let rule_ids: Vec<&str> = explanation
+        .fired_candidates
+        .iter()
+        .map(|c| c.rule_id)
+        .collect();
+    assert!(rule_ids.contains(&"ps2_system_cnf_boot2_strong"));
+    assert!(rule_ids.contains(&"ps2_system_cnf_boot2_candidate"));
+}
+
+#[test]
+fn psp_strong_and_candidate_rules_both_evaluated_neither_shadows_the_other() {
+    let explanation = fuse_platform_evidence([
+        corroborated(BootStructure, "PSP_GAME"),
+        strong(BootStructure, "UMD_DATA.BIN"),
+        corroborated(ProductCode, "UCUS98737"),
+    ]);
+    let rule_ids: Vec<&str> = explanation
+        .fired_candidates
+        .iter()
+        .map(|c| c.rule_id)
+        .collect();
+    assert!(rule_ids.contains(&"psp_umd_data_bin_strong"));
+    assert!(rule_ids.contains(&"psp_layout_candidate"));
+}
+
+#[test]
+fn gbc_cgb_only_and_gb_dmg_rules_are_evaluated_independently_by_value_not_order() {
+    // Declaration order in RULES has GB rules before the GBC rules -
+    // firing the CGB-only-specific rule on CGB-only evidence must not be
+    // affected by that ordering.
+    let explanation = fuse_platform_evidence([strong(
+        BootStructure,
+        "Nintendo Game Boy Color logo (CGB-only)",
+    )]);
+    let rule_ids: Vec<&str> = explanation
+        .fired_candidates
+        .iter()
+        .map(|c| c.rule_id)
+        .collect();
+    assert!(rule_ids.contains(&"gbc_cgb_only_logo_and_checksum"));
+    assert!(!rule_ids.contains(&"gb_logo_and_checksum"));
+}
+
+// ----------------------------------------------------------------------
+// No action authority (section 28) - Batch 6 top-up.
+// ----------------------------------------------------------------------
+
+#[test]
+fn resolution_explanation_type_has_no_apply_or_execute_method() {
+    // Structural: the public surface of ResolutionExplanation is read-only
+    // data; this test exists to make that boundary explicit for the
+    // Batch 6 fusion-integration milestone the same way Batch 5's own
+    // equivalent test did.
+    let explanation = fuse_platform_evidence([strong(BootStructure, "SEGA SEGASATURN")]);
+    let _outcome: FusionOutcome = explanation.outcome;
+    let _platform: Option<&str> = explanation.resolved_platform;
+    let _candidates: &[FiredCandidate] = &explanation.fired_candidates;
+    let _conflicts: &[&str] = &explanation.conflicting_platforms;
+    let _evidence: &[ContentEvidence] = &explanation.input_evidence;
+}

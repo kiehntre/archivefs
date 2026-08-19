@@ -73,9 +73,51 @@ pub fn parse_ps2_system_cnf(bytes: &[u8]) -> Option<SystemCnfBootFact> {
 /// `ContentSignature` fact when the executable header was checked and
 /// matched - reusing [`crate::executable_signatures::ElfDetector`]'s own
 /// evidence shape rather than inventing a second one.
+///
+/// # The `BOOT2` strong leg (Batch 6)
+///
+/// [`observe_system_cnf_evidence`] emits `BOOT2` at `Corroborated` - the
+/// same confidence as PS1's `BOOT`, because that shared function treats
+/// both keys identically. But `BOOT2` is not actually the same kind of
+/// fact as `BOOT`: [`crate::content_evidence_scope`]'s own catalog already
+/// scopes `"BOOT2"` `PlatformSpecific("PS2")` (unlike `"BOOT"`, which is
+/// `Family("PlayStation")` - PS1 shares that key's *literal string* with
+/// nothing, but the scope catalog still treats it as family-level because
+/// PS1's own Strong leg comes from `PS-X EXE`, not from the key). No other
+/// format this crate parses ever emits `"BOOT2"` as a `BootStructure`
+/// value - the key genuinely, exclusively identifies a PS2-style
+/// `SYSTEM.CNF`.
+///
+/// This function corrects the confidence/scope conflation the milestone's
+/// own audit asked for: once the executable `BOOT2=` names has been
+/// independently confirmed to actually be a valid ELF (not just that the
+/// text token `"BOOT2"` appears - the same "verified against real bytes,
+/// not just a filename" standard every other `Strong` fact in this crate
+/// already meets), the `BOOT2` fact itself is replaced with a `Strong`
+/// version. `PS2`'s own [`crate::platform_evidence_fusion::RULES`] entry
+/// requires exactly this - see `ps2_system_cnf_boot2_strong` there.
+///
+/// A `BOOT2` key with no executable check performed (`elf_magic_present ==
+/// None`) or a non-ELF header (`Some(false)`) stays at the original
+/// `Corroborated` confidence - deliberately never promoted from the text
+/// token alone, matching the milestone's explicit "do not promote BOOT2
+/// alone to Strong without justification."
 pub fn observe_ps2_evidence(observation: &Ps2BootObservation) -> Vec<ContentEvidence> {
     let mut evidence = observe_system_cnf_evidence(&observation.system_cnf);
     if observation.elf_magic_present == Some(true) {
+        if observation.system_cnf.boot_key == "BOOT2" {
+            for item in &mut evidence {
+                if item.kind == crate::content_evidence::ContentEvidenceKind::BootStructure
+                    && item.value == "BOOT2"
+                {
+                    item.confidence = crate::content_evidence::ContentEvidenceConfidence::Strong;
+                    item.detail = format!(
+                        "{} - confirmed against a validated ELF executable at the named path (BOOT2 is PS2-exclusive in this crate's grammar, unlike BOOT)",
+                        item.detail
+                    );
+                }
+            }
+        }
         evidence.push(ContentEvidence::new(
             crate::content_evidence::ContentEvidenceKind::ContentSignature,
             "ELF",
@@ -168,6 +210,97 @@ mod tests {
         let fact = parse_ps2_system_cnf(b"BOOT2=cdrom0:\\SLES_123.45;1\n").unwrap();
         let a = observe_ps2_boot(fact.clone(), None);
         let b = observe_ps2_boot(fact, None);
+        assert_eq!(a, b);
+    }
+
+    // ------------------------------------------------------------------
+    // The BOOT2 Strong upgrade (Batch 6) - see observe_ps2_evidence's own
+    // doc comment for the full justification.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn boot2_is_upgraded_to_strong_when_elf_header_is_confirmed() {
+        let fact = parse_ps2_system_cnf(b"BOOT2=cdrom0:\\SLUS_205.20;1\n").unwrap();
+        let header = [0x7f, b'E', b'L', b'F'];
+        let observation = observe_ps2_boot(fact, Some(&header));
+        let evidence = observe_ps2_evidence(&observation);
+        let boot2 = evidence
+            .iter()
+            .find(|item| {
+                item.kind == crate::content_evidence::ContentEvidenceKind::BootStructure
+                    && item.value == "BOOT2"
+            })
+            .unwrap();
+        assert_eq!(boot2.confidence, ContentEvidenceConfidence::Strong);
+    }
+
+    #[test]
+    fn boot2_stays_corroborated_when_no_executable_header_was_checked() {
+        let fact = parse_ps2_system_cnf(b"BOOT2=cdrom0:\\SLUS_205.20;1\n").unwrap();
+        let observation = observe_ps2_boot(fact, None);
+        let evidence = observe_ps2_evidence(&observation);
+        let boot2 = evidence
+            .iter()
+            .find(|item| {
+                item.kind == crate::content_evidence::ContentEvidenceKind::BootStructure
+                    && item.value == "BOOT2"
+            })
+            .unwrap();
+        assert_eq!(boot2.confidence, ContentEvidenceConfidence::Corroborated);
+    }
+
+    #[test]
+    fn boot2_stays_corroborated_when_the_named_executable_is_not_elf() {
+        let fact = parse_ps2_system_cnf(b"BOOT2=cdrom0:\\SLUS_205.20;1\n").unwrap();
+        let observation = observe_ps2_boot(fact, Some(b"not an elf at all"));
+        let evidence = observe_ps2_evidence(&observation);
+        let boot2 = evidence
+            .iter()
+            .find(|item| {
+                item.kind == crate::content_evidence::ContentEvidenceKind::BootStructure
+                    && item.value == "BOOT2"
+            })
+            .unwrap();
+        assert_eq!(boot2.confidence, ContentEvidenceConfidence::Corroborated);
+    }
+
+    #[test]
+    fn boot1_ps1_key_is_never_upgraded_by_this_module() {
+        // parse_ps2_system_cnf itself already refuses BOOT= (PS1) content,
+        // but this test documents the upgrade guard's own second layer:
+        // even if a caller constructed a Ps2BootObservation by hand with a
+        // BOOT= fact (bypassing the parser), the upgrade logic only ever
+        // touches a fact literally named "BOOT2".
+        use crate::playstation_boot_evidence::parse_system_cnf_boot;
+        let ps1_fact = parse_system_cnf_boot(b"BOOT=cdrom:\\SLUS_014.18;1\n").unwrap();
+        let header = [0x7f, b'E', b'L', b'F'];
+        let observation = observe_ps2_boot(ps1_fact, Some(&header));
+        let evidence = observe_ps2_evidence(&observation);
+        let boot = evidence
+            .iter()
+            .find(|item| item.kind == crate::content_evidence::ContentEvidenceKind::BootStructure)
+            .unwrap();
+        assert_eq!(boot.value, "BOOT");
+        assert_eq!(boot.confidence, ContentEvidenceConfidence::Corroborated);
+    }
+
+    #[test]
+    fn upgraded_boot2_detail_documents_the_upgrade_reason() {
+        let fact = parse_ps2_system_cnf(b"BOOT2=cdrom0:\\SLUS_205.20;1\n").unwrap();
+        let header = [0x7f, b'E', b'L', b'F'];
+        let observation = observe_ps2_boot(fact, Some(&header));
+        let evidence = observe_ps2_evidence(&observation);
+        let boot2 = evidence.iter().find(|item| item.value == "BOOT2").unwrap();
+        assert!(boot2.detail.contains("confirmed against a validated ELF"));
+    }
+
+    #[test]
+    fn upgrade_is_deterministic() {
+        let fact = parse_ps2_system_cnf(b"BOOT2=cdrom0:\\SLUS_205.20;1\n").unwrap();
+        let header = [0x7f, b'E', b'L', b'F'];
+        let observation = observe_ps2_boot(fact, Some(&header));
+        let a = observe_ps2_evidence(&observation);
+        let b = observe_ps2_evidence(&observation);
         assert_eq!(a, b);
     }
 }

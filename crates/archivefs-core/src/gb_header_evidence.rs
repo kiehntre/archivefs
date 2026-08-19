@@ -197,6 +197,33 @@ pub fn parse_gb_header(bytes: &[u8]) -> Option<GbHeaderFact> {
 /// - Logo invalid: no evidence at all, regardless of the checksum -
 ///   matching [`crate::saturn_boot_evidence::observe_saturn_evidence`]'s
 ///   "unrecognised signature emits nothing" precedent.
+///
+/// # CGB disambiguation (Batch 6)
+///
+/// `cgb_flag` (read into [`GbColorSupport`]) further splits the emitted
+/// fact by what the header actually declares - never by filename/extension:
+///
+/// - [`GbColorSupport::DmgOnly`]: unchanged from before this milestone -
+///   `"Nintendo Game Boy logo"`, `PlatformSpecific("Game Boy")`.
+/// - [`GbColorSupport::CgbOnly`] (`cgb_flag == 0xC0`): the cartridge
+///   physically cannot run on original Game Boy hardware - a genuinely
+///   different, platform-specific fact, `"Nintendo Game Boy Color logo
+///   (CGB-only)"`, scoped `PlatformSpecific("Game Boy Color")` in
+///   [`crate::content_evidence_scope`]. Reaches the same confidence ceiling
+///   as the DMG case (`Strong` when the checksum also validates).
+/// - [`GbColorSupport::CgbEnhanced`] (`cgb_flag == 0x80`): the cartridge
+///   *is* a real, backward-compatible Game Boy cartridge (it runs
+///   unmodified on original DMG hardware) that additionally enhances on
+///   CGB - both things are simultaneously true, so both are reported: the
+///   ordinary `"Nintendo Game Boy logo"` fact at its normal confidence
+///   (this is what actually resolves the platform - a dual-mode cart is a
+///   real Game Boy cartridge first), plus a second, deliberately capped-at-
+///   `Corroborated` `"Nintendo Game Boy Color logo (dual-mode)"` fact
+///   (`Family("Game Boy/Game Boy Color")`) that never independently
+///   resolves anything on its own - it only ever *corroborates* alongside
+///   the Strong DMG leg, honestly representing that this title belongs to
+///   both ecosystems without inventing an exclusive platform claim the
+///   header itself does not make.
 pub fn observe_gb_evidence(fact: &GbHeaderFact) -> Vec<ContentEvidence> {
     if !fact.logo_valid {
         return Vec::new();
@@ -206,19 +233,45 @@ pub fn observe_gb_evidence(fact: &GbHeaderFact) -> Vec<ContentEvidence> {
     } else {
         ContentEvidenceConfidence::Corroborated
     };
-    vec![ContentEvidence::new(
-        ContentEvidenceKind::BootStructure,
-        "Nintendo Game Boy logo",
-        confidence,
-        format!(
-            "Nintendo logo bitmap matched; header checksum {}",
-            if fact.header_checksum_valid {
-                "valid"
-            } else {
-                "did not validate"
-            }
-        ),
-    )]
+    let checksum_detail = if fact.header_checksum_valid {
+        "valid"
+    } else {
+        "did not validate"
+    };
+    match fact.color_support {
+        GbColorSupport::DmgOnly => vec![ContentEvidence::new(
+            ContentEvidenceKind::BootStructure,
+            "Nintendo Game Boy logo",
+            confidence,
+            format!(
+                "Nintendo logo bitmap matched (cgb_flag=DMG-only); header checksum {checksum_detail}"
+            ),
+        )],
+        GbColorSupport::CgbOnly => vec![ContentEvidence::new(
+            ContentEvidenceKind::BootStructure,
+            "Nintendo Game Boy Color logo (CGB-only)",
+            confidence,
+            format!(
+                "Nintendo logo bitmap matched with cgb_flag=0xC0 (CGB-exclusive - will not run on original Game Boy hardware); header checksum {checksum_detail}"
+            ),
+        )],
+        GbColorSupport::CgbEnhanced => vec![
+            ContentEvidence::new(
+                ContentEvidenceKind::BootStructure,
+                "Nintendo Game Boy logo",
+                confidence,
+                format!(
+                    "Nintendo logo bitmap matched with cgb_flag=0x80 (CGB-enhanced, but still a real DMG-compatible Game Boy cartridge); header checksum {checksum_detail}"
+                ),
+            ),
+            ContentEvidence::new(
+                ContentEvidenceKind::BootStructure,
+                "Nintendo Game Boy Color logo (dual-mode)",
+                confidence.min(ContentEvidenceConfidence::Corroborated),
+                "cgb_flag=0x80 additionally signals CGB-enhanced dual-mode support - corroborating context only, never independently resolved, since the cartridge is a genuine DMG-compatible Game Boy cartridge first",
+            ),
+        ],
+    }
 }
 
 /// A [`ContentDetector`] wrapping [`parse_gb_header`]/[`observe_gb_evidence`].
@@ -440,5 +493,111 @@ mod tests {
         let before = header.clone();
         let _ = parse_gb_header(&header);
         assert_eq!(header, before);
+    }
+
+    // ------------------------------------------------------------------
+    // CGB disambiguation evidence (Batch 6, section 7) - see
+    // observe_gb_evidence's own doc comment for the full design.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn cgb_only_valid_header_yields_one_strong_fact_with_the_cgb_only_value() {
+        let header = synthetic_header("GAME", 0xC0, false);
+        let fact = parse_gb_header(&header).unwrap();
+        let evidence = observe_gb_evidence(&fact);
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].value, "Nintendo Game Boy Color logo (CGB-only)");
+        assert_eq!(evidence[0].confidence, ContentEvidenceConfidence::Strong);
+    }
+
+    #[test]
+    fn cgb_only_invalid_checksum_downgrades_to_corroborated() {
+        let header = synthetic_header("GAME", 0xC0, true);
+        let fact = parse_gb_header(&header).unwrap();
+        let evidence = observe_gb_evidence(&fact);
+        assert_eq!(
+            evidence[0].confidence,
+            ContentEvidenceConfidence::Corroborated
+        );
+        assert_eq!(evidence[0].value, "Nintendo Game Boy Color logo (CGB-only)");
+    }
+
+    #[test]
+    fn cgb_enhanced_valid_header_yields_two_facts() {
+        let header = synthetic_header("GAME", 0x80, false);
+        let fact = parse_gb_header(&header).unwrap();
+        let evidence = observe_gb_evidence(&fact);
+        assert_eq!(evidence.len(), 2);
+        assert!(
+            evidence
+                .iter()
+                .any(|item| item.value == "Nintendo Game Boy logo")
+        );
+        assert!(
+            evidence
+                .iter()
+                .any(|item| item.value == "Nintendo Game Boy Color logo (dual-mode)")
+        );
+    }
+
+    #[test]
+    fn cgb_enhanced_dmg_leg_is_strong_when_checksum_valid() {
+        let header = synthetic_header("GAME", 0x80, false);
+        let fact = parse_gb_header(&header).unwrap();
+        let evidence = observe_gb_evidence(&fact);
+        let dmg_leg = evidence
+            .iter()
+            .find(|item| item.value == "Nintendo Game Boy logo")
+            .unwrap();
+        assert_eq!(dmg_leg.confidence, ContentEvidenceConfidence::Strong);
+    }
+
+    #[test]
+    fn cgb_enhanced_dual_mode_leg_is_never_strong_even_with_a_valid_checksum() {
+        // The dual-mode fact must always cap at Corroborated - even when
+        // the header checksum validates - so it can never independently
+        // resolve Game Boy Color; see the rule table's own doc comment.
+        let header = synthetic_header("GAME", 0x80, false);
+        let fact = parse_gb_header(&header).unwrap();
+        let evidence = observe_gb_evidence(&fact);
+        let dual_mode_leg = evidence
+            .iter()
+            .find(|item| item.value == "Nintendo Game Boy Color logo (dual-mode)")
+            .unwrap();
+        assert_eq!(
+            dual_mode_leg.confidence,
+            ContentEvidenceConfidence::Corroborated
+        );
+    }
+
+    #[test]
+    fn cgb_enhanced_dual_mode_leg_is_corroborated_even_with_invalid_checksum() {
+        let header = synthetic_header("GAME", 0x80, true);
+        let fact = parse_gb_header(&header).unwrap();
+        let evidence = observe_gb_evidence(&fact);
+        let dual_mode_leg = evidence
+            .iter()
+            .find(|item| item.value == "Nintendo Game Boy Color logo (dual-mode)")
+            .unwrap();
+        assert_eq!(
+            dual_mode_leg.confidence,
+            ContentEvidenceConfidence::Corroborated
+        );
+    }
+
+    #[test]
+    fn dmg_only_still_yields_exactly_one_fact() {
+        let header = synthetic_header("GAME", 0x00, false);
+        let fact = parse_gb_header(&header).unwrap();
+        let evidence = observe_gb_evidence(&fact);
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].value, "Nintendo Game Boy logo");
+    }
+
+    #[test]
+    fn cgb_evidence_is_deterministic() {
+        let header = synthetic_header("GAME", 0x80, false);
+        let fact = parse_gb_header(&header).unwrap();
+        assert_eq!(observe_gb_evidence(&fact), observe_gb_evidence(&fact));
     }
 }

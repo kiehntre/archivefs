@@ -1038,6 +1038,9 @@ fn print_boot_evidence<M: LogicalMedia>(media: &M, observation: &DiscFilesystemO
     psp_layout.eboot_bin_present = sony_layout_paths
         .iter()
         .any(|(path, exists)| *path == "PSP_GAME/SYSDIR/EBOOT.BIN" && *exists);
+    psp_layout.umd_data_bin_present = sony_layout_paths
+        .iter()
+        .any(|(path, exists)| *path == "UMD_DATA.BIN" && *exists);
     if psp_layout.psp_game_dir_present {
         evidence.extend(observe_psp_evidence(&psp_layout));
     }
@@ -1085,7 +1088,22 @@ fn print_boot_evidence<M: LogicalMedia>(media: &M, observation: &DiscFilesystemO
 /// for one gathered evidence bundle - the structured
 /// [`archivefs_core::platform_evidence_fusion::ResolutionExplanation`]
 /// rendered as text, never a second decision-making path of its own.
+/// Batch 6: developer-facing prose rendering of a [`ResolutionExplanation`],
+/// all core logic (the outcome, the fired rules, the retained evidence)
+/// already living in [`platform_evidence_fusion`] itself; this function
+/// only formats it. `dat_platform` is an optional, separately obtained DAT
+/// platform id (this probe has no DAT audit wiring of its own, so `None`
+/// here just documents where a real caller would plug one in via
+/// [`archivefs_core::platform_evidence_fusion::compare_content_and_dat`]).
 fn print_fusion(evidence: &[ContentEvidence]) {
+    print_fusion_with_dat(evidence, None);
+}
+
+fn print_fusion_with_dat(evidence: &[ContentEvidence], dat_platform: Option<&'static str>) {
+    use archivefs_core::content_evidence::ContentEvidenceConfidence;
+    use archivefs_core::content_evidence_scope::{EvidenceScope, scope_of};
+    use archivefs_core::platform_evidence_fusion::compare_content_and_dat;
+
     let explanation = fuse_platform_evidence(evidence.iter().cloned());
     println!("Fusion outcome: {:?}", explanation.outcome);
     match explanation.resolved_platform {
@@ -1098,12 +1116,48 @@ fn print_fusion(evidence: &[ContentEvidence]) {
             explanation.conflicting_platforms
         );
     }
+    println!("Rules fired:");
     for candidate in &explanation.fired_candidates {
         println!(
-            "  candidate: {} -> {} (strong leg: {})",
+            "  {} -> {} (strong leg: {})",
             candidate.rule_id, candidate.platform, candidate.has_strong_leg
         );
     }
+    let normalized: Vec<_> = explanation
+        .input_evidence
+        .iter()
+        .filter(|fact| fact.detail.starts_with("[normalized view] "))
+        .collect();
+    if !normalized.is_empty() {
+        println!("Normalized-view evidence:");
+        for fact in &normalized {
+            println!("  {:?} = {} ({:?})", fact.kind, fact.value, fact.confidence);
+        }
+    }
+    let generic: Vec<_> = explanation
+        .input_evidence
+        .iter()
+        .filter(|fact| scope_of(fact.kind, &fact.value) == EvidenceScope::Generic)
+        .collect();
+    if !generic.is_empty() {
+        println!("Generic evidence (never platform-discriminating on its own):");
+        for fact in &generic {
+            println!("  {:?} = {} ({:?})", fact.kind, fact.value, fact.confidence);
+        }
+    }
+    let ignored_weak: Vec<_> = explanation
+        .input_evidence
+        .iter()
+        .filter(|fact| fact.confidence == ContentEvidenceConfidence::Weak)
+        .collect();
+    if !ignored_weak.is_empty() {
+        println!("Ignored weak evidence (never independently resolves):");
+        for fact in &ignored_weak {
+            println!("  {:?} = {}", fact.kind, fact.value);
+        }
+    }
+    let comparison = compare_content_and_dat(&explanation, dat_platform);
+    println!("DAT comparison: {comparison:?}");
 }
 
 fn probe_iso9660(bytes: &[u8]) -> ExitCode {

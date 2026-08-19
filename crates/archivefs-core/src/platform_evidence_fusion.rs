@@ -171,19 +171,22 @@ use RequiredFact::{AnyOfKind, Exact, ValuePrefix};
 ///
 /// # Platforms deliberately *not* given a Strong-eligible rule
 ///
-/// - **PS2**: the only executable-format fact this crate currently emits
-///   for PS2 (`ELF`) is `Weak` by [`crate::ps2_boot_evidence`]'s own
-///   design (a generic executable signature, explicitly not platform
-///   evidence - matching this milestone's own worked example), and
-///   `BOOT2` is `Corroborated`, never `Strong`. This rule can fire (both
-///   legs satisfied) but [`FusionRule::has_strong_leg`] is honestly
-///   `false` - PS2 registers only as a candidate today, never
-///   [`FusionOutcome::Resolved`]. A future batch that adds real PS2-
-///   specific `Strong` evidence should add a second rule, not weaken this
-///   one.
-/// - **PSP**: every fact [`crate::psp_boot_evidence`] emits is
-///   `Corroborated` - the module's own documentation says so explicitly.
-///   Candidate-only, for the same reason.
+/// - **PS2** (as of Batch 6, PS2 *does* have a Strong-eligible rule -
+///   `ps2_system_cnf_boot2_strong` - see [`crate::ps2_boot_evidence`]'s own
+///   doc comment for the full justification: `BOOT2` is upgraded to
+///   `Strong` only once the executable it names is independently confirmed
+///   to be a valid ELF, never from the text token alone. The plain ELF
+///   `ContentSignature` fact itself is still always `Weak` and never the
+///   discriminating leg - it remains true, as this milestone requires,
+///   that "generic ELF" is never promoted). The older
+///   `ps2_system_cnf_boot2_candidate` rule stays, unchanged, as the
+///   fallback for callers that could not confirm the executable header.
+/// - **PSP** (as of Batch 6, PSP *does* have a Strong-eligible rule -
+///   `psp_umd_data_bin_strong` - see [`crate::psp_boot_evidence`]'s own doc
+///   comment: `UMD_DATA.BIN`'s presence, not `PSP_GAME`/`PARAM.SFO`/
+///   `EBOOT.BIN` alone, is the platform-specific leg. The older
+///   `psp_layout_candidate` rule stays as the fallback for a dump missing
+///   the physical-medium file).
 /// - **Mega Drive / 32X**: [`crate::megadrive_header_evidence`] emits its
 ///   console-name fact at `Corroborated` only (matching this crate's
 ///   existing `MegaDrive` platform registry entry, itself `Corroborated`
@@ -400,6 +403,32 @@ pub const RULES: &[FusionRule] = &[
         }],
         explanation: "Nintendo logo matched but the header checksum did not validate - candidate only",
     },
+    // -- Game Boy Color (Batch 6): the CGB-only fact is its own,
+    //    genuinely platform-specific evidence - see
+    //    gb_header_evidence::observe_gb_evidence's own doc comment for why
+    //    CGB-enhanced dual-mode carts deliberately do NOT get an
+    //    exclusive-resolving rule here (they resolve as Game Boy, via the
+    //    two rules above, with the dual-mode fact only ever corroborating).
+    FusionRule {
+        id: "gbc_cgb_only_logo_and_checksum",
+        platform: "Game Boy Color",
+        legs: &[Exact {
+            kind: BootStructure,
+            value: "Nintendo Game Boy Color logo (CGB-only)",
+            min_confidence: STRONG,
+        }],
+        explanation: "Nintendo logo bitmap matched with cgb_flag=0xC0 (CGB-exclusive) AND the header checksum validated - Game Boy Color-specific strong evidence",
+    },
+    FusionRule {
+        id: "gbc_cgb_only_logo_candidate",
+        platform: "Game Boy Color",
+        legs: &[Exact {
+            kind: BootStructure,
+            value: "Nintendo Game Boy Color logo (CGB-only)",
+            min_confidence: CORROBORATED,
+        }],
+        explanation: "CGB-only logo matched but the header checksum did not validate - candidate only",
+    },
     FusionRule {
         id: "gba_header_strong",
         platform: "Game Boy Advance",
@@ -515,6 +544,24 @@ pub const RULES: &[FusionRule] = &[
         ],
         explanation: "SYSTEM.CNF BOOT= plus a validated PS-X EXE executable header",
     },
+    // -- PS2 (Batch 6): BOOT2 is PS2-exclusive in this crate's grammar
+    //    (content_evidence_scope.rs already scopes it
+    //    PlatformSpecific("PS2")) - once ps2_boot_evidence::observe_ps2_evidence
+    //    has confirmed the named executable is a real, valid ELF, the
+    //    BOOT2 fact itself is upgraded to Strong. ELF stays Weak in its
+    //    own right always - it is never the discriminating leg here, the
+    //    now-Strong BOOT2 key is. See that module's own doc comment for
+    //    the full justification and why this is not "promoting ELF."
+    FusionRule {
+        id: "ps2_system_cnf_boot2_strong",
+        platform: "PS2",
+        legs: &[Exact {
+            kind: BootStructure,
+            value: "BOOT2",
+            min_confidence: STRONG,
+        }],
+        explanation: "SYSTEM.CNF BOOT2= key confirmed against a validated ELF executable at the named path - BOOT2 is PS2-exclusive in this crate's grammar, unlike BOOT (shared with PS1)",
+    },
     FusionRule {
         id: "ps2_system_cnf_boot2_candidate",
         platform: "PS2",
@@ -530,7 +577,29 @@ pub const RULES: &[FusionRule] = &[
                 min_confidence: WEAK,
             },
         ],
-        explanation: "SYSTEM.CNF BOOT2= plus a generic ELF magic (candidate only, never Strong - ELF is not platform evidence)",
+        explanation: "SYSTEM.CNF BOOT2= plus a generic ELF magic, without a confirmed ELF header on the named executable - candidate only",
+    },
+    // -- PSP (Batch 6): UMD_DATA.BIN is PSP-UMD-exclusive (see
+    //    psp_boot_evidence.rs's own doc comment) - genuinely different
+    //    from PSP_GAME/, which PS3 shares the convention style of
+    //    (PS3_GAME/). PSP_GAME/ alone, without UMD_DATA.BIN, stays
+    //    candidate-only via the rule below.
+    FusionRule {
+        id: "psp_umd_data_bin_strong",
+        platform: "PSP",
+        legs: &[
+            Exact {
+                kind: BootStructure,
+                value: "PSP_GAME",
+                min_confidence: CORROBORATED,
+            },
+            Exact {
+                kind: BootStructure,
+                value: "UMD_DATA.BIN",
+                min_confidence: STRONG,
+            },
+        ],
+        explanation: "PSP_GAME layout plus UMD_DATA.BIN - the UMD medium-identification file is PSP-UMD-exclusive, no other Sony optical format in this crate uses it",
     },
     FusionRule {
         id: "psp_layout_candidate",
@@ -546,7 +615,7 @@ pub const RULES: &[FusionRule] = &[
                 min_confidence: CORROBORATED,
             },
         ],
-        explanation: "PSP_GAME layout plus a PARAM.SFO-derived product code (candidate only - every fact here is Corroborated)",
+        explanation: "PSP_GAME layout plus a PARAM.SFO-derived product code, without a confirmed UMD_DATA.BIN - candidate only",
     },
     FusionRule {
         id: "ps3_full_layout",
@@ -823,3 +892,7 @@ mod tests;
 
 #[cfg(test)]
 mod dat_and_normalization_tests;
+
+/// The Batch 6 bridge into [`crate::platform::identity`] - see that
+/// module's own doc comment for the full design.
+pub mod identity_bridge;

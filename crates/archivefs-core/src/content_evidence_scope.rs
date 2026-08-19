@@ -144,6 +144,40 @@ const SCOPE_CATALOG: &[ScopeEntry] = &[
         value: "TMR SEGA",
         scope: EvidenceScope::Family("Sega 8-bit"),
     },
+    // sms_gg_header_evidence.rs (Batch 6 audit finding): the region/system
+    // nibble facts were never scoped at all before this milestone -
+    // scope_of silently fell back to Generic for all five of them, even
+    // though each one, unlike the shared "TMR SEGA" magic above, fully
+    // and uniquely determines Master System vs. Game Gear on its own.
+    // This is exactly the "generic fact vs. platform-discriminating fact"
+    // conflation this milestone's own audit asked for - fixed here, not a
+    // functional resolver bug (RULES's own ValuePrefix legs never
+    // consulted this table), but a real gap in the audit trail.
+    ScopeEntry {
+        kind: ContentSignature,
+        value: "Master System (Japan)",
+        scope: EvidenceScope::PlatformSpecific("MasterSystem"),
+    },
+    ScopeEntry {
+        kind: ContentSignature,
+        value: "Master System (Export)",
+        scope: EvidenceScope::PlatformSpecific("MasterSystem"),
+    },
+    ScopeEntry {
+        kind: ContentSignature,
+        value: "Game Gear (Japan)",
+        scope: EvidenceScope::PlatformSpecific("GameGear"),
+    },
+    ScopeEntry {
+        kind: ContentSignature,
+        value: "Game Gear (Export)",
+        scope: EvidenceScope::PlatformSpecific("GameGear"),
+    },
+    ScopeEntry {
+        kind: ContentSignature,
+        value: "Game Gear (International)",
+        scope: EvidenceScope::PlatformSpecific("GameGear"),
+    },
     // playstation_boot_evidence.rs: PS-X EXE is a PlayStation-ecosystem
     // executable signature, not proof of PS1 specifically on its own -
     // matches the milestone's own worked example.
@@ -252,6 +286,15 @@ const SCOPE_CATALOG: &[ScopeEntry] = &[
         value: "BOOT2",
         scope: EvidenceScope::PlatformSpecific("PS2"),
     },
+    // psp_boot_evidence.rs (Batch 6): UMD_DATA.BIN is the Universal Media
+    // Disc identification file - UMD is the PSP's own physical disc
+    // format name, never used by PS3 (Blu-ray) or any other Sony optical
+    // convention in this crate.
+    ScopeEntry {
+        kind: BootStructure,
+        value: "UMD_DATA.BIN",
+        scope: EvidenceScope::PlatformSpecific("PSP"),
+    },
     ScopeEntry {
         kind: BootStructure,
         value: "GameCube",
@@ -306,6 +349,25 @@ const SCOPE_CATALOG: &[ScopeEntry] = &[
         kind: BootStructure,
         value: "Nintendo Game Boy logo",
         scope: EvidenceScope::PlatformSpecific("Game Boy"),
+    },
+    // gb_header_evidence.rs (Batch 6): cgb_flag == 0xC0 - the cartridge is
+    // physically CGB-exclusive, a genuinely different platform claim from
+    // the DMG-compatible fact above.
+    ScopeEntry {
+        kind: BootStructure,
+        value: "Nintendo Game Boy Color logo (CGB-only)",
+        scope: EvidenceScope::PlatformSpecific("Game Boy Color"),
+    },
+    // gb_header_evidence.rs (Batch 6): cgb_flag == 0x80 - a real,
+    // DMG-compatible Game Boy cartridge that also enhances on CGB. This
+    // fact never resolves anything on its own (see the corresponding
+    // fusion rule's own doc comment); Family scope reflects that it
+    // corroborates membership in the shared ecosystem, not a platform on
+    // its own.
+    ScopeEntry {
+        kind: BootStructure,
+        value: "Nintendo Game Boy Color logo (dual-mode)",
+        scope: EvidenceScope::Family("Game Boy/Game Boy Color"),
     },
     ScopeEntry {
         kind: BootStructure,
@@ -514,6 +576,118 @@ mod tests {
         assert_eq!(
             scope_of(BootStructure, "SEGA SEGASATURN"),
             scope_of(BootStructure, "SEGA SEGASATURN")
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Batch 6 scope catalog audit (milestone section 14/15): every
+    // PlatformSpecific entry must name a real canonical platform id - a
+    // typo'd or stale platform name here would silently make
+    // fuse_platform_evidence's own `every_rule_platform_id_exists_in_the_
+    // canonical_registry` test the only thing catching a rule that
+    // depends on it, rather than catching the error at its source.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn every_platform_specific_scope_entry_names_a_real_canonical_platform() {
+        for entry in SCOPE_CATALOG {
+            if let EvidenceScope::PlatformSpecific(platform) = entry.scope {
+                assert!(
+                    crate::platform::platform_by_id(platform).is_some(),
+                    "scope entry ({:?}, {:?}) claims PlatformSpecific({:?}) but that is not a real canonical platform id",
+                    entry.kind,
+                    entry.value,
+                    platform
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_two_platform_specific_entries_share_a_kind_and_value_with_different_platforms() {
+        // A (kind, value) pair must map to exactly one scope - the
+        // catalog is a lookup table, not a multi-valued relation.
+        for (i, a) in SCOPE_CATALOG.iter().enumerate() {
+            for b in &SCOPE_CATALOG[i + 1..] {
+                assert!(
+                    !(a.kind == b.kind && a.value == b.value),
+                    "duplicate scope catalog entry for ({:?}, {:?})",
+                    a.kind,
+                    a.value
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn platform_specific_entries_never_reuse_a_value_string_across_two_platforms() {
+        use std::collections::HashMap;
+        let mut seen: HashMap<&str, &str> = HashMap::new();
+        for entry in SCOPE_CATALOG {
+            if let EvidenceScope::PlatformSpecific(platform) = entry.scope
+                && let Some(previous) = seen.insert(entry.value, platform)
+            {
+                assert_eq!(
+                    previous, platform,
+                    "value {:?} is PlatformSpecific for both {:?} and {:?}",
+                    entry.value, previous, platform
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn family_scope_strings_are_never_empty() {
+        for entry in SCOPE_CATALOG {
+            if let EvidenceScope::Family(name) = entry.scope {
+                assert!(
+                    !name.is_empty(),
+                    "Family scope for ({:?}, {:?}) has an empty name",
+                    entry.kind,
+                    entry.value
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cgb_and_dmg_game_boy_facts_are_distinct_platform_specific_entries() {
+        // Batch 6 GBC audit: the DMG fact and the CGB-only fact must be
+        // recognized as different, non-overlapping platform claims.
+        assert_eq!(
+            scope_of(BootStructure, "Nintendo Game Boy logo"),
+            EvidenceScope::PlatformSpecific("Game Boy")
+        );
+        assert_eq!(
+            scope_of(BootStructure, "Nintendo Game Boy Color logo (CGB-only)"),
+            EvidenceScope::PlatformSpecific("Game Boy Color")
+        );
+    }
+
+    #[test]
+    fn cgb_dual_mode_fact_is_family_not_platform_specific() {
+        // The dual-mode fact must never be treated as exclusive proof of
+        // either Game Boy or Game Boy Color on its own - Family scope
+        // reflects that honestly.
+        assert_eq!(
+            scope_of(BootStructure, "Nintendo Game Boy Color logo (dual-mode)"),
+            EvidenceScope::Family("Game Boy/Game Boy Color")
+        );
+    }
+
+    #[test]
+    fn umd_data_bin_is_platform_specific_psp() {
+        assert_eq!(
+            scope_of(BootStructure, "UMD_DATA.BIN"),
+            EvidenceScope::PlatformSpecific("PSP")
+        );
+    }
+
+    #[test]
+    fn boot2_and_umd_data_bin_are_distinct_sony_platform_specific_facts() {
+        assert_ne!(
+            scope_of(BootStructure, "BOOT2"),
+            scope_of(BootStructure, "UMD_DATA.BIN")
         );
     }
 }

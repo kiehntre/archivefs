@@ -104,7 +104,22 @@ opticaldiscs = { version = "0.15", default-features = false, features = [
 # features disabled. Reused rather than hand-writing a GC/Wii optical
 # filesystem stack from scratch; only structural/header facts are read,
 # never Wii partition decryption (no keys are available to this crate).
-nod = { version = "1.4.4", default-features = false }
+#
+# `compress-zstd` (Batch 6): enabled so real RVZ images (Dolphin's
+# zstd-compressed disc-image format; every real .rvz specimen checked this
+# session declares WIA/RVZ compression_type=5/Zstd) can actually be read,
+# not just uncompressed WBFS/ISO. `compress-bzip2`/`compress-lzma` are
+# deliberately left disabled: no real specimen in this project's corpus
+# uses them, and unlike zstd (already a real, compiled dependency of this
+# crate via `zip`'s own default `zstd`/`zstd-safe`/`zstd-sys` 0.13.3/7.2.4/
+# 2.0.16 - this feature adds zero new crates to the dependency graph),
+# `compress-bzip2` would pull a second, different major version of the
+# `bzip2` crate (nod wants 0.4.x; `zip` already uses 0.6.1) and
+# `compress-lzma` would activate a currently-inactive native `liblzma`
+# build - real new native/build surface this milestone's own "no
+# unnecessary feature explosion" instruction says not to add without a
+# real specimen justifying it.
+nod = { version = "1.4.4", default-features = false, features = ["compress-zstd"] }
 # Original Xbox/Xbox 360 XDVDFS filesystem - pure Rust, `read`+`std`+`sync`
 # only (no `write`/`wax`/crypto). `sync` turns the crate's `maybe_async` API
 # (built on `async-trait`) into plain synchronous functions via

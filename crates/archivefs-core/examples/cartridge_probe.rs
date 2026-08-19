@@ -262,10 +262,27 @@ fn probe_bytes(bytes: &[u8]) {
             explanation.conflicting_platforms
         );
     }
+    println!("Rules fired:");
     for candidate in &explanation.fired_candidates {
         println!(
-            "  candidate: {} -> {} (strong leg: {})",
+            "  {} -> {} (strong leg: {})",
             candidate.rule_id, candidate.platform, candidate.has_strong_leg
         );
     }
+    let ignored_weak: Vec<_> = explanation
+        .input_evidence
+        .iter()
+        .filter(|fact| {
+            fact.confidence == archivefs_core::content_evidence::ContentEvidenceConfidence::Weak
+        })
+        .collect();
+    if !ignored_weak.is_empty() {
+        println!("Ignored weak evidence (never independently resolves):");
+        for fact in &ignored_weak {
+            println!("  {:?} = {}", fact.kind, fact.value);
+        }
+    }
+    let comparison =
+        archivefs_core::platform_evidence_fusion::compare_content_and_dat(&explanation, None);
+    println!("DAT comparison: {comparison:?}");
 }
