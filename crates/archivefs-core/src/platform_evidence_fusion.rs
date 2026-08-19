@@ -896,3 +896,8 @@ mod dat_and_normalization_tests;
 /// The Batch 6 bridge into [`crate::platform::identity`] - see that
 /// module's own doc comment for the full design.
 pub mod identity_bridge;
+
+/// The Batch 7 content+DAT convergence layer - see that module's own doc
+/// comment for the full design and why it is distinct from
+/// [`identity_bridge`]/[`DatContentComparison`].
+pub mod combined_identity;

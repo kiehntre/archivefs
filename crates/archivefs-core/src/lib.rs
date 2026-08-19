@@ -318,6 +318,12 @@ pub mod archive_member_content_evidence;
 /// data - never a hand-typed total.
 pub mod coverage_inventory;
 
+/// Batch 7: the normalized-view provenance sweep - proves physical vs
+/// normalized bytes stay distinct and reversible for every format this
+/// crate normalizes, and documents (honestly, without inventing it) why no
+/// normalized-hash DAT-matching feature exists yet.
+pub mod normalized_view_provenance;
+
 pub mod repair;
 
 pub mod safe_read;
