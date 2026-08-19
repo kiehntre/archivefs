@@ -88,6 +88,20 @@ flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 # (see docs/research/SEVEN_Z_RAR_ARCHIVE_VERIFICATION_RESEARCH.md §12).
 sevenz-rust2 = { version = "0.21.4", default-features = false }
 chd = "0.3.4"
+# Optional specialist optical-disc backend (crate::chd_optical_specialist),
+# behind the `chd-optical-specialist` feature - see that module's own doc
+# comment. Unlike `chd` above (pure Rust), this pulls in `libchdman-rs`,
+# which links a native build of MAME's own `chd_file`/`cdrom_file` C++ core
+# (BSD-3-Clause) - by default via a prebuilt static archive fetched at build
+# time, not compiled from source. Only enabled explicitly; every other path
+# in this crate (including the pure-Rust `chd_logical_media` reader) builds
+# and passes its own tests with this feature off.
+opticaldiscs = { version = "0.15", default-features = false, features = [
+    "chd",
+], optional = true }
+
+[features]
+chd-optical-specialist = ["dep:opticaldiscs"]
 
 [dev-dependencies]
 # Same crate, fuller feature set: only test fixtures need to *write* 7z

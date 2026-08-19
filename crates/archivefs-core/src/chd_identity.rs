@@ -747,6 +747,51 @@ pub fn select_candidate_data_track(
         .min_by_key(|candidate| candidate.track)
 }
 
+/// The Dreamcast GD-ROM low-density/high-density boundary: the frame index
+/// (within the CHD's own track-ordered logical stream) where the
+/// high-density game-data area begins. Verified as a well-established,
+/// independently-documented Dreamcast GD-ROM convention (matches the
+/// `opticaldiscs` crate's own `GDROM_HD_START_LBA` constant).
+///
+/// Track 1 of a real GD-ROM CHD is consistently the small, CD-compatible
+/// "low-density" area (a handful of warning/text files - `ABSTRACT.TXT`,
+/// `BIBLIOGR.TXT`, `COPYRIGH.TXT`, and similar - never the actual game).
+/// [`select_candidate_data_track`] has no way to know this and simply picks
+/// the lowest-numbered non-audio track, which for a GD-ROM is always that
+/// low-density track. [`needs_specialist_optical_backend`] is how a caller
+/// finds out its selection is architecturally incomplete for this CHD.
+pub const GDROM_HIGH_DENSITY_START_FRAME: u32 = 45000;
+
+/// Whether this CHD is a GD-ROM whose real game data lives in a
+/// high-density track beyond the low-density track
+/// [`select_candidate_data_track`] would pick - i.e. whether
+/// [`crate::chd_logical_media::ChdTrackLogicalMedia`] (track 1 only) can
+/// only ever reach the low-density warning area for this disc, never the
+/// actual game.
+///
+/// Pure metadata arithmetic - cumulative frame offsets, summed from the
+/// metadata chain's own track order (verified true for chdman-produced
+/// files: the chain lists tracks in track order) - no bytes are read. This
+/// is deliberately always available, independent of any specialist-backend
+/// feature, so a caller can make this routing decision even in a build
+/// that has no specialist backend compiled in at all - see
+/// [`crate::chd_optical_specialist`]'s module documentation for what such a
+/// caller does with a `true` result.
+pub fn needs_specialist_optical_backend(metadata: &ChdMetadataObservation) -> bool {
+    let mut cumulative_frames: u64 = 0;
+    for entry in &metadata.entries {
+        let ChdMetadataFact::GdromTrack(track) = &entry.fact else {
+            continue;
+        };
+        if track.track_type != "AUDIO" && cumulative_frames >= GDROM_HIGH_DENSITY_START_FRAME as u64
+        {
+            return true;
+        }
+        cumulative_frames += track.frames as u64;
+    }
+    false
+}
+
 // ---------------------------------------------------------------------
 // Detector
 // ---------------------------------------------------------------------
@@ -1476,6 +1521,76 @@ mod tests {
         let candidate =
             select_candidate_data_track(&metadata).expect("a non-audio GD-ROM track exists");
         assert_eq!(candidate.media_class, ChdMediaClass::GdRom);
+    }
+
+    #[test]
+    fn single_track_gd_rom_does_not_need_a_specialist_backend() {
+        // A GD-ROM CHD carrying only a low-density track: the simple
+        // track-1 selection already reaches everything there is.
+        let data = chd_with_metadata_entries(
+            [0; 20],
+            &[(
+                meta_tag::GDROM_TRACK,
+                b"TRACK:1 TYPE:MODE1_RAW SUBTYPE:NONE FRAMES:2048 PAD:0 PREGAP:0 PGTYPE:NONE PGSUB:NONE POSTGAP:0",
+            )],
+        );
+        let observation = observe_chd_identity(&data).unwrap();
+        let ChdMetadataOutcome::Observed(metadata) = observation.metadata else {
+            panic!("expected Observed metadata");
+        };
+        assert!(!needs_specialist_optical_backend(&metadata));
+    }
+
+    #[test]
+    fn real_world_shaped_gd_rom_needs_a_specialist_backend() {
+        // Mirrors the real Jet Set Radio / Mr. Driller track layout this
+        // chunk validated against: track 1 (low-density, small), track 2
+        // (audio), track 3 (high-density game data, starting well past
+        // frame 45000 once track 1 + track 2's frames are summed).
+        let data = chd_with_metadata_entries(
+            [0; 20],
+            &[
+                (
+                    meta_tag::GDROM_TRACK,
+                    b"TRACK:1 TYPE:MODE1_RAW SUBTYPE:NONE FRAMES:6835 PAD:0 PREGAP:0 PGTYPE:NONE PGSUB:NONE POSTGAP:0",
+                ),
+                (
+                    meta_tag::GDROM_TRACK,
+                    b"TRACK:2 TYPE:AUDIO SUBTYPE:NONE FRAMES:38165 PAD:0 PREGAP:150 PGTYPE:SILENCE PGSUB:NONE POSTGAP:0",
+                ),
+                (
+                    meta_tag::GDROM_TRACK,
+                    b"TRACK:3 TYPE:MODE1_RAW SUBTYPE:NONE FRAMES:504150 PAD:0 PREGAP:0 PGTYPE:NONE PGSUB:NONE POSTGAP:0",
+                ),
+            ],
+        );
+        let observation = observe_chd_identity(&data).unwrap();
+        let ChdMetadataOutcome::Observed(metadata) = observation.metadata else {
+            panic!("expected Observed metadata");
+        };
+        // select_candidate_data_track still (correctly, per its own
+        // documented scope) picks track 1 - the low-density area.
+        assert_eq!(select_candidate_data_track(&metadata).unwrap().track, 1);
+        // But this CHD does have real high-density data beyond it.
+        assert!(needs_specialist_optical_backend(&metadata));
+    }
+
+    #[test]
+    fn a_plain_cd_rom_never_needs_a_specialist_backend() {
+        // CdromTrack facts are never considered - GDROM_HIGH_DENSITY_START_FRAME
+        // is a Dreamcast-specific convention with no meaning for CD-ROM.
+        let data = chd_with_metadata_entries(
+            [0; 20],
+            &[(
+                meta_tag::CDROM_TRACK2,
+                b"TRACK:1 TYPE:MODE2_RAW SUBTYPE:NONE FRAMES:999999 PREGAP:0 PGTYPE:NONE PGSUB:NONE POSTGAP:0",
+            )],
+        );
+        let observation = observe_chd_identity(&data).unwrap();
+        let ChdMetadataOutcome::Observed(metadata) = observation.metadata else {
+            panic!("expected Observed metadata");
+        };
+        assert!(!needs_specialist_optical_backend(&metadata));
     }
 
     #[test]

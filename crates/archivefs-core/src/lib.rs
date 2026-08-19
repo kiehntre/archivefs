@@ -135,6 +135,14 @@ pub mod iso9660;
 /// CD/GD-ROM data track to [`iso9660`].
 pub mod chd_logical_media;
 
+/// Optional specialist optical-disc backend (Dreamcast GD-ROM high-density
+/// data, and other complex optical layouts [`chd_logical_media`]
+/// deliberately does not handle), behind the `chd-optical-specialist`
+/// feature. See the module documentation for the fallback policy and the
+/// native-dependency tradeoffs of enabling it.
+#[cfg(feature = "chd-optical-specialist")]
+pub mod chd_optical_specialist;
+
 pub mod repair;
 
 pub mod safe_read;

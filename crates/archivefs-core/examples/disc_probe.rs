@@ -14,16 +14,19 @@
 //!
 //! For a `.chd`, the full pipeline now runs too:
 //! [`archivefs_core::chd_identity`] observes the CHD's own identity and
-//! media facts and selects a candidate data track, then
-//! [`archivefs_core::chd_logical_media`] decodes that track's sectors
-//! on demand (via the `chd` crate) and exposes them as
-//! [`archivefs_core::logical_media::LogicalMedia`], which
-//! [`archivefs_core::iso9660`] can observe exactly as it would a plain
-//! image. Any step that this crate does not yet support (a parent-required
-//! CHD, a non-track-1/non-zero-pregap data track, an unsupported track
-//! type) is reported explicitly rather than guessed at - see
-//! [`archivefs_core::chd_logical_media`]'s module documentation for the
-//! exact scope limits.
+//! media facts and selects a candidate data track. For an ordinary
+//! single-data-track disc, [`archivefs_core::chd_logical_media`] (pure
+//! Rust) decodes that track's sectors on demand and exposes them as
+//! [`archivefs_core::logical_media::LogicalMedia`]. For a Dreamcast GD-ROM
+//! whose real game data lives beyond the low-density track the simple
+//! selection reaches (detected via
+//! `chd_identity::needs_specialist_optical_backend`), this probe instead
+//! reaches for the optional
+//! [`archivefs_core::chd_optical_specialist`] backend - if the
+//! `chd-optical-specialist` feature was compiled in; otherwise it reports
+//! that plainly rather than falling back to a wrong/incomplete answer. Any
+//! step neither backend supports (a parent-required CHD, an unsupported
+//! track type) is reported explicitly rather than guessed at.
 //!
 //! Nothing is ever written. The only filesystem call in this file is the
 //! single read of the path given on the command line. No platform is ever
@@ -37,14 +40,17 @@
 //! ```
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 
 use archivefs_core::chd_identity::{
-    ChdMetadataOutcome, looks_like_chd, observe_chd_identity, select_candidate_data_track,
+    ChdMetadataOutcome, looks_like_chd, needs_specialist_optical_backend, observe_chd_identity,
+    select_candidate_data_track,
 };
 use archivefs_core::chd_logical_media::{ChdLogicalMediaError, open_chd_track_logical_media};
+#[cfg(feature = "chd-optical-specialist")]
+use archivefs_core::chd_optical_specialist::open_chd_optical_specialist;
 use archivefs_core::dat::archive::hash::hash_member_stream;
 use archivefs_core::identity_source::hashing::FileFingerprint;
 use archivefs_core::iso9660::{
@@ -102,7 +108,7 @@ fn main() -> ExitCode {
     println!("Physical SHA-256: {physical_sha256}");
 
     if looks_like_chd(&bytes) {
-        return probe_chd(&bytes);
+        return probe_chd(&path, &bytes);
     }
     if looks_like_iso9660(&SliceMedia(&bytes)) {
         return probe_iso9660(&bytes);
@@ -112,7 +118,7 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn probe_chd(bytes: &[u8]) -> ExitCode {
+fn probe_chd(path: &Path, bytes: &[u8]) -> ExitCode {
     println!("Container: CHD");
 
     let observation = match observe_chd_identity(bytes) {
@@ -123,6 +129,7 @@ fn probe_chd(bytes: &[u8]) -> ExitCode {
         }
     };
 
+    let mut needs_specialist = false;
     match &observation.metadata {
         ChdMetadataOutcome::Empty => println!("Media: Unknown (no metadata chain)"),
         ChdMetadataOutcome::Malformed(error) => {
@@ -148,12 +155,24 @@ fn probe_chd(bytes: &[u8]) -> ExitCode {
                     "Data track: none identified (all-audio, or no CD/GD-ROM track metadata)"
                 ),
             }
+
+            needs_specialist = needs_specialist_optical_backend(metadata);
+            if needs_specialist {
+                println!(
+                    "High-density data: YES - this GD-ROM's real data lives beyond the \
+                     low-density track the simple reader selects"
+                );
+            }
         }
+    }
+
+    if needs_specialist {
+        return probe_chd_specialist(path);
     }
 
     let media = match open_chd_track_logical_media(bytes) {
         Ok(media) => {
-            println!("Logical reader: OK");
+            println!("Logical reader: OK (pure-Rust)");
             media
         }
         Err(error) => {
@@ -180,6 +199,51 @@ fn probe_chd(bytes: &[u8]) -> ExitCode {
         }
     }
 
+    ExitCode::SUCCESS
+}
+
+#[cfg(feature = "chd-optical-specialist")]
+fn probe_chd_specialist(path: &Path) -> ExitCode {
+    let media = match open_chd_optical_specialist(path) {
+        Ok(media) => {
+            println!("Logical reader: OK (specialist optical backend)");
+            media
+        }
+        Err(error) => {
+            println!("Logical reader: Malformed (specialist backend: {error})");
+            println!("Filesystem: Unknown (no logical reader available)");
+            print_interesting_paths_unavailable();
+            return ExitCode::SUCCESS;
+        }
+    };
+
+    if !looks_like_iso9660(&media) {
+        println!(
+            "Filesystem: Unknown (logical data does not begin with an ISO9660 CD001 identifier)"
+        );
+        print_interesting_paths_unavailable();
+        return ExitCode::SUCCESS;
+    }
+
+    match observe_iso9660(&media) {
+        Ok(observation) => print_iso9660_observation(&media, &observation),
+        Err(error) => {
+            println!("Filesystem: Unsupported (ISO9660 structure did not parse: {error})");
+            print_interesting_paths_unavailable();
+        }
+    }
+
+    ExitCode::SUCCESS
+}
+
+#[cfg(not(feature = "chd-optical-specialist"))]
+fn probe_chd_specialist(_path: &Path) -> ExitCode {
+    println!(
+        "Logical reader: Unsupported (this CHD needs the specialist optical backend, which is \
+         not compiled into this build - rebuild with --features chd-optical-specialist)"
+    );
+    println!("Filesystem: Unknown (specialist backend not available)");
+    print_interesting_paths_unavailable();
     ExitCode::SUCCESS
 }
 
