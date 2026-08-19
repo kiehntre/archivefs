@@ -268,10 +268,67 @@ pub fn parse_pkg_header(header: &[u8]) -> Option<PkgHeaderFact> {
     })
 }
 
+/// Sony's Content ID grammar (documented across the PS3/PSN developer
+/// ecosystem, and verified end-to-end against a real specimen in this
+/// project's corpus - see the module-level milestone report - whose
+/// `content_id` reads `"EP0102-NPEB00342_00-CONTENT0000DLPKG"` and whose
+/// on-disk `.rap` companion file is independently named
+/// `EP0102-NPEB00342_00-CONTENT0000DLPKG.rap`, the same string, confirming
+/// this is the grammar real PS3 tooling itself relies on):
+///
+/// ```text
+/// <provider(2)><dist-code(4)>-<title-id(9)>_<content-type(2)>-<content-label>
+/// ```
+///
+/// `title-id` is the same 9-character `TITLE_ID`-shaped identifier
+/// (`NPEB00342`) [`crate::param_sfo`]-based observers already emit for
+/// disc/folder installs - this function derives the identical fact from a
+/// `.pkg`'s Content ID by bounded, shape-only grammar matching (exact
+/// segment counts and lengths; no claim about which canonical release the
+/// derived id belongs to). Returns `None` for anything that does not match
+/// this exact shape - never a best-effort guess.
+pub fn derive_title_id_from_content_id(content_id: &str) -> Option<String> {
+    let mut segments = content_id.split('-');
+    let provider_and_dist = segments.next()?;
+    let title_and_type = segments.next()?;
+    let content_label = segments.next()?;
+    if segments.next().is_some() {
+        return None; // more than 3 '-'-delimited segments: not this grammar
+    }
+    if provider_and_dist.len() != 6 || !provider_and_dist.chars().all(|c| c.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    if content_label.is_empty()
+        || content_label.len() > 16
+        || !content_label.chars().all(|c| c.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    let mut title_segments = title_and_type.split('_');
+    let title_id = title_segments.next()?;
+    let content_type = title_segments.next()?;
+    if title_segments.next().is_some() {
+        return None;
+    }
+    if title_id.len() != 9 || !title_id.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    if content_type.len() != 2 || !content_type.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(title_id.to_string())
+}
+
 /// Neutral evidence for a parsed `.pkg` header: the magic itself (`Strong`
-/// `ContentSignature`) and, when non-empty, the Content ID (`Corroborated`
-/// `ProductCode`). Never a claim that the package is a complete, valid, or
-/// installable title - only that its fixed header parsed.
+/// `ContentSignature`), when non-empty the raw Content ID (`Corroborated`
+/// `ProductCode`), and - only when [`derive_title_id_from_content_id`]
+/// recognises the grammar - the derived Title ID as a second, independent
+/// `ProductCode` fact (also `Corroborated`; both facts are kept, matching
+/// this crate's "never collapse independently-derived facts" discipline -
+/// see [`crate::content_evidence`]'s own documentation). Never a claim that
+/// the package is a complete, valid, or installable title - only that its
+/// fixed header parsed.
 pub fn pkg_header_evidence(fact: &PkgHeaderFact) -> Vec<ContentEvidence> {
     let mut evidence = vec![ContentEvidence::new(
         ContentEvidenceKind::ContentSignature,
@@ -286,6 +343,16 @@ pub fn pkg_header_evidence(fact: &PkgHeaderFact) -> Vec<ContentEvidence> {
             ContentEvidenceConfidence::Corroborated,
             "candidate Content ID read from the .pkg header - not verified against a canonical release list, and not proof the package is complete or installable",
         ));
+        if let Some(title_id) = derive_title_id_from_content_id(&fact.content_id) {
+            evidence.push(ContentEvidence::new(
+                ContentEvidenceKind::ProductCode,
+                title_id,
+                ContentEvidenceConfidence::Corroborated,
+                "Title ID derived from the Content ID's verified grammar (provider+dist-\
+                 code)-(title-id)_(content-type)-(content-label) - a candidate only, not \
+                 verified against a canonical release list",
+            ));
+        }
     }
     evidence
 }
@@ -599,6 +666,108 @@ mod tests {
                 ContentEvidenceKind::ContentSignature | ContentEvidenceKind::ProductCode
             ));
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Content ID -> Title ID grammar (section 17)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn real_specimen_content_id_grammar_derives_title_id() {
+        // "EP0102-NPEB00342_00-CONTENT0000DLPKG" - verified against a real
+        // PS3 PKG specimen in this project's corpus (Resident Evil 4 HD),
+        // whose independent `.rap` companion file is named with this exact
+        // string, confirming the grammar.
+        assert_eq!(
+            derive_title_id_from_content_id("EP0102-NPEB00342_00-CONTENT0000DLPKG"),
+            Some("NPEB00342".to_string())
+        );
+    }
+
+    #[test]
+    fn up_provider_content_id_grammar_derives_title_id() {
+        assert_eq!(
+            derive_title_id_from_content_id("UP0001-TEST00000_00-0000000000000000"),
+            Some("TEST00000".to_string())
+        );
+    }
+
+    #[test]
+    fn wrong_provider_segment_length_fails_closed() {
+        assert_eq!(
+            derive_title_id_from_content_id("EP01022-NPEB00342_00-LABEL"),
+            None
+        );
+    }
+
+    #[test]
+    fn wrong_title_id_segment_length_fails_closed() {
+        assert_eq!(
+            derive_title_id_from_content_id("EP0102-NPEB0034_00-LABEL"),
+            None
+        );
+    }
+
+    #[test]
+    fn non_numeric_content_type_fails_closed() {
+        assert_eq!(
+            derive_title_id_from_content_id("EP0102-NPEB00342_AA-LABEL"),
+            None
+        );
+    }
+
+    #[test]
+    fn missing_underscore_fails_closed() {
+        assert_eq!(
+            derive_title_id_from_content_id("EP0102-NPEB00342-LABEL"),
+            None
+        );
+    }
+
+    #[test]
+    fn missing_dash_segments_fails_closed() {
+        assert_eq!(derive_title_id_from_content_id("NPEB00342"), None);
+    }
+
+    #[test]
+    fn extra_dash_segment_fails_closed() {
+        assert_eq!(
+            derive_title_id_from_content_id("EP0102-NPEB00342_00-LABEL-EXTRA"),
+            None
+        );
+    }
+
+    #[test]
+    fn empty_string_fails_closed() {
+        assert_eq!(derive_title_id_from_content_id(""), None);
+    }
+
+    #[test]
+    fn pkg_header_evidence_includes_derived_title_id_alongside_raw_content_id() {
+        let header = synthetic_pkg_header("EP0102-NPEB00342_00-CONTENT0000DLPKG");
+        let fact = parse_pkg_header(&header).unwrap();
+        let evidence = pkg_header_evidence(&fact);
+        let product_codes: Vec<&str> = evidence
+            .iter()
+            .filter(|item| item.kind == ContentEvidenceKind::ProductCode)
+            .map(|item| item.value.as_str())
+            .collect();
+        assert!(product_codes.contains(&"EP0102-NPEB00342_00-CONTENT0000DLPKG"));
+        assert!(product_codes.contains(&"NPEB00342"));
+        assert_eq!(product_codes.len(), 2);
+    }
+
+    #[test]
+    fn pkg_header_evidence_omits_derived_title_id_when_grammar_does_not_match() {
+        let header = synthetic_pkg_header("not-the-right-shape");
+        let fact = parse_pkg_header(&header).unwrap();
+        let evidence = pkg_header_evidence(&fact);
+        let product_codes: Vec<&str> = evidence
+            .iter()
+            .filter(|item| item.kind == ContentEvidenceKind::ProductCode)
+            .map(|item| item.value.as_str())
+            .collect();
+        assert_eq!(product_codes, vec!["not-the-right-shape"]);
     }
 
     #[test]

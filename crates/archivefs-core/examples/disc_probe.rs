@@ -65,6 +65,7 @@ use archivefs_core::logical_media::{LogicalMedia, SliceMedia};
 use archivefs_core::neogeocd_boot_evidence::{
     MAX_IPL_TXT_BYTES, observe_neogeocd_evidence, parse_ipl_txt,
 };
+use archivefs_core::param_sfo;
 use archivefs_core::param_sfo::parse_param_sfo;
 use archivefs_core::pcfx_boot_evidence::{
     PCFX_BOOT_SECTOR_BYTES, observe_pcfx_evidence, parse_pcfx_boot_sector,
@@ -78,6 +79,12 @@ use archivefs_core::ps3_disc_evidence::{
     observe_ps3_directory_evidence, parse_pkg_header, pkg_header_evidence,
 };
 use archivefs_core::psp_boot_evidence::PSP_LAYOUT_PATHS;
+use archivefs_core::psp_pbp_evidence::{
+    PBP_HEADER_BYTES, PBP_SECTION_ICON0_PNG, PBP_SECTION_PARAM_SFO, looks_like_pbp,
+    observe_pbp_evidence, parse_pbp_header, validate_pbp_offsets,
+};
+use archivefs_core::raw_cd_logical_media::{looks_like_raw_cd, open_raw_cd_logical_media};
+use archivefs_core::raw_cd_sector::{LOGICAL_BLOCK_BYTES, RAW_SECTOR_BYTES};
 use archivefs_core::saturn_boot_evidence::{
     SATURN_SYSTEM_ID_BYTES, observe_saturn_evidence, parse_saturn_system_id,
 };
@@ -89,6 +96,9 @@ use archivefs_core::threedo_boot_evidence::{
 };
 use archivefs_core::xbox_boot_evidence::{observe_xbox_disc, observe_xbox_evidence};
 use archivefs_core::xbox360_boot_evidence::{observe_xbox360_disc, observe_xbox360_evidence};
+use archivefs_core::xbox360_stfs_evidence::{
+    STFS_HEADER_PEEK_BYTES, looks_like_stfs, observe_stfs_evidence, parse_stfs_header,
+};
 use archivefs_core::xdvdfs_signature::{XDVDFS_VOLUME_DESCRIPTOR_OFFSET, looks_like_xdvdfs};
 use archivefs_core::xdvdfs_traversal::list_root;
 use std::io::Read as _;
@@ -129,6 +139,32 @@ fn main() -> ExitCode {
             && looks_like_pkg(&peek[..read])
         {
             return probe_pkg(&peek[..read]);
+        }
+    }
+
+    // Same bounded-peek discipline for Xbox 360 STFS packages - a real
+    // package can be multiple gigabytes; only the fixed metadata header
+    // prefix is ever read here.
+    if let Ok(mut file) = std::fs::File::open(&path) {
+        let mut peek = vec![0u8; STFS_HEADER_PEEK_BYTES];
+        if let Ok(read) = file.read(&mut peek)
+            && looks_like_stfs(&peek[..read.min(4)])
+        {
+            return probe_stfs(&peek[..read]);
+        }
+    }
+
+    // Same bounded-peek discipline for EBOOT.PBP - a full PSN-game PBP's
+    // DATA.PSAR section alone can be gigabytes; only the fixed header (plus
+    // a small bounded PARAM.SFO read, itself bounded by
+    // crate::param_sfo::MAX_SFO_BYTES) is ever read here.
+    if let Ok(mut file) = std::fs::File::open(&path) {
+        let mut peek = [0u8; PBP_HEADER_BYTES];
+        if let Ok(read) = file.read(&mut peek)
+            && looks_like_pbp(&peek[..read])
+            && let Ok(metadata) = file.metadata()
+        {
+            return probe_pbp(&path, &peek[..read], metadata.len());
         }
     }
 
@@ -189,6 +225,15 @@ fn main() -> ExitCode {
         if looks_like_xdvdfs(sector) {
             return probe_xdvdfs(&bytes);
         }
+    }
+    // Raw-sector optical images (.bin-style: a bare stream of 2352-byte CD
+    // sectors) - checked before the raw-byte-offset-0 boot-signature checks
+    // below, since those checks only make sense against *cooked* logical
+    // bytes; a genuine raw image simply will not match them at offset 0
+    // (sync/header bytes live there instead), so this ordering costs
+    // nothing on a plain ISO/BIN either way.
+    if looks_like_raw_cd(&bytes) {
+        return probe_raw_cd(&bytes);
     }
     if bytes.len() >= SATURN_SYSTEM_ID_BYTES
         && parse_saturn_system_id(&bytes[..SATURN_SYSTEM_ID_BYTES])
@@ -284,6 +329,185 @@ fn probe_pkg(header: &[u8]) -> ExitCode {
         None => println!("PKG header did not parse (truncated?)"),
     }
     ExitCode::SUCCESS
+}
+
+/// `header` is only the fixed [`PBP_HEADER_BYTES`]-byte prefix `main`
+/// already read; `total_len` is the real file's length (from
+/// `fs::Metadata`, not a read) so [`validate_pbp_offsets`] can bound-check
+/// the offset table without ever reading the (potentially gigabyte-sized)
+/// `DATA.PSAR` section. The embedded `PARAM.SFO` is read separately, bounded
+/// by [`crate::param_sfo::MAX_SFO_BYTES`], from `path` directly (only that
+/// small section, never the whole file).
+fn probe_pbp(path: &Path, header: &[u8], total_len: u64) -> ExitCode {
+    println!("Container: PBP package (EBOOT.PBP)");
+    let Some(fact) = parse_pbp_header(header) else {
+        println!("PBP header did not parse (truncated?)");
+        return ExitCode::SUCCESS;
+    };
+    println!("Version: {}", fact.version);
+    match validate_pbp_offsets(&fact, total_len) {
+        Ok(()) => println!("Offset table: valid"),
+        Err(error) => {
+            println!("Offset table: invalid ({error})");
+            println!("Evidence: {:?}", observe_pbp_evidence(None));
+            return ExitCode::SUCCESS;
+        }
+    }
+
+    // Read only the PARAM.SFO section's declared byte range, directly from
+    // the file via a seek + bounded read - never the whole (potentially
+    // gigabyte-sized) PBP.
+    let sfo_start = u64::from(fact.section_offsets[PBP_SECTION_PARAM_SFO]);
+    let sfo_end = u64::from(fact.section_offsets[PBP_SECTION_ICON0_PNG]);
+    let sfo = if sfo_end >= sfo_start && sfo_end - sfo_start <= param_sfo::MAX_SFO_BYTES as u64 {
+        std::fs::File::open(path).ok().and_then(|mut file| {
+            use std::io::Seek;
+            let sfo_len = (sfo_end - sfo_start) as usize;
+            let mut buf = vec![0u8; sfo_len];
+            if file.seek(std::io::SeekFrom::Start(sfo_start)).is_ok()
+                && file.read_exact(&mut buf).is_ok()
+            {
+                parse_param_sfo(&buf)
+            } else {
+                None
+            }
+        })
+    } else {
+        None
+    };
+    if let Some(sfo) = &sfo {
+        println!("PARAM.SFO: {} entries", sfo.entries.len());
+        if let Some(disc_id) = sfo.get_text("DISC_ID") {
+            println!("DISC_ID: {disc_id}");
+        }
+    } else {
+        println!("PARAM.SFO: unavailable (missing, malformed, or out of bounds)");
+    }
+    println!("Evidence: {:?}", observe_pbp_evidence(sfo.as_ref()));
+    ExitCode::SUCCESS
+}
+
+/// A `.pkg`-style bounded prefix already read by `main` for an STFS
+/// package's fixed metadata header - never the whole (potentially multi-
+/// gigabyte) package.
+fn probe_stfs(header: &[u8]) -> ExitCode {
+    println!("Container: Xbox 360 STFS digital package");
+    match parse_stfs_header(header) {
+        Some(fact) => {
+            println!("Signing variant: {}", fact.variant.magic_str());
+            println!("Content type: {:#010x}", fact.content_type);
+            println!("Title ID: {:08X}", fact.title_id);
+            println!("Media ID: {:#010x}", fact.media_id);
+            println!("Content size (declared): {} bytes", fact.content_size);
+            println!("Display name: {}", fact.display_name);
+            println!("Title name: {}", fact.title_name);
+            println!(
+                "Disc: {} of {}",
+                fact.disc_number.max(1),
+                fact.disc_in_set.max(1)
+            );
+            println!("Evidence: {:?}", observe_stfs_evidence(&fact));
+        }
+        None => println!("STFS header did not parse (truncated, or bad magic)"),
+    }
+    ExitCode::SUCCESS
+}
+
+/// A raw-sector optical image (.bin-style) that `looks_like_raw_cd`
+/// already corroborated with two independently-matching sync sectors -
+/// cooks it through [`RawCdLogicalMedia`] and reuses every existing
+/// generic-over-[`LogicalMedia`] observer (ISO9660, Saturn/Sega CD/3DO/
+/// PC-FX boot signatures) exactly as `probe_chd` already does for CHD-
+/// backed media - no second ISO9660/boot-signature implementation.
+fn probe_raw_cd(bytes: &[u8]) -> ExitCode {
+    println!("Container: Raw optical sector image (bare 2352-byte-sector stream)");
+    let media = match open_raw_cd_logical_media(bytes) {
+        Ok(media) => media,
+        Err(error) => {
+            println!("Raw sector adapter: rejected ({error})");
+            return ExitCode::SUCCESS;
+        }
+    };
+    println!("Physical sector size: {RAW_SECTOR_BYTES} bytes");
+    println!("Logical sector size: {LOGICAL_BLOCK_BYTES} bytes");
+    println!("Raw mode: {}", media.sector_mode().label());
+    println!("Sector count: {}", media.sector_count());
+    println!("Source modified: NO (read-only adapter over already-loaded bytes)");
+
+    if looks_like_iso9660(&media) {
+        println!("Logical filesystem: ISO9660");
+        match observe_iso9660(&media) {
+            Ok(observation) => {
+                print_iso9660_observation(&media, &observation);
+                print_boot_evidence(&media, &observation);
+            }
+            Err(error) => {
+                println!("Filesystem: Unsupported (ISO9660 structure did not parse: {error})")
+            }
+        }
+        return ExitCode::SUCCESS;
+    }
+    println!("Logical filesystem: Unknown (no ISO9660 PVD at cooked sector 16)");
+
+    print_raw_cd_boot_evidence(&media);
+    ExitCode::SUCCESS
+}
+
+/// Re-runs this crate's existing raw-boot-signature checks (Saturn/Sega
+/// CD/3DO/PC-FX) against the *cooked* first sector(s) of a raw-sector
+/// image, the same checks `main` already runs against a plain file's raw
+/// bytes at offset 0 - this is the one part of a raw-sector image that
+/// those existing detectors cannot see without cooking first, since their
+/// signatures sit at a cooked-byte offset, not a physical-byte offset.
+fn print_raw_cd_boot_evidence<M: LogicalMedia>(media: &M) {
+    let prefix_len = SATURN_SYSTEM_ID_BYTES
+        .max(OPERA_HEADER_BYTES)
+        .max(PCFX_BOOT_SECTOR_BYTES)
+        .max(16);
+    let mut prefix = vec![0u8; prefix_len.min(media.len() as usize)];
+    if media.read_at(0, &mut prefix).is_err() {
+        println!("Boot signature: N/A (could not read cooked sector 0)");
+        return;
+    }
+
+    if prefix.len() >= SATURN_SYSTEM_ID_BYTES
+        && let Some(fact) = parse_saturn_system_id(&prefix[..SATURN_SYSTEM_ID_BYTES])
+        && fact.hardware_id_recognized
+    {
+        println!(
+            "Boot signature: {} (Sega Saturn System ID)",
+            fact.hardware_id
+        );
+        println!("Product code: {}", fact.product_number);
+        println!("Version: {}", fact.version);
+        println!("Region: {}", fact.area_symbols);
+        println!("Game title: {}", fact.game_title);
+        println!("Evidence: {:?}", observe_saturn_evidence(&fact));
+        return;
+    }
+    if looks_like_sega_cd_boot_sector(&prefix) {
+        println!("Boot signature: SEGADISCSYSTEM (Sega CD/Mega-CD)");
+        println!("Evidence: {:?}", observe_segacd_evidence(&prefix));
+        return;
+    }
+    if prefix.len() >= OPERA_HEADER_BYTES
+        && let Some(fact) = parse_opera_volume_header(&prefix[..OPERA_HEADER_BYTES])
+        && fact.header_is_valid()
+    {
+        println!("Boot signature: OperaFS (3DO)");
+        println!("Volume label: {}", fact.volume_label);
+        println!("Evidence: {:?}", observe_threedo_evidence(&fact));
+        return;
+    }
+    if prefix.len() >= PCFX_BOOT_SECTOR_BYTES {
+        let fact = parse_pcfx_boot_sector(&prefix[..PCFX_BOOT_SECTOR_BYTES]);
+        if fact.any_magic_present() {
+            println!("Boot signature: PC-FX boot sector");
+            println!("Evidence: {:?}", observe_pcfx_evidence(&fact));
+            return;
+        }
+    }
+    println!("Boot signature: N/A (no recognised boot structure at cooked sector 0)");
 }
 
 fn probe_threedo(bytes: &[u8]) -> ExitCode {
@@ -669,6 +893,62 @@ fn print_boot_evidence<M: LogicalMedia>(media: &M, observation: &DiscFilesystemO
         }
         if boot_file == "N/A" && !fact.boot_filename.is_empty() {
             boot_file = format!("{} (declared in IP.BIN)", fact.boot_filename);
+        }
+    }
+
+    // Saturn/Sega CD/3DO/PC-FX all place their own boot signature at
+    // logical offset 0, the same convention IP.BIN above already reads -
+    // checked only if Dreamcast's own IP.BIN check above did not already
+    // claim `boot_signature`, matching this function's existing "one
+    // backend populates its own fields" discipline. This is what lets a
+    // Saturn/3DO disc surface its real boot evidence even when its
+    // filesystem also happens to be plain ISO9660 (as most Saturn/3DO
+    // discs' data area is) and so was already routed through the generic
+    // ISO9660 path above rather than a dedicated raw-signature probe.
+    if boot_signature == "N/A" {
+        let mut prefix = vec![
+            0u8;
+            SATURN_SYSTEM_ID_BYTES
+                .max(OPERA_HEADER_BYTES)
+                .max(PCFX_BOOT_SECTOR_BYTES)
+                .min(media.len() as usize)
+        ];
+        if media.read_at(0, &mut prefix).is_ok() {
+            if prefix.len() >= SATURN_SYSTEM_ID_BYTES
+                && let Some(fact) = parse_saturn_system_id(&prefix[..SATURN_SYSTEM_ID_BYTES])
+                && fact.hardware_id_recognized
+            {
+                boot_signature = fact.hardware_id.clone();
+                if serial_candidate == "N/A" && !fact.product_number.is_empty() {
+                    serial_candidate = fact.product_number.clone();
+                }
+                if !fact.version.is_empty() {
+                    version = fact.version.clone();
+                }
+                if !fact.area_symbols.is_empty() {
+                    region = fact.area_symbols.clone();
+                }
+                if boot_file == "N/A" && !fact.game_title.is_empty() {
+                    boot_file = format!("{} (declared in Saturn System ID)", fact.game_title);
+                }
+            } else if looks_like_sega_cd_boot_sector(&prefix) {
+                boot_signature = "SEGADISCSYSTEM".to_string();
+            } else if prefix.len() >= OPERA_HEADER_BYTES
+                && let Some(fact) = parse_opera_volume_header(&prefix[..OPERA_HEADER_BYTES])
+                && fact.header_is_valid()
+            {
+                boot_signature = "OperaFS".to_string();
+                if boot_file == "N/A" && !fact.volume_label.is_empty() {
+                    boot_file = format!("{} (declared in Opera volume header)", fact.volume_label);
+                }
+            } else if prefix.len() >= PCFX_BOOT_SECTOR_BYTES {
+                let fact = parse_pcfx_boot_sector(&prefix[..PCFX_BOOT_SECTOR_BYTES]);
+                if fact.primary_magic_present {
+                    boot_signature = "PC-FX:Hu_CD-ROM".to_string();
+                } else if fact.secondary_magic_present {
+                    boot_signature = "PPPPHHHHOOOOTTTTOOOO____CCCCDDDD".to_string();
+                }
+            }
         }
     }
 

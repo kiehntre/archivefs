@@ -135,6 +135,18 @@ pub mod iso9660;
 /// CD/GD-ROM data track to [`iso9660`].
 pub mod chd_logical_media;
 
+/// Shared, pure, read-only raw CD/CD-XA sector layout (sync pattern, mode
+/// byte, Mode 1 / Mode 2 Form 1 user-data extraction) used by both
+/// [`chd_logical_media`] and [`raw_cd_logical_media`].
+pub mod raw_cd_sector;
+
+/// A [`logical_media::LogicalMedia`] adapter over a plain, file-backed
+/// raw-sector optical image (`.bin`-style: a bare stream of 2352-byte CD
+/// sectors) - cooks physical raw sectors down to the conventional
+/// 2048-byte logical view [`iso9660`] and the various boot-header observers
+/// expect, without a second ISO9660/CHD implementation.
+pub mod raw_cd_logical_media;
+
 /// Optional specialist optical-disc backend (Dreamcast GD-ROM high-density
 /// data, and other complex optical layouts [`chd_logical_media`]
 /// deliberately does not handle), behind the `chd-optical-specialist`
@@ -166,6 +178,11 @@ pub mod ps2_boot_evidence;
 /// Pure, read-only PSP boot/layout evidence (`PSP_GAME/` + `PARAM.SFO`).
 pub mod psp_boot_evidence;
 
+/// Pure, read-only PSP/PS3/Vita `EBOOT.PBP` container header evidence:
+/// bounded fixed-header parsing, offset-table validation, and reuse of
+/// [`param_sfo`] for the embedded `PARAM.SFO` section.
+pub mod psp_pbp_evidence;
+
 /// Pure, read-only PS3 boot/layout evidence (`PS3_GAME/` + `PARAM.SFO` +
 /// SELF magic).
 pub mod ps3_boot_evidence;
@@ -192,6 +209,12 @@ pub mod xbox_boot_evidence;
 
 /// Pure, read-only Xbox 360 boot evidence (XDVDFS + XEX2).
 pub mod xbox360_boot_evidence;
+
+/// Pure, read-only Xbox 360 STFS digital-package metadata evidence (Xbox
+/// Live Arcade, DLC, saves, and other package content) - bounded, magic +
+/// fixed-header only, verified against a real specimen. See the module
+/// documentation for the Xbox digital collision policy.
+pub mod xbox360_stfs_evidence;
 
 /// Pure, read-only GameCube/Wii disc-structure evidence, backed by the
 /// `nod` crate rather than a hand-written optical filesystem stack.

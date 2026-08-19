@@ -69,72 +69,18 @@ use chd::header::Header;
 use crate::chd_identity::{ChdMetadataOutcome, observe_chd_identity, select_candidate_data_track};
 use crate::dat::archive::chd::ChdHeaderError;
 use crate::logical_media::{LogicalMedia, LogicalMediaError};
-
-/// The size of one raw CD sector, verified against MAME's
-/// `cdrom.h` (`MAX_SECTOR_DATA = 2352`).
-pub const RAW_SECTOR_BYTES: usize = 2352;
-
-/// The size of the logical block this adapter exposes to a filesystem
-/// reader - the conventional ISO9660/CD-ROM user-data block size.
-pub const LOGICAL_BLOCK_BYTES: usize = 2048;
-
-/// `MODE1` user-data offset within a raw sector: sync(12) + header(4).
-/// Verified against `simias/cdimage`'s `sector.rs` (an independently
-/// authored, working CD sector reader) and cross-checked against ECMA-130's
-/// documented Mode 1 field sizes (12+4+2048+4+8+172+104 = 2352).
-pub const MODE1_USER_DATA_OFFSET: usize = 16;
-
-/// `MODE2 Form 1` user-data offset within a raw sector: sync(12) +
-/// header(4) + subheader(8). Verified against the same source as
-/// [`MODE1_USER_DATA_OFFSET`] (`self.data[24..2072]` for Form 1).
-pub const MODE2_FORM1_USER_DATA_OFFSET: usize = 24;
-
-/// The byte offset, within a raw sector, of the XA subheader's `submode`
-/// byte (first of its two duplicated copies). Verified against the same
-/// source.
-pub const MODE2_SUBMODE_OFFSET: usize = 18;
-
-/// The bit of the XA submode byte that is set for a Form 2 sector and
-/// clear for a Form 1 sector. Verified against the same source
-/// (`self.data[18] & (1 << 5) != 0` => Form 2).
-pub const MODE2_SUBMODE_FORM2_BIT: u8 = 1 << 5;
-
-/// Which recorded CD/GD-ROM track type this module knows how to extract
-/// filesystem-relevant user data from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TrackKind {
-    Mode1Raw,
-    Mode2Raw,
-}
-
-/// Extracts the 2048-byte logical block from one raw `sector` (must be
-/// exactly [`RAW_SECTOR_BYTES`] long), according to `kind`.
-///
-/// For `Mode2Raw`, a Form 2 sector (submode bit `0x20` set) is refused
-/// rather than misread - Form 2's own user-data field is 2324 bytes, not
-/// 2048, and treating it as a plain 2048-byte block would silently corrupt
-/// every byte read from that sector onward. See the module documentation.
-fn extract_user_data(sector: &[u8], kind: TrackKind) -> Result<&[u8], String> {
-    debug_assert_eq!(sector.len(), RAW_SECTOR_BYTES);
-    match kind {
-        TrackKind::Mode1Raw => {
-            Ok(&sector[MODE1_USER_DATA_OFFSET..MODE1_USER_DATA_OFFSET + LOGICAL_BLOCK_BYTES])
-        }
-        TrackKind::Mode2Raw => {
-            let submode = sector[MODE2_SUBMODE_OFFSET];
-            if submode & MODE2_SUBMODE_FORM2_BIT != 0 {
-                Err(
-                    "encountered a CD-XA Mode 2 Form 2 sector; only Form 1 sectors are \
-                     supported for filesystem reads"
-                        .to_string(),
-                )
-            } else {
-                Ok(&sector[MODE2_FORM1_USER_DATA_OFFSET
-                    ..MODE2_FORM1_USER_DATA_OFFSET + LOGICAL_BLOCK_BYTES])
-            }
-        }
-    }
-}
+// Sector layout (sync pattern, mode byte, Mode 1 / Mode 2 Form 1 user-data
+// extraction) is verified once, in `crate::raw_cd_sector`, and shared with
+// `crate::raw_cd_logical_media` - see that module's documentation for why
+// this crate keeps a single copy rather than re-deriving the offsets here.
+// `TrackKind` is this module's existing local name for the shared
+// `RawCdSectorMode` type; kept as an alias so the rest of this file's
+// `TrackKind::Mode1Raw`/`TrackKind::Mode2Raw` matches are unchanged.
+pub use crate::raw_cd_sector::{
+    LOGICAL_BLOCK_BYTES, MODE1_USER_DATA_OFFSET, MODE2_FORM1_USER_DATA_OFFSET,
+    MODE2_SUBMODE_FORM2_BIT, MODE2_SUBMODE_OFFSET, RAW_SECTOR_BYTES,
+};
+use crate::raw_cd_sector::{RawCdSectorMode as TrackKind, extract_user_data};
 
 /// Why [`open_chd_track_logical_media`] could not produce a
 /// [`ChdTrackLogicalMedia`].
