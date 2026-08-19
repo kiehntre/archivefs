@@ -111,6 +111,10 @@ pub mod n64_byte_order;
 /// copier/container headers (iNES, FDS, Lynx, Atari 7800, SNES copier).
 pub mod header_normalization;
 
+/// Pure, read-only Super Magic Drive (SMD) de-interleave normalization for
+/// Sega Mega Drive / Genesis ROM images.
+pub mod smd_normalization;
+
 pub mod repair;
 
 pub mod safe_read;
