@@ -115,6 +115,11 @@ pub mod header_normalization;
 /// Sega Mega Drive / Genesis ROM images.
 pub mod smd_normalization;
 
+/// Pure, read-only CHD identity observation - separates a CHD's physical
+/// file identity from the raw/combined logical identity its own v5 header
+/// already records. Reuses [`dat::archive::chd`] rather than duplicating it.
+pub mod chd_identity;
+
 pub mod repair;
 
 pub mod safe_read;

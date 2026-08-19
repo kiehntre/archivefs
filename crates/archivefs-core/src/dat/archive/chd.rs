@@ -24,7 +24,12 @@ pub const CHD_V5_HEADER_BYTES: usize = 124;
 /// Maximum hunk size defined by the CHD v5 format.
 pub const CHD_V5_MAX_HUNK_BYTES: u32 = 512 * 1024;
 
-const CHD_MAGIC: &[u8; 8] = b"MComprHD";
+/// The fixed 8-byte CHD magic every supported version begins with. Visible
+/// within the crate so a caller that only wants a cheap "does this look like
+/// a CHD at all" pre-check (before deciding whether to attempt the full,
+/// stricter [`read_chd_v5_header`] parse) never has to duplicate the
+/// literal - see [`crate::chd_identity`].
+pub(crate) const CHD_MAGIC: &[u8; 8] = b"MComprHD";
 const FIXED_PREFIX_BYTES: usize = 16;
 
 /// Identity and geometry fields exposed directly by a validated CHD v5
