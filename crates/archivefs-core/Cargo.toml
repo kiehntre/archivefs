@@ -99,6 +99,16 @@ chd = "0.3.4"
 opticaldiscs = { version = "0.15", default-features = false, features = [
     "chd",
 ], optional = true }
+# GameCube/Wii disc structure (game ID, disc header, partition table, FST,
+# apploader, main.dol) - pure Rust, no native/C dependency with default
+# features disabled. Reused rather than hand-writing a GC/Wii optical
+# filesystem stack from scratch; only structural/header facts are read,
+# never Wii partition decryption (no keys are available to this crate).
+nod = { version = "1.4.4", default-features = false }
+# Original Xbox/Xbox 360 XDVDFS filesystem - pure Rust with only `read`+`std`
+# enabled (no `write`/`ciso`/`wax`/crypto features). Reused rather than
+# hand-writing an XDVDFS filesystem stack from scratch.
+xdvdfs = { version = "0.8.3", default-features = false, features = ["read", "std"] }
 
 [features]
 chd-optical-specialist = ["dep:opticaldiscs"]

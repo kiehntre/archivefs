@@ -151,6 +151,47 @@ pub mod playstation_boot_evidence;
 /// [`content_evidence`] facts, never a platform.
 pub mod dreamcast_boot_evidence;
 
+/// Shared, pure, read-only executable/container header observers: ELF,
+/// PS3 SELF, Xbox XBE, Xbox 360 XEX2.
+pub mod executable_signatures;
+
+/// Shared, pure, read-only PARAM.SFO parser used by
+/// [`psp_boot_evidence`]/[`ps3_boot_evidence`].
+pub mod param_sfo;
+
+/// Pure, read-only PlayStation 2 boot evidence (`SYSTEM.CNF` `BOOT2=` +
+/// ELF magic) - reuses [`playstation_boot_evidence`]/[`executable_signatures`].
+pub mod ps2_boot_evidence;
+
+/// Pure, read-only PSP boot/layout evidence (`PSP_GAME/` + `PARAM.SFO`).
+pub mod psp_boot_evidence;
+
+/// Pure, read-only PS3 boot/layout evidence (`PS3_GAME/` + `PARAM.SFO` +
+/// SELF magic).
+pub mod ps3_boot_evidence;
+
+/// Pure, read-only Sega Saturn boot-header ("System ID") evidence,
+/// verified against Sega's own official SDK specification.
+pub mod saturn_boot_evidence;
+
+/// Pure, read-only Sega CD/Mega-CD boot-signature evidence
+/// (`SEGADISCSYSTEM` only - see the module documentation for scope limits).
+pub mod segacd_boot_evidence;
+
+/// Shared XDVDFS volume-descriptor magic check, used by
+/// [`xbox_boot_evidence`]/[`xbox360_boot_evidence`].
+pub mod xdvdfs_signature;
+
+/// Pure, read-only original Xbox boot evidence (XDVDFS + XBE).
+pub mod xbox_boot_evidence;
+
+/// Pure, read-only Xbox 360 boot evidence (XDVDFS + XEX2).
+pub mod xbox360_boot_evidence;
+
+/// Pure, read-only GameCube/Wii disc-structure evidence, backed by the
+/// `nod` crate rather than a hand-written optical filesystem stack.
+pub mod gamecube_wii_boot_evidence;
+
 pub mod repair;
 
 pub mod safe_read;

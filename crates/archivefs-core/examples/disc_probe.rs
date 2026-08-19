@@ -53,16 +53,28 @@ use archivefs_core::chd_logical_media::{ChdLogicalMediaError, open_chd_track_log
 use archivefs_core::chd_optical_specialist::open_chd_optical_specialist;
 use archivefs_core::dat::archive::hash::hash_member_stream;
 use archivefs_core::dreamcast_boot_evidence::{IP_BIN_META_BYTES, parse_ip_bin_meta};
+use archivefs_core::executable_signatures::{looks_like_elf, looks_like_xbe, looks_like_xex};
 use archivefs_core::game_identity::MAX_SYSTEM_CNF_BYTES;
+use archivefs_core::gamecube_wii_boot_evidence::{observe_gc_wii_disc, observe_gc_wii_evidence};
 use archivefs_core::identity_source::hashing::FileFingerprint;
 use archivefs_core::iso9660::{
     DiscFilesystemObservation, INTERESTING_ROOT_PATHS, find_path, looks_like_iso9660,
     observe_iso9660,
 };
 use archivefs_core::logical_media::{LogicalMedia, SliceMedia};
+use archivefs_core::param_sfo::parse_param_sfo;
 use archivefs_core::playstation_boot_evidence::{
     PSX_EXECUTABLE_HEADER_BYTES, looks_like_psx_exe, parse_system_cnf_boot,
 };
+use archivefs_core::ps3_boot_evidence::PS3_LAYOUT_PATHS;
+use archivefs_core::psp_boot_evidence::PSP_LAYOUT_PATHS;
+use archivefs_core::saturn_boot_evidence::{
+    SATURN_SYSTEM_ID_BYTES, observe_saturn_evidence, parse_saturn_system_id,
+};
+use archivefs_core::segacd_boot_evidence::{
+    looks_like_sega_cd_boot_sector, observe_segacd_evidence,
+};
+use archivefs_core::xdvdfs_signature::{XDVDFS_VOLUME_DESCRIPTOR_OFFSET, looks_like_xdvdfs};
 
 fn main() -> ExitCode {
     let args: Vec<_> = env::args_os().skip(1).collect();
@@ -118,8 +130,102 @@ fn main() -> ExitCode {
     if looks_like_iso9660(&SliceMedia(&bytes)) {
         return probe_iso9660(&bytes);
     }
+    // nod supports several GameCube/Wii container formats (plain ISO/GCM,
+    // WIA/RVZ, WBFS, CISO, NFS, GCZ) with their own distinct on-disk magic
+    // bytes - rather than duplicating nod's own format-sniffing here, just
+    // try it and let a non-GC/Wii file fail closed on its own.
+    if let Ok(observation) = observe_gc_wii_disc(&path) {
+        return print_gc_wii_probe(observation);
+    }
+    if bytes.len() as u64 >= XDVDFS_VOLUME_DESCRIPTOR_OFFSET + 32 {
+        let sector = &bytes[XDVDFS_VOLUME_DESCRIPTOR_OFFSET as usize..];
+        if looks_like_xdvdfs(sector) {
+            return probe_xdvdfs(&bytes);
+        }
+    }
+    if bytes.len() >= SATURN_SYSTEM_ID_BYTES
+        && parse_saturn_system_id(&bytes[..SATURN_SYSTEM_ID_BYTES])
+            .is_some_and(|f| f.hardware_id_recognized)
+    {
+        return probe_saturn(&bytes);
+    }
+    if looks_like_sega_cd_boot_sector(&bytes) {
+        return probe_segacd(&bytes);
+    }
 
-    println!("Container: Unknown (neither CHD magic nor ISO9660 CD001 recognised)");
+    println!("Container: Unknown (no recognised container/disc signature)");
+    ExitCode::SUCCESS
+}
+
+fn print_gc_wii_probe(
+    observation: archivefs_core::gamecube_wii_boot_evidence::GcWiiDiscObservation,
+) -> ExitCode {
+    println!("Container: GameCube/Wii disc image");
+    println!(
+        "Media: {}",
+        if observation.is_wii {
+            "Wii optical disc"
+        } else {
+            "GameCube optical disc"
+        }
+    );
+    println!("Filesystem: nod-managed GameCube/Wii disc structure");
+    println!("Product code: {}", observation.game_id);
+    println!(
+        "Version: disc {} version {}",
+        observation.disc_num, observation.disc_version
+    );
+    println!("Game title: {}", observation.game_title);
+    println!("Partitions: {}", observation.partitions.len());
+    for partition in &observation.partitions {
+        println!("  [{}] {}", partition.index, partition.kind);
+    }
+    match &observation.data_partition_meta {
+        Some(meta) => {
+            println!("main.dol present: {}", meta.main_dol_present);
+            println!(
+                "FST present: {} (root entries: {:?})",
+                meta.fst_present, meta.fst_root_entry_count
+            );
+            println!("Apploader date: {:?}", meta.apploader_date);
+        }
+        None => println!("Data partition metadata: unavailable"),
+    }
+    println!("Evidence: {:?}", observe_gc_wii_evidence(&observation));
+    ExitCode::SUCCESS
+}
+
+fn probe_xdvdfs(bytes: &[u8]) -> ExitCode {
+    println!("Container: XDVDFS volume (Xbox/Xbox 360 family)");
+    println!(
+        "Filesystem: XDVDFS (magic verified, deep traversal not yet integrated - see xdvdfs_signature module docs)"
+    );
+
+    let default_xbe_header = looks_like_xbe(bytes);
+    let default_xex_header = looks_like_xex(bytes);
+    println!(
+        "Executable format: XBE={default_xbe_header} XEX2={default_xex_header} (checked at file start only; real discs carry these inside the filesystem, not at offset 0 - this is a conservative whole-buffer check)"
+    );
+    ExitCode::SUCCESS
+}
+
+fn probe_saturn(bytes: &[u8]) -> ExitCode {
+    println!("Container: Sega Saturn boot header");
+    if let Some(fact) = parse_saturn_system_id(&bytes[..SATURN_SYSTEM_ID_BYTES]) {
+        println!("Boot signature: {}", fact.hardware_id);
+        println!("Product code: {}", fact.product_number);
+        println!("Version: {}", fact.version);
+        println!("Region: {}", fact.area_symbols);
+        println!("Game title: {}", fact.game_title);
+        println!("Evidence: {:?}", observe_saturn_evidence(&fact));
+    }
+    ExitCode::SUCCESS
+}
+
+fn probe_segacd(bytes: &[u8]) -> ExitCode {
+    println!("Container: Sega CD / Mega-CD boot sector");
+    println!("Boot signature: SEGADISCSYSTEM");
+    println!("Evidence: {:?}", observe_segacd_evidence(bytes));
     ExitCode::SUCCESS
 }
 
@@ -344,6 +450,8 @@ fn print_boot_evidence<M: LogicalMedia>(media: &M, observation: &DiscFilesystemO
                     executable_magic = if media.read_at(exec_offset, &mut header).is_ok() {
                         if looks_like_psx_exe(&header) {
                             "PS-X EXE"
+                        } else if looks_like_elf(&header) {
+                            "ELF"
                         } else {
                             "NO"
                         }
@@ -379,6 +487,34 @@ fn print_boot_evidence<M: LogicalMedia>(media: &M, observation: &DiscFilesystemO
         }
     }
 
+    // PSP_GAME / PS3_GAME layout + PARAM.SFO (independent of the SYSTEM.CNF
+    // check above - a disc uses at most one of these conventions, but this
+    // probe checks each honestly rather than assuming).
+    let mut sony_layout_paths = Vec::new();
+    for path in PSP_LAYOUT_PATHS.iter().chain(PS3_LAYOUT_PATHS.iter()) {
+        let exists = matches!(find_path(media, observation, path), Ok(Some(_)));
+        sony_layout_paths.push((*path, exists));
+    }
+    for sfo_path in ["PSP_GAME/PARAM.SFO", "PS3_GAME/PARAM.SFO"] {
+        if let Ok(Some(entry)) = find_path(media, observation, sfo_path)
+            && !entry.is_directory
+        {
+            let offset = entry.extent_lba as u64 * observation.logical_block_size as u64;
+            let mut buf = vec![0u8; entry.size as usize];
+            if media.read_at(offset, &mut buf).is_ok()
+                && let Some(sfo) = parse_param_sfo(&buf)
+            {
+                let id = sfo.get_text("DISC_ID").or_else(|| sfo.get_text("TITLE_ID"));
+                if let Some(id) = id
+                    && serial_candidate == "N/A"
+                {
+                    serial_candidate = id.to_string();
+                }
+                println!("PARAM.SFO ({sfo_path}): {} entries", sfo.entries.len());
+            }
+        }
+    }
+
     println!("Boot file: {boot_file}");
     println!("Boot target: {boot_target}");
     println!("Serial/product candidate: {serial_candidate}");
@@ -386,6 +522,11 @@ fn print_boot_evidence<M: LogicalMedia>(media: &M, observation: &DiscFilesystemO
     println!("Boot signature: {boot_signature}");
     println!("Version: {version}");
     println!("Region: {region}");
+    for (path, exists) in &sony_layout_paths {
+        if *exists {
+            println!("  {path}: YES");
+        }
+    }
 }
 
 fn probe_iso9660(bytes: &[u8]) -> ExitCode {
