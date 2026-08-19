@@ -33,8 +33,9 @@
 //! only - real, additional, non-Mega-Drive-generic evidence, but explicitly
 //! never strong enough to be mistaken for proof.
 
+use crate::content_detector::{ContentDetectionOutcome, ContentDetector};
 use crate::content_evidence::{ContentEvidence, ContentEvidenceConfidence, ContentEvidenceKind};
-use crate::megadrive_header_evidence::MegaDriveHeaderFact;
+use crate::megadrive_header_evidence::{MegaDriveHeaderFact, parse_megadrive_header};
 
 /// The substring this module looks for in the reused
 /// [`MegaDriveHeaderFact::console_name`] field - observed convention, not a
@@ -90,10 +91,38 @@ pub fn observe_sega32x_evidence(fact: &Sega32xCandidateFact) -> Vec<ContentEvide
     )]
 }
 
+/// A [`ContentDetector`] wrapping the base Mega Drive header parse plus this
+/// module's own `"32X"` console-name leg - lets a multi-detector caller
+/// (such as [`crate::archive_member_content_evidence`]) see the 32X-specific
+/// fact without hand-composing [`parse_megadrive_header`] and
+/// [`observe_sega32x_candidate`] itself. Recognises only when the 32X leg
+/// actually fires (see [`observe_sega32x_evidence`]) - a plain Mega Drive
+/// header with no `"32X"` hint is
+/// [`crate::megadrive_header_evidence::MegaDriveHeaderDetector`]'s territory,
+/// not this one's.
+pub struct Sega32xDetector;
+
+impl ContentDetector for Sega32xDetector {
+    fn id(&self) -> &'static str {
+        "sega32x_console_name_leg"
+    }
+
+    fn detect(&self, data: &[u8]) -> ContentDetectionOutcome {
+        let Some(megadrive_fact) = parse_megadrive_header(data) else {
+            return ContentDetectionOutcome::NotRecognized;
+        };
+        let candidate = observe_sega32x_candidate(&megadrive_fact);
+        let evidence = observe_sega32x_evidence(&candidate);
+        if evidence.is_empty() {
+            return ContentDetectionOutcome::NotRecognized;
+        }
+        ContentDetectionOutcome::Recognized { evidence }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::megadrive_header_evidence::parse_megadrive_header;
     use crate::megadrive_header_evidence::tests_support::synthetic_header_for_tests;
 
     #[test]
@@ -164,5 +193,37 @@ mod tests {
         let megadrive_fact = parse_megadrive_header(&header).unwrap();
         let fact = observe_sega32x_candidate(&megadrive_fact);
         assert!(fact.console_name_mentions_32x);
+    }
+
+    // ------------------------------------------------------------------
+    // Sega32xDetector
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn detector_recognizes_32x_console_name() {
+        let header = synthetic_header_for_tests(b"SEGA 32X", "MK-84509");
+        assert!(Sega32xDetector.detect(&header).is_recognized());
+    }
+
+    #[test]
+    fn detector_does_not_recognize_plain_mega_drive_header() {
+        let header = synthetic_header_for_tests(b"SEGA GENESIS", "GM 00000000");
+        assert_eq!(
+            Sega32xDetector.detect(&header),
+            ContentDetectionOutcome::NotRecognized
+        );
+    }
+
+    #[test]
+    fn detector_does_not_recognize_unrelated_bytes() {
+        assert_eq!(
+            Sega32xDetector.detect(b"nothing here"),
+            ContentDetectionOutcome::NotRecognized
+        );
+    }
+
+    #[test]
+    fn detector_id_is_stable() {
+        assert_eq!(Sega32xDetector.id(), "sega32x_console_name_leg");
     }
 }

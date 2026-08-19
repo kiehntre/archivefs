@@ -291,11 +291,32 @@ pub mod ngp_header_evidence;
 /// evidence, including an opt-in whole-ROM checksum verifier.
 pub mod ws_header_evidence;
 
+/// Evidence *scope*: whether an observed content fact could ever
+/// discriminate between platforms (Generic/Family/PlatformSpecific) -
+/// deliberately a separate axis from
+/// [`content_evidence::ContentEvidenceConfidence`] (how reliably the fact
+/// was observed). Consumed only by [`platform_evidence_fusion`].
+pub mod content_evidence_scope;
+
+/// The first conservative, explainable content-evidence fusion layer:
+/// groups/weighs/compares [`content_evidence::ContentEvidence`] facts into
+/// a [`platform_evidence_fusion::FusionOutcome`]
+/// (Resolved/Ambiguous/Conflict/Unknown), never an action. See the module
+/// documentation for how this differs from
+/// [`platform::identity::resolve_platform_identity`].
+pub mod platform_evidence_fusion;
+
 /// Bounded, read-only ZIP archive-member content evidence: runs this
 /// crate's cartridge/console-signature detectors over a bounded prefix of
 /// each candidate member's decompressed bytes, with an explicit multi-
 /// member policy that never silently picks a "winning" member.
 pub mod archive_member_content_evidence;
+
+/// Machine-counted evidence coverage inventory: one small manifest linked
+/// to canonical platform ids from [`platform::PLATFORMS`], plus counting
+/// functions that compute every coverage number a report needs from real
+/// data - never a hand-typed total.
+pub mod coverage_inventory;
 
 pub mod repair;
 

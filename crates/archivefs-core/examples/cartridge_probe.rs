@@ -44,6 +44,9 @@ fn main() -> ExitCode {
     if path.extension().and_then(|e| e.to_str()) == Some("zip") {
         return probe_zip(&path);
     }
+    if path.extension().and_then(|e| e.to_str()) == Some("7z") {
+        return probe_sevenz(&path);
+    }
 
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
@@ -77,42 +80,124 @@ fn probe_zip(path: &std::path::Path) -> ExitCode {
                 "Classification: {:?}",
                 classify_archive_content(&observation)
             );
+            let combined: Vec<_> = observation
+                .members
+                .iter()
+                .flat_map(|m| m.evidence.iter().cloned())
+                .collect();
+            let explanation =
+                archivefs_core::platform_evidence_fusion::fuse_platform_evidence(combined);
+            println!(
+                "Fusion outcome (all members combined): {:?}",
+                explanation.outcome
+            );
+            println!(
+                "Fusion resolved platform: {:?}",
+                explanation.resolved_platform
+            );
         }
         Err(error) => println!("ZIP content observation failed: {error:?}"),
     }
     ExitCode::SUCCESS
 }
 
+fn probe_sevenz(path: &std::path::Path) -> ExitCode {
+    use archivefs_core::archive_member_content_evidence::observe_sevenz_member_content;
+    use archivefs_core::dat::archive::limits::ArchiveLimits;
+    use archivefs_core::safe_read::TrustedRoots;
+    use std::sync::atomic::AtomicBool;
+
+    let trusted = TrustedRoots::from_paths(path.parent());
+    let cancel = AtomicBool::new(false);
+    match observe_sevenz_member_content(path, &trusted, ArchiveLimits::default(), &cancel) {
+        Ok(observation) => {
+            println!("7z members: {}", observation.members.len());
+            for member in &observation.members {
+                println!(
+                    "  [{}] {} ({} bytes declared): {:?}",
+                    member.member_index, member.member_name, member.declared_size, member.outcome
+                );
+                for fact in &member.evidence {
+                    println!(
+                        "      {:?} = {} ({:?}) - {}",
+                        fact.kind, fact.value, fact.confidence, fact.detail
+                    );
+                }
+            }
+            println!(
+                "Classification: {:?}",
+                classify_archive_content(&observation)
+            );
+            let combined: Vec<_> = observation
+                .members
+                .iter()
+                .flat_map(|m| m.evidence.iter().cloned())
+                .collect();
+            let explanation =
+                archivefs_core::platform_evidence_fusion::fuse_platform_evidence(combined);
+            println!(
+                "Fusion outcome (all members combined): {:?}",
+                explanation.outcome
+            );
+            println!(
+                "Fusion resolved platform: {:?}",
+                explanation.resolved_platform
+            );
+        }
+        Err(error) => println!("7z content observation failed: {error:?}"),
+    }
+    ExitCode::SUCCESS
+}
+
 fn probe_bytes(bytes: &[u8]) {
+    let mut evidence: Vec<archivefs_core::content_evidence::ContentEvidence> = Vec::new();
+
     if let Some(fact) = parse_ines_header(bytes) {
         println!("iNES/NES2.0: {:?}", fact);
-        println!("Evidence: {:?}", observe_ines_evidence(&fact));
+        let facts = observe_ines_evidence(&fact);
+        println!("Evidence: {facts:?}");
+        evidence.extend(facts);
     }
     if let Some(fact) = best_snes_header_candidate(bytes) {
         println!("SNES: {:?}", fact);
-        println!("Evidence: {:?}", observe_snes_evidence(&fact));
+        let facts = observe_snes_evidence(&fact);
+        println!("Evidence: {facts:?}");
+        evidence.extend(facts);
     }
     if let Some(fact) = parse_gb_header(bytes) {
         println!(
             "GB/GBC: logo_valid={} checksum_valid={} title={:?} color={:?}",
             fact.logo_valid, fact.header_checksum_valid, fact.title, fact.color_support
         );
-        println!("Evidence: {:?}", observe_gb_evidence(&fact));
+        let facts = observe_gb_evidence(&fact);
+        println!("Evidence: {facts:?}");
+        evidence.extend(facts);
     }
     if let Some(fact) = parse_gba_header(bytes) {
         println!(
             "GBA: fixed_value_valid={} checksum_valid={} title={:?} code={:?}",
             fact.fixed_value_valid, fact.complement_check_valid, fact.game_title, fact.game_code
         );
-        println!("Evidence: {:?}", observe_gba_evidence(&fact));
+        let facts = observe_gba_evidence(&fact);
+        println!("Evidence: {facts:?}");
+        evidence.extend(facts);
     }
     if let Some(order) = detect_n64_byte_order(bytes) {
         println!("N64 byte order: {}", order.label());
+        use archivefs_core::content_detector::ContentDetector as _;
+        evidence.extend(
+            archivefs_core::n64_byte_order::N64ByteOrderDetector
+                .detect(bytes)
+                .evidence()
+                .to_vec(),
+        );
         if order == archivefs_core::n64_byte_order::N64ByteOrder::Z64
             && let Some(fact) = parse_n64_header(bytes)
         {
             println!("N64 header: {:?}", fact);
-            println!("Evidence: {:?}", observe_n64_evidence(&fact));
+            let facts = observe_n64_evidence(&fact);
+            println!("Evidence: {facts:?}");
+            evidence.extend(facts);
         } else {
             println!("(N64 header fields skipped - not canonical Z64 order in this probe)");
         }
@@ -129,29 +214,58 @@ fn probe_bytes(bytes: &[u8]) {
                 computed == fact.checksum
             );
         }
-        println!("Evidence: {:?}", observe_megadrive_evidence(&fact));
+        let facts = observe_megadrive_evidence(&fact);
+        println!("Evidence: {facts:?}");
+        evidence.extend(facts);
         let sega32x_fact = observe_sega32x_candidate(&fact);
         let sega32x_evidence = observe_sega32x_evidence(&sega32x_fact);
         if !sega32x_evidence.is_empty() {
             println!("32X evidence: {sega32x_evidence:?}");
+            evidence.extend(sega32x_evidence);
         }
     }
     if let Some(offset) = find_tmr_sega_header(bytes)
         && let Some(fact) = parse_tmr_sega_header(bytes, offset)
     {
         println!("TMR SEGA: {:?}", fact);
-        println!("Evidence: {:?}", observe_tmr_sega_evidence(&fact));
+        let facts = observe_tmr_sega_evidence(&fact);
+        println!("Evidence: {facts:?}");
+        evidence.extend(facts);
     }
     if let Some(fact) = parse_a78_header(bytes) {
         println!("Atari 7800: {:?}", fact);
-        println!("Evidence: {:?}", observe_a78_evidence(&fact));
+        let facts = observe_a78_evidence(&fact);
+        println!("Evidence: {facts:?}");
+        evidence.extend(facts);
     }
     if let Some(fact) = parse_lynx_header(bytes) {
         println!("Lynx: {:?}", fact);
-        println!("Evidence: {:?}", observe_lynx_evidence(&fact));
+        let facts = observe_lynx_evidence(&fact);
+        println!("Evidence: {facts:?}");
+        evidence.extend(facts);
     }
     let ws_evidence = observe_ws_evidence(bytes);
     if !ws_evidence.is_empty() {
         println!("WonderSwan evidence: {ws_evidence:?}");
+        evidence.extend(ws_evidence);
+    }
+
+    let explanation = archivefs_core::platform_evidence_fusion::fuse_platform_evidence(evidence);
+    println!("Fusion outcome: {:?}", explanation.outcome);
+    match explanation.resolved_platform {
+        Some(platform) => println!("Fusion resolved platform: {platform}"),
+        None => println!("Fusion resolved platform: N/A"),
+    }
+    if !explanation.conflicting_platforms.is_empty() {
+        println!(
+            "Fusion conflicting platforms: {:?}",
+            explanation.conflicting_platforms
+        );
+    }
+    for candidate in &explanation.fired_candidates {
+        println!(
+            "  candidate: {} -> {} (strong leg: {})",
+            candidate.rule_id, candidate.platform, candidate.has_strong_leg
+        );
     }
 }

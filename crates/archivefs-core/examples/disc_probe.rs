@@ -51,6 +51,8 @@ use archivefs_core::chd_identity::{
 use archivefs_core::chd_logical_media::{ChdLogicalMediaError, open_chd_track_logical_media};
 #[cfg(feature = "chd-optical-specialist")]
 use archivefs_core::chd_optical_specialist::open_chd_optical_specialist;
+use archivefs_core::content_detector::ContentDetector;
+use archivefs_core::content_evidence::ContentEvidence;
 use archivefs_core::dat::archive::hash::hash_member_stream;
 use archivefs_core::dreamcast_boot_evidence::{IP_BIN_META_BYTES, parse_ip_bin_meta};
 use archivefs_core::executable_signatures::looks_like_elf;
@@ -70,15 +72,20 @@ use archivefs_core::param_sfo::parse_param_sfo;
 use archivefs_core::pcfx_boot_evidence::{
     PCFX_BOOT_SECTOR_BYTES, observe_pcfx_evidence, parse_pcfx_boot_sector,
 };
+use archivefs_core::platform_evidence_fusion::fuse_platform_evidence;
 use archivefs_core::playstation_boot_evidence::{
-    PSX_EXECUTABLE_HEADER_BYTES, looks_like_psx_exe, parse_system_cnf_boot,
+    PSX_EXECUTABLE_HEADER_BYTES, PsxExeDetector, looks_like_psx_exe, observe_system_cnf_evidence,
+    parse_system_cnf_boot,
 };
+use archivefs_core::ps2_boot_evidence::{observe_ps2_boot, observe_ps2_evidence};
 use archivefs_core::ps3_boot_evidence::PS3_LAYOUT_PATHS;
 use archivefs_core::ps3_disc_evidence::{
     PKG_HEADER_BYTES, locate_ps3_game_dir, looks_like_pkg, observe_ps3_directory,
     observe_ps3_directory_evidence, parse_pkg_header, pkg_header_evidence,
 };
-use archivefs_core::psp_boot_evidence::PSP_LAYOUT_PATHS;
+use archivefs_core::psp_boot_evidence::{
+    PSP_LAYOUT_PATHS, PspLayoutObservation, observe_psp_evidence,
+};
 use archivefs_core::psp_pbp_evidence::{
     PBP_HEADER_BYTES, PBP_SECTION_ICON0_PNG, PBP_SECTION_PARAM_SFO, looks_like_pbp,
     observe_pbp_evidence, parse_pbp_header, validate_pbp_offsets,
@@ -324,7 +331,9 @@ fn probe_pkg(header: &[u8]) -> ExitCode {
             println!("Data offset: {}", fact.data_offset);
             println!("Data size: {} bytes", fact.data_size);
             println!("Content ID: {}", fact.content_id);
-            println!("Evidence: {:?}", pkg_header_evidence(&fact));
+            let evidence = pkg_header_evidence(&fact);
+            println!("Evidence: {evidence:?}");
+            print_fusion(&evidence);
         }
         None => println!("PKG header did not parse (truncated?)"),
     }
@@ -406,7 +415,9 @@ fn probe_stfs(header: &[u8]) -> ExitCode {
                 fact.disc_number.max(1),
                 fact.disc_in_set.max(1)
             );
-            println!("Evidence: {:?}", observe_stfs_evidence(&fact));
+            let evidence = observe_stfs_evidence(&fact);
+            println!("Evidence: {evidence:?}");
+            print_fusion(&evidence);
         }
         None => println!("STFS header did not parse (truncated, or bad magic)"),
     }
@@ -565,7 +576,9 @@ fn print_gc_wii_probe(
         }
         None => println!("Data partition metadata: unavailable"),
     }
-    println!("Evidence: {:?}", observe_gc_wii_evidence(&observation));
+    let evidence = observe_gc_wii_evidence(&observation);
+    println!("Evidence: {evidence:?}");
+    print_fusion(&evidence);
     ExitCode::SUCCESS
 }
 
@@ -601,7 +614,8 @@ fn probe_xdvdfs(bytes: &[u8]) -> ExitCode {
         println!("  title_id: {:?}", header.title_id);
         println!("  title_name: {:?}", header.title_name);
     }
-    println!("Xbox evidence: {:?}", observe_xbox_evidence(&xbox));
+    let xbox_evidence = observe_xbox_evidence(&xbox);
+    println!("Xbox evidence: {xbox_evidence:?}");
 
     let xbox360 = observe_xbox360_disc(bytes);
     println!("default.xex present: {}", xbox360.default_xex_present);
@@ -610,10 +624,12 @@ fn probe_xdvdfs(bytes: &[u8]) -> ExitCode {
         println!("  media_id: {}", header.media_id);
         println!("  title_id: {}", header.title_id);
     }
-    println!(
-        "Xbox 360 evidence: {:?}",
-        observe_xbox360_evidence(&xbox360)
-    );
+    let xbox360_evidence = observe_xbox360_evidence(&xbox360);
+    println!("Xbox 360 evidence: {xbox360_evidence:?}");
+
+    let mut combined = xbox_evidence;
+    combined.extend(xbox360_evidence);
+    print_fusion(&combined);
 
     ExitCode::SUCCESS
 }
@@ -834,6 +850,12 @@ fn print_boot_evidence<M: LogicalMedia>(media: &M, observation: &DiscFilesystemO
     let mut boot_signature = "N/A".to_string();
     let mut version = "N/A".to_string();
     let mut region = "N/A".to_string();
+    // Every real ContentEvidence fact this function actually gathers -
+    // fed to platform_evidence_fusion at the end. Kept separate from the
+    // display-only strings above (which existed before fusion was wired
+    // in and stay for human-readable output); this is the real evidence
+    // bundle.
+    let mut evidence: Vec<ContentEvidence> = Vec::new();
 
     if let Ok(Some(entry)) = find_path(media, observation, "SYSTEM.CNF")
         && !entry.is_directory
@@ -848,6 +870,7 @@ fn print_boot_evidence<M: LogicalMedia>(media: &M, observation: &DiscFilesystemO
                 if let Some(serial) = &fact.serial_candidate {
                     serial_candidate = serial.clone();
                 }
+                let mut exec_header: Option<Vec<u8>> = None;
                 if let Some(exec_path) = &fact.executable_path
                     && let Ok(Some(exec_entry)) = find_path(media, observation, exec_path)
                     && !exec_entry.is_directory
@@ -857,19 +880,37 @@ fn print_boot_evidence<M: LogicalMedia>(media: &M, observation: &DiscFilesystemO
                         exec_entry.extent_lba as u64 * observation.logical_block_size as u64;
                     let mut header = vec![0u8; header_len];
                     executable_magic = if media.read_at(exec_offset, &mut header).is_ok() {
-                        if looks_like_psx_exe(&header) {
+                        let magic = if looks_like_psx_exe(&header) {
                             "PS-X EXE"
                         } else if looks_like_elf(&header) {
                             "ELF"
                         } else {
                             "NO"
-                        }
-                        .to_string()
+                        };
+                        exec_header = Some(header);
+                        magic.to_string()
                     } else {
                         "N/A (could not read executable header)".to_string()
                     };
                 } else {
                     executable_magic = "NO (executable not found)".to_string();
+                }
+
+                // Real ContentEvidence: BOOT (PS1) and BOOT2 (PS2) are
+                // deliberately different rules downstream - never
+                // conflated here either.
+                if fact.boot_key == "BOOT2" {
+                    if let Some(ps2_fact) =
+                        archivefs_core::ps2_boot_evidence::parse_ps2_system_cnf(&buf)
+                    {
+                        let ps2_observation = observe_ps2_boot(ps2_fact, exec_header.as_deref());
+                        evidence.extend(observe_ps2_evidence(&ps2_observation));
+                    }
+                } else {
+                    evidence.extend(observe_system_cnf_evidence(&fact));
+                    if let Some(header) = &exec_header {
+                        evidence.extend(PsxExeDetector.detect(header).evidence().to_vec());
+                    }
                 }
             }
         }
@@ -894,6 +935,7 @@ fn print_boot_evidence<M: LogicalMedia>(media: &M, observation: &DiscFilesystemO
         if boot_file == "N/A" && !fact.boot_filename.is_empty() {
             boot_file = format!("{} (declared in IP.BIN)", fact.boot_filename);
         }
+        evidence.extend(archivefs_core::dreamcast_boot_evidence::observe_ip_bin_evidence(&fact));
     }
 
     // Saturn/Sega CD/3DO/PC-FX all place their own boot signature at
@@ -931,8 +973,10 @@ fn print_boot_evidence<M: LogicalMedia>(media: &M, observation: &DiscFilesystemO
                 if boot_file == "N/A" && !fact.game_title.is_empty() {
                     boot_file = format!("{} (declared in Saturn System ID)", fact.game_title);
                 }
+                evidence.extend(observe_saturn_evidence(&fact));
             } else if looks_like_sega_cd_boot_sector(&prefix) {
                 boot_signature = "SEGADISCSYSTEM".to_string();
+                evidence.extend(observe_segacd_evidence(&prefix));
             } else if prefix.len() >= OPERA_HEADER_BYTES
                 && let Some(fact) = parse_opera_volume_header(&prefix[..OPERA_HEADER_BYTES])
                 && fact.header_is_valid()
@@ -941,6 +985,7 @@ fn print_boot_evidence<M: LogicalMedia>(media: &M, observation: &DiscFilesystemO
                 if boot_file == "N/A" && !fact.volume_label.is_empty() {
                     boot_file = format!("{} (declared in Opera volume header)", fact.volume_label);
                 }
+                evidence.extend(observe_threedo_evidence(&fact));
             } else if prefix.len() >= PCFX_BOOT_SECTOR_BYTES {
                 let fact = parse_pcfx_boot_sector(&prefix[..PCFX_BOOT_SECTOR_BYTES]);
                 if fact.primary_magic_present {
@@ -948,6 +993,7 @@ fn print_boot_evidence<M: LogicalMedia>(media: &M, observation: &DiscFilesystemO
                 } else if fact.secondary_magic_present {
                     boot_signature = "PPPPHHHHOOOOTTTTOOOO____CCCCDDDD".to_string();
                 }
+                evidence.extend(observe_pcfx_evidence(&fact));
             }
         }
     }
@@ -960,6 +1006,7 @@ fn print_boot_evidence<M: LogicalMedia>(media: &M, observation: &DiscFilesystemO
         let exists = matches!(find_path(media, observation, path), Ok(Some(_)));
         sony_layout_paths.push((*path, exists));
     }
+    let mut psp_layout = PspLayoutObservation::default();
     for sfo_path in ["PSP_GAME/PARAM.SFO", "PS3_GAME/PARAM.SFO"] {
         if let Ok(Some(entry)) = find_path(media, observation, sfo_path)
             && !entry.is_directory
@@ -976,8 +1023,23 @@ fn print_boot_evidence<M: LogicalMedia>(media: &M, observation: &DiscFilesystemO
                     serial_candidate = id.to_string();
                 }
                 println!("PARAM.SFO ({sfo_path}): {} entries", sfo.entries.len());
+                if sfo_path.starts_with("PSP_GAME") {
+                    psp_layout.param_sfo = Some(sfo);
+                }
             }
         }
+    }
+    psp_layout.psp_game_dir_present = sony_layout_paths
+        .iter()
+        .any(|(path, exists)| *path == "PSP_GAME" && *exists);
+    psp_layout.sysdir_present = sony_layout_paths
+        .iter()
+        .any(|(path, exists)| *path == "PSP_GAME/SYSDIR" && *exists);
+    psp_layout.eboot_bin_present = sony_layout_paths
+        .iter()
+        .any(|(path, exists)| *path == "PSP_GAME/SYSDIR/EBOOT.BIN" && *exists);
+    if psp_layout.psp_game_dir_present {
+        evidence.extend(observe_psp_evidence(&psp_layout));
     }
 
     // Neo Geo CD: IPL.TXT lives inside a plain ISO9660 filesystem, so - like
@@ -1015,6 +1077,32 @@ fn print_boot_evidence<M: LogicalMedia>(media: &M, observation: &DiscFilesystemO
         if *exists {
             println!("  {path}: YES");
         }
+    }
+    print_fusion(&evidence);
+}
+
+/// Prints the [`platform_evidence_fusion::fuse_platform_evidence`] result
+/// for one gathered evidence bundle - the structured
+/// [`archivefs_core::platform_evidence_fusion::ResolutionExplanation`]
+/// rendered as text, never a second decision-making path of its own.
+fn print_fusion(evidence: &[ContentEvidence]) {
+    let explanation = fuse_platform_evidence(evidence.iter().cloned());
+    println!("Fusion outcome: {:?}", explanation.outcome);
+    match explanation.resolved_platform {
+        Some(platform) => println!("Fusion resolved platform: {platform}"),
+        None => println!("Fusion resolved platform: N/A"),
+    }
+    if !explanation.conflicting_platforms.is_empty() {
+        println!(
+            "Fusion conflicting platforms: {:?}",
+            explanation.conflicting_platforms
+        );
+    }
+    for candidate in &explanation.fired_candidates {
+        println!(
+            "  candidate: {} -> {} (strong leg: {})",
+            candidate.rule_id, candidate.platform, candidate.has_strong_leg
+        );
     }
 }
 

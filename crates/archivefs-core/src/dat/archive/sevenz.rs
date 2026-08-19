@@ -595,6 +595,235 @@ impl SevenZArchiveSource {
     }
 }
 
+impl SevenZArchiveSource {
+    /// Bounded-prefix content-evidence probe: the 7z counterpart to
+    /// [`crate::archive_member_content_evidence::observe_zip_member_content`],
+    /// reusing that module's own format-neutral result types
+    /// ([`crate::archive_member_content_evidence::ArchiveMemberContentResult`]/
+    /// [`crate::archive_member_content_evidence::MemberProbeOutcome`]) so a
+    /// caller aggregates ZIP and 7z member evidence through the identical
+    /// [`crate::archive_member_content_evidence::classify_archive_content`]
+    /// policy - never a second, competing multi-member rule set.
+    ///
+    /// For each ordinary (non-nested, non-empty, within-limits) stream
+    /// member: reads at most `max_probe_bytes` of decompressed output,
+    /// runs `detectors` over exactly those bytes, then drains the
+    /// remainder of the member (bounded by its own declared logical size,
+    /// via the same [`drain_member`] helper an already-reviewed nested-
+    /// member skip already uses) so a solid block's decode position stays
+    /// aligned for whatever entry follows - this module never decodes a
+    /// member twice and never seeks backward. Nested-archive members are
+    /// drained and reported, never recursively opened, exactly like
+    /// [`crate::archive_member_content_evidence`]'s own ZIP nested-archive
+    /// handling. The cumulative logical-byte budget
+    /// (`self.limits.max_archive_logical_bytes`) is enforced exactly as
+    /// [`Self::verify_with_visitor`] already enforces it; an oversized
+    /// member stops the whole pass rather than being partially drained,
+    /// matching that same precedent.
+    pub fn probe_member_content(
+        &mut self,
+        cancel: &AtomicBool,
+        max_probe_bytes: usize,
+        max_members_probed: usize,
+        detectors: &[&dyn crate::content_detector::ContentDetector],
+    ) -> (
+        Vec<crate::archive_member_content_evidence::ArchiveMemberContentResult>,
+        bool,
+    ) {
+        use crate::archive_member_content_evidence::{
+            ArchiveMemberContentResult, MemberProbeOutcome,
+        };
+        use crate::content_detector::run_content_detectors;
+        use crate::inspector::InspectorEntryClassification;
+
+        let members: Vec<MemberMeta> = self.members.clone();
+        let limits = self.limits;
+        let reader = &mut self.reader;
+        let mut cursor: usize = 0;
+        let mut total_consumed: u64 = 0;
+        let mut results: Vec<ArchiveMemberContentResult> = Vec::with_capacity(members.len());
+        let mut stop = false;
+
+        let result = reader.for_each_entries(|entry, stream| {
+            if results.len() >= max_members_probed {
+                stop = true;
+                return Ok(false);
+            }
+            let Some(meta) = members.get(cursor).cloned() else {
+                return Ok(true);
+            };
+            if meta.name != entry.name() {
+                stop = true;
+                results.push(ArchiveMemberContentResult {
+                    member_index: cursor,
+                    member_name: meta.name.clone(),
+                    declared_size: meta.logical_size,
+                    outcome: MemberProbeOutcome::SkippedCorrupt {
+                        detail: format!("member order mismatch at index {cursor}"),
+                    },
+                    evidence: Vec::new(),
+                });
+                return Ok(false);
+            }
+            let index = cursor;
+            cursor += 1;
+
+            if meta.logical_size == 0 {
+                results.push(ArchiveMemberContentResult {
+                    member_index: index,
+                    member_name: meta.name.clone(),
+                    declared_size: 0,
+                    outcome: MemberProbeOutcome::Probed { bytes_probed: 0 },
+                    evidence: Vec::new(),
+                });
+                return Ok(true);
+            }
+
+            let Some(consumed_after) = total_consumed.checked_add(meta.logical_size) else {
+                stop = true;
+                return Ok(false);
+            };
+            if consumed_after > limits.max_archive_logical_bytes {
+                stop = true;
+                results.push(ArchiveMemberContentResult {
+                    member_index: index,
+                    member_name: meta.name.clone(),
+                    declared_size: meta.logical_size,
+                    outcome: MemberProbeOutcome::SkippedTooLarge {
+                        declared_size: meta.logical_size,
+                    },
+                    evidence: Vec::new(),
+                });
+                return Ok(false);
+            }
+
+            if meta.is_nested {
+                if let Err(error) = drain_member(stream, meta.logical_size, cancel) {
+                    stop = true;
+                    results.push(ArchiveMemberContentResult {
+                        member_index: index,
+                        member_name: meta.name.clone(),
+                        declared_size: meta.logical_size,
+                        outcome: stream_error_outcome(error),
+                        evidence: Vec::new(),
+                    });
+                    return Ok(false);
+                }
+                total_consumed = consumed_after;
+                results.push(ArchiveMemberContentResult {
+                    member_index: index,
+                    member_name: meta.name.clone(),
+                    declared_size: meta.logical_size,
+                    outcome: MemberProbeOutcome::SkippedByClassification(
+                        InspectorEntryClassification::NestedArchive,
+                    ),
+                    evidence: Vec::new(),
+                });
+                return Ok(true);
+            }
+
+            if meta.logical_size > limits.max_member_logical_bytes {
+                stop = true;
+                results.push(ArchiveMemberContentResult {
+                    member_index: index,
+                    member_name: meta.name.clone(),
+                    declared_size: meta.logical_size,
+                    outcome: MemberProbeOutcome::SkippedTooLarge {
+                        declared_size: meta.logical_size,
+                    },
+                    evidence: Vec::new(),
+                });
+                return Ok(false);
+            }
+
+            let mut buf = Vec::with_capacity(max_probe_bytes.min(1 << 16));
+            let mut limited = stream.take(max_probe_bytes as u64);
+            let read_result = limited.read_to_end(&mut buf);
+            let inner = limited.into_inner();
+            match read_result {
+                Ok(bytes_probed) => {
+                    let remaining = meta.logical_size.saturating_sub(bytes_probed as u64);
+                    if let Err(error) = drain_member(inner, remaining, cancel) {
+                        stop = true;
+                        results.push(ArchiveMemberContentResult {
+                            member_index: index,
+                            member_name: meta.name.clone(),
+                            declared_size: meta.logical_size,
+                            outcome: stream_error_outcome(error),
+                            evidence: Vec::new(),
+                        });
+                        return Ok(false);
+                    }
+                    total_consumed = consumed_after;
+                    let evidence = run_content_detectors(detectors.iter().copied(), &buf).evidence;
+                    results.push(ArchiveMemberContentResult {
+                        member_index: index,
+                        member_name: meta.name.clone(),
+                        declared_size: meta.logical_size,
+                        outcome: MemberProbeOutcome::Probed { bytes_probed },
+                        evidence,
+                    });
+                    Ok(true)
+                }
+                Err(error) => {
+                    stop = true;
+                    results.push(ArchiveMemberContentResult {
+                        member_index: index,
+                        member_name: meta.name.clone(),
+                        declared_size: meta.logical_size,
+                        outcome: MemberProbeOutcome::SkippedCorrupt {
+                            detail: error.to_string(),
+                        },
+                        evidence: Vec::new(),
+                    });
+                    Ok(false)
+                }
+            }
+        });
+
+        if let Err(error) = result
+            && !stop
+        {
+            results.push(ArchiveMemberContentResult {
+                member_index: cursor,
+                member_name: members
+                    .get(cursor)
+                    .map(|m| m.name.clone())
+                    .unwrap_or_default(),
+                declared_size: members.get(cursor).map(|m| m.logical_size).unwrap_or(0),
+                outcome: MemberProbeOutcome::SkippedCorrupt {
+                    detail: format!("{:?}", classify_error(&error)),
+                },
+                evidence: Vec::new(),
+            });
+            stop = true;
+        }
+
+        let truncated = stop || results.len() < members.len();
+        (results, truncated)
+    }
+}
+
+/// Maps a mid-drain stream failure onto a
+/// [`crate::archive_member_content_evidence::MemberProbeOutcome`] - the
+/// bounded-prefix-probe counterpart to this module's own
+/// `MemberStreamError` -> [`ArchiveMemberSourceError`] mapping used
+/// elsewhere in this file.
+fn stream_error_outcome(
+    error: MemberStreamError,
+) -> crate::archive_member_content_evidence::MemberProbeOutcome {
+    use crate::archive_member_content_evidence::MemberProbeOutcome;
+    match error {
+        MemberStreamError::Cancelled => MemberProbeOutcome::SkippedCorrupt {
+            detail: "cancelled".to_string(),
+        },
+        MemberStreamError::TooLarge { limit } => MemberProbeOutcome::SkippedTooLarge {
+            declared_size: limit,
+        },
+        MemberStreamError::Io(detail) => MemberProbeOutcome::SkippedCorrupt { detail },
+    }
+}
+
 impl ArchiveMemberSource for SevenZArchiveSource {
     fn archive_format(&self) -> &'static str {
         "7z"
@@ -3291,5 +3520,334 @@ mod tests {
             ),
             "unexpected refusal: {err:?}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // probe_member_content: bounded-prefix content-evidence probing
+    // ------------------------------------------------------------------
+
+    mod probe_member_content_tests {
+        use super::*;
+        use crate::archive_member_content_evidence::MemberProbeOutcome;
+        use crate::content_detector::ContentDetector;
+        use crate::header_normalization::HeaderNormalizationDetector;
+
+        fn ines_rom(payload: &[u8]) -> Vec<u8> {
+            let mut bytes = vec![0u8; 16];
+            bytes[0..4].copy_from_slice(b"NES\x1a");
+            bytes[4] = 1;
+            bytes.extend_from_slice(payload);
+            bytes
+        }
+
+        /// Writes a 7z with the given entries as raw bytes (not `&str`) -
+        /// [`make_archive`] mangles non-UTF-8 content through `&str`, which
+        /// a synthetic binary ROM fixture (arbitrary byte values, including
+        /// the iNES magic's `0x1a`) cannot round-trip through safely.
+        fn make_binary_archive(dir: &std::path::Path, files: &[(&str, &[u8])]) -> PathBuf {
+            let archive_path = dir.join("archive.7z");
+            let mut writer =
+                ArchiveWriter::new(std::fs::File::create(&archive_path).unwrap()).unwrap();
+            for (name, contents) in files {
+                let entry = fixture_entry(name, contents.len() as u64);
+                writer
+                    .push_archive_entry(entry, Some(std::io::Cursor::new(*contents)))
+                    .unwrap();
+            }
+            writer.finish().unwrap();
+            archive_path
+        }
+
+        fn detectors() -> Vec<Box<dyn ContentDetector>> {
+            vec![Box::new(HeaderNormalizationDetector)]
+        }
+
+        fn detector_refs(detectors: &[Box<dyn ContentDetector>]) -> Vec<&dyn ContentDetector> {
+            detectors.iter().map(|d| d.as_ref()).collect()
+        }
+
+        #[test]
+        fn recognized_member_is_probed_and_yields_evidence() {
+            let dir = tempdir().unwrap();
+            let rom = ines_rom(&[0xAB; 64]);
+            let path = make_binary_archive(dir.path(), &[("game.nes", &rom)]);
+            let trusted = trusted_for(dir.path());
+            let mut source = SevenZArchiveSource::open(
+                &path,
+                &trusted,
+                ArchiveLimits::default(),
+                &TEST_NO_CANCEL,
+            )
+            .unwrap();
+            let det = detectors();
+            let (results, truncated) =
+                source.probe_member_content(&TEST_NO_CANCEL, 65536, 2000, &detector_refs(&det));
+            assert!(!truncated);
+            assert_eq!(results.len(), 1);
+            assert!(matches!(
+                results[0].outcome,
+                MemberProbeOutcome::Probed { .. }
+            ));
+        }
+
+        #[test]
+        fn unrelated_member_yields_no_evidence() {
+            let dir = tempdir().unwrap();
+            let path = make_archive(dir.path(), &[("data.bin", "just some arbitrary bytes")]);
+            let trusted = trusted_for(dir.path());
+            let mut source = SevenZArchiveSource::open(
+                &path,
+                &trusted,
+                ArchiveLimits::default(),
+                &TEST_NO_CANCEL,
+            )
+            .unwrap();
+            let det = detectors();
+            let (results, _truncated) =
+                source.probe_member_content(&TEST_NO_CANCEL, 65536, 2000, &detector_refs(&det));
+            assert_eq!(results.len(), 1);
+            assert!(results[0].evidence.is_empty());
+        }
+
+        #[test]
+        fn multiple_members_are_each_probed_independently() {
+            let dir = tempdir().unwrap();
+            let rom1 = ines_rom(&[0x01; 32]);
+            let rom2 = b"not a rom at all".to_vec();
+            let path = make_binary_archive(
+                dir.path(),
+                &[("a.nes", rom1.as_slice()), ("b.bin", rom2.as_slice())],
+            );
+            let trusted = trusted_for(dir.path());
+            let mut source = SevenZArchiveSource::open(
+                &path,
+                &trusted,
+                ArchiveLimits::default(),
+                &TEST_NO_CANCEL,
+            )
+            .unwrap();
+            let det = detectors();
+            let (results, truncated) =
+                source.probe_member_content(&TEST_NO_CANCEL, 65536, 2000, &detector_refs(&det));
+            assert!(!truncated);
+            assert_eq!(results.len(), 2);
+            assert!(!results[0].evidence.is_empty());
+            assert!(results[1].evidence.is_empty());
+        }
+
+        #[test]
+        fn bounded_prefix_never_exceeds_the_configured_bound() {
+            let dir = tempdir().unwrap();
+            let payload: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+            let huge = ines_rom(&payload);
+            let path = make_binary_archive(dir.path(), &[("game.nes", &huge)]);
+            let trusted = trusted_for(dir.path());
+            let mut source = SevenZArchiveSource::open(
+                &path,
+                &trusted,
+                ArchiveLimits::default(),
+                &TEST_NO_CANCEL,
+            )
+            .unwrap();
+            let det = detectors();
+            let (results, _truncated) =
+                source.probe_member_content(&TEST_NO_CANCEL, 4096, 2000, &detector_refs(&det));
+            assert_eq!(results.len(), 1);
+            match results[0].outcome {
+                MemberProbeOutcome::Probed { bytes_probed } => assert!(bytes_probed <= 4096),
+                ref other => panic!("expected Probed, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn member_count_cap_truncates_the_pass() {
+            let dir = tempdir().unwrap();
+            let path = make_archive(dir.path(), &[("a", "x"), ("b", "y"), ("c", "z")]);
+            let trusted = trusted_for(dir.path());
+            let mut source = SevenZArchiveSource::open(
+                &path,
+                &trusted,
+                ArchiveLimits::default(),
+                &TEST_NO_CANCEL,
+            )
+            .unwrap();
+            assert_eq!(source.member_count(), 3);
+            let det = detectors();
+            let (results, truncated) =
+                source.probe_member_content(&TEST_NO_CANCEL, 65536, 2, &detector_refs(&det));
+            assert!(truncated);
+            assert!(results.len() <= 2);
+        }
+
+        #[test]
+        fn empty_member_is_probed_with_zero_bytes_not_skipped() {
+            let dir = tempdir().unwrap();
+            let path = make_archive(dir.path(), &[("empty.rom", "")]);
+            let trusted = trusted_for(dir.path());
+            let mut source = SevenZArchiveSource::open(
+                &path,
+                &trusted,
+                ArchiveLimits::default(),
+                &TEST_NO_CANCEL,
+            )
+            .unwrap();
+            let det = detectors();
+            let (results, _truncated) =
+                source.probe_member_content(&TEST_NO_CANCEL, 65536, 2000, &detector_refs(&det));
+            assert_eq!(results.len(), 1);
+            assert_eq!(
+                results[0].outcome,
+                MemberProbeOutcome::Probed { bytes_probed: 0 }
+            );
+        }
+
+        #[test]
+        fn nested_archive_member_is_skipped_not_recursed() {
+            let dir = tempdir().unwrap();
+            let path = make_archive(dir.path(), &[("inner.zip", "pretend nested zip bytes")]);
+            let trusted = trusted_for(dir.path());
+            let mut source = SevenZArchiveSource::open(
+                &path,
+                &trusted,
+                ArchiveLimits::default(),
+                &TEST_NO_CANCEL,
+            )
+            .unwrap();
+            let det = detectors();
+            let (results, _truncated) =
+                source.probe_member_content(&TEST_NO_CANCEL, 65536, 2000, &detector_refs(&det));
+            assert_eq!(results.len(), 1);
+            assert!(matches!(
+                results[0].outcome,
+                MemberProbeOutcome::SkippedByClassification(
+                    crate::inspector::InspectorEntryClassification::NestedArchive
+                )
+            ));
+        }
+
+        #[test]
+        fn oversized_member_is_refused_before_any_content_is_probed() {
+            // A member whose declared size exceeds the configured per-member
+            // ceiling is refused by the existing, already-reviewed preflight
+            // at `open()` time - before this probe (or anything else) ever
+            // gets a chance to read a single byte of it. This is a stronger
+            // guarantee than "the pass stops partway"; it proves the content
+            // probe never even sees an oversized member's bytes.
+            let dir = tempdir().unwrap();
+            let contents = "y".repeat(1000);
+            let path = make_archive(dir.path(), &[("big.rom", &contents)]);
+            let trusted = trusted_for(dir.path());
+            let tight_limits = ArchiveLimits {
+                max_member_logical_bytes: 10,
+                ..ArchiveLimits::default()
+            };
+            let error = SevenZArchiveSource::open(&path, &trusted, tight_limits, &TEST_NO_CANCEL)
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                ArchiveMemberSourceError::RefusedLimits {
+                    reason: "member size"
+                }
+            ));
+        }
+
+        #[test]
+        fn encrypted_member_is_reported_not_decrypted() {
+            let dir = tempdir().unwrap();
+            let path = make_encrypted_archive(dir.path(), "secret content");
+            let trusted = trusted_for(dir.path());
+            let mut source = SevenZArchiveSource::open(
+                &path,
+                &trusted,
+                ArchiveLimits::default(),
+                &TEST_NO_CANCEL,
+            )
+            .unwrap();
+            let det = detectors();
+            let (results, _truncated) =
+                source.probe_member_content(&TEST_NO_CANCEL, 65536, 2000, &detector_refs(&det));
+            assert_eq!(results.len(), 1);
+            assert!(!matches!(
+                results[0].outcome,
+                MemberProbeOutcome::Probed { .. }
+            ));
+        }
+
+        #[test]
+        fn cancellation_is_observed() {
+            let dir = tempdir().unwrap();
+            let rom = ines_rom(&[0x01; 64]);
+            let path = make_binary_archive(dir.path(), &[("game.nes", &rom)]);
+            let trusted = trusted_for(dir.path());
+            let mut source = SevenZArchiveSource::open(
+                &path,
+                &trusted,
+                ArchiveLimits::default(),
+                &TEST_NO_CANCEL,
+            )
+            .unwrap();
+            let cancelled = AtomicBool::new(true);
+            let det = detectors();
+            let (results, truncated) =
+                source.probe_member_content(&cancelled, 65536, 2000, &detector_refs(&det));
+            assert!(truncated);
+            assert!(
+                results
+                    .iter()
+                    .any(|r| !matches!(r.outcome, MemberProbeOutcome::Probed { .. }))
+                    || results.is_empty()
+            );
+        }
+
+        #[test]
+        fn probing_never_mutates_the_archive_file() {
+            let dir = tempdir().unwrap();
+            let rom = ines_rom(&[0x01; 64]);
+            let path = make_binary_archive(dir.path(), &[("game.nes", &rom)]);
+            let before = std::fs::read(&path).unwrap();
+            let trusted = trusted_for(dir.path());
+            let mut source = SevenZArchiveSource::open(
+                &path,
+                &trusted,
+                ArchiveLimits::default(),
+                &TEST_NO_CANCEL,
+            )
+            .unwrap();
+            let det = detectors();
+            let _ = source.probe_member_content(&TEST_NO_CANCEL, 65536, 2000, &detector_refs(&det));
+            let after = std::fs::read(&path).unwrap();
+            assert_eq!(before, after);
+        }
+
+        #[test]
+        fn repeated_probe_is_deterministic() {
+            let dir = tempdir().unwrap();
+            let rom = ines_rom(&[0x01; 64]);
+            let path = make_binary_archive(dir.path(), &[("game.nes", &rom)]);
+            let trusted = trusted_for(dir.path());
+            let det = detectors();
+
+            let mut source_a = SevenZArchiveSource::open(
+                &path,
+                &trusted,
+                ArchiveLimits::default(),
+                &TEST_NO_CANCEL,
+            )
+            .unwrap();
+            let (results_a, _) =
+                source_a.probe_member_content(&TEST_NO_CANCEL, 65536, 2000, &detector_refs(&det));
+
+            let mut source_b = SevenZArchiveSource::open(
+                &path,
+                &trusted,
+                ArchiveLimits::default(),
+                &TEST_NO_CANCEL,
+            )
+            .unwrap();
+            let (results_b, _) =
+                source_b.probe_member_content(&TEST_NO_CANCEL, 65536, 2000, &detector_refs(&det));
+
+            assert_eq!(results_a, results_b);
+        }
     }
 }

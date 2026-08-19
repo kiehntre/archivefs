@@ -156,7 +156,7 @@ pub enum ArchiveContentError {
 /// intentionally the crate's existing cartridge/console-signature detectors,
 /// not a second copy of their logic. New detectors added to this crate
 /// naturally reach archive members too, once added here.
-fn member_detectors() -> Vec<Box<dyn ContentDetector>> {
+pub(crate) fn member_detectors() -> Vec<Box<dyn ContentDetector>> {
     vec![
         Box::new(HeaderNormalizationDetector),
         Box::new(N64ByteOrderDetector),
@@ -165,6 +165,7 @@ fn member_detectors() -> Vec<Box<dyn ContentDetector>> {
         Box::new(crate::gb_header_evidence::GbHeaderDetector),
         Box::new(crate::gba_header_evidence::GbaHeaderDetector),
         Box::new(crate::megadrive_header_evidence::MegaDriveHeaderDetector),
+        Box::new(crate::sega32x_header_evidence::Sega32xDetector),
         Box::new(crate::sms_gg_header_evidence::TmrSegaHeaderDetector),
         Box::new(crate::atari7800_header_evidence::Atari7800HeaderDetector),
         Box::new(crate::lynx_header_evidence::LynxHeaderDetector),
@@ -282,6 +283,43 @@ pub fn observe_zip_member_content(
             evidence,
         });
     }
+
+    Ok(ArchiveContentObservation {
+        archive_path: path.to_path_buf(),
+        members,
+        truncated,
+    })
+}
+
+/// The 7z counterpart to [`observe_zip_member_content`] - same bounded-
+/// prefix behavioral model, same result types, same
+/// [`classify_archive_content`] policy downstream. Opens `path` through the
+/// existing hardened [`crate::dat::archive::sevenz::SevenZArchiveSource`]
+/// (the same preflight/limits/cancellation pipeline
+/// [`crate::dat::archive::sevenz`]'s DAT-hashing pass already uses - see
+/// that module's own documentation), then probes each member's bounded
+/// prefix via [`crate::dat::archive::sevenz::SevenZArchiveSource::probe_member_content`]
+/// instead of hashing it whole.
+///
+/// Everything happens in-process: no system `7z`/`7za` invocation, no
+/// extraction to disk, no nested-archive recursion.
+pub fn observe_sevenz_member_content(
+    path: &Path,
+    trusted: &crate::safe_read::TrustedRoots,
+    limits: crate::dat::archive::limits::ArchiveLimits,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<ArchiveContentObservation, crate::dat::archive::ArchiveMemberSourceError> {
+    use crate::dat::archive::sevenz::SevenZArchiveSource;
+
+    let mut source = SevenZArchiveSource::open(path, trusted, limits, cancel)?;
+    let detectors = member_detectors();
+    let detector_refs: Vec<&dyn ContentDetector> = detectors.iter().map(|d| d.as_ref()).collect();
+    let (members, truncated) = source.probe_member_content(
+        cancel,
+        MAX_MEMBER_PROBE_BYTES,
+        MAX_MEMBERS_PROBED,
+        &detector_refs,
+    );
 
     Ok(ArchiveContentObservation {
         archive_path: path.to_path_buf(),
@@ -767,5 +805,251 @@ mod tests {
             classify_archive_content(&observation),
             ArchiveContentClassification::NoUsefulMember
         );
+    }
+}
+
+/// Batch 5: [`observe_sevenz_member_content`] through the public API,
+/// exercising the same [`classify_archive_content`] policy ZIP already
+/// covers above, plus fusion over members drawn from either archive kind.
+#[cfg(test)]
+mod sevenz_observation_tests {
+    use super::*;
+    use crate::dat::archive::limits::ArchiveLimits;
+    use crate::platform_evidence_fusion::{FusionOutcome, fuse_platform_evidence};
+    use crate::safe_read::TrustedRoots;
+    use sevenz_rust2::{ArchiveEntry, ArchiveWriter};
+    use std::sync::atomic::AtomicBool;
+
+    fn ines_rom(payload: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0u8; 16];
+        bytes[0..4].copy_from_slice(b"NES\x1a");
+        bytes[4] = 1;
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    fn write_zip(path: &Path, entries: &[(&str, &[u8])]) {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        use zip::{CompressionMethod, ZipWriter};
+        let file = File::create(path).unwrap();
+        let mut writer = ZipWriter::new(file);
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        for (name, data) in entries {
+            writer.start_file(*name, options).unwrap();
+            writer.write_all(data).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    fn fixture_entry(name: &str, size: u64) -> ArchiveEntry {
+        let mut entry = ArchiveEntry::new_file(name);
+        entry.size = size;
+        entry
+    }
+
+    fn make_sevenz(dir: &std::path::Path, files: &[(&str, &[u8])]) -> PathBuf {
+        let archive_path = dir.join("archive.7z");
+        let mut writer = ArchiveWriter::new(File::create(&archive_path).unwrap()).unwrap();
+        for (name, contents) in files {
+            let entry = fixture_entry(name, contents.len() as u64);
+            writer
+                .push_archive_entry(entry, Some(std::io::Cursor::new(*contents)))
+                .unwrap();
+        }
+        writer.finish().unwrap();
+        archive_path
+    }
+
+    fn observe(path: &Path) -> ArchiveContentObservation {
+        let trusted = TrustedRoots::from_paths(path.parent());
+        let cancel = AtomicBool::new(false);
+        observe_sevenz_member_content(path, &trusted, ArchiveLimits::default(), &cancel).unwrap()
+    }
+
+    #[test]
+    fn single_recognized_member_is_a_single_strong_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = make_sevenz(dir.path(), &[("game.nes", &ines_rom(&[0u8; 32]))]);
+        let observation = observe(&path);
+        assert!(matches!(
+            classify_archive_content(&observation),
+            ArchiveContentClassification::SingleStrongMember { .. }
+        ));
+    }
+
+    #[test]
+    fn strong_member_plus_junk_is_still_a_single_strong_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = make_sevenz(
+            dir.path(),
+            &[("game.nes", &ines_rom(&[0u8; 32])), ("readme.txt", b"hi")],
+        );
+        let observation = observe(&path);
+        assert!(matches!(
+            classify_archive_content(&observation),
+            ArchiveContentClassification::SingleStrongMember { .. }
+        ));
+    }
+
+    #[test]
+    fn unrelated_member_alone_yields_no_useful_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = make_sevenz(dir.path(), &[("readme.txt", b"just text, nothing else")]);
+        let observation = observe(&path);
+        assert_eq!(
+            classify_archive_content(&observation),
+            ArchiveContentClassification::NoUsefulMember
+        );
+    }
+
+    #[test]
+    fn empty_sevenz_yields_no_useful_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = make_sevenz(dir.path(), &[]);
+        let observation = observe(&path);
+        assert!(observation.members.is_empty());
+        assert_eq!(
+            classify_archive_content(&observation),
+            ArchiveContentClassification::NoUsefulMember
+        );
+    }
+
+    #[test]
+    fn each_member_carries_its_own_index_and_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = make_sevenz(
+            dir.path(),
+            &[("a.nes", &ines_rom(&[1u8; 8])), ("b.txt", b"unrelated")],
+        );
+        let observation = observe(&path);
+        assert_eq!(observation.members.len(), 2);
+        assert_eq!(observation.members[0].member_name, "a.nes");
+        assert_eq!(observation.members[1].member_name, "b.txt");
+        assert_eq!(observation.members[0].member_index, 0);
+        assert_eq!(observation.members[1].member_index, 1);
+    }
+
+    #[test]
+    fn probing_never_mutates_the_archive_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = make_sevenz(dir.path(), &[("game.nes", &ines_rom(&[9u8; 16]))]);
+        let before = std::fs::read(&path).unwrap();
+        let _ = observe(&path);
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn repeated_observation_is_deterministic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = make_sevenz(dir.path(), &[("game.nes", &ines_rom(&[3u8; 16]))]);
+        let first = observe(&path);
+        let second = observe(&path);
+        assert_eq!(
+            classify_archive_content(&first),
+            classify_archive_content(&second)
+        );
+        assert_eq!(first.members.len(), second.members.len());
+    }
+
+    #[test]
+    fn nonexistent_sevenz_path_is_an_open_error() {
+        let path = PathBuf::from("/nonexistent/does-not-exist.7z");
+        let trusted = TrustedRoots::from_paths(std::iter::once(Path::new("/nonexistent")));
+        let cancel = AtomicBool::new(false);
+        let result =
+            observe_sevenz_member_content(&path, &trusted, ArchiveLimits::default(), &cancel);
+        assert!(result.is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // Combined ZIP + 7z member fusion: the resolver must not care which
+    // archive kind a member's bytes were probed from.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn fusing_evidence_from_a_sevenz_member_reaches_the_same_outcome_as_zip() {
+        let dir = tempfile::tempdir().unwrap();
+        let sevenz_path = make_sevenz(dir.path(), &[("game.nes", &ines_rom(&[5u8; 32]))]);
+        let zip_path = dir.path().join("game.zip");
+        write_zip(&zip_path, &[("game.nes", &ines_rom(&[5u8; 32]))]);
+
+        let sevenz_observation = observe(&sevenz_path);
+        let zip_observation = observe_zip_member_content(&zip_path).unwrap();
+
+        let sevenz_evidence: Vec<_> = sevenz_observation
+            .members
+            .iter()
+            .flat_map(|m| m.evidence.iter().cloned())
+            .collect();
+        let zip_evidence: Vec<_> = zip_observation
+            .members
+            .iter()
+            .flat_map(|m| m.evidence.iter().cloned())
+            .collect();
+
+        let sevenz_explanation = fuse_platform_evidence(sevenz_evidence);
+        let zip_explanation = fuse_platform_evidence(zip_evidence);
+        assert_eq!(sevenz_explanation.outcome, zip_explanation.outcome);
+        assert_eq!(
+            sevenz_explanation.resolved_platform,
+            zip_explanation.resolved_platform
+        );
+    }
+
+    #[test]
+    fn two_members_resolving_to_different_platforms_across_archive_kinds_is_a_conflict_input() {
+        // The archive-level policy (classify_archive_content) already flags
+        // this as ConflictingStrongMembers per-archive; here we check that
+        // pooling evidence across a 7z-sourced Saturn-ish fact and an
+        // unrelated iNES fact never spuriously resolves to one winner
+        // through the fusion layer either, regardless of which archive
+        // kind supplied which member.
+        let dir = tempfile::tempdir().unwrap();
+        let sevenz_path = make_sevenz(dir.path(), &[("game.nes", &ines_rom(&[7u8; 32]))]);
+        let sevenz_observation = observe(&sevenz_path);
+        let mut evidence: Vec<_> = sevenz_observation
+            .members
+            .iter()
+            .flat_map(|m| m.evidence.iter().cloned())
+            .collect();
+        // NES's iNES header is structural, never Strong on its own - so
+        // pairing it with nothing else must stay Unknown, not Resolved.
+        evidence.retain(|fact| {
+            fact.confidence != crate::content_evidence::ContentEvidenceConfidence::Strong
+        });
+        let explanation = fuse_platform_evidence(evidence);
+        assert_ne!(explanation.outcome, FusionOutcome::Resolved);
+    }
+
+    #[test]
+    fn a_junk_only_sevenz_member_never_resolves_through_fusion() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = make_sevenz(dir.path(), &[("readme.txt", b"nothing recognizable here")]);
+        let observation = observe(&path);
+        let evidence: Vec<_> = observation
+            .members
+            .iter()
+            .flat_map(|m| m.evidence.iter().cloned())
+            .collect();
+        assert!(evidence.is_empty());
+        let explanation = fuse_platform_evidence(evidence);
+        assert_eq!(explanation.outcome, FusionOutcome::Unknown);
+    }
+
+    #[test]
+    fn sevenz_member_count_respects_max_members_probed() {
+        // Short names, few entries: a longer/larger fixture here trips the
+        // real 7z writer's own header-compression threshold (see the
+        // hardened preflight's "encoded 7z header is not supported" refusal
+        // documented in `dat::archive::sevenz`'s own tests) - not something
+        // this test needs to explore, since the bound under test is
+        // `MAX_MEMBERS_PROBED` itself, not header encoding.
+        let dir = tempfile::tempdir().unwrap();
+        let path = make_sevenz(dir.path(), &[("a.txt", b"junk"), ("b.txt", b"junk")]);
+        let observation = observe(&path);
+        assert!(observation.members.len() <= MAX_MEMBERS_PROBED);
+        assert_eq!(observation.members.len(), 2);
     }
 }
