@@ -87,6 +87,7 @@ flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 # this comment was written calls only the ZIP source.
 # (see docs/research/SEVEN_Z_RAR_ARCHIVE_VERIFICATION_RESEARCH.md §12).
 sevenz-rust2 = { version = "0.21.4", default-features = false }
+chd = "0.3.4"
 
 [dev-dependencies]
 # Same crate, fuller feature set: only test fixtures need to *write* 7z

@@ -688,16 +688,12 @@ fn media_class_value(class: ChdMediaClass) -> &'static str {
 //
 // A logical-filesystem reader (see `crate::iso9660`) needs to know *which*
 // track of a multi-track CD/GD-ROM CHD to read a filesystem from, and must
-// never mistake an audio track for one. This crate cannot yet hand that
-// reader any bytes to work with: CHD hunks are compressed (with one of
-// several codecs selected per-hunk, via a separately compressed/huffman-
-// coded map for v5), and this crate has no CHD hunk decompressor. Adding
-// one is a substantial undertaking - correctly reproducing MAME's map/hunk
-// decoding, several CD-specific codecs, and CD sector/ECC reconstruction -
-// and is out of scope for this chunk; see the crate-level report for this
-// explicit blocker. What *is* safe and useful today is choosing which
-// track a future reader would target, using only the track metadata this
-// module already parses - no bytes are read or decompressed to do this.
+// never mistake an audio track for one. This function is metadata-only
+// track *classification* - it answers "which track would a logical
+// filesystem reader target", never "here are its bytes". Producing those
+// bytes is [`crate::chd_logical_media`]'s job, built on top of this
+// function's output plus the `frames`/`pregap` facts it also exposes for
+// track-boundary math.
 
 /// A conservative choice of which CD/GD-ROM track is likely to carry a
 /// logical filesystem, based only on already-parsed track metadata.
@@ -706,6 +702,13 @@ pub struct CandidateDataTrack {
     pub track: u32,
     pub track_type: String,
     pub media_class: ChdMediaClass,
+    /// The track's declared frame (sector) count - how many CD/GD-ROM
+    /// frames of this track were physically stored in the CHD.
+    pub frames: u32,
+    /// The track's declared pregap frame count, if the metadata format
+    /// carried one. `None` only for the older v1 `CHTR` text format, which
+    /// has no `PREGAP` field at all - not the same as a `PREGAP:0` fact.
+    pub pregap: Option<u32>,
 }
 
 /// Picks the lowest-numbered CD-ROM or GD-ROM track whose recorded
@@ -714,11 +717,6 @@ pub struct CandidateDataTrack {
 /// format in this module's documentation). Returns `None` when there is no
 /// such track: an all-audio disc, or a metadata chain with no CD/GD-ROM
 /// track facts at all.
-///
-/// This is metadata-only track *classification*, not byte access - it
-/// answers "which track would a logical filesystem reader target", never
-/// "here are its bytes". See this section's own documentation for why
-/// producing those bytes is currently blocked.
 pub fn select_candidate_data_track(
     metadata: &ChdMetadataObservation,
 ) -> Option<CandidateDataTrack> {
@@ -727,19 +725,26 @@ pub fn select_candidate_data_track(
         .iter()
         .filter_map(|entry| match &entry.fact {
             ChdMetadataFact::CdromTrack(track) if track.track_type != "AUDIO" => {
-                Some((track.track, track.track_type.clone(), ChdMediaClass::CdRom))
+                Some(CandidateDataTrack {
+                    track: track.track,
+                    track_type: track.track_type.clone(),
+                    media_class: ChdMediaClass::CdRom,
+                    frames: track.frames,
+                    pregap: track.pregap,
+                })
             }
             ChdMetadataFact::GdromTrack(track) if track.track_type != "AUDIO" => {
-                Some((track.track, track.track_type.clone(), ChdMediaClass::GdRom))
+                Some(CandidateDataTrack {
+                    track: track.track,
+                    track_type: track.track_type.clone(),
+                    media_class: ChdMediaClass::GdRom,
+                    frames: track.frames,
+                    pregap: track.pregap,
+                })
             }
             _ => None,
         })
-        .min_by_key(|(track, _, _)| *track)
-        .map(|(track, track_type, media_class)| CandidateDataTrack {
-            track,
-            track_type,
-            media_class,
-        })
+        .min_by_key(|candidate| candidate.track)
 }
 
 // ---------------------------------------------------------------------

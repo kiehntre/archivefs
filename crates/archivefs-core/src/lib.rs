@@ -130,6 +130,11 @@ pub mod logical_media;
 /// evidence, never a platform - see the module documentation.
 pub mod iso9660;
 
+/// Pure, read-only CHD logical-data reading: adapts the `chd` crate
+/// (chd-rs) to [`logical_media::LogicalMedia`], connecting a CHD's selected
+/// CD/GD-ROM data track to [`iso9660`].
+pub mod chd_logical_media;
+
 pub mod repair;
 
 pub mod safe_read;

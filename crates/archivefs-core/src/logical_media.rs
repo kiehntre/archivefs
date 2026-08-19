@@ -4,16 +4,16 @@
 //! [`crate::iso9660`] (and any future logical-media reader: UDF, XDVDFS,
 //! GameCube/Wii FST) needs to read bytes at arbitrary offsets without caring
 //! whether those bytes came from a plain `.iso`/`.bin` file already fully in
-//! memory, or - once a CHD hunk decompressor exists (see
-//! [`crate::chd_identity`]'s module documentation on that blocker) - from a
-//! CHD's decompressed logical data track. Coupling the ISO9660 parser
-//! directly to `&[u8]` would make that future integration a rewrite;
-//! coupling it to a full virtual-filesystem trait would be over-engineering
-//! for what is, today, exactly one concrete implementation. This module is
-//! the middle ground: one trait, one method, one in-memory implementation.
+//! memory, or from [`crate::chd_logical_media`]'s CHD-backed adapter, which
+//! decodes a CD/GD-ROM CHD's selected data track on demand. Coupling the
+//! ISO9660 parser directly to `&[u8]` would have made that integration a
+//! rewrite; coupling it to a full virtual-filesystem trait would be
+//! over-engineering for what is, today, exactly two concrete
+//! implementations. This module is the middle ground: one trait, one
+//! method, plus an in-memory implementation.
 
 /// Why a [`LogicalMedia::read_at`] call was refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LogicalMediaError {
     /// The requested `[offset, offset + requested_len)` range does not fit
     /// inside a medium of length `media_len`.
@@ -22,6 +22,14 @@ pub enum LogicalMediaError {
         requested_len: usize,
         media_len: u64,
     },
+    /// The requested range was in bounds, but the underlying medium could
+    /// not actually produce the bytes - for example, a CHD-backed medium
+    /// hitting an unsupported CD sector form partway through a read.
+    /// `detail` is a plain description; this module deliberately does not
+    /// know about any one medium's own error types (see the module
+    /// documentation - implementations own their error semantics, this
+    /// trait only needs to report failure).
+    DecodeFailed { detail: String },
 }
 
 impl std::fmt::Display for LogicalMediaError {
@@ -35,6 +43,9 @@ impl std::fmt::Display for LogicalMediaError {
                 formatter,
                 "read of {requested_len} bytes at offset {offset} is out of bounds for {media_len}-byte media"
             ),
+            Self::DecodeFailed { detail } => {
+                write!(formatter, "logical media read failed: {detail}")
+            }
         }
     }
 }

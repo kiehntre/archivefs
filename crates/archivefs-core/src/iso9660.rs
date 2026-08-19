@@ -107,7 +107,7 @@ pub const MAX_PATH_DEPTH: usize = 32;
 // Errors
 // ---------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Iso9660Error {
     Media(LogicalMediaError),
     /// The first Volume Descriptor's `id` field was not `"CD001"`.

@@ -12,13 +12,18 @@
 //! bytes are the logical media, so [`archivefs_core::iso9660`] can observe
 //! it directly via [`archivefs_core::logical_media::SliceMedia`].
 //!
-//! For a `.chd`, only the first two legs run. [`archivefs_core::chd_identity`]
-//! observes the CHD's own identity and media facts, and (for a CD/GD-ROM
-//! CHD) which track its metadata suggests holds a filesystem - but this
-//! crate has no CHD hunk decompressor yet, so there are no logical bytes to
-//! hand the ISO9660 reader. The probe says so explicitly rather than
-//! fabricating a result; see [`archivefs_core::chd_identity`]'s module
-//! documentation for why that decompressor is out of scope for now.
+//! For a `.chd`, the full pipeline now runs too:
+//! [`archivefs_core::chd_identity`] observes the CHD's own identity and
+//! media facts and selects a candidate data track, then
+//! [`archivefs_core::chd_logical_media`] decodes that track's sectors
+//! on demand (via the `chd` crate) and exposes them as
+//! [`archivefs_core::logical_media::LogicalMedia`], which
+//! [`archivefs_core::iso9660`] can observe exactly as it would a plain
+//! image. Any step that this crate does not yet support (a parent-required
+//! CHD, a non-track-1/non-zero-pregap data track, an unsupported track
+//! type) is reported explicitly rather than guessed at - see
+//! [`archivefs_core::chd_logical_media`]'s module documentation for the
+//! exact scope limits.
 //!
 //! Nothing is ever written. The only filesystem call in this file is the
 //! single read of the path given on the command line. No platform is ever
@@ -39,12 +44,14 @@ use std::sync::atomic::AtomicBool;
 use archivefs_core::chd_identity::{
     ChdMetadataOutcome, looks_like_chd, observe_chd_identity, select_candidate_data_track,
 };
+use archivefs_core::chd_logical_media::{ChdLogicalMediaError, open_chd_track_logical_media};
 use archivefs_core::dat::archive::hash::hash_member_stream;
 use archivefs_core::identity_source::hashing::FileFingerprint;
 use archivefs_core::iso9660::{
-    INTERESTING_ROOT_PATHS, find_path, looks_like_iso9660, observe_iso9660,
+    DiscFilesystemObservation, INTERESTING_ROOT_PATHS, find_path, looks_like_iso9660,
+    observe_iso9660,
 };
-use archivefs_core::logical_media::SliceMedia;
+use archivefs_core::logical_media::{LogicalMedia, SliceMedia};
 
 fn main() -> ExitCode {
     let args: Vec<_> = env::args_os().skip(1).collect();
@@ -134,28 +141,93 @@ fn probe_chd(bytes: &[u8]) -> ExitCode {
 
             match select_candidate_data_track(metadata) {
                 Some(candidate) => println!(
-                    "Data track(s): track {} (type={}, media={:?}) - conservative metadata-only selection, audio tracks excluded",
+                    "Data track: track {} (type={}, media={:?}) - conservative metadata-only selection, audio tracks excluded",
                     candidate.track, candidate.track_type, candidate.media_class
                 ),
                 None => println!(
-                    "Data track(s): none identified (all-audio, or no CD/GD-ROM track metadata)"
+                    "Data track: none identified (all-audio, or no CD/GD-ROM track metadata)"
                 ),
             }
         }
     }
 
-    println!(
-        "Filesystem: BLOCKED - this crate has no CHD hunk decompressor yet, so a CHD's logical \
-         data track cannot be handed to the ISO9660 reader. See archivefs_core::chd_identity's \
-         module documentation for this blocker."
-    );
-    println!("Volume ID: N/A");
-    println!("Root entries: N/A");
-    for path in INTERESTING_ROOT_PATHS {
-        println!("  {path}: N/A (filesystem not readable from a CHD in this build)");
+    let media = match open_chd_track_logical_media(bytes) {
+        Ok(media) => {
+            println!("Logical reader: OK");
+            media
+        }
+        Err(error) => {
+            println!("Logical reader: {}", logical_reader_outcome(&error));
+            println!("Filesystem: Unknown (no logical reader available)");
+            print_interesting_paths_unavailable();
+            return ExitCode::SUCCESS;
+        }
+    };
+
+    if !looks_like_iso9660(&media) {
+        println!(
+            "Filesystem: Unknown (logical data does not begin with an ISO9660 CD001 identifier)"
+        );
+        print_interesting_paths_unavailable();
+        return ExitCode::SUCCESS;
+    }
+
+    match observe_iso9660(&media) {
+        Ok(observation) => print_iso9660_observation(&media, &observation),
+        Err(error) => {
+            println!("Filesystem: Unsupported (ISO9660 structure did not parse: {error})");
+            print_interesting_paths_unavailable();
+        }
     }
 
     ExitCode::SUCCESS
+}
+
+fn logical_reader_outcome(error: &ChdLogicalMediaError) -> String {
+    match error {
+        ChdLogicalMediaError::NeedsParent { parent_sha1 } => {
+            format!(
+                "NeedsParent (combined SHA-1 {})",
+                parent_sha1
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            )
+        }
+        ChdLogicalMediaError::NoDataTrack
+        | ChdLogicalMediaError::UnsupportedTrackType { .. }
+        | ChdLogicalMediaError::UnsupportedTrackPosition { .. }
+        | ChdLogicalMediaError::UnsupportedPregap { .. } => format!("Unsupported ({error})"),
+        ChdLogicalMediaError::Header(_) | ChdLogicalMediaError::Codec { .. } => {
+            format!("Malformed ({error})")
+        }
+    }
+}
+
+fn print_interesting_paths_unavailable() {
+    println!("Volume ID: N/A");
+    println!("Root entries: N/A");
+    for path in INTERESTING_ROOT_PATHS {
+        println!("  {path}: N/A");
+    }
+}
+
+fn print_iso9660_observation<M: LogicalMedia>(media: &M, observation: &DiscFilesystemObservation) {
+    println!("Filesystem: ISO9660");
+    println!("Volume ID: {}", observation.volume_identifier);
+    println!("Root entries: {}", observation.root_entries.len());
+    for entry in &observation.root_entries {
+        println!(
+            "  {} ({}, size={})",
+            entry.original_name,
+            if entry.is_directory { "dir" } else { "file" },
+            entry.size
+        );
+    }
+    for path in INTERESTING_ROOT_PATHS {
+        let exists = matches!(find_path(media, observation, path), Ok(Some(_)));
+        println!("  {path}: {}", if exists { "YES" } else { "NO" });
+    }
 }
 
 fn probe_iso9660(bytes: &[u8]) -> ExitCode {
@@ -172,23 +244,7 @@ fn probe_iso9660(bytes: &[u8]) -> ExitCode {
         }
     };
 
-    println!("Filesystem: ISO9660");
-    println!("Volume ID: {}", observation.volume_identifier);
-    println!("Root entries: {}", observation.root_entries.len());
-    for entry in &observation.root_entries {
-        println!(
-            "  {} ({}, size={})",
-            entry.original_name,
-            if entry.is_directory { "dir" } else { "file" },
-            entry.size
-        );
-    }
-
-    for path in INTERESTING_ROOT_PATHS {
-        let exists = matches!(find_path(&media, &observation, path), Ok(Some(_)));
-        println!("  {path}: {}", if exists { "YES" } else { "NO" });
-    }
-
+    print_iso9660_observation(&media, &observation);
     ExitCode::SUCCESS
 }
 
