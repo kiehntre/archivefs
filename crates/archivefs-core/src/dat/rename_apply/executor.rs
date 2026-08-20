@@ -63,6 +63,19 @@ pub enum ApplyError {
     Journal(String),
     /// The batch was cancelled before any mutation.
     Cancelled,
+    /// The transaction has already reached (or begun entering) a rollback
+    /// or otherwise-settled terminal state and must never be resumed by a
+    /// fresh apply call - a caller must build a new transaction instead.
+    /// [`crate::platform_evidence_fusion::plan_transaction::apply_plan_transaction_with_mode`]
+    /// checks this before ever invoking [`apply_transaction`]: after a
+    /// rollback, an entry's source path is restored to its original,
+    /// recorded identity, which an ordinary preflight pass would otherwise
+    /// treat as fresh and safe - silently resurrecting an already-reversed
+    /// transaction (Batch 15 finding).
+    AlreadySettled {
+        transaction_id: String,
+        state: TransactionState,
+    },
 }
 
 impl std::fmt::Display for ApplyError {
@@ -85,6 +98,14 @@ impl std::fmt::Display for ApplyError {
             Self::InvalidTransactionId(id) => write!(f, "transaction id '{id}' is not usable"),
             Self::Journal(detail) => write!(f, "could not write the transaction journal: {detail}"),
             Self::Cancelled => write!(f, "the apply was cancelled"),
+            Self::AlreadySettled {
+                transaction_id,
+                state,
+            } => write!(
+                f,
+                "transaction {transaction_id} has already reached {state:?} and cannot be \
+                 reapplied; build a fresh transaction instead"
+            ),
         }
     }
 }

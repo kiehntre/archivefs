@@ -20,6 +20,7 @@
 
 use std::sync::atomic::AtomicBool;
 
+use archivefs_core::dat::rename_apply::HardConflictMode;
 use archivefs_core::platform_evidence_fusion::library_plan_export::{
     LibraryPlanExport, LibraryPlanExportItem, OperationIntent, SourcePrecondition,
 };
@@ -27,8 +28,9 @@ use archivefs_core::platform_evidence_fusion::library_planning::{
     PlanStatus, RenameBasis, RommMappingStatus,
 };
 use archivefs_core::platform_evidence_fusion::plan_transaction::{
-    apply_plan_transaction, approve_transaction, build_plan_transaction, build_preview,
-    plan_generation_of, render_preview_text, rollback_plan_transaction,
+    apply_plan_transaction_with_mode, approve_transaction, build_plan_transaction, build_preview,
+    plan_generation_of, preview_is_confined_to_root, render_preview_text,
+    rollback_plan_transaction,
 };
 use archivefs_core::safe_read::TrustedRoots;
 
@@ -63,7 +65,11 @@ fn synthetic_export(source: &std::path::Path, destination: &std::path::Path) -> 
 }
 
 fn main() {
-    let apply_requested = std::env::args().any(|arg| arg == "--temp-fixture-apply");
+    let args: Vec<String> = std::env::args().collect();
+    let apply_requested = args.iter().any(|arg| arg == "--temp-fixture-apply");
+    let fail_after_1_requested = args.iter().any(|arg| arg == "--temp-fixture-fail-after-1");
+    let rollback_requested = args.iter().any(|arg| arg == "--temp-fixture-rollback");
+    let mutation_requested = apply_requested || fail_after_1_requested || rollback_requested;
 
     // A tempdir this process creates itself - never a caller-supplied
     // path. This is the hard safety guard: there is no flag anywhere in
@@ -85,10 +91,27 @@ fn main() {
     let preview = build_preview(&export);
     println!("{}", render_preview_text(&preview));
 
-    if !apply_requested {
-        println!("(preview only - pass --temp-fixture-apply to run the mutation fixture)");
+    if !mutation_requested {
+        println!(
+            "(preview only - pass --temp-fixture-apply, --temp-fixture-fail-after-1, or \
+             --temp-fixture-rollback to run a mutation fixture)"
+        );
         let _ = std::fs::remove_dir_all(&fixture_dir);
         return;
+    }
+
+    // Hard temp-safety guard (milestone section 39): every operation must
+    // resolve underneath the tempdir this process just created itself.
+    // There is no flag anywhere in this file that can point a destination
+    // outside `fixture_dir`, so this can only ever be an internal-logic
+    // failure, never an attacker-supplied path - but it is checked
+    // unconditionally anyway, before the executor is ever invoked.
+    if !preview_is_confined_to_root(&preview, &fixture_dir) {
+        eprintln!(
+            "refusing to proceed: an operation is not confined to the probe's own fixture root"
+        );
+        let _ = std::fs::remove_dir_all(&fixture_dir);
+        std::process::exit(1);
     }
 
     let approved = match approve_transaction(&preview, "developer probe fixture apply") {
@@ -109,13 +132,22 @@ fn main() {
         }
     };
 
+    if fail_after_1_requested {
+        // Sabotage: pre-create the destination so the whole-batch preflight
+        // finds a hard conflict and the AbortAll executor refuses before any
+        // mutation - demonstrating fail-closed behavior on demand, still
+        // entirely inside `fixture_dir`.
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        std::fs::write(&destination, b"pre-existing, never overwritten").unwrap();
+    }
+
     let generation = plan_generation_of(&export);
     let journal_dir = fixture_dir.join("journal");
     std::fs::create_dir_all(&journal_dir).unwrap();
     let cancel = AtomicBool::new(false);
     let trusted = TrustedRoots::from_paths([fixture_dir.as_path()]);
 
-    match apply_plan_transaction(
+    match apply_plan_transaction_with_mode(
         &mut transaction,
         generation,
         &fixture_dir,
@@ -123,6 +155,7 @@ fn main() {
         &journal_dir,
         &cancel,
         false,
+        HardConflictMode::AbortAll,
     ) {
         Ok(outcome) => {
             println!("Applied: {:?}", outcome.transaction.state);
@@ -133,11 +166,13 @@ fn main() {
         }
     }
 
-    // Roll back immediately so this probe never leaves a mutated fixture
-    // behind - it exists to demonstrate the mechanics, not to persist a
-    // result.
-    if let Ok(rollback) = rollback_plan_transaction(&mut transaction, &journal_dir, &cancel) {
-        println!("Rollback: {:?}", rollback.rollback.result);
+    if rollback_requested || apply_requested {
+        // Roll back immediately so this probe never leaves a mutated
+        // fixture behind - it exists to demonstrate the mechanics, not to
+        // persist a result.
+        if let Ok(rollback) = rollback_plan_transaction(&mut transaction, &journal_dir, &cancel) {
+            println!("Rollback: {:?}", rollback.rollback.result);
+        }
     }
 
     let _ = std::fs::remove_dir_all(&fixture_dir);

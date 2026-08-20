@@ -591,6 +591,26 @@ pub fn apply_plan_transaction_with_mode(
     if cancel.load(std::sync::atomic::Ordering::Relaxed) {
         return Err(ApplyError::Cancelled);
     }
+    // Batch 15 finding: once a transaction has entered or completed
+    // rollback, its entries' source paths are restored to their original,
+    // recorded identity - which the shared executor's own preflight would
+    // otherwise treat as fresh and safe to reapply, silently resurrecting
+    // an already-reversed transaction. Refused here, before the shared
+    // executor is ever invoked. `Applied`/`ApplyFailed`/`Planned` are not
+    // guarded here: a second apply on those is already safely refused by
+    // the shared executor's own preflight (the source is gone or already
+    // failed), which existing tests already rely on.
+    if matches!(
+        transaction.state,
+        TransactionState::RolledBack
+            | TransactionState::RollingBack
+            | TransactionState::RollbackFailed
+    ) {
+        return Err(ApplyError::AlreadySettled {
+            transaction_id: transaction.transaction_id.clone(),
+            state: transaction.state,
+        });
+    }
 
     transaction.state = TransactionState::Applying;
     write_journal(journal_dir, transaction)
@@ -735,5 +755,164 @@ pub fn assess_recovery(
     }
 }
 
+// --------------------------------------------------------------------
+// Developer-probe hard temp-safety guard (Batch 15, milestone section 39)
+// --------------------------------------------------------------------
+
+/// Whether every operation in `preview` has both its source and its
+/// destination underneath `root` - the hard guard a mutation-capable
+/// developer probe must check before ever invoking the executor. Pure and
+/// read-only: it inspects only the strings already captured in the preview,
+/// never touches the filesystem, and never trusts a caller-supplied
+/// destination that was not already confined to a root the probe created
+/// itself.
+pub fn preview_is_confined_to_root(preview: &TransactionPreview, root: &Path) -> bool {
+    preview.operations.iter().all(|op| {
+        let source_ok = Path::new(&op.source_path).starts_with(root);
+        let destination_ok = op
+            .destination_path
+            .as_deref()
+            .map(|destination| Path::new(destination).starts_with(root))
+            .unwrap_or(false);
+        source_ok && destination_ok
+    })
+}
+
+// --------------------------------------------------------------------
+// Human-readable manual recovery output (Batch 15, milestone section 36)
+// --------------------------------------------------------------------
+
+/// Renders a human-readable manual recovery report for a transaction whose
+/// [`RecoveryAssessment`] is anything other than a clean settled state -
+/// milestone section 36. Never proposes or performs a destructive fix; it
+/// only describes what is known, what is uncertain, and a safe next step.
+///
+/// Deliberately reports `plan_generation` (the only plan-identifying value
+/// [`RenameTransaction`] itself persists) rather than a full [`PlanDigest`]:
+/// this module never stores the 64-character digest on the transaction
+/// itself, only the derived generation number folded into
+/// `plan_generation` by [`plan_generation_of`]. A human recovering by hand
+/// can still match that number against a freshly recomputed
+/// `plan_generation_of` on the export they believe was in force.
+pub fn render_recovery_report(
+    transaction: &RenameTransaction,
+    issues: &[RecoveryIssue],
+    assessment: RecoveryAssessment,
+) -> String {
+    let mut out = String::new();
+    out.push_str("MANUAL RECOVERY REPORT\n\n");
+    out.push_str(&format!(
+        "Transaction id:\n  {}\n",
+        transaction.transaction_id
+    ));
+    out.push_str(&format!(
+        "Plan generation (derived from the plan digest):\n  {}\n",
+        transaction.plan_generation
+    ));
+    out.push_str(&format!(
+        "Current transaction state:\n  {:?}\n",
+        transaction.state
+    ));
+    out.push_str(&format!("Assessment:\n  {assessment:?}\n\n"));
+
+    let last_successful = transaction
+        .entries
+        .iter()
+        .filter(|entry| entry.state == EntryState::Applied)
+        .max_by_key(|entry| entry.applied_at_unix.unwrap_or(0));
+    out.push_str("Last successful operation:\n");
+    match last_successful {
+        Some(entry) => {
+            out.push_str(&format!("  Source:      {}\n", entry.source_path.display()));
+            out.push_str(&format!(
+                "  Destination: {}\n",
+                entry.destination_path.display()
+            ));
+        }
+        None => out.push_str("  (none - nothing in this transaction is confirmed applied)\n"),
+    }
+    out.push('\n');
+
+    out.push_str("Uncertain operations:\n");
+    let uncertain: Vec<&TransactionEntry> = transaction
+        .entries
+        .iter()
+        .filter(|entry| matches!(entry.state, EntryState::Applying | EntryState::RollingBack))
+        .collect();
+    if uncertain.is_empty() && issues.is_empty() {
+        out.push_str("  (none)\n");
+    } else {
+        for entry in &uncertain {
+            let observation = observe_path(&entry.source_path, &entry.destination_path);
+            out.push_str(&format!(
+                "  - Original source:     {}\n",
+                entry.source_path.display()
+            ));
+            out.push_str(&format!(
+                "    Intended destination: {}\n",
+                entry.destination_path.display()
+            ));
+            out.push_str(&format!(
+                "    Expected identity:    size={} bytes, kind={:?}\n",
+                entry.identity.size_bytes, entry.identity.kind
+            ));
+            out.push_str(&format!("    Current observation:  {observation}\n"));
+        }
+        for issue in issues {
+            out.push_str(&format!(
+                "  - Journal finding (entry #{}): {}\n",
+                issue.entry_index, issue.detail
+            ));
+        }
+    }
+    out.push('\n');
+
+    out.push_str("Suggested non-destructive next step:\n  ");
+    out.push_str(match assessment {
+        RecoveryAssessment::SafeToResume => {
+            "rebuild a fresh transaction from a current plan export and apply it; nothing was mutated by this one."
+        }
+        RecoveryAssessment::SafeToRollback => {
+            "call rollback on this exact transaction id to reverse its applied entries."
+        }
+        RecoveryAssessment::AlreadyCommitted => {
+            "nothing to do; every entry already settled cleanly."
+        }
+        RecoveryAssessment::AlreadyRolledBack => {
+            "nothing to do; every entry was already reversed."
+        }
+        RecoveryAssessment::ManualRecoveryRequired => {
+            "do not run apply or rollback automatically; inspect each uncertain operation above \
+             by hand, comparing the current observation against the expected identity, before \
+             deciding a safe manual action."
+        }
+    });
+    out.push('\n');
+    out
+}
+
+fn observe_path(source: &Path, destination: &Path) -> String {
+    let source_state = describe_symlink_metadata(source);
+    let destination_state = describe_symlink_metadata(destination);
+    format!("source={source_state}, destination={destination_state}")
+}
+
+fn describe_symlink_metadata(path: &Path) -> String {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                "present (symlink)".to_string()
+            } else if metadata.is_dir() {
+                "present (directory)".to_string()
+            } else {
+                format!("present ({} bytes)", metadata.len())
+            }
+        }
+        Err(_) => "absent".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod hardening_tests;
 #[cfg(test)]
 mod tests;
