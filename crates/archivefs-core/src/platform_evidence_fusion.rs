@@ -927,3 +927,27 @@ pub mod library_planning;
 /// [`library_planning::LibraryItemPlan`] - see that module's own doc
 /// comment.
 pub mod library_plan_presentation;
+
+/// Batch 11: the production canonical-platform -> RomM slug mapping - see
+/// that module's own doc comment.
+pub mod romm_platform_mapping;
+
+/// Batch 11: read-only side-file role classification - see that module's
+/// own doc comment.
+pub mod side_file_classification;
+
+/// Batch 11: bounded, read-only cue/m3u reference parsing - see that
+/// module's own doc comment.
+pub mod cue_m3u_parsing;
+
+/// Batch 11: read-only, hash-indexed duplicate classification - see that
+/// module's own doc comment.
+pub mod duplicate_taxonomy;
+
+/// Batch 11: read-only game/release/set hierarchy and multi-disc grouping -
+/// see that module's own doc comment.
+pub mod library_grouping;
+
+/// Batch 11: the complete read-only planning report - see that module's
+/// own doc comment.
+pub mod full_library_report;

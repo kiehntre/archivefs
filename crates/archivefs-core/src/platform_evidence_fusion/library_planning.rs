@@ -83,6 +83,7 @@ use crate::platform::identity::{
     PlatformIdentityConfidence, PlatformIdentityEvidence, PlatformIdentityResolution,
     PlatformIdentitySource, resolve_platform_identity,
 };
+use crate::platform::platform_by_id;
 
 use super::archive_set_identity::ArchiveSetIdentity;
 use super::dat_hash_representation::RepresentationMatchOutcome;
@@ -318,6 +319,22 @@ pub fn no_slug_mapping(_platform: &str) -> Option<String> {
     None
 }
 
+/// The library-native destination-folder fallback used when no RomM slug
+/// is available (milestone sections 35-36) - the canonical platform id
+/// itself, exactly as the registry spells it (e.g. `"N64"`, `"Game Boy
+/// Advance"`). Deliberately distinct from, and never confusable with, a
+/// RomM slug: RomM slugs are lowercase/dashed provider-specific strings
+/// (`"n64"`, `"game-boy-advance"`); this is the crate's own canonical id,
+/// used only to compute a real destination path when RomM has none to
+/// offer. `entry.slug` on the returned [`LibraryItemPlan::organisation`]
+/// is always patched back to the *real* RomM resolution (or `None`) before
+/// a plan is returned, so nothing downstream ever mistakes this fallback
+/// for a RomM slug. `None` only when `platform_id` is not a real
+/// registered platform at all.
+fn canonical_library_folder_name(platform_id: &str) -> Option<String> {
+    platform_by_id(platform_id).map(|platform| platform.id.to_string())
+}
+
 pub fn romm_mapping_preview(entry: &OrganisationPlanEntry) -> RommMappingPreview {
     let status = match (&entry.platform, &entry.slug) {
         (None, _) => RommMappingStatus::Unsupported,
@@ -433,12 +450,31 @@ pub struct LibraryItemPlan {
     pub rename: RenameSuggestion,
 }
 
+/// Builds one item's plan from *two* independently computed organisation
+/// entries for the same candidate - milestone sections 35-36's decoupling.
+///
+/// `library_entry` was built with a slug resolver that falls back to
+/// [`canonical_library_folder_name`] when no real RomM slug exists, so its
+/// `status`/`destination_path` reflect library-plan readiness on its own:
+/// a confidently resolved platform can be `Ready` here with zero RomM
+/// involvement. `romm_entry` was built with the caller's real RomM slug
+/// resolver only, so its `slug`/`status` are the honest RomM-specific
+/// picture (`Unsupported` there just means "no RomM slug", never "identity
+/// failed"). Only [`romm_mapping_preview`] ever reads from `romm_entry`;
+/// everything else (destination, rename, status) reads from
+/// `library_entry`, whose own `.slug` field is patched back to
+/// `romm_entry.slug` before being returned so a caller reading
+/// `organisation.slug` off the result always sees the real RomM slug (or
+/// `None`), never the internal library-folder fallback.
 fn build_item_plan(
-    entry: OrganisationPlanEntry,
+    library_entry: OrganisationPlanEntry,
+    romm_entry: &OrganisationPlanEntry,
     identity_status: IdentityStatus,
     set_identity: Option<ArchiveSetIdentity>,
 ) -> LibraryItemPlan {
-    let romm = romm_mapping_preview(&entry);
+    let romm = romm_mapping_preview(romm_entry);
+    let mut entry = library_entry;
+    entry.slug = romm_entry.slug.clone();
     let rename = rename_suggestion(&entry);
     let status = plan_status(identity_status, entry.status);
     LibraryItemPlan {
@@ -472,6 +508,16 @@ pub struct LibraryPlanInput {
     pub source_path: PathBuf,
     pub identity: IdentityResult,
     pub set_identity: Option<ArchiveSetIdentity>,
+    /// The physical file's own cryptographic hash, when the caller already
+    /// computed one (e.g. during DAT hash-representation auditing) -
+    /// Batch 11's duplicate taxonomy indexes on this rather than
+    /// re-hashing anything itself (milestone section 53). `None` when the
+    /// caller has no hash to offer; duplicate detection simply skips this
+    /// axis for that item rather than computing one.
+    pub physical_hash: Option<String>,
+    /// The normalized representation's hash, under the same "caller
+    /// already computed it, planner never re-hashes" rule.
+    pub normalized_hash: Option<String>,
 }
 
 /// The aggregated result of planning a whole collection - milestone
@@ -496,7 +542,11 @@ pub struct LibraryPlanningReport {
 
 /// Plans a whole collection - milestone section 28's `plan_library`. Pure
 /// composition of already-reviewed pieces: `build_organisation_plan` does
-/// the actual destination/collision/safety work, unchanged.
+/// the actual destination/collision/safety work, unchanged. Called
+/// *twice* internally (milestone sections 35-36's RomM decoupling - see
+/// [`build_item_plan`]'s own doc comment): once with the caller's real RomM
+/// slug resolver, once with a library-native fallback, so library-plan
+/// readiness is never held hostage to RomM mapping availability.
 pub fn plan_library(
     inputs: &[LibraryPlanInput],
     context: &LibraryPlanningContext<'_>,
@@ -512,7 +562,7 @@ pub fn plan_library(
         })
         .collect();
 
-    let request = OrganisationPlanRequest {
+    let romm_request = OrganisationPlanRequest {
         master_root: context.destination_root,
         mode: context.mode,
         content_policy: Default::default(),
@@ -520,21 +570,41 @@ pub fn plan_library(
         slug_for_platform: context.slug_for_platform,
         generation: context.generation,
     };
-    let organisation_plan = build_organisation_plan(&request);
+    let romm_plan = build_organisation_plan(&romm_request);
+
+    let library_slug_for_platform = |platform: &str| {
+        (context.slug_for_platform)(platform).or_else(|| canonical_library_folder_name(platform))
+    };
+    let library_request = OrganisationPlanRequest {
+        master_root: context.destination_root,
+        mode: context.mode,
+        content_policy: Default::default(),
+        candidates: &candidates,
+        slug_for_platform: &library_slug_for_platform,
+        generation: context.generation,
+    };
+    let organisation_plan = build_organisation_plan(&library_request);
 
     // organisation_plan.entries is sorted (status, source_path,
     // destination_path) by build_organisation_plan itself - match each
-    // entry back to its input by source_path for a stable, deterministic
-    // per-item plan regardless of input order (milestone section 44).
+    // entry back to its input, and to its counterpart in romm_plan, by
+    // source_path for a stable, deterministic per-item plan regardless of
+    // input order (milestone section 44).
     let mut items = Vec::with_capacity(organisation_plan.entries.len());
     for entry in &organisation_plan.entries {
         let input = inputs
             .iter()
             .find(|input| input.source_path == entry.source_path)
             .expect("every entry corresponds to a supplied input");
+        let romm_entry = romm_plan
+            .entries
+            .iter()
+            .find(|romm_entry| romm_entry.source_path == entry.source_path)
+            .expect("romm_plan was built from the same candidates as organisation_plan");
         let identity_status = present_identity(&input.identity).status;
         items.push(build_item_plan(
             entry.clone(),
+            romm_entry,
             identity_status,
             input.set_identity.clone(),
         ));

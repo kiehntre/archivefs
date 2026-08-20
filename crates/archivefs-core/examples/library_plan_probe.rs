@@ -25,6 +25,9 @@ use archivefs_core::dat::index::DatIndex;
 use archivefs_core::dat::limits::DatLimits;
 use archivefs_core::dat::parsers::parse_dat_file;
 use archivefs_core::dat::rom_organisation::OrganisationMode;
+use archivefs_core::disc_evidence_collector::{
+    MAX_CHD_BYTES, collect_chd_evidence, collect_plain_iso_evidence,
+};
 use archivefs_core::gb_header_evidence::{observe_gb_evidence, parse_gb_header};
 use archivefs_core::gba_header_evidence::{observe_gba_evidence, parse_gba_header};
 use archivefs_core::lynx_header_evidence::{observe_lynx_evidence, parse_lynx_header};
@@ -39,10 +42,14 @@ use archivefs_core::platform_evidence_fusion::dat_hash_representation::{
     hash_bytes, normalized_header_stripped_representation, normalized_n64_representation,
     normalized_smd_representation,
 };
+use archivefs_core::platform_evidence_fusion::duplicate_taxonomy::{
+    DuplicateClass, group_duplicates,
+};
 use archivefs_core::platform_evidence_fusion::fuse_platform_evidence;
 use archivefs_core::platform_evidence_fusion::identity_orchestrator::{
     IdentityInspectionInput, IdentityResult, inspect_identity,
 };
+use archivefs_core::platform_evidence_fusion::library_grouping::group_multidisc_sets;
 use archivefs_core::platform_evidence_fusion::library_plan_presentation::{
     present_library_plan, render_library_plan_text,
 };
@@ -66,20 +73,18 @@ struct Args {
     demo_slug: bool,
 }
 
-/// A hand-typed demo slug table for `--demo-slug` only - explicitly NOT the
-/// real RomM slug mapping (no such production table exists in this crate
-/// yet; see `no_slug_mapping`'s own doc comment). Exists only so this probe
-/// can demonstrate a real `Ready` plan end-to-end against a real file; never
-/// used unless the caller opts in with `--demo-slug`.
+/// `--demo-slug` now resolves through the real Batch 11 production mapping
+/// ([`archivefs_core::platform_evidence_fusion::romm_platform_mapping::production_romm_slug`])
+/// with no override map and no live identity cache - so this exercises
+/// exactly the same vetted static table (tier 3) a real caller with no
+/// connected RomM instance would see. Still opt-in via the flag, since
+/// `no_slug_mapping` (the honest zero-mapping default) remains this
+/// probe's own default.
 fn demo_slug_for_platform(platform: &str) -> Option<String> {
-    match platform {
-        "N64" => Some("n64".to_string()),
-        "Game Boy" => Some("gb".to_string()),
-        "Game Boy Color" => Some("gbc".to_string()),
-        "Game Boy Advance" => Some("gba".to_string()),
-        "GameGear" => Some("gg".to_string()),
-        _ => None,
-    }
+    use archivefs_core::platform_evidence_fusion::romm_platform_mapping::{
+        FrontendPlatformMapping, production_romm_slug,
+    };
+    production_romm_slug(platform, &FrontendPlatformMapping::default(), None)
 }
 
 fn parse_args() -> Option<Args> {
@@ -176,16 +181,70 @@ fn main() -> ExitCode {
     let mut inputs = Vec::new();
     let mut identities: Vec<(PathBuf, IdentityResult)> = Vec::new();
     for path in &files {
+        let extension = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        // Auto-routing (milestone section 44): the extension only chooses
+        // *which parser to try* - identity itself still comes entirely from
+        // the structural evidence that parser produces, never the
+        // extension text itself.
+        // Deliberately just ".chd"/".iso" - ".bin"/".img" are too overloaded
+        // with cartridge-format use elsewhere in this same probe (a Mega
+        // Drive `.bin`, for one) to route blindly; a real `.cue`+`.bin`
+        // pair is a cue/m3u-grouping concern (see
+        // `archivefs_core::platform_evidence_fusion::cue_m3u_parsing`), not
+        // this per-file dispatch.
+        let disc_evidence = match extension.as_deref() {
+            Some("chd") => {
+                Some(collect_chd_evidence(path).map_err(|refusal| format!("{refusal:?}")))
+            }
+            Some("iso") => Some(
+                collect_plain_iso_evidence(path, MAX_CHD_BYTES)
+                    .map_err(|refusal| format!("{refusal:?}")),
+            ),
+            _ => None,
+        };
+
+        if let Some(disc_result) = disc_evidence {
+            match disc_result {
+                Ok(evidence) => {
+                    let identity = inspect_identity(IdentityInspectionInput {
+                        content_evidence: evidence,
+                        ..Default::default()
+                    });
+                    identities.push((path.clone(), identity.clone()));
+                    inputs.push(LibraryPlanInput {
+                        source_path: path.clone(),
+                        identity,
+                        set_identity: None,
+                        physical_hash: None,
+                        normalized_hash: None,
+                    });
+                }
+                Err(reason) => {
+                    println!(
+                        "[skip] disc evidence collection refused for {}: {reason}",
+                        path.display()
+                    );
+                }
+            }
+            continue;
+        }
+
         let Ok(bytes) = std::fs::read(path) else {
             println!("[skip] could not read {}", path.display());
             continue;
         };
         let identity = build_identity(&bytes, path, args.dat_path.as_deref());
         identities.push((path.clone(), identity.clone()));
+        let physical_hash = hash_bytes(&bytes, path.to_str().unwrap_or(""), "physical").sha256;
         inputs.push(LibraryPlanInput {
             source_path: path.clone(),
             identity,
             set_identity: None,
+            physical_hash,
+            normalized_hash: None,
         });
     }
 
@@ -213,9 +272,42 @@ fn main() -> ExitCode {
         report.unsupported,
     );
     println!(
-        "RomM: mapped={} unmapped={} (no production slug table exists yet - see library_planning module doc)",
-        report.romm_mapped, report.romm_unmapped
+        "RomM: mapped={} unmapped={} ({})",
+        report.romm_mapped,
+        report.romm_unmapped,
+        if args.demo_slug {
+            "using the real Batch 11 production static table (--demo-slug)"
+        } else {
+            "no mapping requested - pass --demo-slug for the production static table"
+        }
     );
+    let duplicate_groups = group_duplicates(&inputs);
+    let multidisc_sets = group_multidisc_sets(&inputs);
+    println!(
+        "Duplicate groups: {} ({} exact physical, {} exact normalized, {} same DAT release/dump, \
+         {} possible)",
+        duplicate_groups.len(),
+        duplicate_groups
+            .iter()
+            .filter(|g| g.classification == DuplicateClass::ExactPhysicalDuplicate)
+            .count(),
+        duplicate_groups
+            .iter()
+            .filter(|g| g.classification == DuplicateClass::ExactNormalizedDuplicate)
+            .count(),
+        duplicate_groups
+            .iter()
+            .filter(|g| matches!(
+                g.classification,
+                DuplicateClass::SameDatRelease | DuplicateClass::SameGameDifferentDump
+            ))
+            .count(),
+        duplicate_groups
+            .iter()
+            .filter(|g| g.classification == DuplicateClass::PossibleDuplicate)
+            .count(),
+    );
+    println!("Multi-disc sets: {}", multidisc_sets.len());
     println!();
 
     for (item, (path, identity)) in report.items.iter().zip(identities.iter()) {

@@ -98,6 +98,9 @@ pub mod disk_format;
 /// Pure content/container/media evidence, deliberately separate from
 /// canonical platform identity. See the module documentation for why.
 pub mod content_evidence;
+/// Batch 11: the smallest reusable, read-only disc-evidence collector -
+/// see that module's own doc comment.
+pub mod disc_evidence_collector;
 
 /// The generic, dependency-free contract future content/media detectors
 /// implement. No detector implementation lives here.

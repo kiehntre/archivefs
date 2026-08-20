@@ -424,6 +424,8 @@ fn plan_library_resolves_a_confident_single_item() {
         source_path: source,
         identity: saturn_identity(),
         set_identity: None,
+        physical_hash: None,
+        normalized_hash: None,
     }];
     let report = plan_library(&inputs, &context(&root, &slug));
     assert_eq!(report.items.len(), 1);
@@ -442,10 +444,125 @@ fn plan_library_reports_unsupported_when_no_slug_mapping_exists() {
         source_path: source,
         identity: saturn_identity(),
         set_identity: None,
+        physical_hash: None,
+        normalized_hash: None,
     }];
     let report = plan_library(&inputs, &context(&root, &no_slug_mapping));
     assert_eq!(report.romm_unmapped, 1);
     assert_eq!(report.romm_mapped, 0);
+}
+
+// ------------------------------------------------------------------
+// RomM decoupling (milestone sections 35-36) - the batch's own named
+// "IMPORTANT ROMM DECOUPLING TEST".
+// ------------------------------------------------------------------
+
+#[test]
+fn confident_identity_with_no_romm_mapping_is_ready_not_unsupported() {
+    // Section 36's exact case: content+DAT confidently resolve a platform,
+    // no RomM mapping exists at all. The library plan must still be able
+    // to reach Ready (a real destination, under the library-native
+    // fallback folder) - RomM mapping unavailability must never by itself
+    // drag the whole plan down to Unsupported.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    let source = write_temp(dir.path(), "game.bin");
+
+    let identity = inspect_identity(IdentityInspectionInput {
+        content_evidence: vec![strong(
+            ContentEvidenceKind::BootStructure,
+            "SEGA SEGASATURN",
+        )],
+        dat: Some(resolved_dat("Saturn")),
+        representation_match: Some(RepresentationMatchOutcome::PhysicalOnly {
+            verdict: exact_verdict("Athlete Kings", "athlete_kings.bin"),
+        }),
+        ..Default::default()
+    });
+    let inputs = vec![LibraryPlanInput {
+        source_path: source,
+        identity,
+        set_identity: None,
+        physical_hash: None,
+        normalized_hash: None,
+    }];
+    let report = plan_library(&inputs, &context(&root, &no_slug_mapping));
+
+    assert_eq!(report.items.len(), 1);
+    assert_eq!(
+        report.items[0].status,
+        PlanStatus::Ready,
+        "a confidently resolved platform with no RomM mapping must still reach Ready"
+    );
+    assert_eq!(report.ready, 1);
+    assert_eq!(report.unsupported, 0);
+    // RomM's own state is independently, honestly Unmapped - never
+    // silently upgraded, never allowed to drag the plan down either.
+    assert_eq!(report.items[0].romm.status, RommMappingStatus::Unmapped);
+    assert_eq!(report.romm_unmapped, 1);
+    // The public `organisation.slug` field must report the *real* RomM
+    // state (None), never the internal library-folder fallback string.
+    assert!(report.items[0].organisation.slug.is_none());
+    // A real destination was still computed, using the library-native
+    // fallback folder (the canonical platform id).
+    assert!(
+        report.items[0]
+            .organisation
+            .destination_path
+            .starts_with(&root)
+    );
+}
+
+#[test]
+fn romm_mapped_and_library_ready_agree_when_a_slug_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    let source = write_temp(dir.path(), "game.bin");
+    let slug = |platform: &str| (platform == "Saturn").then(|| "saturn".to_string());
+
+    let inputs = vec![LibraryPlanInput {
+        source_path: source,
+        identity: saturn_identity(),
+        set_identity: None,
+        physical_hash: None,
+        normalized_hash: None,
+    }];
+    let report = plan_library(&inputs, &context(&root, &slug));
+    assert_eq!(report.items[0].status, PlanStatus::Ready);
+    assert_eq!(report.items[0].romm.status, RommMappingStatus::Mapped);
+    assert_eq!(
+        report.items[0].organisation.slug.as_deref(),
+        Some("saturn"),
+        "when a real RomM slug exists, organisation.slug must be that real slug, not the \
+         library-native fallback"
+    );
+}
+
+#[test]
+fn unresolved_identity_still_makes_the_plan_unsupported_or_needs_review_regardless_of_romm() {
+    // Decoupling must never *weaken* identity: an item whose identity is
+    // genuinely Unknown must not become Ready just because the library
+    // fallback can technically build *a* folder name for a resolved
+    // platform - here there is no resolved platform at all, so both plans
+    // agree there is nothing to organise.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    let source = write_temp(dir.path(), "game.bin");
+    let slug = |platform: &str| (platform == "Saturn").then(|| "saturn".to_string());
+
+    let inputs = vec![LibraryPlanInput {
+        source_path: source,
+        identity: inspect_identity(IdentityInspectionInput::default()),
+        set_identity: None,
+        physical_hash: None,
+        normalized_hash: None,
+    }];
+    let report = plan_library(&inputs, &context(&root, &slug));
+    assert_eq!(report.items[0].status, PlanStatus::Unknown);
+    assert_ne!(report.items[0].status, PlanStatus::Ready);
 }
 
 #[test]
@@ -467,6 +584,8 @@ fn plan_library_counts_conflicts_correctly() {
         source_path: source,
         identity: conflicting_identity,
         set_identity: None,
+        physical_hash: None,
+        normalized_hash: None,
     }];
     let report = plan_library(&inputs, &context(&root, &no_slug_mapping));
     assert_eq!(report.conflict, 1);
@@ -485,6 +604,8 @@ fn plan_library_counts_unknown_correctly() {
         source_path: source,
         identity: unknown_identity,
         set_identity: None,
+        physical_hash: None,
+        normalized_hash: None,
     }];
     let report = plan_library(&inputs, &context(&root, &no_slug_mapping));
     assert_eq!(report.unknown, 1);
@@ -520,6 +641,8 @@ fn plan_library_counts_ambiguous_correctly() {
         source_path: source,
         identity: ambiguous_identity,
         set_identity: None,
+        physical_hash: None,
+        normalized_hash: None,
     }];
     let report = plan_library(&inputs, &context(&root, &no_slug_mapping));
     assert_eq!(report.ambiguous, 1);
@@ -540,6 +663,8 @@ fn plan_library_carries_set_identity_separately_from_platform() {
         source_path: source,
         identity: saturn_identity(),
         set_identity: Some(set.clone()),
+        physical_hash: None,
+        normalized_hash: None,
     }];
     let report = plan_library(&inputs, &context(&root, &no_slug_mapping));
     assert_eq!(report.items[0].set_identity, Some(set));
@@ -564,11 +689,15 @@ fn plan_library_is_deterministic_regardless_of_input_order() {
             source_path: source_a.clone(),
             identity: saturn_identity(),
             set_identity: None,
+            physical_hash: None,
+            normalized_hash: None,
         },
         LibraryPlanInput {
             source_path: source_b.clone(),
             identity: saturn_identity(),
             set_identity: None,
+            physical_hash: None,
+            normalized_hash: None,
         },
     ];
     let inputs_backward = vec![
@@ -576,11 +705,15 @@ fn plan_library_is_deterministic_regardless_of_input_order() {
             source_path: source_b,
             identity: saturn_identity(),
             set_identity: None,
+            physical_hash: None,
+            normalized_hash: None,
         },
         LibraryPlanInput {
             source_path: source_a,
             identity: saturn_identity(),
             set_identity: None,
+            physical_hash: None,
+            normalized_hash: None,
         },
     ];
     let slug = |platform: &str| (platform == "Saturn").then(|| "saturn".to_string());
@@ -638,6 +771,8 @@ fn plan_library_never_writes_to_the_source_files() {
         source_path: source.clone(),
         identity: saturn_identity(),
         set_identity: None,
+        physical_hash: None,
+        normalized_hash: None,
     }];
     let _ = plan_library(&inputs, &context(&root, &slug));
 
@@ -676,6 +811,8 @@ fn plan_library_never_silently_proposes_the_dat_platform_over_a_disagreeing_cont
         source_path: source,
         identity,
         set_identity: None,
+        physical_hash: None,
+        normalized_hash: None,
     }];
     let slug = |_: &str| Some("whatever".to_string());
     let report = plan_library(&inputs, &context(&root, &slug));
@@ -713,6 +850,8 @@ fn adversarial_filename_with_embedded_newline_never_escapes_destination_root() {
         source_path: source,
         identity: saturn_identity(),
         set_identity: None,
+        physical_hash: None,
+        normalized_hash: None,
     }];
     let report = plan_library(&inputs, &context(&root, &slug));
     let entry = &report.items[0].organisation;
@@ -739,6 +878,8 @@ fn adversarial_very_long_filename_is_handled_without_a_silent_ready_outside_root
         source_path: source,
         identity: saturn_identity(),
         set_identity: None,
+        physical_hash: None,
+        normalized_hash: None,
     }];
     let report = plan_library(&inputs, &context(&root, &slug));
     let entry = &report.items[0].organisation;
@@ -761,6 +902,8 @@ fn adversarial_dot_prefixed_filename_never_escapes_destination_root() {
         source_path: source,
         identity: saturn_identity(),
         set_identity: None,
+        physical_hash: None,
+        normalized_hash: None,
     }];
     let report = plan_library(&inputs, &context(&root, &slug));
     let entry = &report.items[0].organisation;
@@ -794,6 +937,8 @@ fn adversarial_caller_supplied_source_path_with_dotdot_components_is_not_trusted
         source_path: via_dotdot,
         identity: saturn_identity(),
         set_identity: None,
+        physical_hash: None,
+        normalized_hash: None,
     }];
     let report = plan_library(&inputs, &context(&root, &slug));
     let entry = &report.items[0].organisation;
@@ -826,11 +971,15 @@ fn adversarial_duplicate_destination_collision_is_reported_not_silently_ready() 
             source_path: a,
             identity: saturn_identity(),
             set_identity: None,
+            physical_hash: None,
+            normalized_hash: None,
         },
         LibraryPlanInput {
             source_path: b,
             identity: saturn_identity(),
             set_identity: None,
+            physical_hash: None,
+            normalized_hash: None,
         },
     ];
     let report = plan_library(&inputs, &context(&root, &slug));
@@ -957,6 +1106,8 @@ fn matrix_multi_platform_archive_is_reported_as_multi_platform_not_collapsed() {
         source_path: source,
         identity: identity.clone(),
         set_identity: Some(set),
+        physical_hash: None,
+        normalized_hash: None,
     }];
     let report = plan_library(&inputs, &context(&root, &no_slug_mapping));
     let item = &report.items[0];
@@ -1008,6 +1159,8 @@ fn library_planning_report_serializes_to_json_without_error() {
             member_index: 0,
             platform: "Saturn",
         }),
+        physical_hash: None,
+        normalized_hash: None,
     }];
     let report = plan_library(&inputs, &context(&root, &slug));
     let json = serde_json::to_string_pretty(&report).expect("report must serialize to JSON");
@@ -1032,6 +1185,8 @@ fn adversarial_empty_extension_filename_is_handled_without_panicking() {
         source_path: source,
         identity: saturn_identity(),
         set_identity: None,
+        physical_hash: None,
+        normalized_hash: None,
     }];
     let report = plan_library(&inputs, &context(&root, &slug));
     let entry = &report.items[0].organisation;

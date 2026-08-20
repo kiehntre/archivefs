@@ -49,6 +49,8 @@ fn ready_plan_shows_a_real_destination_preview() {
             source_path: source,
             identity: identity.clone(),
             set_identity: None,
+            physical_hash: None,
+            normalized_hash: None,
         }],
         &context,
     );
@@ -62,6 +64,41 @@ fn ready_plan_shows_a_real_destination_preview() {
 
 #[test]
 fn non_ready_plan_never_shows_a_fabricated_destination() {
+    // A genuinely unresolved identity (never "no RomM slug" - Batch 11's
+    // RomM decoupling means a missing RomM mapping alone no longer makes a
+    // plan non-Ready; see `library_planning::tests::
+    // confident_identity_with_no_romm_mapping_is_ready_not_unsupported`).
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    let source = write_temp(dir.path(), "game.bin");
+    let identity = inspect_identity(IdentityInspectionInput::default());
+    let context = LibraryPlanningContext {
+        destination_root: &root,
+        mode: OrganisationMode::MoveRealFile,
+        slug_for_platform: &no_slug_mapping,
+        generation: 1,
+    };
+    let report = plan_library(
+        &[LibraryPlanInput {
+            source_path: source,
+            identity: identity.clone(),
+            set_identity: None,
+            physical_hash: None,
+            normalized_hash: None,
+        }],
+        &context,
+    );
+    let presentation = present_library_plan(&report.items[0], &identity);
+    assert!(presentation.destination_preview.is_none());
+}
+
+#[test]
+fn romm_unmapped_alone_still_reaches_ready_with_a_real_destination() {
+    // The decoupling itself, exercised from the presentation layer: a
+    // confidently resolved platform with no RomM mapping must still show a
+    // real destination preview - RomM's own summary independently says
+    // Unmapped.
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("root");
     std::fs::create_dir_all(&root).unwrap();
@@ -78,11 +115,19 @@ fn non_ready_plan_never_shows_a_fabricated_destination() {
             source_path: source,
             identity: identity.clone(),
             set_identity: None,
+            physical_hash: None,
+            normalized_hash: None,
         }],
         &context,
     );
     let presentation = present_library_plan(&report.items[0], &identity);
-    assert!(presentation.destination_preview.is_none());
+    assert!(presentation.destination_preview.is_some());
+    assert!(
+        presentation
+            .romm_summary
+            .to_lowercase()
+            .contains("no romm slug mapping")
+    );
 }
 
 #[test]
@@ -104,6 +149,8 @@ fn rename_summary_always_says_not_authorized_when_a_name_is_proposed() {
             source_path: source,
             identity: identity.clone(),
             set_identity: None,
+            physical_hash: None,
+            normalized_hash: None,
         }],
         &context,
     );
@@ -129,6 +176,8 @@ fn set_summary_reports_single_file_when_no_archive_context() {
             source_path: source,
             identity: identity.clone(),
             set_identity: None,
+            physical_hash: None,
+            normalized_hash: None,
         }],
         &context,
     );
@@ -158,6 +207,8 @@ fn set_summary_reports_multi_member_when_archive_context_present() {
             source_path: source,
             identity: identity.clone(),
             set_identity: Some(set),
+            physical_hash: None,
+            normalized_hash: None,
         }],
         &context,
     );
@@ -184,6 +235,8 @@ fn romm_summary_reports_unmapped_honestly() {
             source_path: source,
             identity: identity.clone(),
             set_identity: None,
+            physical_hash: None,
+            normalized_hash: None,
         }],
         &context,
     );
@@ -214,6 +267,8 @@ fn render_text_always_reports_source_modified_no() {
             source_path: source,
             identity: identity.clone(),
             set_identity: None,
+            physical_hash: None,
+            normalized_hash: None,
         }],
         &context,
     );
@@ -255,6 +310,8 @@ fn render_text_conflict_never_proposes_a_library() {
             source_path: source,
             identity: identity.clone(),
             set_identity: None,
+            physical_hash: None,
+            normalized_hash: None,
         }],
         &context,
     );
@@ -293,6 +350,8 @@ fn present_library_plan_is_deterministic() {
             source_path: source,
             identity: identity.clone(),
             set_identity: None,
+            physical_hash: None,
+            normalized_hash: None,
         }],
         &context,
     );

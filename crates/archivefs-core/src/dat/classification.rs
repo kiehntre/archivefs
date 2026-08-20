@@ -427,6 +427,40 @@ fn strict_multidisc_token(name: &str) -> Option<String> {
     None
 }
 
+/// One DAT release name's recognised multi-disc token, decomposed for
+/// grouping - milestone section 11 (Batch 11). Reuses
+/// [`strict_multidisc_token`] as the sole detector; adds nothing new to
+/// what counts as a multi-disc token, only exposes it and derives a
+/// grouping key from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultidiscToken {
+    /// `name` with the recognised `"(Disc N of M)"`-shaped token and its
+    /// enclosing parentheses removed and trimmed - two release names
+    /// differing only by disc number produce the same `base_title`.
+    pub base_title: String,
+    pub part: u16,
+    pub total: u16,
+}
+
+/// Public read-only wrapper over the same reviewed multi-disc token
+/// detector this classifier already uses internally for
+/// [`DatContentClass::RequiredMultidiscPart`] - never a second, looser
+/// parser. `None` when `name` carries no strict, delimited multi-disc
+/// token.
+pub fn multidisc_group_key(name: &str) -> Option<MultidiscToken> {
+    let token = strict_multidisc_token(name)?;
+    let full = format!("({token})");
+    let base_title = name.replacen(&full, "", 1).trim().to_string();
+    let words: Vec<&str> = token.split_whitespace().collect();
+    let part: u16 = words.get(1)?.parse().ok()?;
+    let total: u16 = words.get(3)?.parse().ok()?;
+    Some(MultidiscToken {
+        base_title,
+        part,
+        total,
+    })
+}
+
 fn classification(
     class: DatContentClass,
     confidence: ClassifierConfidence,
@@ -759,5 +793,27 @@ mod tests {
                 ContentEligibility::Selected
             );
         }
+    }
+
+    #[test]
+    fn multidisc_group_key_strips_the_token_and_reports_part_total() {
+        let token = multidisc_group_key("Final Fantasy VII (USA) (Disc 1 of 3)").unwrap();
+        assert_eq!(token.base_title, "Final Fantasy VII (USA)");
+        assert_eq!(token.part, 1);
+        assert_eq!(token.total, 3);
+
+        let token2 = multidisc_group_key("Final Fantasy VII (USA) (Disc 2 of 3)").unwrap();
+        assert_eq!(token2.base_title, token.base_title);
+        assert_eq!(token2.part, 2);
+    }
+
+    #[test]
+    fn multidisc_group_key_is_none_for_a_plain_single_disc_title() {
+        assert!(multidisc_group_key("Chrono Trigger (USA)").is_none());
+    }
+
+    #[test]
+    fn multidisc_group_key_rejects_a_title_merely_containing_the_word_disc() {
+        assert!(multidisc_group_key("Disc Jockey Simulator (USA)").is_none());
     }
 }
