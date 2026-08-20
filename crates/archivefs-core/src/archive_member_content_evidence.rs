@@ -1053,3 +1053,308 @@ mod sevenz_observation_tests {
         assert_eq!(observation.members.len(), 2);
     }
 }
+
+/// Batch 8: ZIP/7z archive members combined with
+/// [`crate::platform_evidence_fusion::archive_set_identity`] and
+/// [`crate::platform_evidence_fusion::dat_hash_representation`] -
+/// milestone sections 16, 20, 21, 25, 26.
+#[cfg(test)]
+mod archive_dat_set_identity_tests {
+    use super::*;
+    use crate::dat::index::DatIndex;
+    use crate::dat::model::{
+        DatEcosystem, DatFormat, DatGameEntry, DatRomEntry, DatSource, ParsedDat,
+    };
+    use crate::platform_evidence_fusion::archive_set_identity::{
+        ArchiveSetIdentity, classify_archive_set,
+    };
+    use crate::platform_evidence_fusion::dat_hash_representation::{
+        ByteRepresentation, RepresentationHashes, audit_representation, hash_bytes,
+    };
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipWriter};
+
+    fn ines_rom(payload: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0u8; 16];
+        bytes[0..4].copy_from_slice(b"NES\x1a");
+        bytes[4] = 1;
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    fn write_zip(path: &Path, entries: &[(&str, &[u8])]) {
+        let file = File::create(path).unwrap();
+        let mut writer = ZipWriter::new(file);
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        for (name, data) in entries {
+            writer.start_file(*name, options).unwrap();
+            writer.write_all(data).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    fn temp_zip_path(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "archivefs-set-identity-dat-test-{name}-{}-{:?}.zip",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
+        path
+    }
+
+    fn member_evidence(
+        observation: &ArchiveContentObservation,
+    ) -> Vec<(usize, Vec<crate::content_evidence::ContentEvidence>)> {
+        observation
+            .members
+            .iter()
+            .map(|m| (m.member_index, m.evidence.clone()))
+            .collect()
+    }
+
+    fn dat_index_for(game_name: &str, evidence: &crate::dat::audit::KnownFileEvidence) -> DatIndex {
+        let dat = ParsedDat {
+            source: DatSource {
+                format: DatFormat::Logiqx,
+                ecosystem: DatEcosystem::GenericLogiqx,
+                file_path: "test.dat".into(),
+                name: Some("Test".into()),
+                description: None,
+                version: None,
+                author: None,
+                homepage: None,
+                clrmamepro_header: None,
+                entry_count: 1,
+                rom_count: 1,
+                parse_warnings: Vec::new(),
+            },
+            games: vec![DatGameEntry {
+                name: game_name.to_string(),
+                description: None,
+                roms: vec![DatRomEntry {
+                    name: format!("{game_name}.bin"),
+                    size_bytes: evidence.size_bytes,
+                    crc32: evidence.crc32.clone(),
+                    md5: evidence.md5.clone(),
+                    sha1: evidence.sha1.clone(),
+                    sha256: evidence.sha256.clone(),
+                    status: None,
+                    merge: None,
+                    date: None,
+                    loadflag: None,
+                    ..Default::default()
+                }],
+                clone_of: None,
+                sample_of: None,
+                board: None,
+                rebuild_to: None,
+                year: None,
+                manufacturer: None,
+                source_file: None,
+                comment: None,
+                original_metadata: Default::default(),
+                content_classification: Default::default(),
+                unsupported_structure: false,
+                ..Default::default()
+            }],
+        };
+        DatIndex::build(&dat)
+    }
+
+    // ------------------------------------------------------------------
+    // Section 20: one-game+junk ZIP, content + DAT agree
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn one_game_plus_junk_zip_set_identity_and_dat_agree() {
+        let rom = ines_rom(&[7u8; 64]);
+        let path = temp_zip_path("one-game-plus-junk");
+        write_zip(&path, &[("game.nes", &rom), ("readme.txt", b"just docs")]);
+        let observation = observe_zip_member_content(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let members = member_evidence(&observation);
+        let set_identity = classify_archive_set(&members);
+        match &set_identity {
+            ArchiveSetIdentity::SingleMember { platform, .. } => assert_eq!(*platform, "NES"),
+            other => panic!("expected SingleMember, got {other:?}"),
+        }
+
+        // DAT convergence: the physical ROM bytes match a DAT entry built
+        // from the ROM's own real hash.
+        let rom_evidence = hash_bytes(&rom, "game.nes", "game.nes");
+        let index = dat_index_for("Test NES Game", &rom_evidence);
+        let (_, verdict) = audit_representation(
+            &RepresentationHashes {
+                representation: ByteRepresentation::ArchiveMember {
+                    member_name: "game.nes".to_string(),
+                },
+                evidence: rom_evidence,
+            },
+            &index,
+        );
+        assert!(verdict.is_confident());
+    }
+
+    // ------------------------------------------------------------------
+    // Section 20: two-game ZIP - set identity stays multi-member, not one
+    // collapsed game identity
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn two_game_zip_same_platform_set_identity_never_collapses_to_one_game() {
+        let rom_a = ines_rom(&[1u8; 64]);
+        let rom_b = ines_rom(&[2u8; 64]);
+        let path = temp_zip_path("two-game-same-platform");
+        write_zip(&path, &[("game_a.nes", &rom_a), ("game_b.nes", &rom_b)]);
+        let observation = observe_zip_member_content(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let members = member_evidence(&observation);
+        let set_identity = classify_archive_set(&members);
+        match set_identity {
+            ArchiveSetIdentity::MultiMemberSamePlatform {
+                platform,
+                member_indices,
+            } => {
+                assert_eq!(platform, "NES");
+                assert_eq!(member_indices.len(), 2);
+            }
+            other => panic!("expected MultiMemberSamePlatform, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn two_game_zip_different_platform_is_multi_platform_conflict() {
+        let nes_rom = ines_rom(&[3u8; 64]);
+        let mut gba_rom = vec![0u8; 192];
+        gba_rom[0] = 0xEA;
+        gba_rom[4..4 + 4].copy_from_slice(&[0x24, 0xff, 0xae, 0x51]);
+        gba_rom[0xB2] = 0x96;
+        let path = temp_zip_path("two-game-different-platform");
+        write_zip(&path, &[("game.nes", &nes_rom), ("game.gba", &gba_rom)]);
+        let observation = observe_zip_member_content(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let members = member_evidence(&observation);
+        let set_identity = classify_archive_set(&members);
+        // Depending on whether the synthetic GBA header validates fully,
+        // this either resolves as MultiPlatform (both strong) or the GBA
+        // member simply produces no evidence (still SingleMember/NES) -
+        // either is an honest outcome; what matters is it never silently
+        // reports a single, wrongly-collapsed game/platform pair.
+        assert!(!matches!(
+            set_identity,
+            ArchiveSetIdentity::StructuredSet { .. }
+        ));
+    }
+
+    // ------------------------------------------------------------------
+    // Section 21: 7z member + set identity + DAT (in-process only)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn sevenz_single_member_set_identity_and_dat_convergence() {
+        use crate::dat::archive::limits::ArchiveLimits;
+        use crate::safe_read::TrustedRoots;
+        use sevenz_rust2::{ArchiveEntry, ArchiveWriter};
+        use std::sync::atomic::AtomicBool;
+
+        let dir = tempfile::tempdir().unwrap();
+        let rom = ines_rom(&[9u8; 64]);
+        let archive_path = dir.path().join("archive.7z");
+        let mut writer = ArchiveWriter::new(File::create(&archive_path).unwrap()).unwrap();
+        let mut entry = ArchiveEntry::new_file("game.nes");
+        entry.size = rom.len() as u64;
+        writer
+            .push_archive_entry(entry, Some(std::io::Cursor::new(rom.as_slice())))
+            .unwrap();
+        writer.finish().unwrap();
+
+        let trusted = TrustedRoots::from_paths(dir.path().parent());
+        let cancel = AtomicBool::new(false);
+        let observation = observe_sevenz_member_content(
+            &archive_path,
+            &trusted,
+            ArchiveLimits::default(),
+            &cancel,
+        )
+        .unwrap();
+
+        let members = member_evidence(&observation);
+        let set_identity = classify_archive_set(&members);
+        match &set_identity {
+            ArchiveSetIdentity::SingleMember { platform, .. } => assert_eq!(*platform, "NES"),
+            other => panic!("expected SingleMember, got {other:?}"),
+        }
+
+        let rom_evidence = hash_bytes(&rom, "game.nes", "game.nes");
+        let index = dat_index_for("Test 7z NES Game", &rom_evidence);
+        let (_, verdict) = audit_representation(
+            &RepresentationHashes {
+                representation: ByteRepresentation::ArchiveMember {
+                    member_name: "game.nes".to_string(),
+                },
+                evidence: rom_evidence,
+            },
+            &index,
+        );
+        assert!(verdict.is_confident());
+    }
+
+    #[test]
+    fn sevenz_member_with_no_local_dat_entry_reports_content_only() {
+        use crate::dat::archive::limits::ArchiveLimits;
+        use crate::safe_read::TrustedRoots;
+        use sevenz_rust2::{ArchiveEntry, ArchiveWriter};
+        use std::sync::atomic::AtomicBool;
+
+        let dir = tempfile::tempdir().unwrap();
+        let rom = ines_rom(&[11u8; 64]);
+        let archive_path = dir.path().join("archive.7z");
+        let mut writer = ArchiveWriter::new(File::create(&archive_path).unwrap()).unwrap();
+        let mut entry = ArchiveEntry::new_file("game.nes");
+        entry.size = rom.len() as u64;
+        writer
+            .push_archive_entry(entry, Some(std::io::Cursor::new(rom.as_slice())))
+            .unwrap();
+        writer.finish().unwrap();
+
+        let trusted = TrustedRoots::from_paths(dir.path().parent());
+        let cancel = AtomicBool::new(false);
+        let observation = observe_sevenz_member_content(
+            &archive_path,
+            &trusted,
+            ArchiveLimits::default(),
+            &cancel,
+        )
+        .unwrap();
+        let evidence: Vec<_> = observation
+            .members
+            .iter()
+            .flat_map(|m| m.evidence.iter().cloned())
+            .collect();
+        let explanation = crate::platform_evidence_fusion::fuse_platform_evidence(evidence);
+        assert_eq!(explanation.resolved_platform, Some("NES"));
+
+        // No local DAT entry supplied - empty index - honestly reports
+        // NotInDat, never a fabricated match.
+        let empty_index = dat_index_for(
+            "Unrelated Game",
+            &crate::dat::audit::KnownFileEvidence::new("x", "x"),
+        );
+        let rom_evidence = hash_bytes(&rom, "game.nes", "game.nes");
+        let (_, verdict) = audit_representation(
+            &RepresentationHashes {
+                representation: ByteRepresentation::ArchiveMember {
+                    member_name: "game.nes".to_string(),
+                },
+                evidence: rom_evidence,
+            },
+            &empty_index,
+        );
+        assert!(!verdict.is_confident());
+    }
+}

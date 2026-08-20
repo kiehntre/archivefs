@@ -901,3 +901,15 @@ pub mod identity_bridge;
 /// comment for the full design and why it is distinct from
 /// [`identity_bridge`]/[`DatContentComparison`].
 pub mod combined_identity;
+
+/// Batch 8: which byte representation (physical/normalized/archive-member)
+/// produced a DAT hash match - see that module's own doc comment.
+pub mod dat_hash_representation;
+
+/// Batch 8: the archive **set** identity axis, separate from platform
+/// identity - see that module's own doc comment.
+pub mod archive_set_identity;
+
+/// Batch 8: the thin end-to-end identity orchestrator - see that module's
+/// own doc comment.
+pub mod identity_orchestrator;

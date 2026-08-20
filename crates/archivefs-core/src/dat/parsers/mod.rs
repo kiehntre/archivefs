@@ -85,7 +85,15 @@ pub fn detect_format(path: &Path) -> Result<DatFormat, ParseError> {
         path: path.to_path_buf(),
         error,
     })?;
-    let head = &buf[..n];
+    let mut head = &buf[..n];
+    // A UTF-8 BOM (some real TOSEC DATs carry one) precedes the XML
+    // declaration and is not Unicode whitespace, so `.trim()` alone never
+    // removes it - left unstripped, sniffing below silently fails to
+    // recognize `<?xml` and misclassifies a real Logiqx file as
+    // ClrMamePro (which then parses zero games, no error surfaced).
+    if let Some(without_bom) = head.strip_prefix(b"\xEF\xBB\xBF") {
+        head = without_bom;
+    }
 
     let trimmed = String::from_utf8_lossy(head).trim().to_ascii_lowercase();
 
@@ -190,6 +198,37 @@ mod tests {
             outcome.dat.games[0].content_classification.class,
             DatContentClass::Unknown
         );
+    }
+
+    #[test]
+    fn a_utf8_bom_before_the_xml_declaration_still_detects_as_logiqx() {
+        // Batch 8: some real TOSEC DATs carry a UTF-8 BOM before `<?xml`;
+        // this must still be recognized as Logiqx, not silently
+        // misclassified as ClrMamePro (which would then parse zero games
+        // without ever surfacing an error).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bom.dat");
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(
+            br#"<?xml version="1.0" encoding="UTF-8"?><datafile><header><name>BOM Example</name></header><game name="Some Game"><rom name="game.bin" size="4" crc="00000000"/></game></datafile>"#,
+        );
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(detect_format(&path).unwrap(), DatFormat::Logiqx);
+        let outcome = parse_dat_file(&path, DatLimits::default()).unwrap();
+        assert_eq!(outcome.dat.games.len(), 1);
+        assert_eq!(outcome.dat.games[0].name, "Some Game");
+    }
+
+    #[test]
+    fn no_bom_logiqx_detection_is_unaffected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no-bom.dat");
+        std::fs::write(
+            &path,
+            r#"<?xml version="1.0"?><datafile><header><name>No BOM</name></header></datafile>"#,
+        )
+        .unwrap();
+        assert_eq!(detect_format(&path).unwrap(), DatFormat::Logiqx);
     }
 
     #[test]
