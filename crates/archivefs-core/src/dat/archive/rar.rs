@@ -2189,6 +2189,7 @@ mod tests {
                 merge: None,
                 content_classification: Default::default(),
                 original_metadata: Default::default(),
+                clone_of: None,
             }
         }
 
@@ -2201,6 +2202,7 @@ mod tests {
                 by_sha1: HashMap::new(),
                 by_sha256: HashMap::new(),
                 by_filename: HashMap::from([(filename.to_ascii_lowercase(), refs)]),
+                game_clone_of: HashMap::new(),
             }
         }
 
@@ -2471,6 +2473,7 @@ mod tests {
                 by_sha1: HashMap::new(),
                 by_sha256: HashMap::new(),
                 by_filename,
+                game_clone_of: HashMap::new(),
             };
             let mut source = open_source(
                 &fixture("test_read_format_rar5_multiple_files.rar"),
@@ -2563,6 +2566,7 @@ mod tests {
                 by_sha1: HashMap::new(),
                 by_sha256: HashMap::new(),
                 by_filename: HashMap::new(),
+                game_clone_of: HashMap::new(),
             };
 
             let encrypted = open_source(

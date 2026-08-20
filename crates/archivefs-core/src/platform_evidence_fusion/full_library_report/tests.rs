@@ -39,6 +39,7 @@ fn full_report_counts_primary_and_support_files_separately() {
             set_identity: None,
             physical_hash: None,
             normalized_hash: None,
+            release_relationship: None,
         },
         LibraryPlanInput {
             source_path: cover,
@@ -46,6 +47,7 @@ fn full_report_counts_primary_and_support_files_separately() {
             set_identity: None,
             physical_hash: None,
             normalized_hash: None,
+            release_relationship: None,
         },
     ];
     let context = LibraryPlanningContext {
@@ -72,6 +74,7 @@ fn full_report_status_counts_match_the_underlying_plan() {
         set_identity: None,
         physical_hash: None,
         normalized_hash: None,
+        release_relationship: None,
     }];
     let context = LibraryPlanningContext {
         destination_root: &root,
@@ -99,6 +102,7 @@ fn full_report_reflects_duplicate_groups() {
             set_identity: None,
             physical_hash: Some("hash1".to_string()),
             normalized_hash: None,
+            release_relationship: None,
         },
         LibraryPlanInput {
             source_path: b,
@@ -106,6 +110,7 @@ fn full_report_reflects_duplicate_groups() {
             set_identity: None,
             physical_hash: Some("hash1".to_string()),
             normalized_hash: None,
+            release_relationship: None,
         },
     ];
     let context = LibraryPlanningContext {
@@ -131,6 +136,7 @@ fn full_report_serializes_to_json() {
         set_identity: None,
         physical_hash: None,
         normalized_hash: None,
+        release_relationship: None,
     }];
     let context = LibraryPlanningContext {
         destination_root: &root,

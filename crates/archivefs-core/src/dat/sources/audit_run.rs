@@ -1224,6 +1224,7 @@ mod nested_member_evidence_tests {
             merge: None,
             content_classification: Default::default(),
             original_metadata: Default::default(),
+            clone_of: None,
         };
         let index = DatIndex {
             by_crc32: HashMap::new(),
@@ -1231,6 +1232,7 @@ mod nested_member_evidence_tests {
             by_sha1: HashMap::from([(digest.to_string(), vec![candidate])]),
             by_sha256: HashMap::new(),
             by_filename: HashMap::new(),
+            game_clone_of: HashMap::new(),
         };
         let known = KnownFileEvidence::new("archive.zip::#0", "nested.bin")
             .with_size(4)
@@ -1321,6 +1323,7 @@ mod rar_dispatch_tests {
             by_sha1: std::collections::HashMap::new(),
             by_sha256: std::collections::HashMap::new(),
             by_filename: std::collections::HashMap::new(),
+            game_clone_of: std::collections::HashMap::new(),
         }
     }
 

@@ -26,7 +26,7 @@ use archivefs_core::dat::limits::DatLimits;
 use archivefs_core::dat::parsers::parse_dat_file;
 use archivefs_core::dat::rom_organisation::OrganisationMode;
 use archivefs_core::disc_evidence_collector::{
-    MAX_CHD_BYTES, collect_chd_evidence, collect_plain_iso_evidence,
+    MAX_CHD_BYTES, collect_chd_evidence, collect_gc_wii_evidence, collect_plain_iso_evidence,
 };
 use archivefs_core::gb_header_evidence::{observe_gb_evidence, parse_gb_header};
 use archivefs_core::gba_header_evidence::{observe_gba_evidence, parse_gba_header};
@@ -180,11 +180,22 @@ fn main() -> ExitCode {
 
     let mut inputs = Vec::new();
     let mut identities: Vec<(PathBuf, IdentityResult)> = Vec::new();
+    let mut cue_m3u_files: Vec<PathBuf> = Vec::new();
     for path in &files {
         let extension = path
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
+        if matches!(
+            extension.as_deref(),
+            Some("cue") | Some("m3u") | Some("m3u8")
+        ) {
+            // Handled separately below (milestone section 20/22): a cue/m3u
+            // is a set-membership reference list, not itself a primary-
+            // content item to identify.
+            cue_m3u_files.push(path.clone());
+            continue;
+        }
         // Auto-routing (milestone section 44): the extension only chooses
         // *which parser to try* - identity itself still comes entirely from
         // the structural evidence that parser produces, never the
@@ -199,10 +210,23 @@ fn main() -> ExitCode {
             Some("chd") => {
                 Some(collect_chd_evidence(path).map_err(|refusal| format!("{refusal:?}")))
             }
-            Some("iso") => Some(
-                collect_plain_iso_evidence(path, MAX_CHD_BYTES)
-                    .map_err(|refusal| format!("{refusal:?}")),
-            ),
+            // GameCube/Wii's own reviewed formats (RVZ/WBFS/WIA/CISO/NFS/
+            // GCZ/plain GCM) plus plain `.iso` - `nod` does its own
+            // container sniffing internally and fails closed on anything
+            // that isn't actually GameCube/Wii, so `.iso` tries this path
+            // first (cheap, bounded - no whole-file read) and only falls
+            // back to plain ISO9660 if that refuses.
+            Some("rvz") | Some("wbfs") | Some("wia") | Some("ciso") | Some("nfs") | Some("gcz")
+            | Some("gcm") => {
+                Some(collect_gc_wii_evidence(path).map_err(|refusal| format!("{refusal:?}")))
+            }
+            Some("iso") => match collect_gc_wii_evidence(path) {
+                Ok(evidence) => Some(Ok(evidence)),
+                Err(_) => Some(
+                    collect_plain_iso_evidence(path, MAX_CHD_BYTES)
+                        .map_err(|refusal| format!("{refusal:?}")),
+                ),
+            },
             _ => None,
         };
 
@@ -220,6 +244,7 @@ fn main() -> ExitCode {
                         set_identity: None,
                         physical_hash: None,
                         normalized_hash: None,
+                        release_relationship: None,
                     });
                 }
                 Err(reason) => {
@@ -245,7 +270,17 @@ fn main() -> ExitCode {
             set_identity: None,
             physical_hash,
             normalized_hash: None,
+            release_relationship: None,
         });
+    }
+
+    if !cue_m3u_files.is_empty() {
+        println!("==================================================");
+        println!("Cue/M3U planned sets ({} file(s)):", cue_m3u_files.len());
+        for path in &cue_m3u_files {
+            print_cue_m3u_plan(path);
+        }
+        println!();
     }
 
     let slug_fn: &dyn Fn(&str) -> Option<String> = if args.demo_slug {
@@ -318,6 +353,79 @@ fn main() -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+/// Prints one cue/m3u file's planned set (milestone sections 20-23): each
+/// safe reference, whether the referenced member is actually present on
+/// disk (missing => a real blocker, never silently ignored), and any
+/// rejected (unsafe) reference. Bounded read (max
+/// `cue_m3u_parsing::MAX_PARSE_BYTES`) - never a full read of an
+/// arbitrarily large file claiming to be a cue/m3u.
+fn print_cue_m3u_plan(path: &Path) {
+    use archivefs_core::platform_evidence_fusion::cue_m3u_parsing::{
+        MAX_PARSE_BYTES, parse_cue_file_references, parse_m3u_references,
+    };
+    use std::io::Read as _;
+
+    println!("  {}", path.display());
+    let Ok(mut file) = std::fs::File::open(path) else {
+        println!("    [could not open]");
+        return;
+    };
+    let mut buf = vec![0u8; MAX_PARSE_BYTES + 1];
+    let Ok(read) = file.read(&mut buf) else {
+        println!("    [could not read]");
+        return;
+    };
+    if read > MAX_PARSE_BYTES {
+        println!("    [refused: file exceeds the {MAX_PARSE_BYTES}-byte bound]");
+        return;
+    }
+    buf.truncate(read);
+    let Ok(text) = String::from_utf8(buf) else {
+        println!("    [refused: not valid UTF-8]");
+        return;
+    };
+
+    let is_cue = path.extension().and_then(|e| e.to_str()) == Some("cue");
+    let references = if is_cue {
+        parse_cue_file_references(path, &text)
+    } else {
+        parse_m3u_references(path, &text)
+    };
+
+    if references.is_empty() {
+        println!("    (no references found)");
+        return;
+    }
+    let mut missing = 0;
+    let mut unsafe_count = 0;
+    for reference in &references {
+        if !reference.is_safe() {
+            unsafe_count += 1;
+            println!(
+                "    REJECTED  {:?}  ({:?})",
+                reference.raw, reference.rejection
+            );
+            continue;
+        }
+        let resolved = reference.resolved.as_ref().unwrap();
+        if resolved.is_file() {
+            println!("    OK        {}", resolved.display());
+        } else {
+            missing += 1;
+            println!("    MISSING   {}", resolved.display());
+        }
+    }
+    let status = if unsafe_count > 0 || missing > 0 {
+        "NeedsReview"
+    } else {
+        "Ready (all members present and safe)"
+    };
+    println!(
+        "    Set status: {status} ({} member(s), {missing} missing, {unsafe_count} unsafe)",
+        references.len()
+    );
 }
 
 /// Builds an [`IdentityResult`] the same way `cartridge_probe` does: by

@@ -1632,6 +1632,7 @@ mod tests {
             merge: None,
             content_classification: Default::default(),
             original_metadata: Default::default(),
+            clone_of: None,
         }];
         let mut out = outcome(dir.path(), Vec::new(), Vec::new(), None, false);
         out.archives = vec![audit];

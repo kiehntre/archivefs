@@ -51,6 +51,13 @@ pub struct DatRomRef {
     pub merge: Option<String>,
     pub content_classification: DatContentClassification,
     pub original_metadata: DatOriginalMetadata,
+    /// Batch 12: the owning game entry's own `cloneof`/`cloneofid` value,
+    /// verbatim from the DAT source - `None` when the DAT carries no such
+    /// relationship for this game, or declares this game itself as a
+    /// parent. No fuzzy derivation: this is exactly
+    /// `DatGameEntry::clone_of`, copied at index-build time, never
+    /// re-parsed from a title string.
+    pub clone_of: Option<String>,
 }
 
 impl DatRomRef {
@@ -238,6 +245,13 @@ pub struct DatIndex {
     pub by_sha1: HashMap<String, Vec<DatRomRef>>,
     pub by_sha256: HashMap<String, Vec<DatRomRef>>,
     pub by_filename: HashMap<String, Vec<DatRomRef>>,
+    /// Batch 12: every game's own `cloneof` value (verbatim, `None` when
+    /// the DAT declares none), keyed by game name - built once here so a
+    /// caller holding only a confident `AuditVerdict::Exact`'s `game_name`
+    /// (never a hash relookup) can still answer "does this release have a
+    /// declared parent?" in O(1). See
+    /// [`crate::platform_evidence_fusion::release_relationship`].
+    pub game_clone_of: HashMap<String, Option<String>>,
 }
 
 impl DatIndex {
@@ -252,7 +266,14 @@ impl DatIndex {
             by_sha1: HashMap::new(),
             by_sha256: HashMap::new(),
             by_filename: HashMap::new(),
+            game_clone_of: HashMap::new(),
         };
+
+        for game in &dat.games {
+            index
+                .game_clone_of
+                .insert(game.name.clone(), game.clone_of.clone());
+        }
 
         for (game_index, game) in dat.games.iter().enumerate() {
             for (rom_index, rom) in game.roms.iter().enumerate() {
@@ -271,6 +292,7 @@ impl DatIndex {
                     merge: rom.merge.clone(),
                     content_classification: game.content_classification.clone(),
                     original_metadata: game.original_metadata.clone(),
+                    clone_of: game.clone_of.clone(),
                 };
 
                 index.insert_rom(rom, rom_ref);
@@ -300,6 +322,7 @@ impl DatIndex {
                             merge: rom.merge.clone(),
                             content_classification: game.content_classification.clone(),
                             original_metadata: game.original_metadata.clone(),
+                            clone_of: game.clone_of.clone(),
                         };
                         index.insert_rom(rom, rom_ref);
                     }

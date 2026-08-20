@@ -518,6 +518,12 @@ pub struct LibraryPlanInput {
     /// The normalized representation's hash, under the same "caller
     /// already computed it, planner never re-hashes" rule.
     pub normalized_hash: Option<String>,
+    /// Batch 12: this item's DAT-declared `cloneof` lineage, when the
+    /// caller already resolved one via
+    /// [`super::release_relationship::resolve_release_relationship`] -
+    /// `None` when no DAT/index was available. The planner never looks
+    /// this up itself (no `DatIndex` is held here).
+    pub release_relationship: Option<super::release_relationship::ReleaseRelationship>,
 }
 
 /// The aggregated result of planning a whole collection - milestone

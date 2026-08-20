@@ -1655,6 +1655,7 @@ mod tests {
                 merge: None,
                 content_classification: Default::default(),
                 original_metadata: Default::default(),
+                clone_of: None,
             }
         }
 
@@ -1900,6 +1901,7 @@ mod tests {
             merge: rom.merge.clone(),
             content_classification: game.content_classification.clone(),
             original_metadata: game.original_metadata.clone(),
+            clone_of: None,
         }
     }
 
@@ -1922,6 +1924,7 @@ mod tests {
             merge: rom.merge.clone(),
             content_classification: game.content_classification.clone(),
             original_metadata: game.original_metadata.clone(),
+            clone_of: None,
         }
     }
 
@@ -2877,6 +2880,7 @@ mod tests {
                 merge: rom.merge.clone(),
                 content_classification: game.content_classification.clone(),
                 original_metadata: game.original_metadata.clone(),
+                clone_of: None,
             }
         }
 
@@ -2928,6 +2932,7 @@ mod tests {
             merge: None,
             content_classification: games[1].content_classification.clone(),
             original_metadata: games[1].original_metadata.clone(),
+            clone_of: None,
         };
 
         let resolutions = classify_archive_sets(

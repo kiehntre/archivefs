@@ -951,3 +951,15 @@ pub mod library_grouping;
 /// Batch 11: the complete read-only planning report - see that module's
 /// own doc comment.
 pub mod full_library_report;
+
+/// Batch 12: DAT `cloneof` relationship plumbing - see that module's own
+/// doc comment.
+pub mod release_relationship;
+
+/// Batch 12: read-only support-file attachment - see that module's own
+/// doc comment.
+pub mod support_attachment;
+
+/// Batch 12: the owned, frozen plan-export boundary - see that module's
+/// own doc comment.
+pub mod library_plan_export;

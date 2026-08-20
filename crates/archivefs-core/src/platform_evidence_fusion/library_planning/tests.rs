@@ -426,6 +426,7 @@ fn plan_library_resolves_a_confident_single_item() {
         set_identity: None,
         physical_hash: None,
         normalized_hash: None,
+        release_relationship: None,
     }];
     let report = plan_library(&inputs, &context(&root, &slug));
     assert_eq!(report.items.len(), 1);
@@ -446,6 +447,7 @@ fn plan_library_reports_unsupported_when_no_slug_mapping_exists() {
         set_identity: None,
         physical_hash: None,
         normalized_hash: None,
+        release_relationship: None,
     }];
     let report = plan_library(&inputs, &context(&root, &no_slug_mapping));
     assert_eq!(report.romm_unmapped, 1);
@@ -486,6 +488,7 @@ fn confident_identity_with_no_romm_mapping_is_ready_not_unsupported() {
         set_identity: None,
         physical_hash: None,
         normalized_hash: None,
+        release_relationship: None,
     }];
     let report = plan_library(&inputs, &context(&root, &no_slug_mapping));
 
@@ -528,6 +531,7 @@ fn romm_mapped_and_library_ready_agree_when_a_slug_exists() {
         set_identity: None,
         physical_hash: None,
         normalized_hash: None,
+        release_relationship: None,
     }];
     let report = plan_library(&inputs, &context(&root, &slug));
     assert_eq!(report.items[0].status, PlanStatus::Ready);
@@ -559,6 +563,7 @@ fn unresolved_identity_still_makes_the_plan_unsupported_or_needs_review_regardle
         set_identity: None,
         physical_hash: None,
         normalized_hash: None,
+        release_relationship: None,
     }];
     let report = plan_library(&inputs, &context(&root, &slug));
     assert_eq!(report.items[0].status, PlanStatus::Unknown);
@@ -586,6 +591,7 @@ fn plan_library_counts_conflicts_correctly() {
         set_identity: None,
         physical_hash: None,
         normalized_hash: None,
+        release_relationship: None,
     }];
     let report = plan_library(&inputs, &context(&root, &no_slug_mapping));
     assert_eq!(report.conflict, 1);
@@ -606,6 +612,7 @@ fn plan_library_counts_unknown_correctly() {
         set_identity: None,
         physical_hash: None,
         normalized_hash: None,
+        release_relationship: None,
     }];
     let report = plan_library(&inputs, &context(&root, &no_slug_mapping));
     assert_eq!(report.unknown, 1);
@@ -643,6 +650,7 @@ fn plan_library_counts_ambiguous_correctly() {
         set_identity: None,
         physical_hash: None,
         normalized_hash: None,
+        release_relationship: None,
     }];
     let report = plan_library(&inputs, &context(&root, &no_slug_mapping));
     assert_eq!(report.ambiguous, 1);
@@ -665,6 +673,7 @@ fn plan_library_carries_set_identity_separately_from_platform() {
         set_identity: Some(set.clone()),
         physical_hash: None,
         normalized_hash: None,
+        release_relationship: None,
     }];
     let report = plan_library(&inputs, &context(&root, &no_slug_mapping));
     assert_eq!(report.items[0].set_identity, Some(set));
@@ -691,6 +700,7 @@ fn plan_library_is_deterministic_regardless_of_input_order() {
             set_identity: None,
             physical_hash: None,
             normalized_hash: None,
+            release_relationship: None,
         },
         LibraryPlanInput {
             source_path: source_b.clone(),
@@ -698,6 +708,7 @@ fn plan_library_is_deterministic_regardless_of_input_order() {
             set_identity: None,
             physical_hash: None,
             normalized_hash: None,
+            release_relationship: None,
         },
     ];
     let inputs_backward = vec![
@@ -707,6 +718,7 @@ fn plan_library_is_deterministic_regardless_of_input_order() {
             set_identity: None,
             physical_hash: None,
             normalized_hash: None,
+            release_relationship: None,
         },
         LibraryPlanInput {
             source_path: source_a,
@@ -714,6 +726,7 @@ fn plan_library_is_deterministic_regardless_of_input_order() {
             set_identity: None,
             physical_hash: None,
             normalized_hash: None,
+            release_relationship: None,
         },
     ];
     let slug = |platform: &str| (platform == "Saturn").then(|| "saturn".to_string());
@@ -773,6 +786,7 @@ fn plan_library_never_writes_to_the_source_files() {
         set_identity: None,
         physical_hash: None,
         normalized_hash: None,
+        release_relationship: None,
     }];
     let _ = plan_library(&inputs, &context(&root, &slug));
 
@@ -813,6 +827,7 @@ fn plan_library_never_silently_proposes_the_dat_platform_over_a_disagreeing_cont
         set_identity: None,
         physical_hash: None,
         normalized_hash: None,
+        release_relationship: None,
     }];
     let slug = |_: &str| Some("whatever".to_string());
     let report = plan_library(&inputs, &context(&root, &slug));
@@ -852,6 +867,7 @@ fn adversarial_filename_with_embedded_newline_never_escapes_destination_root() {
         set_identity: None,
         physical_hash: None,
         normalized_hash: None,
+        release_relationship: None,
     }];
     let report = plan_library(&inputs, &context(&root, &slug));
     let entry = &report.items[0].organisation;
@@ -880,6 +896,7 @@ fn adversarial_very_long_filename_is_handled_without_a_silent_ready_outside_root
         set_identity: None,
         physical_hash: None,
         normalized_hash: None,
+        release_relationship: None,
     }];
     let report = plan_library(&inputs, &context(&root, &slug));
     let entry = &report.items[0].organisation;
@@ -904,6 +921,7 @@ fn adversarial_dot_prefixed_filename_never_escapes_destination_root() {
         set_identity: None,
         physical_hash: None,
         normalized_hash: None,
+        release_relationship: None,
     }];
     let report = plan_library(&inputs, &context(&root, &slug));
     let entry = &report.items[0].organisation;
@@ -939,6 +957,7 @@ fn adversarial_caller_supplied_source_path_with_dotdot_components_is_not_trusted
         set_identity: None,
         physical_hash: None,
         normalized_hash: None,
+        release_relationship: None,
     }];
     let report = plan_library(&inputs, &context(&root, &slug));
     let entry = &report.items[0].organisation;
@@ -973,6 +992,7 @@ fn adversarial_duplicate_destination_collision_is_reported_not_silently_ready() 
             set_identity: None,
             physical_hash: None,
             normalized_hash: None,
+            release_relationship: None,
         },
         LibraryPlanInput {
             source_path: b,
@@ -980,6 +1000,7 @@ fn adversarial_duplicate_destination_collision_is_reported_not_silently_ready() 
             set_identity: None,
             physical_hash: None,
             normalized_hash: None,
+            release_relationship: None,
         },
     ];
     let report = plan_library(&inputs, &context(&root, &slug));
@@ -1108,6 +1129,7 @@ fn matrix_multi_platform_archive_is_reported_as_multi_platform_not_collapsed() {
         set_identity: Some(set),
         physical_hash: None,
         normalized_hash: None,
+        release_relationship: None,
     }];
     let report = plan_library(&inputs, &context(&root, &no_slug_mapping));
     let item = &report.items[0];
@@ -1161,6 +1183,7 @@ fn library_planning_report_serializes_to_json_without_error() {
         }),
         physical_hash: None,
         normalized_hash: None,
+        release_relationship: None,
     }];
     let report = plan_library(&inputs, &context(&root, &slug));
     let json = serde_json::to_string_pretty(&report).expect("report must serialize to JSON");
@@ -1187,6 +1210,7 @@ fn adversarial_empty_extension_filename_is_handled_without_panicking() {
         set_identity: None,
         physical_hash: None,
         normalized_hash: None,
+        release_relationship: None,
     }];
     let report = plan_library(&inputs, &context(&root, &slug));
     let entry = &report.items[0].organisation;

@@ -36,12 +36,23 @@ fn identity_with_verdict_and_platform(game: &str, rom: &str, platform: &str) -> 
 }
 
 fn input(path: &str, identity: IdentityResult) -> LibraryPlanInput {
+    input_with_relationship(path, identity, None)
+}
+
+fn input_with_relationship(
+    path: &str,
+    identity: IdentityResult,
+    release_relationship: Option<
+        crate::platform_evidence_fusion::release_relationship::ReleaseRelationship,
+    >,
+) -> LibraryPlanInput {
     LibraryPlanInput {
         source_path: PathBuf::from(path),
         identity,
         set_identity: None,
         physical_hash: None,
         normalized_hash: None,
+        release_relationship,
     }
 }
 
@@ -52,7 +63,7 @@ fn input(path: &str, identity: IdentityResult) -> LibraryPlanInput {
 #[test]
 fn confident_dat_match_gives_the_exact_release_title() {
     let identity = identity_with_verdict("Tony Hawk's Pro Skater 2 (USA)", "thps2.z64");
-    let hierarchy = hierarchy_for(&identity, Some("N64"), "thps2.z64");
+    let hierarchy = hierarchy_for(&identity, Some("N64"), "thps2.z64", None);
     assert_eq!(hierarchy.game_label, "Tony Hawk's Pro Skater 2 (USA)");
     assert!(hierarchy.game_label_is_dat_confirmed);
 }
@@ -60,7 +71,7 @@ fn confident_dat_match_gives_the_exact_release_title() {
 #[test]
 fn no_dat_match_falls_back_to_original_basename_not_invented() {
     let identity = inspect_identity(IdentityInspectionInput::default());
-    let hierarchy = hierarchy_for(&identity, None, "some_unmatched_rom.bin");
+    let hierarchy = hierarchy_for(&identity, None, "some_unmatched_rom.bin", None);
     assert_eq!(hierarchy.game_label, "some_unmatched_rom.bin");
     assert!(!hierarchy.game_label_is_dat_confirmed);
 }
@@ -68,21 +79,21 @@ fn no_dat_match_falls_back_to_original_basename_not_invented() {
 #[test]
 fn hierarchy_never_requires_platform_to_be_known() {
     let identity = inspect_identity(IdentityInspectionInput::default());
-    let hierarchy = hierarchy_for(&identity, None, "mystery.bin");
+    let hierarchy = hierarchy_for(&identity, None, "mystery.bin", None);
     assert!(hierarchy.platform.is_none());
 }
 
 #[test]
 fn single_disc_title_is_single_file_membership() {
     let identity = identity_with_verdict("Chrono Trigger (USA)", "chrono.sfc");
-    let hierarchy = hierarchy_for(&identity, Some("SNES"), "chrono.sfc");
+    let hierarchy = hierarchy_for(&identity, Some("SNES"), "chrono.sfc", None);
     assert_eq!(hierarchy.set, SetMembership::SingleFile);
 }
 
 #[test]
 fn multidisc_title_reports_part_and_total() {
     let identity = identity_with_verdict("Final Fantasy VII (USA) (Disc 1 of 3)", "ff7d1.bin");
-    let hierarchy = hierarchy_for(&identity, Some("PSX"), "ff7d1.bin");
+    let hierarchy = hierarchy_for(&identity, Some("PSX"), "ff7d1.bin", None);
     assert_eq!(
         hierarchy.set,
         SetMembership::MultiDiscPart {
@@ -96,7 +107,7 @@ fn multidisc_title_reports_part_and_total() {
 #[test]
 fn title_merely_containing_the_word_disc_is_never_multidisc() {
     let identity = identity_with_verdict("Disc Jockey Simulator (USA)", "dj.bin");
-    let hierarchy = hierarchy_for(&identity, Some("PC"), "dj.bin");
+    let hierarchy = hierarchy_for(&identity, Some("PC"), "dj.bin", None);
     assert_eq!(hierarchy.set, SetMembership::SingleFile);
 }
 
@@ -229,6 +240,133 @@ fn two_members_declaring_the_same_disc_part_are_both_retained_not_silently_dropp
         "both same-part members must be retained, not deduplicated away"
     );
     assert!(sets[0].discs.iter().all(|(part, _)| *part == 1));
+}
+
+// ------------------------------------------------------------------
+// group_revisions (section 17)
+// ------------------------------------------------------------------
+
+#[test]
+fn parent_and_two_clones_form_one_revision_group() {
+    use crate::platform_evidence_fusion::release_relationship::ReleaseRelationship;
+    let parent = ReleaseRelationship::Canonical {
+        game_name: "Example Game (USA)".to_string(),
+    };
+    let rev1 = ReleaseRelationship::CloneOf {
+        game_name: "Example Game (USA) (Rev 1)".to_string(),
+        parent: "Example Game (USA)".to_string(),
+    };
+    let inputs = vec![
+        input_with_relationship(
+            "/roms/a.bin",
+            inspect_identity(IdentityInspectionInput::default()),
+            Some(parent),
+        ),
+        input_with_relationship(
+            "/roms/b.bin",
+            inspect_identity(IdentityInspectionInput::default()),
+            Some(rev1),
+        ),
+    ];
+    let groups = group_revisions(&inputs);
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].lineage_root, "Example Game (USA)");
+    assert_eq!(groups[0].releases.len(), 2);
+}
+
+#[test]
+fn lone_revision_with_no_sibling_is_not_reported_as_a_group() {
+    use crate::platform_evidence_fusion::release_relationship::ReleaseRelationship;
+    let clone = ReleaseRelationship::CloneOf {
+        game_name: "Example Game (USA) (Rev 1)".to_string(),
+        parent: "Example Game (USA)".to_string(),
+    };
+    let inputs = vec![input_with_relationship(
+        "/roms/a.bin",
+        inspect_identity(IdentityInspectionInput::default()),
+        Some(clone),
+    )];
+    assert!(group_revisions(&inputs).is_empty());
+}
+
+#[test]
+fn no_release_relationship_never_forms_a_revision_group() {
+    let inputs = vec![
+        input(
+            "/roms/a.bin",
+            inspect_identity(IdentityInspectionInput::default()),
+        ),
+        input(
+            "/roms/b.bin",
+            inspect_identity(IdentityInspectionInput::default()),
+        ),
+    ];
+    assert!(group_revisions(&inputs).is_empty());
+}
+
+#[test]
+fn revision_group_retains_every_member_never_replaces_one_with_another() {
+    use crate::platform_evidence_fusion::release_relationship::ReleaseRelationship;
+    let parent = ReleaseRelationship::Canonical {
+        game_name: "Example Game (USA)".to_string(),
+    };
+    let rev1 = ReleaseRelationship::CloneOf {
+        game_name: "Example Game (USA) (Rev 1)".to_string(),
+        parent: "Example Game (USA)".to_string(),
+    };
+    let rev2 = ReleaseRelationship::CloneOf {
+        game_name: "Example Game (USA) (Rev 2)".to_string(),
+        parent: "Example Game (USA)".to_string(),
+    };
+    let inputs = vec![
+        input_with_relationship(
+            "/roms/a.bin",
+            inspect_identity(IdentityInspectionInput::default()),
+            Some(parent),
+        ),
+        input_with_relationship(
+            "/roms/b.bin",
+            inspect_identity(IdentityInspectionInput::default()),
+            Some(rev1),
+        ),
+        input_with_relationship(
+            "/roms/c.bin",
+            inspect_identity(IdentityInspectionInput::default()),
+            Some(rev2),
+        ),
+    ];
+    let groups = group_revisions(&inputs);
+    assert_eq!(groups[0].releases.len(), 3);
+}
+
+#[test]
+fn revision_grouping_is_deterministic_regardless_of_input_order() {
+    use crate::platform_evidence_fusion::release_relationship::ReleaseRelationship;
+    let make = || {
+        let parent = ReleaseRelationship::Canonical {
+            game_name: "Example Game (USA)".to_string(),
+        };
+        let rev1 = ReleaseRelationship::CloneOf {
+            game_name: "Example Game (USA) (Rev 1)".to_string(),
+            parent: "Example Game (USA)".to_string(),
+        };
+        vec![
+            input_with_relationship(
+                "/roms/a.bin",
+                inspect_identity(IdentityInspectionInput::default()),
+                Some(parent),
+            ),
+            input_with_relationship(
+                "/roms/b.bin",
+                inspect_identity(IdentityInspectionInput::default()),
+                Some(rev1),
+            ),
+        ]
+    };
+    let forward = make();
+    let mut backward = make();
+    backward.reverse();
+    assert_eq!(group_revisions(&forward), group_revisions(&backward));
 }
 
 #[test]

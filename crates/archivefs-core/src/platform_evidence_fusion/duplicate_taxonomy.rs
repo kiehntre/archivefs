@@ -25,7 +25,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::dat_hash_representation::RepresentationMatchOutcome;
 use super::identity_orchestrator::IdentityResult;
@@ -33,7 +33,7 @@ use super::library_planning::LibraryPlanInput;
 use crate::dat::audit::AuditVerdict;
 
 /// Milestone section 13's taxonomy, at minimum.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DuplicateClass {
     /// Same physical cryptographic hash - the strongest fact
@@ -52,15 +52,14 @@ pub enum DuplicateClass {
     /// dump" - not to be confused with section 17's revision case).
     SameGameDifferentDump,
     /// Distinguished from [`Self::SameGameDifferentDump`] by *structured*
-    /// release/revision identity (milestone section 17 - "Rev 1"/"Rev 2").
-    /// No detector in this crate currently produces this variant: doing so
-    /// would require plumbing DAT `clone_of`/revision metadata through the
-    /// identity pipeline into `IdentityResult`, which does not exist yet
-    /// (a genuine, disclosed gap - see this batch's final report - not a
-    /// bug). Exists now, like [`super::archive_set_identity::ArchiveSetIdentity::StructuredSet`]
-    /// before it, so a future batch with that plumbing has somewhere to
-    /// land it, per this module's own "no free-form filename parsing"
-    /// discipline (milestone section 27) rather than a guessed regex.
+    /// release lineage: two items whose caller-supplied
+    /// [`super::release_relationship::ReleaseRelationship`] share a
+    /// `cloneof` lineage root (Batch 12) - a real DAT parent/clone
+    /// relationship, never a filename guess ("Rev 1"/"Rev 2" in a title is
+    /// never itself evidence). Only produced when the caller actually
+    /// supplies `LibraryPlanInput::release_relationship`; most callers
+    /// with no DAT clone_of data simply never populate this axis, which is
+    /// the honest default, not a bug.
     SameGameDifferentRevision,
     /// Same original basename (case-insensitive), same resolved platform,
     /// but no stronger evidence links them - the weakest class,
@@ -210,6 +209,20 @@ pub fn group_duplicates(inputs: &[LibraryPlanInput]) -> Vec<DuplicateGroup> {
         |game_name: &String| format!(
             "both confidently match the same DAT game {game_name:?}, under different rom entries"
         )
+    );
+
+    // Batch 12: real DAT `cloneof` lineage (never a filename guess) - two
+    // items sharing a lineage root but *not* already claimed by a
+    // stronger, same-release class above are genuinely different specific
+    // releases of the same underlying game.
+    index_and_emit!(
+        |input: &LibraryPlanInput| {
+            let relationship = input.release_relationship.as_ref()?;
+            relationship.lineage_root().map(str::to_string)
+        },
+        DuplicateClass::SameGameDifferentRevision,
+        DuplicateGroupConfidence::Strong,
+        |root: &String| format!("share a DAT-declared cloneof lineage rooted at {root:?}")
     );
 
     index_and_emit!(

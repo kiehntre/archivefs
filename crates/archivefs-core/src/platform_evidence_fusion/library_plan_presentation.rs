@@ -27,6 +27,21 @@ pub struct LibraryPlanPresentation {
     pub blockers: Vec<String>,
     pub provenance_rows: Vec<PlanRow>,
     pub source_modified: bool,
+    /// Batch 12 (milestone section 30/32): the duplicate group this item
+    /// belongs to, when the caller already computed one via
+    /// [`super::duplicate_taxonomy::group_duplicates`]. `None` from
+    /// [`present_library_plan`] itself; only
+    /// [`present_library_plan_with_context`] ever populates this.
+    pub duplicate_relationship: Option<super::duplicate_taxonomy::DuplicateGroup>,
+    /// Batch 12 (milestone section 30/33): this item's DAT-declared
+    /// lineage, when supplied.
+    pub revision_relationship: Option<super::release_relationship::ReleaseRelationship>,
+    /// Batch 12 (milestone section 30): a human summary of this item's
+    /// multi-disc set membership, when supplied.
+    pub multidisc_state: Option<String>,
+    /// Batch 12 (milestone section 30/34): this item's support-file role
+    /// and association, when this item is itself a support file.
+    pub support_role: Option<SupportRolePresentation>,
 }
 
 /// Builds a [`LibraryPlanPresentation`] from an already-computed
@@ -127,6 +142,10 @@ pub fn present_library_plan(
         blockers,
         provenance_rows,
         source_modified: false,
+        duplicate_relationship: None,
+        revision_relationship: None,
+        multidisc_state: None,
+        support_role: None,
     }
 }
 
@@ -203,7 +222,93 @@ pub fn render_library_plan_text(presentation: &LibraryPlanPresentation) -> Strin
             "NO"
         }
     ));
+    if let Some(duplicate) = &presentation.duplicate_relationship {
+        out.push_str("\nDuplicate relationship:\n  ");
+        out.push_str(duplicate.classification.label());
+        out.push('\n');
+        out.push_str("  ");
+        out.push_str(&duplicate.basis);
+        out.push('\n');
+        out.push_str("  Delete:\n    NOT AUTHORIZED\n");
+    }
+    if let Some(revision) = &presentation.revision_relationship {
+        out.push_str("\nRelease relationship:\n  ");
+        out.push_str(&revision.label());
+        out.push('\n');
+    }
+    if let Some(multidisc) = &presentation.multidisc_state {
+        out.push_str("\nMulti-disc set:\n  ");
+        out.push_str(multidisc);
+        out.push('\n');
+    }
+    if let Some(support) = &presentation.support_role {
+        out.push_str("\nSupport file role:\n  ");
+        out.push_str(support.role.label());
+        out.push_str(" - ");
+        out.push_str(&support.association_label);
+        out.push('\n');
+    }
     out
+}
+
+/// Batch 12: additional, entirely optional cross-batch context a caller
+/// may have already computed (a duplicate group this item belongs to, its
+/// release lineage, a multi-disc set summary, its support-file
+/// attachment) - milestone section 30. Kept as a *separate* function from
+/// [`present_library_plan`] rather than widening that function's own
+/// signature, so every one of its existing callers/tests is untouched;
+/// this function composes on top of it.
+pub fn present_library_plan_with_context(
+    plan: &LibraryItemPlan,
+    identity: &super::identity_orchestrator::IdentityResult,
+    duplicate_relationship: Option<&super::duplicate_taxonomy::DuplicateGroup>,
+    revision_relationship: Option<&super::release_relationship::ReleaseRelationship>,
+    multidisc_state: Option<&str>,
+    support: Option<&super::support_attachment::SupportFileAttachment>,
+) -> LibraryPlanPresentation {
+    let mut presentation = present_library_plan(plan, identity);
+    presentation.duplicate_relationship = duplicate_relationship.cloned();
+    presentation.revision_relationship = revision_relationship.cloned();
+    presentation.multidisc_state = multidisc_state.map(str::to_string);
+    presentation.support_role = support.map(|attachment| SupportRolePresentation {
+        role: attachment.role,
+        association_label: match &attachment.association {
+            super::support_attachment::SupportAssociation::Attached { set_label } => {
+                format!("Attached ({set_label})")
+            }
+            super::support_attachment::SupportAssociation::Candidate { reason } => {
+                format!("Candidate ({reason})")
+            }
+            super::support_attachment::SupportAssociation::Unassociated => {
+                "Unassociated".to_string()
+            }
+            super::support_attachment::SupportAssociation::UnsafeReference { detail } => {
+                format!("UnsafeReference ({detail})")
+            }
+        },
+    });
+    presentation
+}
+
+/// A support file's role plus a human-readable association label -
+/// milestone section 34's example shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupportRolePresentation {
+    pub role: super::side_file_classification::SideFileRole,
+    pub association_label: String,
+}
+
+impl super::release_relationship::ReleaseRelationship {
+    /// Human label for presentation - milestone section 33.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Unknown => "Unknown (no DAT match)".to_string(),
+            Self::Canonical { .. } => "Canonical release (no declared parent)".to_string(),
+            Self::CloneOf { parent, .. } => {
+                format!("Same game, different revision (parent: {parent})")
+            }
+        }
+    }
 }
 
 #[cfg(test)]

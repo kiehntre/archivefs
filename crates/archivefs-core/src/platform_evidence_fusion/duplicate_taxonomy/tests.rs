@@ -33,12 +33,25 @@ fn input(
     physical: Option<&str>,
     normalized: Option<&str>,
 ) -> LibraryPlanInput {
+    input_with_relationship(path, identity, physical, normalized, None)
+}
+
+fn input_with_relationship(
+    path: &str,
+    identity: IdentityResult,
+    physical: Option<&str>,
+    normalized: Option<&str>,
+    release_relationship: Option<
+        crate::platform_evidence_fusion::release_relationship::ReleaseRelationship,
+    >,
+) -> LibraryPlanInput {
     LibraryPlanInput {
         source_path: PathBuf::from(path),
         identity,
         set_identity: None,
         physical_hash: physical.map(str::to_string),
         normalized_hash: normalized.map(str::to_string),
+        release_relationship,
     }
 }
 
@@ -339,12 +352,37 @@ fn labels_are_all_distinct() {
 }
 
 #[test]
-fn same_game_different_revision_is_never_produced_this_batch() {
-    // Disclosed gap (see the enum variant's own doc comment): no detector
-    // here produces this classification, since the structured
-    // clone_of/revision plumbing it would need does not yet reach
-    // IdentityResult. This test pins that honestly rather than silently
-    // letting a future accidental heuristic start producing it unreviewed.
+fn same_game_different_revision_is_produced_from_real_cloneof_lineage() {
+    // Batch 12: the disclosed Batch-11 gap is closed - a real DAT
+    // `cloneof` relationship (never a filename guess) now produces this
+    // classification.
+    use crate::platform_evidence_fusion::release_relationship::ReleaseRelationship;
+    let parent = ReleaseRelationship::Canonical {
+        game_name: "Super Game (USA)".to_string(),
+    };
+    let clone = ReleaseRelationship::CloneOf {
+        game_name: "Super Game (USA) (Rev 1)".to_string(),
+        parent: "Super Game (USA)".to_string(),
+    };
+    let inputs = vec![
+        input_with_relationship("/roms/a.bin", saturn_identity(), None, None, Some(parent)),
+        input_with_relationship("/roms/b.bin", saturn_identity(), None, None, Some(clone)),
+    ];
+    let groups = group_duplicates(&inputs);
+    assert_eq!(groups.len(), 1);
+    assert_eq!(
+        groups[0].classification,
+        DuplicateClass::SameGameDifferentRevision
+    );
+    assert_eq!(groups[0].confidence, DuplicateGroupConfidence::Strong);
+}
+
+#[test]
+fn same_game_different_revision_is_never_produced_without_supplied_lineage_data() {
+    // Honest default: when no caller ever supplied a `release_relationship`
+    // (the common case - most callers have no DAT clone_of data to hand),
+    // this classification never fires, even for release names that *look*
+    // like revisions of each other.
     let identity_a = inspect_identity(IdentityInspectionInput {
         representation_match: Some(RepresentationMatchOutcome::PhysicalOnly {
             verdict: exact_verdict("Super Game (USA)", "super_game.bin"),
@@ -367,4 +405,78 @@ fn same_game_different_revision_is_never_produced_this_batch() {
             .iter()
             .all(|g| g.classification != DuplicateClass::SameGameDifferentRevision)
     );
+}
+
+#[test]
+fn revision_class_never_fires_for_a_single_unrelated_lineage() {
+    use crate::platform_evidence_fusion::release_relationship::ReleaseRelationship;
+    let a = ReleaseRelationship::Canonical {
+        game_name: "Game A".to_string(),
+    };
+    let b = ReleaseRelationship::Canonical {
+        game_name: "Game B".to_string(),
+    };
+    let inputs = vec![
+        input_with_relationship("/roms/a.bin", saturn_identity(), None, None, Some(a)),
+        input_with_relationship("/roms/b.bin", saturn_identity(), None, None, Some(b)),
+    ];
+    assert!(group_duplicates(&inputs).is_empty());
+}
+
+#[test]
+fn revision_class_never_fires_when_physical_duplicate_already_claimed_the_pair() {
+    use crate::platform_evidence_fusion::release_relationship::ReleaseRelationship;
+    let parent = ReleaseRelationship::Canonical {
+        game_name: "Super Game (USA)".to_string(),
+    };
+    let clone = ReleaseRelationship::CloneOf {
+        game_name: "Super Game (USA) (Rev 1)".to_string(),
+        parent: "Super Game (USA)".to_string(),
+    };
+    let inputs = vec![
+        input_with_relationship(
+            "/roms/a.bin",
+            saturn_identity(),
+            Some("h1"),
+            None,
+            Some(parent),
+        ),
+        input_with_relationship(
+            "/roms/b.bin",
+            saturn_identity(),
+            Some("h1"),
+            None,
+            Some(clone),
+        ),
+    ];
+    let groups = group_duplicates(&inputs);
+    assert_eq!(groups.len(), 1);
+    assert_eq!(
+        groups[0].classification,
+        DuplicateClass::ExactPhysicalDuplicate
+    );
+}
+
+#[test]
+fn three_way_lineage_groups_all_revisions_together() {
+    use crate::platform_evidence_fusion::release_relationship::ReleaseRelationship;
+    let parent = ReleaseRelationship::Canonical {
+        game_name: "Super Game (USA)".to_string(),
+    };
+    let rev1 = ReleaseRelationship::CloneOf {
+        game_name: "Super Game (USA) (Rev 1)".to_string(),
+        parent: "Super Game (USA)".to_string(),
+    };
+    let rev2 = ReleaseRelationship::CloneOf {
+        game_name: "Super Game (USA) (Rev 2)".to_string(),
+        parent: "Super Game (USA)".to_string(),
+    };
+    let inputs = vec![
+        input_with_relationship("/roms/a.bin", saturn_identity(), None, None, Some(parent)),
+        input_with_relationship("/roms/b.bin", saturn_identity(), None, None, Some(rev1)),
+        input_with_relationship("/roms/c.bin", saturn_identity(), None, None, Some(rev2)),
+    ];
+    let groups = group_duplicates(&inputs);
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].members.len(), 3);
 }

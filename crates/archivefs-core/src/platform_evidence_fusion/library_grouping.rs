@@ -41,6 +41,10 @@ pub struct GameReleaseSetHierarchy {
     /// never mistakes an unverified label for an authoritative one.
     pub game_label_is_dat_confirmed: bool,
     pub set: SetMembership,
+    /// Batch 12: this item's DAT-declared `cloneof` lineage, when the
+    /// caller supplied one - `None` when no such data was available
+    /// (most callers). Never derived from a filename.
+    pub revision: Option<super::release_relationship::ReleaseRelationship>,
 }
 
 /// Which set (if any) this file belongs to - milestone section 9/11.
@@ -104,6 +108,7 @@ pub fn hierarchy_for(
     identity: &IdentityResult,
     resolved_platform: Option<&str>,
     original_basename: &str,
+    revision: Option<super::release_relationship::ReleaseRelationship>,
 ) -> GameReleaseSetHierarchy {
     let (game_label, game_label_is_dat_confirmed) = display_label(identity, original_basename);
     GameReleaseSetHierarchy {
@@ -111,7 +116,54 @@ pub fn hierarchy_for(
         game_label,
         game_label_is_dat_confirmed,
         set: set_membership(identity),
+        revision,
     }
+}
+
+/// One game's revision family - milestone section 17's "Game / Rev 0 /
+/// Rev 1 / Rev 2" hierarchy. Never replaces one revision with another -
+/// every supplied member is retained.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RevisionGroup {
+    /// The lineage root (the parent's own game name).
+    pub lineage_root: String,
+    /// `(release name, source path)`, sorted by release name for stable
+    /// ordering.
+    pub releases: Vec<(String, PathBuf)>,
+}
+
+/// Groups every item carrying a `release_relationship` by lineage root -
+/// milestone section 17. Only reports groups with at least two members
+/// (a lone release with no supplied sibling has nothing to group with,
+/// same discipline as [`group_multidisc_sets`]).
+pub fn group_revisions(inputs: &[LibraryPlanInput]) -> Vec<RevisionGroup> {
+    let mut by_root: BTreeMap<String, Vec<(String, PathBuf)>> = BTreeMap::new();
+    for input in inputs {
+        let Some(relationship) = &input.release_relationship else {
+            continue;
+        };
+        let (Some(root), Some(name)) = (relationship.lineage_root(), relationship.game_name())
+        else {
+            continue;
+        };
+        by_root
+            .entry(root.to_string())
+            .or_default()
+            .push((name.to_string(), input.source_path.clone()));
+    }
+    let mut groups: Vec<RevisionGroup> = by_root
+        .into_iter()
+        .filter(|(_, releases)| releases.len() >= 2)
+        .map(|(lineage_root, mut releases)| {
+            releases.sort();
+            RevisionGroup {
+                lineage_root,
+                releases,
+            }
+        })
+        .collect();
+    groups.sort_by(|a, b| a.lineage_root.cmp(&b.lineage_root));
+    groups
 }
 
 /// One multi-disc set - milestone section 50's example shape.

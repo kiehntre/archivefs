@@ -92,12 +92,18 @@ pub const MAX_CHD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiscCollectionRefusal {
     NotReadable(String),
-    TooLarge { bytes: u64, maximum: u64 },
+    TooLarge {
+        bytes: u64,
+        maximum: u64,
+    },
     NotRecognizedContainer,
     ChdHeaderDidNotParse(String),
     NoLogicalReaderAvailable,
     NotIso9660,
     Iso9660DidNotParse(String),
+    /// `nod` could not open/parse the container at all, or it recognized
+    /// neither GameCube nor Wii.
+    NotGcOrWii(String),
 }
 
 /// Collects real, structural [`ContentEvidence`] from a `.chd`'s decoded
@@ -163,6 +169,25 @@ pub fn collect_plain_iso_evidence(
     let filesystem = observe_iso9660(&media)
         .map_err(|error| DiscCollectionRefusal::Iso9660DidNotParse(error.to_string()))?;
     Ok(collect_disc_boot_evidence(&media, &filesystem))
+}
+
+/// Collects evidence from a GameCube/Wii disc image (plain ISO/GCM, WIA/
+/// RVZ, WBFS, CISO, NFS, GCZ - whatever `nod` itself recognizes) -
+/// milestone section 5. `nod` opens and reads the container through its
+/// own internal I/O, never a `std::fs::read` of the whole file: this
+/// function performs **no** whole-file buffering itself, unlike
+/// [`collect_chd_evidence`]/[`collect_plain_iso_evidence`] above, so it
+/// carries no size cap of its own - the safety property here is "this
+/// function's own code never allocates a full-image-sized buffer," not "a
+/// cap refuses large files." Reuses the exact same reviewed
+/// `gamecube_wii_boot_evidence` path `disc_probe.rs` already calls; adds
+/// no new disc parsing.
+pub fn collect_gc_wii_evidence(path: &Path) -> Result<Vec<ContentEvidence>, DiscCollectionRefusal> {
+    let observation = crate::gamecube_wii_boot_evidence::observe_gc_wii_disc(path)
+        .map_err(|error| DiscCollectionRefusal::NotGcOrWii(error.to_string()))?;
+    Ok(crate::gamecube_wii_boot_evidence::observe_gc_wii_evidence(
+        &observation,
+    ))
 }
 
 /// The reused core: identical evidence-gathering to `disc_probe.rs`'s own

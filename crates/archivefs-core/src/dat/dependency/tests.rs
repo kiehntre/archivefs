@@ -129,6 +129,7 @@ fn top_ref(game_index: usize, games: &[DatGameEntry], rom_index: usize) -> DatRo
         merge: member.merge.clone(),
         content_classification: entry.content_classification.clone(),
         original_metadata: entry.original_metadata.clone(),
+        clone_of: None,
     }
 }
 
