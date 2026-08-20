@@ -113,7 +113,12 @@ pub fn classify_archive_set(members: &[(usize, Vec<ContentEvidence>)]) -> Archiv
         _ => {
             let platforms: Vec<&'static str> = resolved.iter().map(|(_, p)| *p).collect();
             let groups = group_by_equivalence(&platforms);
-            let member_indices: Vec<usize> = resolved.iter().map(|(i, _)| *i).collect();
+            // Sorted so the result never depends on the order `members` was
+            // handed in - the member's own index (not its position in the
+            // input slice) is the only thing that should decide ordering
+            // here (Batch 9 determinism fix).
+            let mut member_indices: Vec<usize> = resolved.iter().map(|(i, _)| *i).collect();
+            member_indices.sort_unstable();
             if groups.len() == 1 {
                 ArchiveSetIdentity::MultiMemberSamePlatform {
                     member_indices,

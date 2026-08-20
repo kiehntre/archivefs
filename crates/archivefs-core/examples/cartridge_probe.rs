@@ -6,7 +6,15 @@
 //! ```text
 //! cargo run -p archivefs-core --example cartridge_probe -- /path/to/rom
 //! cargo run -p archivefs-core --example cartridge_probe -- /path/to/archive.zip
+//! cargo run -p archivefs-core --example cartridge_probe -- /path/to/rom /path/to/some.dat
 //! ```
+//!
+//! Batch 9: an optional second argument names a real local DAT file - when
+//! given, its physical and normalized hash representations are compared
+//! against the DAT via
+//! [`archivefs_core::platform_evidence_fusion::dat_hash_representation`]
+//! and shown through the shared identity presentation layer, exactly the
+//! same pipeline `real_dat_match_scan` uses for a whole directory.
 
 use std::env;
 use std::path::PathBuf;
@@ -56,7 +64,8 @@ fn main() -> ExitCode {
         }
     };
     println!("File size: {} bytes", bytes.len());
-    probe_bytes(&bytes);
+    let dat_path = env::args_os().nth(2).map(PathBuf::from);
+    probe_bytes(&bytes, dat_path.as_deref());
     ExitCode::SUCCESS
 }
 
@@ -149,7 +158,7 @@ fn probe_sevenz(path: &std::path::Path) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn probe_bytes(bytes: &[u8]) {
+fn probe_bytes(bytes: &[u8], dat_path: Option<&std::path::Path>) {
     let mut evidence: Vec<archivefs_core::content_evidence::ContentEvidence> = Vec::new();
 
     if let Some(fact) = parse_ines_header(bytes) {
@@ -282,7 +291,63 @@ fn probe_bytes(bytes: &[u8]) {
             println!("  {:?} = {}", fact.kind, fact.value);
         }
     }
-    let comparison =
-        archivefs_core::platform_evidence_fusion::compare_content_and_dat(&explanation, None);
-    println!("DAT comparison: {comparison:?}");
+    // Batch 9: route through the shared identity orchestrator/presentation
+    // pipeline rather than a second, hand-built DAT comparison.
+    use archivefs_core::dat::index::DatIndex;
+    use archivefs_core::dat::limits::DatLimits;
+    use archivefs_core::dat::parsers::parse_dat_file;
+    use archivefs_core::platform_evidence_fusion::dat_hash_representation::{
+        ByteRepresentation, RepresentationHashes, audit_representation, compare_representations,
+        hash_bytes, normalized_header_stripped_representation, normalized_n64_representation,
+        normalized_smd_representation,
+    };
+    use archivefs_core::platform_evidence_fusion::identity_orchestrator::{
+        IdentityInspectionInput, inspect_identity,
+    };
+    use archivefs_core::platform_evidence_fusion::identity_presentation::{
+        present_identity, render_identity_text,
+    };
+
+    let representation_match = dat_path.and_then(|dat_path| {
+        let outcome = parse_dat_file(dat_path, DatLimits::default()).ok()?;
+        let index = DatIndex::build(&outcome.dat);
+        let physical_evidence = hash_bytes(bytes, dat_path.to_str().unwrap_or(""), "physical");
+        let (_, physical_verdict) = audit_representation(
+            &RepresentationHashes {
+                representation: ByteRepresentation::Physical,
+                evidence: physical_evidence,
+            },
+            &index,
+        );
+        let normalized = normalized_n64_representation(bytes, dat_path.to_str().unwrap_or(""), "n")
+            .or_else(|| {
+                normalized_header_stripped_representation(
+                    bytes,
+                    dat_path.to_str().unwrap_or(""),
+                    "n",
+                )
+            })
+            .or_else(|| normalized_smd_representation(bytes, dat_path.to_str().unwrap_or(""), "n"));
+        let (identical, normalized_verdict) = match normalized {
+            Some((normalized, identical)) => {
+                let (_, verdict) = audit_representation(&normalized, &index);
+                (identical, Some(verdict))
+            }
+            None => (false, None),
+        };
+        Some(compare_representations(
+            physical_verdict,
+            normalized_verdict,
+            identical,
+        ))
+    });
+
+    let identity_result = inspect_identity(IdentityInspectionInput {
+        content_evidence: explanation.input_evidence.clone(),
+        representation_match,
+        ..Default::default()
+    });
+    let presentation = present_identity(&identity_result);
+    println!("\n--- Identity summary ---");
+    println!("{}", render_identity_text(&presentation));
 }

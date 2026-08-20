@@ -1099,10 +1099,23 @@ fn print_fusion(evidence: &[ContentEvidence]) {
     print_fusion_with_dat(evidence, None);
 }
 
+/// Batch 9: routes through the shared [`inspect_identity`]/
+/// [`present_identity`]/[`render_identity_text`] pipeline rather than
+/// hand-computing a fusion outcome and DAT comparison separately - the
+/// milestone's own "do not maintain separate hand-built identity logic in
+/// the probes" instruction.
 fn print_fusion_with_dat(evidence: &[ContentEvidence], dat_platform: Option<&'static str>) {
     use archivefs_core::content_evidence::ContentEvidenceConfidence;
     use archivefs_core::content_evidence_scope::{EvidenceScope, scope_of};
-    use archivefs_core::platform_evidence_fusion::compare_content_and_dat;
+    use archivefs_core::dat::identity::{
+        DatPlatformConfidence, DatPlatformEvidence, DatPlatformEvidenceKind,
+    };
+    use archivefs_core::platform_evidence_fusion::identity_orchestrator::{
+        IdentityInspectionInput, inspect_identity,
+    };
+    use archivefs_core::platform_evidence_fusion::identity_presentation::{
+        present_identity, render_identity_text,
+    };
 
     let explanation = fuse_platform_evidence(evidence.iter().cloned());
     println!("Fusion outcome: {:?}", explanation.outcome);
@@ -1156,8 +1169,23 @@ fn print_fusion_with_dat(evidence: &[ContentEvidence], dat_platform: Option<&'st
             println!("  {:?} = {}", fact.kind, fact.value);
         }
     }
-    let comparison = compare_content_and_dat(&explanation, dat_platform);
-    println!("DAT comparison: {comparison:?}");
+    let dat = dat_platform.map(|platform| {
+        archivefs_core::dat::identity::resolve_dat_platform_identity([DatPlatformEvidence {
+            platform: platform.to_string(),
+            machine_key: None,
+            kind: DatPlatformEvidenceKind::HeaderName,
+            confidence: DatPlatformConfidence::Strong,
+            detail: "probe-supplied DAT platform for comparison".to_string(),
+        }])
+    });
+    let identity_result = inspect_identity(IdentityInspectionInput {
+        content_evidence: evidence.to_vec(),
+        dat,
+        ..Default::default()
+    });
+    let presentation = present_identity(&identity_result);
+    println!("\n--- Identity summary ---");
+    println!("{}", render_identity_text(&presentation));
 }
 
 fn probe_iso9660(bytes: &[u8]) -> ExitCode {

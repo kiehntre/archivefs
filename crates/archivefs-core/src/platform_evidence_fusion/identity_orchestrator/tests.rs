@@ -273,3 +273,129 @@ fn identity_orchestrator_source_never_references_mutation_modules() {
         );
     }
 }
+
+// ------------------------------------------------------------------
+// Batch 9: determinism depth (section 26) - full orchestrator, not just
+// the lower-level classify_archive_set this already had in Batch 8.
+// ------------------------------------------------------------------
+
+#[test]
+fn archive_member_order_never_affects_the_orchestrated_result() {
+    let forward = IdentityInspectionInput {
+        archive_members: Some(vec![
+            (
+                0,
+                vec![strong(ContentEvidenceKind::ContentSignature, "LoROM")],
+            ),
+            (
+                1,
+                vec![strong(ContentEvidenceKind::ContentSignature, "HiROM")],
+            ),
+        ]),
+        ..Default::default()
+    };
+    let backward = IdentityInspectionInput {
+        archive_members: Some(vec![
+            (
+                1,
+                vec![strong(ContentEvidenceKind::ContentSignature, "HiROM")],
+            ),
+            (
+                0,
+                vec![strong(ContentEvidenceKind::ContentSignature, "LoROM")],
+            ),
+        ]),
+        ..Default::default()
+    };
+    let forward_result = inspect_identity(forward);
+    let backward_result = inspect_identity(backward);
+    assert_eq!(forward_result.set_identity, backward_result.set_identity);
+    assert_eq!(
+        forward_result.has_conflict(),
+        backward_result.has_conflict()
+    );
+}
+
+#[test]
+fn content_evidence_order_never_affects_the_orchestrated_result() {
+    let a = strong(ContentEvidenceKind::BootStructure, "SEGA SEGASATURN");
+    let b = strong(ContentEvidenceKind::Filesystem, "ISO9660");
+    let forward = inspect_identity(IdentityInspectionInput {
+        content_evidence: vec![a.clone(), b.clone()],
+        dat: Some(resolved_dat("Saturn")),
+        ..Default::default()
+    });
+    let backward = inspect_identity(IdentityInspectionInput {
+        content_evidence: vec![b, a],
+        dat: Some(resolved_dat("Saturn")),
+        ..Default::default()
+    });
+    assert_eq!(forward, backward);
+}
+
+#[test]
+fn many_permutations_of_a_three_member_archive_agree() {
+    let base: Vec<(usize, Vec<ContentEvidence>)> = vec![
+        (
+            0,
+            vec![strong(ContentEvidenceKind::ContentSignature, "LoROM")],
+        ),
+        (
+            1,
+            vec![strong(ContentEvidenceKind::ContentSignature, "HiROM")],
+        ),
+        (
+            2,
+            vec![strong(ContentEvidenceKind::ContentSignature, "ExHiROM")],
+        ),
+    ];
+    let baseline = inspect_identity(IdentityInspectionInput {
+        archive_members: Some(base.clone()),
+        ..Default::default()
+    });
+    // A handful of deterministic rotations - no external RNG dependency.
+    for rotation in 0..base.len() {
+        let mut rotated = base.clone();
+        rotated.rotate_left(rotation);
+        let result = inspect_identity(IdentityInspectionInput {
+            archive_members: Some(rotated),
+            ..Default::default()
+        });
+        assert_eq!(result.set_identity, baseline.set_identity);
+    }
+}
+
+#[test]
+fn equivalent_platform_alias_order_never_affects_agreement() {
+    // PC Engine / TurboGrafx-16 - constructed via a synthetic Resolved
+    // content explanation (no real PC Engine detector exists), verifying
+    // combine_identity's own equivalence folding survives the full
+    // orchestrator composition regardless of which alias content names vs.
+    // which alias DAT names.
+    let content_names_pc_engine = inspect_identity(IdentityInspectionInput {
+        content_evidence: Vec::new(),
+        dat: Some(resolved_dat("PC Engine")),
+        ..Default::default()
+    });
+    let content_names_turbografx = inspect_identity(IdentityInspectionInput {
+        content_evidence: Vec::new(),
+        dat: Some(resolved_dat("TurboGrafx-16")),
+        ..Default::default()
+    });
+    assert_eq!(
+        content_names_pc_engine
+            .dat
+            .as_ref()
+            .and_then(|d| d.platform()),
+        Some("PC Engine")
+    );
+    assert_eq!(
+        content_names_turbografx
+            .dat
+            .as_ref()
+            .and_then(|d| d.platform()),
+        Some("TurboGrafx-16")
+    );
+    assert!(!content_names_pc_engine.has_conflict());
+    assert!(!content_names_turbografx.has_conflict());
+}

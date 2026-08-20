@@ -66,6 +66,27 @@ pub struct RealValidationProvenance {
     pub container: &'static str,
 }
 
+/// Batch 9: real content+DAT convergence facts for one platform - separate
+/// from [`RealValidationProvenance`] (which is about content-evidence-only
+/// validation). `None` when no real ROM + real local DAT overlap was found
+/// this session - never fabricated; see [`coverage_report`]'s own
+/// `real_content_dat_agreement` count, which only counts entries where this
+/// field is `Some`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RealDatValidation {
+    /// A short, stable label for the real local DAT family used (e.g.
+    /// `"TOSEC"`, `"No-Intro"`) - never a filesystem path.
+    pub dat_family: &'static str,
+    /// How many real local files in the corpus were confirmed to
+    /// cryptographic-hash-match this DAT family this session - a real,
+    /// counted number, never an estimate.
+    pub sample_match_count: usize,
+    /// Whether at least one of those matches required the normalized
+    /// (not physical) byte representation to succeed - see
+    /// [`crate::platform_evidence_fusion::dat_hash_representation`].
+    pub normalized_match_observed: bool,
+}
+
 /// One platform's evidence-engineering coverage. `canonical_id` must match
 /// a real [`crate::platform::Platform::id`] - enforced by this module's own
 /// test suite, never assumed.
@@ -91,6 +112,11 @@ pub struct PlatformEvidenceCoverage {
     /// `notes` field above still names their specimen; this field is
     /// additive, not a replacement).
     pub real_validation_provenance: Option<RealValidationProvenance>,
+    /// Batch 9: real content+DAT convergence, when this session confirmed
+    /// it against real local corpus + real local DAT files. `None` is
+    /// honest and common - most platforms have no real local DAT overlap
+    /// (or no DAT was checked at all).
+    pub dat_validation: Option<RealDatValidation>,
 }
 
 /// The coverage manifest - one entry per platform this crate has *any*
@@ -108,6 +134,7 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
             sample_class: "Saturn raw2352 real corpus specimen",
             container: "raw CD sector image",
         }),
+        dat_validation: None,
     },
     PlatformEvidenceCoverage {
         canonical_id: "Sega CD",
@@ -116,6 +143,7 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         real_validation: ValidationStatus::SyntheticValidated,
         notes: "No real Sega CD specimen found accessible in the corpus (Batch 3/4)",
         real_validation_provenance: None,
+        dat_validation: None,
     },
     PlatformEvidenceCoverage {
         canonical_id: "3DO",
@@ -124,6 +152,7 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         real_validation: ValidationStatus::SyntheticValidated,
         notes: "No real 3DO specimen found accessible in the corpus (Batch 3/4)",
         real_validation_provenance: None,
+        dat_validation: None,
     },
     PlatformEvidenceCoverage {
         canonical_id: "Dreamcast",
@@ -132,6 +161,7 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         real_validation: ValidationStatus::SyntheticValidated,
         notes: "Dreamcast directory in the local corpus contains no real specimen (Batch 5 search)",
         real_validation_provenance: None,
+        dat_validation: None,
     },
     PlatformEvidenceCoverage {
         canonical_id: "PSX",
@@ -144,6 +174,7 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
             sample_class: "PSX real corpus specimen",
             container: "CHD compressed disc image",
         }),
+        dat_validation: None,
     },
     PlatformEvidenceCoverage {
         canonical_id: "PS2",
@@ -156,6 +187,7 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
             sample_class: "PS2 real corpus specimen (8.5GB single-layer ISO)",
             container: "raw ISO9660 disc image",
         }),
+        dat_validation: None,
     },
     PlatformEvidenceCoverage {
         canonical_id: "PSP",
@@ -168,6 +200,7 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
             sample_class: "PSP UMD real corpus specimen",
             container: "raw ISO9660 UMD disc image",
         }),
+        dat_validation: None,
     },
     PlatformEvidenceCoverage {
         canonical_id: "PS3",
@@ -176,6 +209,7 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         real_validation: ValidationStatus::RealValidated,
         notes: "Real specimen: Resident Evil 4 HD .pkg (3.5GB, Batch 3)",
         real_validation_provenance: None,
+        dat_validation: None,
     },
     PlatformEvidenceCoverage {
         canonical_id: "Xbox",
@@ -188,6 +222,7 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
             sample_class: "Xbox XDVDFS/XBE real corpus specimen",
             container: "raw XDVDFS disc image",
         }),
+        dat_validation: None,
     },
     PlatformEvidenceCoverage {
         canonical_id: "Xbox360",
@@ -204,6 +239,7 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
             sample_class: "Xbox360 XDVDFS/XEX2 real corpus specimen",
             container: "raw XDVDFS disc image",
         }),
+        dat_validation: None,
     },
     PlatformEvidenceCoverage {
         canonical_id: "GameCube",
@@ -216,6 +252,7 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
             sample_class: "GameCube RVZ specimen",
             container: "RVZ (zstd-compressed disc image)",
         }),
+        dat_validation: None,
     },
     PlatformEvidenceCoverage {
         canonical_id: "Wii",
@@ -228,6 +265,7 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
             sample_class: "Wii WBFS specimen",
             container: "WBFS (uncompressed disc image)",
         }),
+        dat_validation: None,
     },
     PlatformEvidenceCoverage {
         canonical_id: "NES",
@@ -236,6 +274,7 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         real_validation: ValidationStatus::SyntheticValidated,
         notes: "No real .nes specimen found accessible in the corpus (Batch 4)",
         real_validation_provenance: None,
+        dat_validation: None,
     },
     PlatformEvidenceCoverage {
         canonical_id: "SNES",
@@ -244,6 +283,7 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         real_validation: ValidationStatus::SyntheticValidated,
         notes: "Real corpus specimens are dominated by unlicensed pirate/multi-cart .unh dumps whose headers do not validate (Batch 4)",
         real_validation_provenance: None,
+        dat_validation: None,
     },
     PlatformEvidenceCoverage {
         canonical_id: "Game Boy",
@@ -255,6 +295,11 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
             rule_id: Some("gb_logo_and_checksum"),
             sample_class: "DMG-only real corpus specimen",
             container: "raw .gb cartridge dump",
+        }),
+        dat_validation: Some(RealDatValidation {
+            dat_family: "TOSEC",
+            sample_match_count: 171,
+            normalized_match_observed: false,
         }),
     },
     PlatformEvidenceCoverage {
@@ -268,6 +313,11 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
             sample_class: "CGB-only real corpus specimen (cgb_flag=0xC0)",
             container: "raw .gbc cartridge dump",
         }),
+        dat_validation: Some(RealDatValidation {
+            dat_family: "TOSEC",
+            sample_match_count: 99,
+            normalized_match_observed: false,
+        }),
     },
     PlatformEvidenceCoverage {
         canonical_id: "Game Boy Advance",
@@ -276,6 +326,11 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         real_validation: ValidationStatus::RealValidated,
         notes: "Real specimen: Metal Slug Advance (via ZIP) - Resolved through fusion (Batch 4/5)",
         real_validation_provenance: None,
+        dat_validation: Some(RealDatValidation {
+            dat_family: "TOSEC",
+            sample_match_count: 3,
+            normalized_match_observed: false,
+        }),
     },
     PlatformEvidenceCoverage {
         canonical_id: "N64",
@@ -284,6 +339,11 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         real_validation: ValidationStatus::RealValidated,
         notes: "Real specimens: Aerofighters Assault (z64) and 1080 Snowboarding (v64) - Resolved through fusion (Batch 4/5)",
         real_validation_provenance: None,
+        dat_validation: Some(RealDatValidation {
+            dat_family: "TOSEC",
+            sample_match_count: 18,
+            normalized_match_observed: true,
+        }),
     },
     PlatformEvidenceCoverage {
         canonical_id: "MegaDrive",
@@ -292,6 +352,11 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         real_validation: ValidationStatus::RealValidated,
         notes: "Real specimens: 3 Ninjas Kick Back .md (whole-ROM checksum validated exactly) and the 32X Doom specimen's base header - candidate-only by design (Corroborated confidence only) (Batch 4/5)",
         real_validation_provenance: None,
+        dat_validation: Some(RealDatValidation {
+            dat_family: "TOSEC",
+            sample_match_count: 58,
+            normalized_match_observed: false,
+        }),
     },
     PlatformEvidenceCoverage {
         canonical_id: "Sega 32X",
@@ -300,14 +365,20 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         real_validation: ValidationStatus::RealValidated,
         notes: "Real specimen: Doom (Japan, USA) (En).7z, probed in-process (no system 7z) - candidate-only by design (Batch 4/5)",
         real_validation_provenance: None,
+        dat_validation: None,
     },
     PlatformEvidenceCoverage {
         canonical_id: "MasterSystem",
         detector_modules: &["sms_gg_header_evidence"],
         normalization: false,
         real_validation: ValidationStatus::Partial,
-        notes: "Real .zip specimens exist in the corpus; not exercised end-to-end this session (Batch 4)",
+        notes: "Real .zip specimens exist in the corpus, content-evidence fusion not exercised end-to-end (Batch 4); Batch 9 confirmed real DAT hash overlap independently via in-process ZIP-member hashing",
         real_validation_provenance: None,
+        dat_validation: Some(RealDatValidation {
+            dat_family: "TOSEC",
+            sample_match_count: 47,
+            normalized_match_observed: false,
+        }),
     },
     PlatformEvidenceCoverage {
         canonical_id: "GameGear",
@@ -316,6 +387,11 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         real_validation: ValidationStatus::RealValidated,
         notes: "Real specimen: Aa Harimanada (Japan).gg - Resolved through fusion (Batch 4/5)",
         real_validation_provenance: None,
+        dat_validation: Some(RealDatValidation {
+            dat_family: "TOSEC",
+            sample_match_count: 96,
+            normalized_match_observed: false,
+        }),
     },
     PlatformEvidenceCoverage {
         canonical_id: "Atari7800",
@@ -324,6 +400,7 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         real_validation: ValidationStatus::SyntheticValidated,
         notes: "No real .a78 specimen found accessible in the corpus (Batch 4)",
         real_validation_provenance: None,
+        dat_validation: None,
     },
     PlatformEvidenceCoverage {
         canonical_id: "Atari Lynx",
@@ -332,6 +409,7 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         real_validation: ValidationStatus::RealValidated,
         notes: "Real specimen: Joust.lnx - Resolved through fusion (Batch 4/5)",
         real_validation_provenance: None,
+        dat_validation: None,
     },
     PlatformEvidenceCoverage {
         canonical_id: "Atari Jaguar",
@@ -340,6 +418,7 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         real_validation: ValidationStatus::Deferred,
         notes: "No corroborated generic internal header exists (per-title encrypted boot block) - deliberately not implemented (Batch 4)",
         real_validation_provenance: None,
+        dat_validation: None,
     },
     PlatformEvidenceCoverage {
         canonical_id: "PC Engine",
@@ -348,6 +427,7 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         real_validation: ValidationStatus::Deferred,
         notes: "No standardized internal HuCard header corroborated to this crate's two-source standard - deliberately not implemented (Batch 4)",
         real_validation_provenance: None,
+        dat_validation: None,
     },
     PlatformEvidenceCoverage {
         canonical_id: "Neo Geo Pocket",
@@ -356,6 +436,7 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         real_validation: ValidationStatus::SyntheticValidated,
         notes: "No real NGP specimen found accessible in the corpus (Batch 4)",
         real_validation_provenance: None,
+        dat_validation: None,
     },
     PlatformEvidenceCoverage {
         canonical_id: "Neo Geo Pocket Color",
@@ -364,6 +445,7 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         real_validation: ValidationStatus::SyntheticValidated,
         notes: "No real NGPC specimen found accessible in the corpus (Batch 4)",
         real_validation_provenance: None,
+        dat_validation: None,
     },
     PlatformEvidenceCoverage {
         canonical_id: "WonderSwan",
@@ -372,6 +454,7 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         real_validation: ValidationStatus::SyntheticValidated,
         notes: "Every local WonderSwan symlink target is missing from the decypharr store - no real specimen accessible (Batch 4)",
         real_validation_provenance: None,
+        dat_validation: None,
     },
     PlatformEvidenceCoverage {
         canonical_id: "WonderSwan Color",
@@ -380,6 +463,7 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         real_validation: ValidationStatus::SyntheticValidated,
         notes: "Every local WonderSwan Color symlink target is missing from the decypharr store - no real specimen accessible (Batch 4)",
         real_validation_provenance: None,
+        dat_validation: None,
     },
     PlatformEvidenceCoverage {
         canonical_id: "Neo Geo CD",
@@ -388,6 +472,7 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         real_validation: ValidationStatus::SyntheticValidated,
         notes: "No real Neo Geo CD specimen recorded as validated in this project's history",
         real_validation_provenance: None,
+        dat_validation: None,
     },
 ];
 
@@ -461,6 +546,59 @@ pub fn evidence_poor_platform_ids() -> Vec<&'static str> {
         .collect()
 }
 
+/// Batch 9 section 11: platforms [`crate::dat::identity`]'s own name-
+/// matching machinery could in principle recognize from a DAT's header
+/// text - structurally every canonical platform, since
+/// `gather_dat_platform_evidence` matches against each platform's own
+/// display name/aliases in the *full* [`PLATFORMS`] registry, never a
+/// second, narrower list scoped to [`COVERAGE`]. Distinct from
+/// [`real_dat_validated_count`] (platforms this session actually proved
+/// real overlap for) - "capable of" is not "proven."
+pub fn dat_identity_capable_count() -> usize {
+    canonical_platform_count()
+}
+
+/// Platforms with a [`RealDatValidation`] on their [`COVERAGE`] entry -
+/// real local ROM bytes hash-matched a real local DAT entry this session.
+pub fn real_dat_validated_count() -> usize {
+    COVERAGE
+        .iter()
+        .filter(|entry| entry.dat_validation.is_some())
+        .count()
+}
+
+/// Platforms where **both** content evidence and DAT identity were
+/// independently real-validated this session or a prior one -
+/// [`ValidationStatus::RealValidated`] *and* a real
+/// [`RealDatValidation`] together. Stricter than [`real_dat_validated_count`]
+/// alone: a platform with real DAT overlap but only `Partial` content
+/// validation (Master System, this session) does not count here, honestly
+/// reflecting that the two lanes were not both proven for the same
+/// platform.
+pub fn real_content_dat_agreement_count() -> usize {
+    COVERAGE
+        .iter()
+        .filter(|entry| {
+            entry.dat_validation.is_some()
+                && entry.real_validation == ValidationStatus::RealValidated
+        })
+        .count()
+}
+
+/// Platforms where at least one real match required the *normalized* byte
+/// representation, not the physical one - the milestone's own headline
+/// "normalized DAT real-validation" metric.
+pub fn normalized_dat_real_validated_count() -> usize {
+    COVERAGE
+        .iter()
+        .filter(|entry| {
+            entry
+                .dat_validation
+                .is_some_and(|dat| dat.normalized_match_observed)
+        })
+        .count()
+}
+
 /// A compact, machine-generated summary - the structured source for a
 /// developer probe's coverage report; never itself a giant prose string.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -473,6 +611,10 @@ pub struct CoverageReport {
     pub deferred: usize,
     pub evidence_poor: usize,
     pub normalization_supported: usize,
+    pub dat_identity_capable: usize,
+    pub real_dat_validated: usize,
+    pub real_content_dat_agreement: usize,
+    pub normalized_dat_real_validated: usize,
 }
 
 pub fn coverage_report() -> CoverageReport {
@@ -485,6 +627,10 @@ pub fn coverage_report() -> CoverageReport {
         deferred: deferred_count(),
         evidence_poor: evidence_poor_count(),
         normalization_supported: normalization_supported_count(),
+        dat_identity_capable: dat_identity_capable_count(),
+        real_dat_validated: real_dat_validated_count(),
+        real_content_dat_agreement: real_content_dat_agreement_count(),
+        normalized_dat_real_validated: normalized_dat_real_validated_count(),
     }
 }
 
@@ -726,5 +872,113 @@ mod tests {
                 assert!(!provenance.sample_class.contains("/home/"));
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Batch 9: RealDatValidation consistency (section 10)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn dat_identity_capable_count_equals_canonical_count() {
+        assert_eq!(dat_identity_capable_count(), canonical_platform_count());
+    }
+
+    #[test]
+    fn real_dat_validated_count_matches_coverage_scan() {
+        let counted = COVERAGE
+            .iter()
+            .filter(|e| e.dat_validation.is_some())
+            .count();
+        assert_eq!(real_dat_validated_count(), counted);
+    }
+
+    #[test]
+    fn real_content_dat_agreement_never_exceeds_real_dat_validated() {
+        assert!(real_content_dat_agreement_count() <= real_dat_validated_count());
+    }
+
+    #[test]
+    fn real_content_dat_agreement_never_exceeds_real_validated_content_count() {
+        assert!(real_content_dat_agreement_count() <= real_validated_count());
+    }
+
+    #[test]
+    fn normalized_dat_real_validated_never_exceeds_real_dat_validated() {
+        assert!(normalized_dat_real_validated_count() <= real_dat_validated_count());
+    }
+
+    #[test]
+    fn dat_validation_sample_match_count_is_never_zero_when_present() {
+        // A `Some(RealDatValidation)` entry must name a genuine, nonzero
+        // count of real matches - `Some` with 0 matches would be
+        // indistinguishable from "not validated" and is never honest.
+        for entry in COVERAGE {
+            if let Some(dat) = entry.dat_validation {
+                assert!(
+                    dat.sample_match_count > 0,
+                    "{} has dat_validation with sample_match_count == 0",
+                    entry.canonical_id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dat_validation_family_is_never_empty() {
+        for entry in COVERAGE {
+            if let Some(dat) = entry.dat_validation {
+                assert!(!dat.dat_family.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn dat_validation_never_contains_a_filesystem_path() {
+        for entry in COVERAGE {
+            if let Some(dat) = entry.dat_validation {
+                assert!(!dat.dat_family.contains('/'));
+            }
+        }
+    }
+
+    #[test]
+    fn master_system_dat_validation_present_despite_partial_content_status() {
+        // The exact real, honest asymmetry this milestone's own section 27
+        // is about: DAT overlap can be proven independently of content
+        // fusion agreement.
+        let entry = COVERAGE
+            .iter()
+            .find(|e| e.canonical_id == "MasterSystem")
+            .unwrap();
+        assert!(entry.dat_validation.is_some());
+        assert_eq!(entry.real_validation, ValidationStatus::Partial);
+    }
+
+    #[test]
+    fn n64_is_the_only_normalized_match_observed_platform_this_session() {
+        let normalized_platforms: Vec<&str> = COVERAGE
+            .iter()
+            .filter(|e| {
+                e.dat_validation
+                    .is_some_and(|dat| dat.normalized_match_observed)
+            })
+            .map(|e| e.canonical_id)
+            .collect();
+        assert_eq!(normalized_platforms, vec!["N64"]);
+    }
+
+    #[test]
+    fn coverage_report_new_fields_match_their_own_functions() {
+        let report = coverage_report();
+        assert_eq!(report.dat_identity_capable, dat_identity_capable_count());
+        assert_eq!(report.real_dat_validated, real_dat_validated_count());
+        assert_eq!(
+            report.real_content_dat_agreement,
+            real_content_dat_agreement_count()
+        );
+        assert_eq!(
+            report.normalized_dat_real_validated,
+            normalized_dat_real_validated_count()
+        );
     }
 }

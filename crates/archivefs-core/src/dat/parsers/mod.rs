@@ -246,4 +246,90 @@ mod tests {
             DatContentClass::RequiredMultidiscPart
         );
     }
+
+    // ------------------------------------------------------------------
+    // Batch 9: further DAT format regression (section 7)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn bom_before_doctype_still_detects_as_logiqx() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bom-doctype.dat");
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(
+            br#"<!DOCTYPE datafile PUBLIC "-//Logiqx//DTD ROM Management Datafile//EN" "http://www.logiqx.com/Dats/datafile.dtd"><datafile><header><name>BOM DOCTYPE</name></header></datafile>"#,
+        );
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(detect_format(&path).unwrap(), DatFormat::Logiqx);
+    }
+
+    #[test]
+    fn bom_prefixed_clrmamepro_is_never_misdetected_as_logiqx() {
+        // A BOM should never flip detection the *other* direction either -
+        // a ClrMamePro file with a leading BOM (unusual, but this test
+        // proves the fix is symmetric) still detects as ClrMamePro.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bom-clrmamepro.dat");
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(b"clrmamepro (\n name \"Test\"\n)\n");
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(detect_format(&path).unwrap(), DatFormat::ClrMamePro);
+    }
+
+    #[test]
+    fn whitespace_before_xml_declaration_still_detects_as_logiqx() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("whitespace.dat");
+        std::fs::write(
+            &path,
+            "   \n\t<?xml version=\"1.0\"?><datafile><header><name>Whitespace</name></header></datafile>",
+        )
+        .unwrap();
+        assert_eq!(detect_format(&path).unwrap(), DatFormat::Logiqx);
+    }
+
+    #[test]
+    fn bom_and_leading_whitespace_together_still_detect_as_logiqx() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bom-whitespace.dat");
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(b"  <?xml version=\"1.0\"?><datafile></datafile>");
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(detect_format(&path).unwrap(), DatFormat::Logiqx);
+    }
+
+    #[test]
+    fn plain_clrmamepro_without_bom_is_unaffected_by_the_bom_fix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plain-cmp.dat");
+        std::fs::write(&path, "clrmamepro (\n name \"Plain\"\n)\n").unwrap();
+        assert_eq!(detect_format(&path).unwrap(), DatFormat::ClrMamePro);
+    }
+
+    #[test]
+    fn empty_file_with_only_a_bom_is_not_misdetected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bom-only.dat");
+        std::fs::write(&path, [0xEFu8, 0xBB, 0xBF]).unwrap();
+        // A bare BOM with nothing else is neither a real Logiqx nor
+        // ClrMamePro shape - detect_format falls back to ClrMamePro (the
+        // same "empty content" default it already used before this
+        // milestone), never panics.
+        assert_eq!(detect_format(&path).unwrap(), DatFormat::ClrMamePro);
+    }
+
+    #[test]
+    fn bom_stripping_never_corrupts_real_game_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bom-games.dat");
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(
+            br#"<?xml version="1.0"?><datafile><header><name>BOM Games</name></header><game name="Game One"><rom name="one.bin" size="4" crc="00000000"/></game><game name="Game Two"><rom name="two.bin" size="4" crc="11111111"/></game></datafile>"#,
+        );
+        std::fs::write(&path, &bytes).unwrap();
+        let outcome = parse_dat_file(&path, DatLimits::default()).unwrap();
+        assert_eq!(outcome.dat.games.len(), 2);
+        assert_eq!(outcome.dat.games[0].name, "Game One");
+        assert_eq!(outcome.dat.games[1].name, "Game Two");
+    }
 }

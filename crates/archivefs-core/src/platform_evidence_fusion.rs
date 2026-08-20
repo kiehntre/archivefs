@@ -913,3 +913,8 @@ pub mod archive_set_identity;
 /// Batch 8: the thin end-to-end identity orchestrator - see that module's
 /// own doc comment.
 pub mod identity_orchestrator;
+
+/// Batch 9: the read-only presentation/view model over
+/// [`identity_orchestrator::IdentityResult`] - see that module's own doc
+/// comment.
+pub mod identity_presentation;
