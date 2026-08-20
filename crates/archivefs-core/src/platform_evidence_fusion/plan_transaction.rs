@@ -42,9 +42,11 @@ use crate::dat::rename_apply::journal::{new_transaction_id, write_journal};
 use crate::dat::rename_apply::model::{
     EntryState, RenameTransaction, TransactionEntry, TransactionState,
 };
-use crate::dat::rename_apply::preflight::{DirectoryPolicy, is_safe_basename};
+use crate::dat::rename_apply::preflight::{
+    DirectoryPolicy, PreflightOptions, batch_destinations, is_safe_basename, run_preflight,
+};
 use crate::dat::rename_apply::reconcile::{RecoveryIssue, RecoveryIssueKind};
-use crate::dat::rename_apply::rollback::{RollbackOutcome, rollback_transaction};
+use crate::dat::rename_apply::rollback::{RollbackOutcome, rollback_transaction_confined};
 use crate::safe_read::TrustedRoots;
 
 use super::library_plan_export::{LibraryPlanExport, LibraryPlanExportItem, OperationIntent};
@@ -309,6 +311,21 @@ pub fn approve_transaction(
 // 9-11, 17-19)
 // --------------------------------------------------------------------
 
+/// The `TransactionEntry.unknown` key a built entry's `set_label` (when it
+/// has one) is carried under - milestone section 5. Private: nothing outside
+/// this module should read or write it directly.
+const SET_LABEL_KEY: &str = "set_label";
+
+/// Reads the `set_label` a [`build_plan_transaction`] entry was tagged with,
+/// if any - the exact frozen-export value, never reconstructed from a path.
+fn set_label_of(entry: &TransactionEntry) -> Option<String> {
+    entry
+        .unknown
+        .get(SET_LABEL_KEY)
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+}
+
 /// Why a transaction could not be built from an approved export.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanTransactionError {
@@ -409,6 +426,21 @@ pub fn build_plan_transaction(
             .unwrap_or_default();
         sources.insert(source_path.clone());
         destinations.insert(destination_path.clone());
+        let mut unknown = std::collections::BTreeMap::new();
+        if let Some(set_label) = &item.set_label {
+            // Batch 16 (sections 5-9): carried through the existing
+            // forward-compat `unknown` flatten field rather than widening
+            // `TransactionEntry` itself, so set-aware `SkipUnsafeSubset`
+            // handling stays entirely inside this bridge module - see
+            // [`set_label_of`] and the grouping pass in
+            // [`apply_plan_transaction_with_mode`]. Never reconstructed from
+            // filenames/folders: this is exactly the frozen export's own
+            // `set_label`, nothing else.
+            unknown.insert(
+                SET_LABEL_KEY.to_string(),
+                serde_json::Value::String(set_label.clone()),
+            );
+        }
         entries.push(TransactionEntry {
             source_path,
             destination_path,
@@ -421,7 +453,7 @@ pub fn build_plan_transaction(
             failure_reason: None,
             applied_at_unix: None,
             rolled_back_at_unix: None,
-            unknown: Default::default(),
+            unknown,
         });
     }
 
@@ -622,13 +654,55 @@ pub fn apply_plan_transaction_with_mode(
         return Err(error);
     }
 
-    let approved_paths: BTreeSet<String> = transaction
+    let mut approved_paths: BTreeSet<String> = transaction
         .entries
         .iter()
         .map(|entry| entry.source_path.to_string_lossy().into_owned())
         .collect();
 
-    apply_transaction(&mut ApplyExecution {
+    // Batch 16 (sections 3-9): make `SkipUnsafeSubset` set-aware without
+    // touching the shared executor at all. The shared executor only ever
+    // decides "skip" per entry, from whether that entry's own preflight
+    // passed - it has no concept of a set. So this pre-pass runs the exact
+    // same preflight check the executor is about to run again, but only to
+    // *decide*, for every entry that belongs to a set (`set_label_of`
+    // is `Some`), whether that whole set is safe. If any member of a set is
+    // unsafe, every member's source path is removed from `approved_paths`
+    // before the executor ever sees it - which makes the executor's own
+    // preflight reject every member of that set with `NotApproved`, so
+    // `SkipUnsafeSubset` marks the *entire* set `Skipped`, never a partial
+    // move (never "Disc1 moved, Disc2 skipped, playlist moved"). Entries
+    // with no `set_label` are unaffected: they keep the pre-existing
+    // per-entry skip behaviour, which was already correct for them.
+    if hard_conflict_mode == HardConflictMode::SkipUnsafeSubset {
+        let dry_run_destinations = batch_destinations(&transaction.entries);
+        let dry_run_options = PreflightOptions {
+            plan_generation: transaction.plan_generation,
+            current_generation,
+            approved_paths: &approved_paths,
+            trusted: &trusted,
+            batch_destinations: &dry_run_destinations,
+            directory_policy: DirectoryPolicy::SameFilesystem,
+            allow_symlink_source,
+        };
+        let mut unsafe_set_labels: BTreeSet<String> = BTreeSet::new();
+        for entry in &transaction.entries {
+            if run_preflight(entry, &dry_run_options).is_err()
+                && let Some(set_label) = set_label_of(entry)
+            {
+                unsafe_set_labels.insert(set_label);
+            }
+        }
+        if !unsafe_set_labels.is_empty() {
+            for entry in &transaction.entries {
+                if set_label_of(entry).is_some_and(|label| unsafe_set_labels.contains(&label)) {
+                    approved_paths.remove(&entry.source_path.to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+
+    let result = apply_transaction(&mut ApplyExecution {
         transaction,
         approved_paths,
         current_generation,
@@ -638,19 +712,51 @@ pub fn apply_plan_transaction_with_mode(
         cancel,
         directory_policy: DirectoryPolicy::SameFilesystem,
         allow_symlink_source,
-    })
+    });
+
+    // Batch 16 finding: `apply_transaction`'s `AbortAll` hard-conflict path
+    // returns `Err(HardConflicts(_))` before it ever demotes
+    // `transaction.state` away from `Applying` - correct in that nothing was
+    // mutated (the whole point of `AbortAll`), but it leaves the *journal*
+    // durably claiming a batch is still in flight when it never started.
+    // `assess_recovery` already treats a lingering `Applying` state as
+    // `ManualRecoveryRequired` (fail-closed, never mistaken for safe), so
+    // this was never a safety hole - only a stale-journal ergonomics gap. If
+    // any directories were created (by `ensure_destination_directories`,
+    // above) before the shared executor refused the batch, they are
+    // harmless (empty, owned, and `rollback_plan_transaction` still removes
+    // them) but would otherwise sit next to a journal that never says the
+    // batch actually failed. Demoting to `ApplyFailed` here - the same
+    // terminal state a batch that fails after starting to mutate reaches -
+    // fixes that without touching the shared executor at all.
+    if result.is_err() && transaction.state == TransactionState::Applying {
+        transaction.state = TransactionState::ApplyFailed;
+        let _ = write_journal(journal_dir, transaction);
+    }
+
+    result
 }
 
-/// Rolls back a plan transaction: the shared entry-move rollback, then any
-/// directories this transaction created that are now empty, deepest first -
-/// the same discipline as
+/// Rolls back a plan transaction: the shared entry-move rollback (with
+/// ancestor-directory containment re-verified immediately before every
+/// reverse rename, via [`rollback_transaction_confined`] - see that
+/// function's doc comment for why the leaf-only checks in ordinary
+/// `rollback_transaction` are not enough), then any directories this
+/// transaction created that are now empty, deepest first - the same
+/// discipline as
 /// [`crate::dat::rom_organisation::transaction::rollback_organisation_transaction`].
+///
+/// `trusted` should be the same [`TrustedRoots`] the transaction was applied
+/// with; an empty set disables the ancestor check (matching
+/// `rollback_transaction`'s unconfined behavior) rather than refusing
+/// everything.
 pub fn rollback_plan_transaction(
     transaction: &mut RenameTransaction,
     journal_dir: &Path,
     cancel: &AtomicBool,
+    trusted: &TrustedRoots,
 ) -> Result<PlanRollbackOutcome, String> {
-    let rollback = rollback_transaction(transaction, journal_dir, cancel)?;
+    let rollback = rollback_transaction_confined(transaction, journal_dir, cancel, trusted)?;
 
     let mut directories_removed = Vec::new();
     let mut directories_remaining = Vec::new();
@@ -756,6 +862,306 @@ pub fn assess_recovery(
 }
 
 // --------------------------------------------------------------------
+// First-real-canary eligibility and preview (Batch 16, sections 10-15,
+// 23-24)
+// --------------------------------------------------------------------
+
+/// The hardcoded, non-configurable production root a canary candidate must
+/// never touch - milestone section 13. This is a defensive belt layered on
+/// top of whatever disposable canary root a caller supplies, never a
+/// replacement for it: a caller must still supply its own trusted,
+/// disposable canary root to [`assess_canary_eligibility`].
+const PRODUCTION_ROMS_ROOT: &str = "/mnt/games/roms";
+
+fn is_under_production_roms_root(path: &Path) -> bool {
+    path.starts_with(PRODUCTION_ROMS_ROOT)
+}
+
+/// The only hard-conflict policy a real-apply run is ever allowed to
+/// request - milestone section 10. There is deliberately no variant that
+/// can express [`HardConflictMode::SkipUnsafeSubset`]: a future real-apply
+/// entry point cannot request it even by mistake, because this type simply
+/// cannot carry it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RealApplyPolicy {
+    /// The first, smallest, most conservative real-apply mode.
+    Canary,
+}
+
+impl RealApplyPolicy {
+    /// The only [`HardConflictMode`] this policy may ever produce.
+    pub fn hard_conflict_mode(self) -> HardConflictMode {
+        match self {
+            RealApplyPolicy::Canary => HardConflictMode::AbortAll,
+        }
+    }
+}
+
+/// The conservative first-canary file-size ceiling - milestone section 12.
+/// Modelled here, in the future-canary validator, deliberately never in the
+/// shared executor (which has, and should keep, no size policy of its own).
+pub const CANARY_MAX_SIZE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Every reason one candidate item was refused for a first real canary -
+/// milestone section 11's exhaustive list. Never a vague "not okay".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum CanaryIneligibleReason {
+    DigestStale,
+    NotReady,
+    HasBlockers,
+    NotApproved,
+    NoDestination,
+    BelongsToSet,
+    HasSupportAssociation,
+    SourceMissing,
+    SourceNotRegularFile,
+    SourceIsSymlink,
+    DestinationAlreadyExists,
+    DestinationParentMissing,
+    NotSameFilesystem,
+    NoHashPrecondition,
+    SourceOutsideCanaryRoot,
+    DestinationOutsideCanaryRoot,
+    SourceUnderProductionRoot,
+    DestinationUnderProductionRoot,
+    SourceTooLarge { bytes: u64, limit: u64 },
+    CycleOrDuplicateTarget,
+}
+
+/// The precondition-strength report milestone section 23 asks for - one
+/// explicit boolean/value per named check, never a vague "looks okay".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CanaryPreconditionReport {
+    pub physical_hash_present: bool,
+    pub normalized_hash_present: bool,
+    pub is_regular_file: bool,
+    pub is_symlink: bool,
+    pub same_filesystem: bool,
+    pub destination_clear: bool,
+    pub size_bytes: Option<u64>,
+    pub strong_enough_for_canary: bool,
+}
+
+/// Assesses whether one export item is eligible to be the very first real
+/// canary - milestone sections 11-15. Read-only: inspects the filesystem
+/// (identity, existence, device ids) but never mutates it, and never builds
+/// a transaction. `canary_root` is the caller's own disposable, trusted
+/// staging directory; `/mnt/games/roms` is refused unconditionally
+/// regardless of what `canary_root` is.
+pub fn assess_canary_eligibility(
+    export: &LibraryPlanExport,
+    item: &LibraryPlanExportItem,
+    approved: &ApprovedPlan,
+    canary_root: &Path,
+) -> Result<CanaryPreconditionReport, Vec<CanaryIneligibleReason>> {
+    let mut reasons = Vec::new();
+
+    if compute_plan_digest(export).as_str() != approved.digest.as_str() {
+        reasons.push(CanaryIneligibleReason::DigestStale);
+    }
+    if item.status != PlanStatus::Ready {
+        reasons.push(CanaryIneligibleReason::NotReady);
+    }
+    if !item.blockers.is_empty() {
+        reasons.push(CanaryIneligibleReason::HasBlockers);
+    }
+    if !approved
+        .approved_item_ids
+        .contains(&item.precondition.source_path)
+    {
+        reasons.push(CanaryIneligibleReason::NotApproved);
+    }
+    let Some(destination_str) = item.proposed_destination.as_ref() else {
+        reasons.push(CanaryIneligibleReason::NoDestination);
+        return Err(reasons);
+    };
+    if item.set_label.is_some() {
+        reasons.push(CanaryIneligibleReason::BelongsToSet);
+    }
+    if item.support_role.is_some() || item.support_association.is_some() {
+        reasons.push(CanaryIneligibleReason::HasSupportAssociation);
+    }
+
+    let source_path = Path::new(&item.precondition.source_path);
+    let destination_path = Path::new(destination_str);
+
+    if is_under_production_roms_root(source_path) {
+        reasons.push(CanaryIneligibleReason::SourceUnderProductionRoot);
+    }
+    if is_under_production_roms_root(destination_path) {
+        reasons.push(CanaryIneligibleReason::DestinationUnderProductionRoot);
+    }
+    if !source_path.starts_with(canary_root) {
+        reasons.push(CanaryIneligibleReason::SourceOutsideCanaryRoot);
+    }
+    if !destination_path.starts_with(canary_root) {
+        reasons.push(CanaryIneligibleReason::DestinationOutsideCanaryRoot);
+    }
+
+    // Cycle / duplicate-target, checked against every other Ready+approved
+    // item in the same export - never this item in isolation.
+    let mut other_sources: BTreeSet<&str> = BTreeSet::new();
+    let mut duplicate_target_count = 0usize;
+    for other in &export.items {
+        if other.status != PlanStatus::Ready
+            || !other.blockers.is_empty()
+            || !approved
+                .approved_item_ids
+                .contains(&other.precondition.source_path)
+        {
+            continue;
+        }
+        other_sources.insert(other.precondition.source_path.as_str());
+        if other.proposed_destination.as_deref() == Some(destination_str.as_str()) {
+            duplicate_target_count += 1;
+        }
+    }
+    let is_cycle = other_sources.contains(destination_str.as_str());
+    if duplicate_target_count > 1 || is_cycle {
+        reasons.push(CanaryIneligibleReason::CycleOrDuplicateTarget);
+    }
+
+    let identity = capture_identity(source_path);
+    let (is_regular_file, is_symlink, size_bytes) = match &identity {
+        Ok(identity) => (
+            identity.kind == crate::dat::rename_apply::model::ObjectKind::RegularFile,
+            matches!(
+                identity.kind,
+                crate::dat::rename_apply::model::ObjectKind::Symlink
+                    | crate::dat::rename_apply::model::ObjectKind::BrokenSymlink
+            ),
+            Some(identity.size_bytes),
+        ),
+        Err(_) => {
+            reasons.push(CanaryIneligibleReason::SourceMissing);
+            (false, false, None)
+        }
+    };
+    if identity.is_ok() && !is_regular_file {
+        reasons.push(CanaryIneligibleReason::SourceNotRegularFile);
+    }
+    if is_symlink {
+        reasons.push(CanaryIneligibleReason::SourceIsSymlink);
+    }
+    if let Some(bytes) = size_bytes
+        && bytes > CANARY_MAX_SIZE_BYTES
+    {
+        reasons.push(CanaryIneligibleReason::SourceTooLarge {
+            bytes,
+            limit: CANARY_MAX_SIZE_BYTES,
+        });
+    }
+
+    let destination_clear = std::fs::symlink_metadata(destination_path).is_err();
+    if !destination_clear {
+        reasons.push(CanaryIneligibleReason::DestinationAlreadyExists);
+    }
+    let destination_parent_exists = destination_path.parent().is_some_and(|p| p.exists());
+    if !destination_parent_exists {
+        reasons.push(CanaryIneligibleReason::DestinationParentMissing);
+    }
+
+    let same_filesystem = source_path
+        .parent()
+        .zip(destination_path.parent())
+        .map(|(s, d)| canary_same_filesystem(s, d))
+        .unwrap_or(false);
+    if !same_filesystem {
+        reasons.push(CanaryIneligibleReason::NotSameFilesystem);
+    }
+
+    let physical_hash_present = item.precondition.physical_hash.is_some();
+    let normalized_hash_present = item.precondition.normalized_hash.is_some();
+    if !physical_hash_present && !normalized_hash_present {
+        reasons.push(CanaryIneligibleReason::NoHashPrecondition);
+    }
+
+    if !reasons.is_empty() {
+        return Err(reasons);
+    }
+
+    Ok(CanaryPreconditionReport {
+        physical_hash_present,
+        normalized_hash_present,
+        is_regular_file,
+        is_symlink,
+        same_filesystem,
+        destination_clear,
+        size_bytes,
+        strong_enough_for_canary: true,
+    })
+}
+
+#[cfg(unix)]
+fn canary_same_filesystem(left: &Path, right: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(left), std::fs::metadata(right)) {
+        (Ok(l), Ok(r)) => l.dev() == r.dev(),
+        _ => false,
+    }
+}
+#[cfg(not(unix))]
+fn canary_same_filesystem(_left: &Path, _right: &Path) -> bool {
+    false
+}
+
+/// Milestone section 24's exact human-readable shape - still preview-only:
+/// nothing here ever mutates, and it is built entirely from
+/// [`assess_canary_eligibility`]'s own read-only output.
+pub fn render_canary_preview(
+    item: &LibraryPlanExportItem,
+    eligibility: &Result<CanaryPreconditionReport, Vec<CanaryIneligibleReason>>,
+) -> String {
+    let mut out = String::new();
+    out.push_str("REAL APPLY CANARY PREVIEW\n\n");
+    out.push_str("Mode:\n  AbortAll\n\n");
+    out.push_str(&format!("Source:\n  {}\n\n", item.precondition.source_path));
+    out.push_str(&format!(
+        "Destination:\n  {}\n\n",
+        item.proposed_destination.as_deref().unwrap_or("(none)")
+    ));
+    match eligibility {
+        Ok(report) => {
+            out.push_str(&format!(
+                "Size:\n  {}\n\n",
+                report
+                    .size_bytes
+                    .map(|bytes| format!("{bytes} bytes"))
+                    .unwrap_or_else(|| "unknown".to_string())
+            ));
+            out.push_str(&format!(
+                "Physical hash:\n  {}\n\n",
+                if report.physical_hash_present {
+                    "present"
+                } else {
+                    "absent"
+                }
+            ));
+            out.push_str(&format!(
+                "Same filesystem:\n  {}\n\n",
+                if report.same_filesystem { "YES" } else { "NO" }
+            ));
+            out.push_str(&format!(
+                "Symlink:\n  {}\n\n",
+                if report.is_symlink { "YES" } else { "NO" }
+            ));
+            out.push_str("Preconditions:\n  PASS\n\n");
+            out.push_str("Blast radius:\n  1 file\n\n");
+        }
+        Err(reasons) => {
+            out.push_str("Preconditions:\n  FAIL\n");
+            for reason in reasons {
+                out.push_str(&format!("    - {reason:?}\n"));
+            }
+            out.push('\n');
+        }
+    }
+    out.push_str("Approval:\n  REQUIRED\n");
+    out.push_str("\nApplied:\n  NO\n");
+    out
+}
+
+// --------------------------------------------------------------------
 // Developer-probe hard temp-safety guard (Batch 15, milestone section 39)
 // --------------------------------------------------------------------
 
@@ -837,7 +1243,12 @@ pub fn render_recovery_report(
     let uncertain: Vec<&TransactionEntry> = transaction
         .entries
         .iter()
-        .filter(|entry| matches!(entry.state, EntryState::Applying | EntryState::RollingBack))
+        .filter(|entry| {
+            matches!(
+                entry.state,
+                EntryState::Applying | EntryState::RollingBack | EntryState::RollbackFailed
+            )
+        })
         .collect();
     if uncertain.is_empty() && issues.is_empty() {
         out.push_str("  (none)\n");
@@ -857,6 +1268,13 @@ pub fn render_recovery_report(
                 entry.identity.size_bytes, entry.identity.kind
             ));
             out.push_str(&format!("    Current observation:  {observation}\n"));
+            // Surfaces the exact refusal reason (e.g. an ancestor-symlink
+            // substitution) rather than only the generic "changed" facts
+            // above - so a genuinely detectable cause is never reported as
+            // a vague "missing file".
+            if let Some(reason) = &entry.failure_reason {
+                out.push_str(&format!("    Refusal reason:       {reason}\n"));
+            }
         }
         for issue in issues {
             out.push_str(&format!(
@@ -912,6 +1330,8 @@ fn describe_symlink_metadata(path: &Path) -> String {
     }
 }
 
+#[cfg(test)]
+mod closeout_tests;
 #[cfg(test)]
 mod hardening_tests;
 #[cfg(test)]

@@ -402,7 +402,13 @@ fn tampering_with_an_entrys_destination_path_is_not_cryptographically_prevented_
 
     // Roll back, then tamper with the journaled destination_path to point
     // at an unrelated, already-existing file elsewhere in the tempdir.
-    rollback_plan_transaction(&mut transaction, &fx.journal_dir, &cancel).unwrap();
+    rollback_plan_transaction(
+        &mut transaction,
+        &fx.journal_dir,
+        &cancel,
+        &TrustedRoots::from_paths([fx.root.as_path()]),
+    )
+    .unwrap();
     let unrelated = fx.root.join("unrelated.bin");
     std::fs::write(&unrelated, b"unrelated real content").unwrap();
     transaction.entries[0].destination_path = unrelated.clone();
@@ -975,7 +981,13 @@ fn directory_created_by_the_transaction_but_given_external_content_before_rollba
     std::fs::write(destination.parent().unwrap().join("unrelated.txt"), b"x").unwrap();
 
     let cancel = AtomicBool::new(false);
-    let rollback = rollback_plan_transaction(&mut transaction, &fx.journal_dir, &cancel).unwrap();
+    let rollback = rollback_plan_transaction(
+        &mut transaction,
+        &fx.journal_dir,
+        &cancel,
+        &TrustedRoots::from_paths([fx.root.as_path()]),
+    )
+    .unwrap();
     assert!(matches!(
         rollback.rollback.result,
         RollbackResult::FullyRolledBack
@@ -1113,12 +1125,24 @@ fn double_rollback_is_a_safe_no_op_with_zero_further_mutation() {
     let (_, mut transaction) = build_and_approve(&export);
     apply(&fx, &export, &mut transaction).unwrap();
     let cancel = AtomicBool::new(false);
-    let first = rollback_plan_transaction(&mut transaction, &fx.journal_dir, &cancel).unwrap();
+    let first = rollback_plan_transaction(
+        &mut transaction,
+        &fx.journal_dir,
+        &cancel,
+        &TrustedRoots::from_paths([fx.root.as_path()]),
+    )
+    .unwrap();
     assert!(matches!(
         first.rollback.result,
         RollbackResult::FullyRolledBack
     ));
-    let second = rollback_plan_transaction(&mut transaction, &fx.journal_dir, &cancel).unwrap();
+    let second = rollback_plan_transaction(
+        &mut transaction,
+        &fx.journal_dir,
+        &cancel,
+        &TrustedRoots::from_paths([fx.root.as_path()]),
+    )
+    .unwrap();
     assert!(matches!(
         second.rollback.result,
         RollbackResult::FullyRolledBack

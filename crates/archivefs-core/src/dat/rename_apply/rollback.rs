@@ -18,6 +18,7 @@ use super::identity::{capture_identity, identity_matches};
 use super::journal::write_journal;
 use super::model::{EntryState, RenameTransaction, RollbackResult, TransactionState};
 use super::noclobber::{NoClobberError, rename_noreplace};
+use crate::safe_read::TrustedRoots;
 
 /// The outcome of a rollback pass (fully / partially / failed).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +43,35 @@ pub fn rollback_transaction(
     transaction: &mut RenameTransaction,
     journal_dir: &Path,
     cancel: &AtomicBool,
+) -> Result<RollbackOutcome, String> {
+    rollback_transaction_inner(transaction, journal_dir, cancel, None)
+}
+
+/// Identical to [`rollback_transaction`], but additionally re-verifies, for
+/// every reverse-rename mutation, that the entire ancestor chain of both the
+/// current (destination) and restored (source) paths, not just the leaf, is
+/// still plain directories confined to `trusted`, immediately before the
+/// rename syscall. This closes a gap ordinary `rollback_transaction` does
+/// not cover: an intermediate ancestor directory silently replaced with a
+/// symlink (e.g. `source_parent` itself) is transparent to normal path
+/// resolution, so an unconfined rollback would follow it like any other
+/// directory. Used by [`crate::platform_evidence_fusion::plan_transaction`],
+/// which already threads a [`TrustedRoots`] through the forward apply path
+/// and is the entry point a future real-canary apply will use.
+pub fn rollback_transaction_confined(
+    transaction: &mut RenameTransaction,
+    journal_dir: &Path,
+    cancel: &AtomicBool,
+    trusted: &TrustedRoots,
+) -> Result<RollbackOutcome, String> {
+    rollback_transaction_inner(transaction, journal_dir, cancel, Some(trusted))
+}
+
+fn rollback_transaction_inner(
+    transaction: &mut RenameTransaction,
+    journal_dir: &Path,
+    cancel: &AtomicBool,
+    trusted: Option<&TrustedRoots>,
 ) -> Result<RollbackOutcome, String> {
     if transaction.state == TransactionState::RolledBack {
         return Ok(RollbackOutcome {
@@ -120,7 +150,7 @@ pub fn rollback_transaction(
         transaction.entries[index].state = EntryState::RollingBack;
         write_journal(journal_dir, transaction).map_err(|error| error.to_string())?;
 
-        match rollback_mutation(&transaction.entries[index]) {
+        match rollback_mutation(&transaction.entries[index], trusted) {
             Ok(()) => {
                 transaction.entries[index].state = EntryState::RolledBack;
                 transaction.entries[index].rolled_back_at_unix =
@@ -200,7 +230,10 @@ pub fn rollback_transaction(
 /// destination to still be the recorded object and the original source path
 /// to be free. Called only after the entry's `RollingBack` state has been
 /// durably persisted.
-fn rollback_mutation(entry: &super::model::TransactionEntry) -> Result<(), String> {
+fn rollback_mutation(
+    entry: &super::model::TransactionEntry,
+    trusted: Option<&TrustedRoots>,
+) -> Result<(), String> {
     // Destination must still exist and still be the recorded object.
     match capture_identity(&entry.destination_path) {
         Err(_) => {
@@ -223,6 +256,40 @@ fn rollback_mutation(entry: &super::model::TransactionEntry) -> Result<(), Strin
         return Err("rollback refused: the original source path is now occupied".to_string());
     }
 
+    // Ancestor-directory containment, immediately before the mutation. The
+    // leaf-only check above (`symlink_metadata` on the source path itself)
+    // cannot see an *intermediate* ancestor - the source or destination
+    // parent, grandparent, or deeper - that has been replaced with a
+    // symlink: ordinary path resolution follows it transparently, exactly
+    // as `cd`/`open` would. `ancestor_chain_is_confined` walks every
+    // ancestor component up to the trusted root and requires each one to
+    // still be a plain directory (never a symlink), regardless of where a
+    // substituted symlink's target points - inside the trusted root or
+    // outside it makes no difference, since the caller's expected canonical
+    // location was replaced either way. Checked right here, immediately
+    // before the rename syscall below, so there is no earlier-check/later-
+    // mutation gap for a race to exploit.
+    if let Some(trusted) = trusted
+        && !trusted.is_empty()
+    {
+        let destination_confined = entry
+            .destination_path
+            .parent()
+            .is_some_and(|parent| ancestor_chain_is_confined(parent, trusted));
+        let source_confined = entry
+            .source_path
+            .parent()
+            .is_some_and(|parent| ancestor_chain_is_confined(parent, trusted));
+        if !destination_confined || !source_confined {
+            return Err(
+                "rollback refused: an ancestor directory has been replaced (e.g. with a \
+                 symlink) and is no longer a plain directory confined to the trusted root - \
+                 manual recovery required"
+                    .to_string(),
+            );
+        }
+    }
+
     match rename_noreplace(&entry.destination_path, &entry.source_path) {
         Ok(()) => {
             // Confirm the source was restored with the recorded identity.
@@ -240,6 +307,40 @@ fn rollback_mutation(entry: &super::model::TransactionEntry) -> Result<(), Strin
             Err("rollback refused: the original source path is occupied (no-overwrite)".to_string())
         }
         Err(error) => Err(format!("rollback rename failed: {error}")),
+    }
+}
+
+/// Whether every ancestor of `path`, from `path` itself up to and including
+/// whichever trusted root contains it, is a plain directory - never a
+/// symlink. Uses `symlink_metadata` (never follows the final component of
+/// each ancestor), so a substituted symlink is caught by its own file type
+/// rather than by comparing where it happens to resolve to; this is why an
+/// inside-root and an outside-root substitution are refused identically.
+/// `path` must be literally contained in one of `trusted`'s roots (a
+/// `starts_with` prefix match on the recorded, non-canonical path) or this
+/// returns `false` immediately - a path outside every trusted root was
+/// never safe to rename into/out of in the first place.
+fn ancestor_chain_is_confined(path: &Path, trusted: &TrustedRoots) -> bool {
+    let Some(root) = trusted
+        .roots()
+        .iter()
+        .find(|root| path.starts_with(root.as_path()))
+    else {
+        return false;
+    };
+    let mut current = path;
+    loop {
+        match std::fs::symlink_metadata(current) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            _ => return false,
+        }
+        if current == root.as_path() {
+            return true;
+        }
+        match current.parent() {
+            Some(parent) => current = parent,
+            None => return false,
+        }
     }
 }
 

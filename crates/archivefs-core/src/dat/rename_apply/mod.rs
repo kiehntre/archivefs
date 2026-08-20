@@ -61,7 +61,7 @@ pub use preflight::{
     DirectoryPolicy, PreflightFailure, PreflightOptions, batch_destinations, run_preflight,
 };
 pub use reconcile::{RecoveryIssue, RecoveryIssueKind, reconcile_recovery};
-pub use rollback::{RollbackOutcome, rollback_transaction};
+pub use rollback::{RollbackOutcome, rollback_transaction, rollback_transaction_confined};
 
 #[cfg(test)]
 mod tests;

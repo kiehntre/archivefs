@@ -3,20 +3,29 @@
 //! layer.
 //!
 //! Default behavior is **preview only** - it builds a small synthetic
-//! export shaped like a real planner result (never touching
-//! `/mnt/games/roms` or any real collection), prints
-//! [`render_preview_text`], and stops.
+//! export shaped like a real planner result (never touching the real,
+//! production ROM collection), prints [`render_preview_text`], and stops.
 //!
 //! ```text
 //! cargo run -p archivefs-core --example transaction_probe
 //! cargo run -p archivefs-core --example transaction_probe -- --temp-fixture-apply
+//! cargo run -p archivefs-core --example transaction_probe -- --temp-fixture-fail-after-1
+//! cargo run -p archivefs-core --example transaction_probe -- --temp-fixture-rollback
+//! cargo run -p archivefs-core --example transaction_probe -- --canary-check
 //! ```
 //!
-//! `--temp-fixture-apply` is the *only* way to mutate anything, and even
-//! then only inside a tempdir this process creates itself
+//! `--temp-fixture-apply`/`--temp-fixture-fail-after-1`/
+//! `--temp-fixture-rollback` are the *only* ways to mutate anything, and
+//! even then only inside a tempdir this process creates itself
 //! (`std::env::temp_dir()` + a random subdirectory) - there is no
 //! `--destination` flag at all, so an arbitrary real path can never be
-//! supplied (milestone section 49's hard safety guard).
+//! supplied (milestone section 49's hard safety guard). `--canary-check`
+//! (Batch 16) is read-only: it runs `assess_canary_eligibility`/
+//! `render_canary_preview` against the same synthetic tempdir fixture and
+//! never touches the filesystem beyond that. There is, and must never be,
+//! any flag in this file that performs a genuine, non-tempdir apply -
+//! see `transaction_probe_source_never_contains_a_real_apply_flag` in
+//! `plan_transaction/closeout_tests.rs` for the structural proof.
 
 use std::sync::atomic::AtomicBool;
 
@@ -28,9 +37,9 @@ use archivefs_core::platform_evidence_fusion::library_planning::{
     PlanStatus, RenameBasis, RommMappingStatus,
 };
 use archivefs_core::platform_evidence_fusion::plan_transaction::{
-    apply_plan_transaction_with_mode, approve_transaction, build_plan_transaction, build_preview,
-    plan_generation_of, preview_is_confined_to_root, render_preview_text,
-    rollback_plan_transaction,
+    apply_plan_transaction_with_mode, approve_transaction, assess_canary_eligibility,
+    build_plan_transaction, build_preview, plan_generation_of, preview_is_confined_to_root,
+    render_canary_preview, render_preview_text, rollback_plan_transaction,
 };
 use archivefs_core::safe_read::TrustedRoots;
 
@@ -69,7 +78,17 @@ fn main() {
     let apply_requested = args.iter().any(|arg| arg == "--temp-fixture-apply");
     let fail_after_1_requested = args.iter().any(|arg| arg == "--temp-fixture-fail-after-1");
     let rollback_requested = args.iter().any(|arg| arg == "--temp-fixture-rollback");
+    let canary_check_requested = args.iter().any(|arg| arg == "--canary-check");
     let mutation_requested = apply_requested || fail_after_1_requested || rollback_requested;
+
+    // Note: `--canary-check` is intentionally NOT a mutation flag and never
+    // sets `mutation_requested` - it only ever calls the read-only
+    // `assess_canary_eligibility`/`render_canary_preview` against the
+    // probe's own synthetic tempdir fixture (milestone section 25). There
+    // is, and must never be, any flag in this file that performs a
+    // genuine, non-tempdir apply - see
+    // `transaction_probe_source_never_contains_a_real_apply_flag` in
+    // `plan_transaction/closeout_tests.rs` for the structural proof.
 
     // A tempdir this process creates itself - never a caller-supplied
     // path. This is the hard safety guard: there is no flag anywhere in
@@ -90,6 +109,22 @@ fn main() {
     let export = synthetic_export(&source, &destination);
     let preview = build_preview(&export);
     println!("{}", render_preview_text(&preview));
+
+    if canary_check_requested {
+        let approved = match approve_transaction(&preview, "developer probe canary-check") {
+            Ok(approved) => approved,
+            Err(error) => {
+                eprintln!("could not approve: {error:?}");
+                let _ = std::fs::remove_dir_all(&fixture_dir);
+                std::process::exit(1);
+            }
+        };
+        let eligibility =
+            assess_canary_eligibility(&export, &export.items[0], &approved, &fixture_dir);
+        println!("{}", render_canary_preview(&export.items[0], &eligibility));
+        let _ = std::fs::remove_dir_all(&fixture_dir);
+        return;
+    }
 
     if !mutation_requested {
         println!(
@@ -170,7 +205,13 @@ fn main() {
         // Roll back immediately so this probe never leaves a mutated
         // fixture behind - it exists to demonstrate the mechanics, not to
         // persist a result.
-        if let Ok(rollback) = rollback_plan_transaction(&mut transaction, &journal_dir, &cancel) {
+        let trusted_for_rollback = TrustedRoots::from_paths([fixture_dir.as_path()]);
+        if let Ok(rollback) = rollback_plan_transaction(
+            &mut transaction,
+            &journal_dir,
+            &cancel,
+            &trusted_for_rollback,
+        ) {
             println!("Rollback: {:?}", rollback.rollback.result);
         }
     }

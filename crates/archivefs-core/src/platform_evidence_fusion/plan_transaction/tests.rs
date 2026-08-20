@@ -702,7 +702,13 @@ fn set_atomicity_if_one_member_fails_the_set_rolls_back() {
 
     // Roll back the whole set - only disc1 (the entry that actually
     // applied) has anything to reverse.
-    let rollback = rollback_plan_transaction(&mut transaction, &fx.journal_dir, &cancel).unwrap();
+    let rollback = rollback_plan_transaction(
+        &mut transaction,
+        &fx.journal_dir,
+        &cancel,
+        &TrustedRoots::from_paths([fx.root.as_path()]),
+    )
+    .unwrap();
     assert!(matches!(
         rollback.rollback.result,
         crate::dat::rename_apply::model::RollbackResult::FullyRolledBack
@@ -992,14 +998,26 @@ fn second_rollback_is_idempotent() {
     )
     .unwrap();
 
-    let first = rollback_plan_transaction(&mut transaction, &fx.journal_dir, &cancel).unwrap();
+    let first = rollback_plan_transaction(
+        &mut transaction,
+        &fx.journal_dir,
+        &cancel,
+        &TrustedRoots::from_paths([fx.root.as_path()]),
+    )
+    .unwrap();
     assert!(matches!(
         first.rollback.result,
         crate::dat::rename_apply::model::RollbackResult::FullyRolledBack
     ));
     assert!(source.exists());
 
-    let second = rollback_plan_transaction(&mut transaction, &fx.journal_dir, &cancel).unwrap();
+    let second = rollback_plan_transaction(
+        &mut transaction,
+        &fx.journal_dir,
+        &cancel,
+        &TrustedRoots::from_paths([fx.root.as_path()]),
+    )
+    .unwrap();
     assert!(matches!(
         second.rollback.result,
         crate::dat::rename_apply::model::RollbackResult::FullyRolledBack
@@ -1036,7 +1054,13 @@ fn rollback_refuses_when_destination_changed_after_apply() {
     // Someone/something replaces the moved file's content after apply.
     std::fs::write(&destination, b"different data now").unwrap();
 
-    let outcome = rollback_plan_transaction(&mut transaction, &fx.journal_dir, &cancel).unwrap();
+    let outcome = rollback_plan_transaction(
+        &mut transaction,
+        &fx.journal_dir,
+        &cancel,
+        &TrustedRoots::from_paths([fx.root.as_path()]),
+    )
+    .unwrap();
     match outcome.rollback.result {
         crate::dat::rename_apply::model::RollbackResult::PartiallyRolledBack { .. }
         | crate::dat::rename_apply::model::RollbackResult::RollbackFailed { .. } => {}
@@ -1072,7 +1096,13 @@ fn empty_directories_created_by_the_transaction_are_removed_on_rollback() {
     .unwrap();
     assert!(destination.parent().unwrap().exists());
 
-    let outcome = rollback_plan_transaction(&mut transaction, &fx.journal_dir, &cancel).unwrap();
+    let outcome = rollback_plan_transaction(
+        &mut transaction,
+        &fx.journal_dir,
+        &cancel,
+        &TrustedRoots::from_paths([fx.root.as_path()]),
+    )
+    .unwrap();
     assert_eq!(outcome.directories_removed.len(), 2);
     assert!(!fx.root.join("ps").exists());
 }
@@ -1105,7 +1135,13 @@ fn a_non_empty_created_directory_is_never_removed_on_rollback() {
     // transaction (simulating something else writing there concurrently).
     std::fs::write(fx.root.join("ps").join("unrelated.txt"), b"hi").unwrap();
 
-    let outcome = rollback_plan_transaction(&mut transaction, &fx.journal_dir, &cancel).unwrap();
+    let outcome = rollback_plan_transaction(
+        &mut transaction,
+        &fx.journal_dir,
+        &cancel,
+        &TrustedRoots::from_paths([fx.root.as_path()]),
+    )
+    .unwrap();
     assert!(outcome.directories_remaining.contains(&fx.root.join("ps")));
     assert!(fx.root.join("ps").exists());
 }
@@ -1186,7 +1222,13 @@ fn rolled_back_transaction_is_already_rolled_back() {
         false,
     )
     .unwrap();
-    rollback_plan_transaction(&mut transaction, &fx.journal_dir, &cancel).unwrap();
+    rollback_plan_transaction(
+        &mut transaction,
+        &fx.journal_dir,
+        &cancel,
+        &TrustedRoots::from_paths([fx.root.as_path()]),
+    )
+    .unwrap();
     assert_eq!(
         assess_recovery(&transaction, &[]),
         RecoveryAssessment::AlreadyRolledBack
