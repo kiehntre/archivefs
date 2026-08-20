@@ -967,3 +967,9 @@ pub mod library_plan_export;
 /// Batch 13: the set-folder destination shape for real multi-file sets -
 /// see that module's own doc comment.
 pub mod set_destination;
+
+/// Batch 14: the frozen-plan-to-transaction boundary (digest-bound
+/// approval, preview, and the bridge into the crate's existing, proven
+/// journal-backed apply/rollback engine) - see that module's own doc
+/// comment for exactly which existing module it reuses.
+pub mod plan_transaction;
