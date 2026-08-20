@@ -56,6 +56,11 @@ use archivefs_core::platform_evidence_fusion::library_plan_presentation::{
 use archivefs_core::platform_evidence_fusion::library_planning::{
     LibraryPlanInput, LibraryPlanningContext, no_slug_mapping, plan_library,
 };
+use archivefs_core::platform_evidence_fusion::set_destination::{
+    SupportCandidate, plan_set_destinations,
+};
+use archivefs_core::platform_evidence_fusion::side_file_classification::SideFileRole;
+use archivefs_core::platform_evidence_fusion::support_attachment::SupportAssociation;
 use archivefs_core::sms_gg_header_evidence::{
     find_tmr_sega_header, observe_tmr_sega_evidence, parse_tmr_sega_header,
 };
@@ -274,15 +279,6 @@ fn main() -> ExitCode {
         });
     }
 
-    if !cue_m3u_files.is_empty() {
-        println!("==================================================");
-        println!("Cue/M3U planned sets ({} file(s)):", cue_m3u_files.len());
-        for path in &cue_m3u_files {
-            print_cue_m3u_plan(path);
-        }
-        println!();
-    }
-
     let slug_fn: &dyn Fn(&str) -> Option<String> = if args.demo_slug {
         &demo_slug_for_platform
     } else {
@@ -345,6 +341,51 @@ fn main() -> ExitCode {
     println!("Multi-disc sets: {}", multidisc_sets.len());
     println!();
 
+    if !cue_m3u_files.is_empty() {
+        println!("==================================================");
+        println!("Cue/M3U planned sets ({} file(s)):", cue_m3u_files.len());
+        let mut support_candidates: Vec<(PathBuf, SideFileRole, SupportAssociation, Vec<PathBuf>)> =
+            Vec::new();
+        for path in &cue_m3u_files {
+            if let Some((role, association, referenced_members)) = print_cue_m3u_plan(path) {
+                support_candidates.push((path.clone(), role, association, referenced_members));
+            }
+        }
+        let candidates: Vec<SupportCandidate> = support_candidates
+            .iter()
+            .map(
+                |(path, role, association, referenced_members)| SupportCandidate {
+                    path,
+                    role: *role,
+                    association: association.clone(),
+                    referenced_members: referenced_members.clone(),
+                },
+            )
+            .collect();
+        let set_plan = plan_set_destinations(&report, &multidisc_sets, &candidates);
+        println!(
+            "Set destinations planned: {} (support items: {})",
+            set_plan.sets.len(),
+            set_plan.support_items.len()
+        );
+        for set in &set_plan.sets {
+            println!("  SET {} -> {}", set.set_label, set.set_folder.display());
+            for (source, destination) in &set.member_destinations {
+                println!("    {} -> {}", source.display(), destination.display());
+            }
+        }
+        for support in &set_plan.support_items {
+            println!(
+                "  SUPPORT {} [{:?}] status={:?} destination={:?}",
+                support.path.display(),
+                support.role,
+                support.status,
+                support.proposed_destination
+            );
+        }
+        println!();
+    }
+
     for (item, (path, identity)) in report.items.iter().zip(identities.iter()) {
         println!("==================================================");
         println!("{}", path.display());
@@ -361,30 +402,36 @@ fn main() -> ExitCode {
 /// rejected (unsafe) reference. Bounded read (max
 /// `cue_m3u_parsing::MAX_PARSE_BYTES`) - never a full read of an
 /// arbitrarily large file claiming to be a cue/m3u.
-fn print_cue_m3u_plan(path: &Path) {
+/// Prints one cue/m3u's parsed reference list and returns the
+/// [`SideFileRole`]/[`SupportAssociation`] `attach_support_file` resolved
+/// for it - `None` only when the file could not even be read/decoded.
+/// Milestone section 20's rule: a missing or unsafe member is surfaced
+/// (`REJECTED`/`MISSING`), never silently dropped.
+fn print_cue_m3u_plan(path: &Path) -> Option<(SideFileRole, SupportAssociation, Vec<PathBuf>)> {
     use archivefs_core::platform_evidence_fusion::cue_m3u_parsing::{
         MAX_PARSE_BYTES, parse_cue_file_references, parse_m3u_references,
     };
+    use archivefs_core::platform_evidence_fusion::support_attachment::attach_support_file;
     use std::io::Read as _;
 
     println!("  {}", path.display());
     let Ok(mut file) = std::fs::File::open(path) else {
         println!("    [could not open]");
-        return;
+        return None;
     };
     let mut buf = vec![0u8; MAX_PARSE_BYTES + 1];
     let Ok(read) = file.read(&mut buf) else {
         println!("    [could not read]");
-        return;
+        return None;
     };
     if read > MAX_PARSE_BYTES {
         println!("    [refused: file exceeds the {MAX_PARSE_BYTES}-byte bound]");
-        return;
+        return None;
     }
     buf.truncate(read);
     let Ok(text) = String::from_utf8(buf) else {
         println!("    [refused: not valid UTF-8]");
-        return;
+        return None;
     };
 
     let is_cue = path.extension().and_then(|e| e.to_str()) == Some("cue");
@@ -396,13 +443,10 @@ fn print_cue_m3u_plan(path: &Path) {
 
     if references.is_empty() {
         println!("    (no references found)");
-        return;
     }
     let mut missing = 0;
-    let mut unsafe_count = 0;
     for reference in &references {
         if !reference.is_safe() {
-            unsafe_count += 1;
             println!(
                 "    REJECTED  {:?}  ({:?})",
                 reference.raw, reference.rejection
@@ -417,15 +461,18 @@ fn print_cue_m3u_plan(path: &Path) {
             println!("    MISSING   {}", resolved.display());
         }
     }
-    let status = if unsafe_count > 0 || missing > 0 {
-        "NeedsReview"
-    } else {
-        "Ready (all members present and safe)"
-    };
-    println!(
-        "    Set status: {status} ({} member(s), {missing} missing, {unsafe_count} unsafe)",
-        references.len()
-    );
+    if missing > 0 {
+        println!("    ({missing} referenced member(s) missing on disk)");
+    }
+
+    let attachment = attach_support_file(path, Some(&text), None);
+    println!("    Attachment: {:?}", attachment.association);
+    let referenced_members: Vec<PathBuf> = references
+        .iter()
+        .filter(|r| r.is_safe())
+        .filter_map(|r| r.resolved.clone())
+        .collect();
+    Some((attachment.role, attachment.association, referenced_members))
 }
 
 /// Builds an [`IdentityResult`] the same way `cartridge_probe` does: by

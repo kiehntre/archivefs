@@ -123,6 +123,21 @@ fn attach_via_references(
             detail: format!("{:?}: {:?}", unsafe_ref.raw, unsafe_ref.rejection),
         };
     }
+    // Batch 13 (milestone section 8/20): a missing referenced member is a
+    // real blocker, never silently ignored - the set stays a Candidate
+    // rather than Attached until every safe reference actually resolves
+    // to a real file.
+    if let Some(missing) = references
+        .iter()
+        .find(|r| !r.resolved.as_ref().is_some_and(|p| p.is_file()))
+    {
+        return SupportAssociation::Candidate {
+            reason: format!(
+                "referenced member does not exist on disk: {:?}",
+                missing.raw
+            ),
+        };
+    }
     let set_label = path
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())

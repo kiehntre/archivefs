@@ -963,3 +963,7 @@ pub mod support_attachment;
 /// Batch 12: the owned, frozen plan-export boundary - see that module's
 /// own doc comment.
 pub mod library_plan_export;
+
+/// Batch 13: the set-folder destination shape for real multi-file sets -
+/// see that module's own doc comment.
+pub mod set_destination;

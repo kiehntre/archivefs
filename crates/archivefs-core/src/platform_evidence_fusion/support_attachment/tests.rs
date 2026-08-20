@@ -2,8 +2,11 @@ use super::*;
 
 #[test]
 fn cue_file_attaches_to_its_own_stem_when_all_references_are_safe() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("track1.bin"), b"data").unwrap();
+    let cue_path = dir.path().join("game.cue");
     let contents = "FILE \"track1.bin\" BINARY\n";
-    let attachment = attach_support_file(Path::new("/roms/game.cue"), Some(contents), None);
+    let attachment = attach_support_file(&cue_path, Some(contents), None);
     assert_eq!(attachment.role, SideFileRole::CueSheet);
     match attachment.association {
         SupportAssociation::Attached { set_label } => assert_eq!(set_label, "game"),
@@ -12,9 +15,26 @@ fn cue_file_attaches_to_its_own_stem_when_all_references_are_safe() {
 }
 
 #[test]
-fn m3u_file_attaches_when_all_references_are_safe() {
+fn cue_file_referencing_a_missing_member_is_candidate_not_attached() {
+    let dir = tempfile::tempdir().unwrap();
+    let cue_path = dir.path().join("game.cue");
+    // "track1.bin" is never actually written to disk.
+    let contents = "FILE \"track1.bin\" BINARY\n";
+    let attachment = attach_support_file(&cue_path, Some(contents), None);
+    match attachment.association {
+        SupportAssociation::Candidate { .. } => {}
+        other => panic!("expected Candidate, got {other:?}"),
+    }
+}
+
+#[test]
+fn m3u_file_attaches_when_all_references_are_safe_and_present() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("Disc 1.chd"), b"data").unwrap();
+    std::fs::write(dir.path().join("Disc 2.chd"), b"data").unwrap();
+    let m3u_path = dir.path().join("game.m3u");
     let contents = "Disc 1.chd\nDisc 2.chd\n";
-    let attachment = attach_support_file(Path::new("/roms/game.m3u"), Some(contents), None);
+    let attachment = attach_support_file(&m3u_path, Some(contents), None);
     match attachment.association {
         SupportAssociation::Attached { .. } => {}
         other => panic!("expected Attached, got {other:?}"),
@@ -122,9 +142,12 @@ fn shared_folder_alone_never_implies_attachment() {
 
 #[test]
 fn attachment_is_deterministic() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("track1.bin"), b"data").unwrap();
+    let cue_path = dir.path().join("game.cue");
     let contents = "FILE \"track1.bin\" BINARY\n";
-    let a = attach_support_file(Path::new("/roms/game.cue"), Some(contents), None);
-    let b = attach_support_file(Path::new("/roms/game.cue"), Some(contents), None);
+    let a = attach_support_file(&cue_path, Some(contents), None);
+    let b = attach_support_file(&cue_path, Some(contents), None);
     assert_eq!(a, b);
 }
 

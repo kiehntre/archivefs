@@ -247,3 +247,81 @@ fn export_plan_preserves_caller_supplied_order() {
     let export = export_plan(&pairs);
     assert_eq!(export.items.len(), 2);
 }
+
+#[test]
+fn export_with_context_carries_set_and_support_facts() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    let source = write_temp(dir.path(), "game.bin");
+    let identity = saturn_identity();
+    let slug = |p: &str| (p == "Saturn").then(|| "saturn".to_string());
+    let context = LibraryPlanningContext {
+        destination_root: &root,
+        mode: crate::dat::rom_organisation::OrganisationMode::MoveRealFile,
+        slug_for_platform: &slug,
+        generation: 1,
+    };
+    let report = plan_library(
+        &[LibraryPlanInput {
+            source_path: source,
+            identity: identity.clone(),
+            set_identity: None,
+            physical_hash: None,
+            normalized_hash: None,
+            release_relationship: None,
+        }],
+        &context,
+    );
+    let presentation = present_library_plan(&report.items[0], &identity);
+    let set_and_support = SetAndSupportContext {
+        set_label: Some("Some Game (USA)".to_string()),
+        set_destination: Some(
+            root.join("saturn")
+                .join("Some Game (USA)")
+                .display()
+                .to_string(),
+        ),
+        support_role: None,
+        support_association: None,
+    };
+    let export = export_item_with_context(
+        &report.items[0],
+        &presentation,
+        None,
+        None,
+        &set_and_support,
+    );
+    assert_eq!(export.set_label.as_deref(), Some("Some Game (USA)"));
+    assert!(export.set_destination.is_some());
+}
+
+#[test]
+fn export_with_context_default_matches_plain_export_item() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    let source = write_temp(dir.path(), "game.bin");
+    let identity = saturn_identity();
+    let context = LibraryPlanningContext {
+        destination_root: &root,
+        mode: crate::dat::rom_organisation::OrganisationMode::MoveRealFile,
+        slug_for_platform: &no_slug_mapping,
+        generation: 1,
+    };
+    let report = plan_library(
+        &[LibraryPlanInput {
+            source_path: source,
+            identity: identity.clone(),
+            set_identity: None,
+            physical_hash: None,
+            normalized_hash: None,
+            release_relationship: None,
+        }],
+        &context,
+    );
+    let presentation = present_library_plan(&report.items[0], &identity);
+    let plain = export_item(&report.items[0], &presentation, None, None);
+    assert!(plain.set_label.is_none());
+    assert!(plain.support_role.is_none());
+}
