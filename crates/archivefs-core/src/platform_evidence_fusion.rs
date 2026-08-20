@@ -918,3 +918,12 @@ pub mod identity_orchestrator;
 /// [`identity_orchestrator::IdentityResult`] - see that module's own doc
 /// comment.
 pub mod identity_presentation;
+
+/// Batch 10: the read-only library-planning bridge into
+/// [`crate::dat::rom_organisation`] - see that module's own doc comment.
+pub mod library_planning;
+
+/// Batch 10: the read-only presentation model over a
+/// [`library_planning::LibraryItemPlan`] - see that module's own doc
+/// comment.
+pub mod library_plan_presentation;

@@ -22,13 +22,22 @@
 
 use std::collections::BTreeSet;
 
+use serde::Serialize;
+
 use crate::content_evidence::ContentEvidence;
 
 use super::{fuse_platform_evidence, group_by_equivalence};
 
 /// The archive-content structure axis - milestone section 17. Deliberately
 /// separate from any single member's own resolved platform.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Batch 10: derives `Serialize` (milestone section 40) - a pure data-shape
+/// addition, no behavior change. `Deserialize` is deliberately not derived:
+/// several variants carry `&'static str` platform ids (interned canonical
+/// platform names), which cannot round-trip through an owned deserializer
+/// without changing the type's shape - out of scope for a read-only
+/// planning report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum ArchiveSetIdentity {
     /// No member's evidence resolved a platform at all.
     Unknown,
