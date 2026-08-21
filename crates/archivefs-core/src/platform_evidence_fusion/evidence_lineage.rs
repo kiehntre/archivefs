@@ -433,9 +433,20 @@ pub fn known_derivation(family: SourceFamily) -> Option<SourceFamily> {
 /// names. Hasheous itself is never returned - it is a channel, never a
 /// source (section 20/57). Unrecognized tags conservatively resolve to
 /// [`SourceFamily::Unknown`] rather than a guess.
+///
+/// Batch 20 extended this with the exact
+/// `RomSignatureObject_Game_Rom_SignatureSourceType` tag strings verified
+/// against the live `https://hasheous.org/swagger/v1/swagger.json` document
+/// (`NoIntros`, `PureDOSDAT`, `TotalDOSCollection`, `ScreenScraper`,
+/// `Generic`) alongside the original researched variants, which are kept
+/// for backward compatibility with any caller already using them. Two live
+/// tags - `Pleasuredome` and `eXo` - have no corresponding [`SourceFamily`]
+/// variant and are deliberately left unmapped (falling through to
+/// `Unknown`) rather than overclaiming a relationship to an existing
+/// variant that isn't actually the same corpus (section 21).
 pub fn hasheous_upstream_for_tag(tag: &str) -> SourceFamily {
     match tag {
-        "NoIntro" | "nointro" | "No-Intro" => SourceFamily::NoIntro,
+        "NoIntro" | "nointro" | "No-Intro" | "NoIntros" => SourceFamily::NoIntro,
         "TOSEC" | "tosec" => SourceFamily::TOSEC,
         "Redump" | "redump" => SourceFamily::Redump,
         "MAMERedump" | "mameredump" => SourceFamily::MAMERedump,
@@ -444,6 +455,11 @@ pub fn hasheous_upstream_for_tag(tag: &str) -> SourceFamily {
         "WHDLoad" | "whdload" => SourceFamily::WHDLoad,
         "Retroplay" | "retroplay" => SourceFamily::Retroplay,
         "FBNeo" | "fbneo" => SourceFamily::FBNeo,
+        "PureDOS" | "PureDOSDAT" => SourceFamily::PureDOS,
+        "TotalDOSCollection" => SourceFamily::TotalDOSCollection,
+        "RetroAchievements" => SourceFamily::RetroAchievements,
+        "ScreenScraper" => SourceFamily::ScreenScraper,
+        "Generic" | "GenericMetadata" => SourceFamily::GenericMetadata,
         _ => SourceFamily::Unknown,
     }
 }
