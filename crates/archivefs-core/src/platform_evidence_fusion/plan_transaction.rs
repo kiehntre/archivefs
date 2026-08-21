@@ -1337,4 +1337,6 @@ mod closeout_tests;
 #[cfg(test)]
 mod hardening_tests;
 #[cfg(test)]
+mod real_rom_canary_tests;
+#[cfg(test)]
 mod tests;
