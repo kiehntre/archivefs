@@ -33,6 +33,7 @@ pub mod hashing;
 pub mod matching;
 pub mod model;
 pub mod net_policy;
+pub mod no_intro;
 pub mod path_map;
 pub mod romm;
 pub mod settings;

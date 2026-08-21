@@ -402,15 +402,58 @@ pub fn group_by_lineage(observations: &[EvidenceObservation]) -> Vec<LineageGrou
     groups
 }
 
-/// How many *independent, non-`Unknown` upstream families* are represented,
+/// One independently-trustworthy evidence lane for grouping/independence
+/// purposes (Batch 21 closeout). Deliberately **not** the same thing as
+/// [`SourceFamily`]:
+///
+/// - [`SourceFamily::Unknown`] still means "we don't know which external
+///   preservation lineage this came from" and stays conservative - it never
+///   becomes a lane, so it can never inflate an independence count. This is
+///   the correct, unchanged behavior for an unrecognized external provider.
+/// - [`EvidenceChannel::LocalStructural`] is different: it is *this crate's
+///   own* byte-level detector, produced by code we wrote and can inspect,
+///   not an unidentified external source. We know exactly how it was
+///   derived, so an [`LineageRelation::Independent`] structural observation
+///   is a known, independently-trustworthy lane even though it carries
+///   `upstream_source = Unknown` (a structural detector is not itself a
+///   preservation corpus and must never be relabeled as one - see
+///   [`observation_from_content_evidence`]).
+///
+/// Do not confuse the two: this enum exists so "lineage genuinely unknown"
+/// and "not a preservation source but still a known, independent local
+/// mechanism" can never be conflated by the classifier below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum LineageLane {
+    Family(SourceFamily),
+    LocalStructuralOrigin,
+}
+
+/// `None` means "excluded from independence accounting" - either a
+/// genuinely `Unknown` external source, or an observation whose
+/// [`LineageRelation`] is itself `Unknown`/non-independent. See
+/// [`LineageLane`] for why `LocalStructural` is deliberately not excluded.
+fn lineage_lane(observation: &EvidenceObservation) -> Option<LineageLane> {
+    if observation.provenance.channel == EvidenceChannel::LocalStructural
+        && observation.provenance.lineage == LineageRelation::Independent
+    {
+        return Some(LineageLane::LocalStructuralOrigin);
+    }
+    if observation.provenance.upstream_source == SourceFamily::Unknown {
+        return None;
+    }
+    Some(LineageLane::Family(observation.provenance.upstream_source))
+}
+
+/// How many *independent, trustworthy evidence lanes* are represented,
 /// deliberately never `observations.len()`. This is the only "count" this
 /// module exposes, and it means something specific: it is not a vote tally
-/// (section 22).
+/// (section 22). A genuinely `Unknown` external source never contributes a
+/// lane; EmuWiz's own [`EvidenceChannel::LocalStructural`] detector does,
+/// per [`LineageLane`]'s doc comment.
 pub fn independent_source_group_count(observations: &[EvidenceObservation]) -> usize {
     observations
         .iter()
-        .map(|observation| observation.provenance.upstream_source)
-        .filter(|family| *family != SourceFamily::Unknown)
+        .filter_map(lineage_lane)
         .collect::<BTreeSet<_>>()
         .len()
 }
@@ -531,6 +574,28 @@ fn metadata_only_claim(claim: ClaimType) -> bool {
     )
 }
 
+/// Whether `claim` is actually *about* a specific representation's bytes
+/// (an exact match on a physical/normalized/track/disc/slave artifact) -
+/// vs. a representation-agnostic fact like [`ClaimType::PlatformCandidate`].
+/// Only representation-bound claims are downgraded to
+/// [`AgreementStatus::CrossRepresentationAgreement`]/
+/// [`AgreementStatus::RepresentationConflict`] merely because their
+/// observations carry different [`Representation`]s - a structural
+/// detector's [`Representation::StructuralMetadata`] and a DAT's
+/// [`Representation::PhysicalFile`] disagreeing on *representation* says
+/// nothing about whether their *platform* claim genuinely agrees (Batch 21
+/// closeout, section 6/7).
+fn representation_bound_claim(claim: ClaimType) -> bool {
+    matches!(
+        claim,
+        ClaimType::ExactBytesMatch
+            | ClaimType::ExactNormalizedMatch
+            | ClaimType::ExactTrackMatch
+            | ClaimType::ExactLogicalDiscMatch
+            | ClaimType::ExactSlaveMatch
+    )
+}
+
 /// Classifies one already claim-scoped, non-empty group of observations
 /// into a single [`AgreementStatus`] via explicit rules - never a numeric
 /// score (matching this crate's established rule-based-fusion
@@ -546,32 +611,29 @@ fn classify_group(claim: ClaimType, group: &[EvidenceObservation]) -> AgreementS
         .iter()
         .map(|observation| observation.provenance.representation)
         .collect();
-    let families: BTreeSet<SourceFamily> = group
-        .iter()
-        .map(|observation| observation.provenance.upstream_source)
-        .collect();
-    let non_unknown_families: BTreeSet<SourceFamily> = families
-        .iter()
-        .copied()
-        .filter(|family| *family != SourceFamily::Unknown)
-        .collect();
+    let lanes: BTreeSet<LineageLane> = group.iter().filter_map(lineage_lane).collect();
+    // A "genuinely unknown" observation is one that contributes no lane at
+    // all (an unrecognized external source), or one that is explicitly
+    // marked `LineageRelation::Unknown` - never a `LocalStructural`
+    // observation, which always has a known lane (see `lineage_lane`).
     let any_unknown_lineage = group.iter().any(|observation| {
-        observation.provenance.upstream_source == SourceFamily::Unknown
-            || observation.provenance.lineage == LineageRelation::Unknown
+        observation.provenance.lineage == LineageRelation::Unknown
+            || lineage_lane(observation).is_none()
     });
     let any_derived = group
         .iter()
         .any(|observation| observation.provenance.lineage == LineageRelation::DerivedFrom);
+    let cross_representation = representation_bound_claim(claim) && representations.len() > 1;
 
     let agree = values.len() <= 1;
 
     if agree {
-        if non_unknown_families.len() <= 1 {
-            // One shared upstream family (possibly via several channels),
-            // or nothing but Unknown observations agreeing by coincidence:
-            // either way there is at most one lineage to trust, never
-            // independent corroboration.
-            return if any_unknown_lineage && non_unknown_families.is_empty() {
+        if lanes.len() <= 1 {
+            // One shared, trustworthy lane (possibly via several
+            // channels), or nothing but genuinely-unknown observations
+            // agreeing by coincidence: either way there is at most one
+            // lineage to trust, never independent corroboration.
+            return if any_unknown_lineage && lanes.is_empty() {
                 AgreementStatus::WeakAgreement
             } else {
                 AgreementStatus::SameSourceAgreement
@@ -580,12 +642,12 @@ fn classify_group(claim: ClaimType, group: &[EvidenceObservation]) -> AgreementS
         if any_derived {
             return AgreementStatus::DerivedAgreement;
         }
-        if representations.len() > 1 {
+        if cross_representation {
             return AgreementStatus::CrossRepresentationAgreement;
         }
         AgreementStatus::IndependentAgreement
     } else {
-        if non_unknown_families.len() <= 1 && !any_unknown_lineage {
+        if lanes.len() <= 1 && !any_unknown_lineage {
             return AgreementStatus::SameSourceVersionConflict;
         }
         if any_derived {
@@ -594,7 +656,7 @@ fn classify_group(claim: ClaimType, group: &[EvidenceObservation]) -> AgreementS
         if metadata_only_claim(claim) {
             return AgreementStatus::MetadataConflict;
         }
-        if representations.len() > 1 {
+        if cross_representation {
             return AgreementStatus::RepresentationConflict;
         }
         AgreementStatus::IndependentSourceConflict

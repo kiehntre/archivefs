@@ -270,23 +270,27 @@ fn test_07_structural_gb_plus_nointro_is_independent_agreement() {
     );
     nointro.claim = ClaimType::PlatformCandidate;
     let summaries = merge_evidence(&[structural, nointro]);
-    // One of the two families is Unknown (structural), so this is not
-    // classified as two independent preservation authorities but the
-    // observation is preserved and value-agreement holds.
+    // Batch 21 closeout: `LocalStructural` carries `upstream_source =
+    // Unknown` (a byte-level detector is not itself a preservation
+    // source), but it is EmuWiz's own, known-provenance mechanism - not a
+    // genuinely unidentified external source. `lineage_lane` treats it as
+    // its own trustworthy lane, so this is real independent agreement
+    // between the structural detector and the No-Intro lineage, not a
+    // downgrade to SameSourceAgreement/WeakAgreement.
     assert_eq!(summaries[0].observations.len(), 2);
-    assert!(matches!(
-        summaries[0].status,
-        AgreementStatus::SameSourceAgreement | AgreementStatus::WeakAgreement
-    ));
+    assert_eq!(summaries[0].status, AgreementStatus::IndependentAgreement);
+    assert_eq!(
+        independent_source_group_count(&summaries[0].observations),
+        2
+    );
 }
 
 #[test]
 fn test_07b_structural_gb_plus_nointro_with_known_family_is_independent_agreement() {
-    // A caller who *does* know the structural detector's family (e.g. a
-    // future dedicated "LocalStructural" pseudo-family were it added to
-    // SourceFamily) would see real independence; here we simulate the
-    // genuinely-independent case using two real preservation families
-    // that do not require same representation to agree.
+    // A separate proof that independence also holds between two *named*
+    // preservation families (TOSEC vs. No-Intro) that do not require the
+    // same representation to agree - complementary to test_07's proof
+    // that `LocalStructural` itself is independently trustworthy.
     let a = platform_obs(
         EvidenceChannel::LocalTosec,
         SourceFamily::TOSEC,
@@ -1793,4 +1797,195 @@ fn dat_identity_resolver_behavior_is_byte_for_byte_unchanged() {
         detail: "header name names NES".to_string(),
     }]);
     assert_eq!(result.platform(), Some("NES"));
+}
+
+// ------------------------------------------------------------------
+// Batch 21 closeout: LocalStructural is a known independent lane,
+// distinct from a genuinely unknown external source (section 8).
+// ------------------------------------------------------------------
+
+fn structural_content_evidence(value: &str) -> crate::content_evidence::ContentEvidence {
+    crate::content_evidence::ContentEvidence {
+        kind: crate::content_evidence::ContentEvidenceKind::BootStructure,
+        value: value.to_string(),
+        confidence: crate::content_evidence::ContentEvidenceConfidence::Strong,
+        detail: "structural detector fact".to_string(),
+    }
+}
+
+#[test]
+fn closeout_1_gb_structural_plus_local_nointro_is_independent_agreement() {
+    let structural = observation_from_content_evidence(&structural_content_evidence("Game Boy"));
+    let nointro = platform_obs(
+        EvidenceChannel::LocalNoIntro,
+        SourceFamily::NoIntro,
+        LineageRelation::Independent,
+        "Game Boy",
+    );
+    let summaries = merge_evidence(&[structural, nointro]);
+    assert_eq!(summaries[0].status, AgreementStatus::IndependentAgreement);
+    assert_eq!(
+        independent_source_group_count(&summaries[0].observations),
+        2
+    );
+}
+
+#[test]
+fn closeout_2_n64_structural_plus_normalized_nointro_is_independent_agreement() {
+    let structural = observation_from_content_evidence(&structural_content_evidence("Nintendo 64"));
+    let mut nointro_normalized = platform_obs(
+        EvidenceChannel::LocalNoIntro,
+        SourceFamily::NoIntro,
+        LineageRelation::Independent,
+        "Nintendo 64",
+    );
+    nointro_normalized.provenance.representation = Representation::NormalizedRom;
+    let summaries = merge_evidence(&[structural, nointro_normalized]);
+    // PlatformCandidate is representation-agnostic (section 6/7): the
+    // structural detector's StructuralMetadata representation and the
+    // No-Intro normalized representation both differing does not demote
+    // this away from genuine independence.
+    assert_eq!(summaries[0].status, AgreementStatus::IndependentAgreement);
+}
+
+#[test]
+fn closeout_3_saturn_structural_plus_redump_is_independent_agreement() {
+    let structural = observation_from_content_evidence(&structural_content_evidence("Saturn"));
+    let redump = platform_obs(
+        EvidenceChannel::LocalRedump,
+        SourceFamily::Redump,
+        LineageRelation::Independent,
+        "Saturn",
+    );
+    let summaries = merge_evidence(&[structural, redump]);
+    assert_eq!(summaries[0].status, AgreementStatus::IndependentAgreement);
+}
+
+#[test]
+fn closeout_4_amiga_structural_plus_whdload_is_independent_agreement() {
+    let structural = observation_from_content_evidence(&structural_content_evidence("Amiga"));
+    let whdload = platform_obs(
+        EvidenceChannel::LocalWHDLoad,
+        SourceFamily::WHDLoad,
+        LineageRelation::Independent,
+        "Amiga",
+    );
+    let summaries = merge_evidence(&[structural, whdload]);
+    assert_eq!(summaries[0].status, AgreementStatus::IndependentAgreement);
+}
+
+#[test]
+fn closeout_5_gameboy_structural_vs_megadrive_nointro_is_independent_source_conflict() {
+    let structural = observation_from_content_evidence(&structural_content_evidence("Game Boy"));
+    let nointro = platform_obs(
+        EvidenceChannel::LocalNoIntro,
+        SourceFamily::NoIntro,
+        LineageRelation::Independent,
+        "Sega Mega Drive",
+    );
+    let summaries = merge_evidence(&[structural, nointro]);
+    assert_eq!(
+        summaries[0].status,
+        AgreementStatus::IndependentSourceConflict
+    );
+    assert!(summaries[0].status.is_conflict());
+}
+
+#[test]
+fn closeout_6_unknown_external_plus_nointro_is_not_automatically_independent() {
+    let unknown_external = platform_obs(
+        EvidenceChannel::Unknown,
+        SourceFamily::Unknown,
+        LineageRelation::Unknown,
+        "Game Boy",
+    );
+    let nointro = platform_obs(
+        EvidenceChannel::LocalNoIntro,
+        SourceFamily::NoIntro,
+        LineageRelation::Independent,
+        "Game Boy",
+    );
+    let summaries = merge_evidence(&[unknown_external, nointro]);
+    assert_ne!(summaries[0].status, AgreementStatus::IndependentAgreement);
+    assert_eq!(summaries[0].status, AgreementStatus::SameSourceAgreement);
+}
+
+#[test]
+fn closeout_7_unknown_external_plus_redump_is_not_automatically_independent() {
+    let unknown_external = platform_obs(
+        EvidenceChannel::Unknown,
+        SourceFamily::Unknown,
+        LineageRelation::Unknown,
+        "Saturn",
+    );
+    let redump = platform_obs(
+        EvidenceChannel::LocalRedump,
+        SourceFamily::Redump,
+        LineageRelation::Independent,
+        "Saturn",
+    );
+    let summaries = merge_evidence(&[unknown_external, redump]);
+    assert_ne!(summaries[0].status, AgreementStatus::IndependentAgreement);
+    assert_eq!(summaries[0].status, AgreementStatus::SameSourceAgreement);
+}
+
+#[test]
+fn closeout_8_local_structural_duplicates_alone_do_not_fake_multiple_independent_sources() {
+    let a = observation_from_content_evidence(&structural_content_evidence("Game Boy"));
+    let b = observation_from_content_evidence(&structural_content_evidence("Game Boy"));
+    let c = observation_from_content_evidence(&structural_content_evidence("Game Boy"));
+    let group = [a, b, c];
+    assert_eq!(
+        independent_source_group_count(&group),
+        1,
+        "three structural facts from the same detector are one lane, not three"
+    );
+    let summaries = merge_evidence(&group);
+    assert_ne!(summaries[0].status, AgreementStatus::IndependentAgreement);
+}
+
+#[test]
+fn closeout_9_local_structural_plus_hasheous_nointro_independent_hasheous_stays_relay() {
+    let structural = observation_from_content_evidence(&structural_content_evidence("Game Boy"));
+    let hasheous_nointro = hasheous_observation(
+        "NoIntro",
+        Representation::Unknown,
+        ClaimType::PlatformCandidate,
+        None,
+        Some("Game Boy".to_string()),
+    );
+    assert_eq!(hasheous_nointro.provenance.lineage, LineageRelation::Relay);
+    let summaries = merge_evidence(&[structural, hasheous_nointro]);
+    assert_eq!(summaries[0].status, AgreementStatus::IndependentAgreement);
+    assert_eq!(
+        independent_source_group_count(&summaries[0].observations),
+        2,
+        "structural lane + NoIntro lineage, Hasheous itself never a third source"
+    );
+}
+
+#[test]
+fn closeout_10_structural_plus_local_nointro_plus_hasheous_nointro_is_two_lineage_groups_never_three()
+ {
+    let structural = observation_from_content_evidence(&structural_content_evidence("Game Boy"));
+    let local_nointro = platform_obs(
+        EvidenceChannel::LocalNoIntro,
+        SourceFamily::NoIntro,
+        LineageRelation::Independent,
+        "Game Boy",
+    );
+    let hasheous_nointro = hasheous_observation(
+        "NoIntro",
+        Representation::Unknown,
+        ClaimType::PlatformCandidate,
+        None,
+        Some("Game Boy".to_string()),
+    );
+    let all = [structural, local_nointro, hasheous_nointro];
+    assert_eq!(all.len(), 3, "three observations");
+    assert_eq!(
+        independent_source_group_count(&all),
+        2,
+        "one structural lane + one NoIntro lineage (direct + Hasheous relay), never three"
+    );
 }
