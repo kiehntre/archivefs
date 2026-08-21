@@ -973,3 +973,9 @@ pub mod set_destination;
 /// journal-backed apply/rollback engine) - see that module's own doc
 /// comment for exactly which existing module it reuses.
 pub mod plan_transaction;
+
+/// Batch 19: the source-lineage / provenance foundation - Observation !=
+/// Channel != UpstreamSource. See that module's own doc comment for the
+/// full thesis; nothing in it changes existing evidence/identity or
+/// transaction behavior.
+pub mod evidence_lineage;
