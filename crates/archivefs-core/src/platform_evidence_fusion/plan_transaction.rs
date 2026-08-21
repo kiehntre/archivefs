@@ -1331,6 +1331,8 @@ fn describe_symlink_metadata(path: &Path) -> String {
 }
 
 #[cfg(test)]
+mod canary_run_tests;
+#[cfg(test)]
 mod closeout_tests;
 #[cfg(test)]
 mod hardening_tests;
